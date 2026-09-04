@@ -1,0 +1,45 @@
+# Kryonsec Zone B sandbox image (spec v2.1.1 §8.5).
+#
+# Build (inside WSL2, from the repo root):
+#   docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
+#
+# Pin by digest after the smoke test (spec §8.6):
+#   docker inspect --format '{{index .RepoDigests 0}}' kryonsec/sandbox
+# Then set KRYONSEC_SANDBOX_IMAGE in the environment / .env.
+FROM kalilinux/kali-rolling:latest
+
+# jq is REQUIRED (entrypoint uses it) and is NOT in the base image.
+# Minimal toolset only: no metasploit-framework/beef-xss/setoolkit
+# (never installed here — the allowlist + image contents are the control).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    nmap \
+    dnsutils \
+    curl \
+    netcat-traditional \
+    python3 \
+    python3-pip \
+    nuclei \
+    sqlmap \
+    nikto \
+    gobuster \
+    ffuf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bake nuclei templates at BUILD time, not runtime (sandbox has no
+# internet egress to template sources).
+RUN nuclei -update-templates || true
+
+# bloodhound.py is a pip package, not apt; executable is bloodhound-python.
+RUN pip install --no-cache-dir --break-system-packages bloodhound.py
+
+# Create non-root user for tool execution
+RUN useradd -m -s /bin/false kryonsec-runner
+
+# Evidence directory
+RUN mkdir -p /evidence && chown kryonsec-runner:kryonsec-runner /evidence
+
+COPY containers/sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod 0755 /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+USER kryonsec-runner

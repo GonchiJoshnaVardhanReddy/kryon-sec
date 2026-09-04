@@ -227,18 +227,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "purple":
         import uuid
 
-        from .purple.runner import profile2_available, start_engagement
+        from .purple.runner import sandbox_available, start_engagement
+        from .purple.zonea import validate_target
 
-        ok, reason = profile2_available()
-        if not ok:
-            err_console.print(f"[red]Purple Team blocked:[/red] {reason}")
-            console.print("Run [bold]kryonsec doctor[/bold] for the full preflight report.")
+        try:
+            target = validate_target(args.target)
+        except ValueError as e:
+            err_console.print(f"[red]Invalid target:[/red] {e}")
             return 2
 
+        sandbox_ok, sandbox_reason = sandbox_available()
+        if not sandbox_ok:
+            console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
+            console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
+
         engagement_id = args.id or str(uuid.uuid4())[:8]
-        orch, audit = start_engagement(cfg, engagement_id)
-        console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={args.target}")
-        console.print("[yellow]State machine ready — subagents are stubs until Phase 2 lands (see README).[/yellow]")
+        orch, audit, graph = start_engagement(cfg, engagement_id, target=target)
+        console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
+        completed = orch.run()
+        console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
+        if orch.halt_reason:
+            console.print(f"[red]halted:[/red] {orch.halt_reason}")
+        subdomains = [n["label"] for n in graph.by_type("subdomain")]
+        if subdomains:
+            console.print(f"\n[cyan]passive recon found {len(subdomains)} subdomains:[/cyan]")
+            for s in subdomains[:30]:
+                console.print(f"  [dim]{s}[/dim]")
+        console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
         return 0
 
     console.print(WELCOME.format(version=__version__))

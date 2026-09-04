@@ -86,6 +86,15 @@ class KryonsecConfig:
     # --- Output bounding (safety Layer 10) ---
     max_tool_output_chars: int = 20000
 
+    # --- Zone B sandbox (spec §8.5/§8.6) ---
+    # Tag until a digest is pinned (docker inspect after the smoke test);
+    # KRYONSEC_SANDBOX_IMAGE may hold "kryonsec/sandbox@sha256:<digest>".
+    sandbox_image: str = field(
+        default_factory=lambda: os.environ.get(
+            "KRYONSEC_SANDBOX_IMAGE", "kryonsec/sandbox:latest"
+        )
+    )
+
     def ensure_dirs(self) -> None:
         """Create home and workspace directories."""
         self.home.mkdir(parents=True, exist_ok=True)

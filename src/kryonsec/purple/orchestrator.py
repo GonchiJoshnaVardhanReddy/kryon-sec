@@ -113,6 +113,9 @@ class PurpleOrchestrator:
                     log.exception("subagent crash in %s", self.state)
                     result = SubagentResult(status="failed")
 
+            if result.status == "halted" and result.halt_reason:
+                self.halt_reason = result.halt_reason
+
             self.state = next_state(self.state, result)
 
         return self.completed

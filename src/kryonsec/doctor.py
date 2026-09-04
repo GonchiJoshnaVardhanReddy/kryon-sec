@@ -107,6 +107,18 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
         if ok:
             ok, msg = _check_gvisor()
             checks.append(("Purple Team: gVisor (runsc)", "sandbox runtime", ok, msg))
+            if ok:
+                from .purple.runner import _image_present
+
+                image = cfg.sandbox_image
+                if _image_present(image):
+                    checks.append(("Purple Team: sandbox image", "Zone B tool container", True, f"OK ({image})"))
+                else:
+                    checks.append((
+                        "Purple Team: sandbox image", "Zone B tool container", False,
+                        f"missing: {image} — build with: docker build -t kryonsec/sandbox "
+                        "-f containers/sandbox/Dockerfile.kali .",
+                    ))
     else:
         checks.append((
             "Purple Team: Docker", "sandbox host", False,
