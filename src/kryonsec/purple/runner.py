@@ -224,12 +224,34 @@ def start_engagement(
 
             return run_report
 
+        if state == "RECON_ACTIVE" and sandbox_ok:
+            from .recon_active import ReconActiveSubagent
+            from .sandbox import KaliSandbox
+
+            sandbox = KaliSandbox(cfg=cfg)
+            sub = ReconActiveSubagent(
+                cfg=cfg, graph=graph, audit=audit, target=target,
+                sandbox=sandbox,
+            )
+            return sub.run
+
         if state == "EXPLOIT" and sandbox_ok:
             from .exploit import ExploitSubagent
             from .sandbox import KaliSandbox
 
             sandbox = KaliSandbox(cfg=cfg)
             sub = ExploitSubagent(
+                cfg=cfg, graph=graph, audit=audit, target=target,
+                sandbox=sandbox,
+            )
+            return sub.run
+
+        if state == "VERIFY" and sandbox_ok:
+            from .sandbox import KaliSandbox
+            from .verify import VerifySubagent
+
+            sandbox = KaliSandbox(cfg=cfg)
+            sub = VerifySubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox,
             )

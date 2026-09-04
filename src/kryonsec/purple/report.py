@@ -63,6 +63,11 @@ def render_report(
         a["label"].split(":")[0] for a in attempts
         if a["properties"].get("confirmed")
     }
+    # a finding is "verified" when VERIFY's independent probe agreed
+    verified_ids = {
+        n["label"] for n in graph.by_type("verify_attempt")
+        if n["properties"].get("verified")
+    }
 
     return template.render(
         engagement_id=engagement_id,
@@ -72,7 +77,8 @@ def render_report(
         hypotheses=[
             {"id": n["label"], **n["properties"],
              "tested": n["label"] in tested_ids,
-             "confirmed": n["label"] in confirmed_ids}
+             "confirmed": n["label"] in confirmed_ids,
+             "verified": n["label"] in verified_ids}
             for n in graph.by_type("hypothesis")
         ],
         attempts=attempts,

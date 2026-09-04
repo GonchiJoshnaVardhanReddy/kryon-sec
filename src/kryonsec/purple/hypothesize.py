@@ -74,6 +74,10 @@ def render_hypothesize_prompt(graph: EngagementGraph) -> str:
         target=target,
         subdomains=subdomains[:50],
         paths=paths[:50],
+        services=[
+            {"label": n["label"], **n["properties"]}
+            for n in graph.by_type("service")
+        ],
     )
 
 
