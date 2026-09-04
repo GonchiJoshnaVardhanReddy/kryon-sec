@@ -1,10 +1,25 @@
 # Kryonsec — Session Handoff Notes
 **Date:** 2026-09-05 (end of session 8)
 **Repo:** https://github.com/GonchiJoshnaVardhanReddy/kryon-sec (branch: main)
-**Status: 100% of planned features done and live-verified. 191 tests
-green. v1.0.0. Working tree should be clean — check `git status` first.**
+**Status: 100% of planned features + real TUI built. 198 tests green.
+v1.0.0. Working tree should be clean — check `git status` first.**
+
+## FIRST THING NEXT SESSION: live-test the TUI (built, untested live)
+Start `kryonsec` in WSL and check:
+1. `exit` quits cleanly (old bug: went to the LLM)
+2. **Shift+Tab** flips `[COPILOT]>` <-> `[PURPLE]>` — if the terminal
+   swallows the key, wire a fallback (e.g. Ctrl+T) in tui.py
+3. Ctrl+C = clean bye, no traceback (fixed CancelledError escape)
+4. Up-arrow / Ctrl+R history (saved to ~/.kryonsec/chat_history)
+Note: first Ctrl+C inside a prompt may still show one ^C glyph — fine.
 
 ## Session 8 additions
+- **TUI (spec §5.1):** `src/kryonsec/tui.py` — prompt_toolkit input
+  (already a dependency). Shift+Tab toggles copilot <-> purple (prompt
+  repaints, typed text survives); /mode shares the same set_mode logic;
+  input history saved to ~/.kryonsec/chat_history (up-arrow, Ctrl+R
+  prefix search); Ctrl+C now exits cleanly (CancelledError was escaping
+  the handler and printing a traceback). 7 tests in tests/test_tui.py.
 - **Web search FIXED (live-verified in WSL):** the root cause was that
   DDG's html + lite endpoints AND Mojeek all serve bot-challenge pages
   to this network. Fix: search now tries 5 sources in order until one
