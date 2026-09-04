@@ -197,6 +197,12 @@ def start_engagement(
             sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit)
             return sub.run
 
+        if state == "HUMAN_REVIEW":
+            from .human_review import HumanReviewSubagent
+
+            sub = HumanReviewSubagent(graph=graph, audit=audit)
+            return sub.run
+
         if state in SANDBOX_FREE_STATES:
             return subagent_stub(state)
 
