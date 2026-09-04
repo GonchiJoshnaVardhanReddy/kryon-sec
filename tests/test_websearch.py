@@ -9,6 +9,9 @@ from kryonsec.copilot.websearch import (
     _cache_key,
     _clean_url,
     _from_ddg,
+    _from_ddg_api,
+    _from_mojeek,
+    _from_wikipedia,
     _strip_tags,
     search_web,
 )
@@ -38,6 +41,38 @@ SAMPLE_HTML = """
   </h2>
   <a class="result__snippet" href="...">The vendor released a patch in version 2.1. Read more.</a>
 </div>
+"""
+
+# Mojeek markup: results use <a class="ob" ...> links + <p class="s"> snippets
+MOJEEK_HTML = """
+<ul class="results-standard">
+<li><h2><a class="ob" href="https://owasp.org/www-community/attacks/SQL_Injection"
+  data-ct="OWASP SQL Injection">OWASP SQL Injection <em>Attack</em></a></h2>
+<p class="s">SQL injection is a code injection technique used to attack data-driven applications.</p></li>
+<li><h2><a class="ob" href="https://portswigger.net/web-security/sql-injection">SQL Injection | Web Security Academy</a></h2>
+<p class="s">Learn about SQL injection vulnerabilities and how to exploit them.</p></li>
+</ul>
+"""
+
+DDG_API_JSON = """
+{
+  "Heading": "SQL injection",
+  "AbstractText": "SQL injection is a code injection technique.",
+  "AbstractURL": "https://en.wikipedia.org/wiki/SQL_injection",
+  "RelatedTopics": [
+    {"FirstURL": "https://owasp.org/sql", "Text": "OWASP - SQL injection resource"},
+    {"Name": "Topic", "Topics": [
+      {"FirstURL": "https://portswigger.net/sql", "Text": "PortSwigger - SQLi labs"}
+    ]}
+  ]
+}
+"""
+
+WIKI_JSON = """
+{"query": {"search": [
+  {"title": "SQL injection", "snippet": "SQL injection is a code injection technique used to attack data-driven applications."},
+  {"title": "Web application security", "snippet": "This is <span class=\\"searchmatch\\">security</span> of web apps."}
+]}}
 """
 
 
@@ -102,6 +137,212 @@ def test_from_ddg_network_failure_returns_none(monkeypatch):
 def test_from_ddg_no_results_empty_list(monkeypatch):
     _patch_urlopen(monkeypatch, "<html><body>nothing here</body></html>")
     assert _from_ddg("query") == []
+
+
+def test_from_ddg_lite_fallback_when_html_empty(monkeypatch):
+    """When the html endpoint serves a JS page (zero parsed results),
+    fall back to the lite endpoint."""
+    calls: list[str] = []
+
+    class Resp:
+        def __init__(self, page: str):
+            self.page = page
+
+        def read(self):
+            return self.page.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        url = req.full_url
+        calls.append(url)
+        if "html.duckduckgo.com" in url:
+            return Resp("<html><body>JS only</body></html>")
+        assert "lite.duckduckgo.com" in url
+        # the lite endpoint receives the query as a POST body
+        assert req.data == b"q=fallback+test"
+        return Resp("""
+        <a rel="nofollow" href="https://example.com/page" class="result-link">Example page</a>
+        <td class="result-snippet">A page about security</td>
+        """)
+
+    monkeypatch.setattr(
+        "kryonsec.copilot.websearch.urllib.request.urlopen", fake_urlopen)
+    results = _from_ddg("fallback test")
+    assert len(calls) == 2  # html tried, then lite
+    assert results is not None
+    assert results[0]["title"] == "Example page"
+    assert results[0]["url"] == "https://example.com/page"
+    assert results[0]["snippet"] == "A page about security"
+
+
+def test_from_ddg_falls_back_to_mojeek(monkeypatch):
+    """DDG's web endpoints bot-challenge some IPs — Mojeek is the next
+    source in the chain and has no bot wall."""
+    calls: list[str] = []
+
+    class Resp:
+        def __init__(self, page: str):
+            self.page = page
+
+        def read(self):
+            return self.page.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        calls.append(req.full_url)
+        if "duckduckgo.com" in req.full_url:
+            return Resp("<html><body>anomaly challenge page</body></html>")
+        assert "mojeek.com" in req.full_url
+        return Resp(MOJEEK_HTML)
+
+    monkeypatch.setattr(
+        "kryonsec.copilot.websearch.urllib.request.urlopen", fake_urlopen)
+    results = _from_ddg("sql injection")
+    # html + lite challenged, Mojeek answered
+    assert len(calls) == 3
+    assert results is not None and len(results) == 2
+    assert results[0]["title"] == "OWASP SQL Injection Attack"
+    assert results[0]["url"] == "https://owasp.org/www-community/attacks/SQL_Injection"
+    assert "code injection technique" in results[0]["snippet"]
+    assert results[1]["url"] == "https://portswigger.net/web-security/sql-injection"
+
+
+def test_from_ddg_falls_back_to_ddg_api(monkeypatch):
+    """Last resort: the Instant Answer JSON API (a real API — no bot
+    wall)."""
+    calls: list[str] = []
+
+    class Resp:
+        def __init__(self, page: str):
+            self.page = page
+
+        def read(self):
+            return self.page.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        calls.append(req.full_url)
+        if "api.duckduckgo.com" in req.full_url:
+            return Resp(DDG_API_JSON)
+        return Resp("<html><body>challenge</body></html>")
+
+    monkeypatch.setattr(
+        "kryonsec.copilot.websearch.urllib.request.urlopen", fake_urlopen)
+    results = _from_ddg("sql injection")
+    assert len(calls) == 4  # html, lite, mojeek, api
+    assert results is not None
+    assert results[0]["title"] == "SQL injection"
+    assert results[0]["url"] == "https://en.wikipedia.org/wiki/SQL_injection"
+    assert "code injection technique" in results[0]["snippet"]
+    urls = [r["url"] for r in results]
+    assert "https://owasp.org/sql" in urls
+    # direct URLs pass through untouched (no DDG redirect to expand)
+    assert "https://portswigger.net/sql" in urls
+
+
+def test_from_ddg_all_sources_dead_returns_none(monkeypatch):
+    def boom(req, timeout):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(
+        "kryonsec.copilot.websearch.urllib.request.urlopen", boom)
+    assert _from_ddg("anything") is None
+
+
+def test_from_mojeek_skips_own_nav_links(monkeypatch):
+    _patch_urlopen(
+        monkeypatch,
+        '<a class="ob" href="https://www.mojeek.com/about">About Mojeek</a>'
+        '<p class="s">about the engine</p>'
+        '<a class="ob" href="https://real.example/page">Real page</a>'
+        '<p class="s">real snippet</p>',
+    )
+    results = _from_mojeek("q")
+    assert len(results) == 1
+    assert results[0]["url"] == "https://real.example/page"
+
+
+def test_from_ddg_api_invalid_json_returns_empty(monkeypatch):
+    _patch_urlopen(monkeypatch, "<html>not json</html>")
+    assert _from_ddg_api("q") == []
+
+
+def test_ddg_topic_url_expands_redirect(monkeypatch):
+    from kryonsec.copilot.websearch import _expand_ddg_topic_url
+
+    assert _expand_ddg_topic_url(
+        "https://duckduckgo.com/Code_injection"
+    ) == "https://en.wikipedia.org/wiki/Code_injection"
+    assert _expand_ddg_topic_url(
+        "https://owasp.org/sql"
+    ) == "https://owasp.org/sql"
+
+
+# ---- Wikipedia source -----------------------------------------------------
+
+def test_from_wikipedia_parses_results(monkeypatch):
+    _patch_urlopen(monkeypatch, WIKI_JSON)
+    results = _from_wikipedia("sql injection")
+    assert results is not None
+    assert len(results) == 2
+    assert results[0]["title"] == "SQL injection"
+    assert results[0]["url"] == "https://en.wikipedia.org/wiki/SQL_injection"
+    assert "code injection technique" in results[0]["snippet"]
+    # snippet markup is stripped
+    assert "<span" not in results[1]["snippet"]
+    assert "security" in results[1]["snippet"]
+
+
+def test_from_wikipedia_error_json_returns_empty(monkeypatch):
+    _patch_urlopen(monkeypatch, '{"error": "unknown"}')
+    assert _from_wikipedia("q") == []
+
+
+def test_from_ddg_falls_back_to_wikipedia(monkeypatch):
+    """When every earlier source answers with nothing (bot-challenged),
+    Wikipedia is the final keyless source that still answers."""
+    calls: list[str] = []
+
+    class Resp:
+        def __init__(self, page: str):
+            self.page = page
+
+        def read(self):
+            return self.page.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout):
+        calls.append(req.full_url)
+        if "en.wikipedia.org" in req.full_url:
+            return Resp(WIKI_JSON)
+        return Resp("<html><body>challenge</body></html>")
+
+    monkeypatch.setattr(
+        "kryonsec.copilot.websearch.urllib.request.urlopen", fake_urlopen)
+    results = _from_ddg("sql injection")
+    assert len(calls) == 5  # html, lite, mojeek, api, wiki
+    assert results is not None
+    assert results[0]["title"] == "SQL injection"
 
 
 # ---- search_web: cache behavior -----------------------------------------
