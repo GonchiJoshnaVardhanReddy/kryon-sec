@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kryonsec"
+version = "2.1.1"
+description = "Single-user CLI cybersecurity platform: conversational copilot + deterministic purple-team engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "litellm>=1.40",
+    "pydantic>=2.6",
+    "sqlalchemy>=2.0",
+    "prompt_toolkit>=3.0",
+    "jinja2>=3.1",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+kryonsec = "kryonsec.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kryonsec"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

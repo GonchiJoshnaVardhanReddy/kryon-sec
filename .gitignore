@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Databases
+*.db
+*.sqlite3
+
+# Env & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
