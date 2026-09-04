@@ -29,7 +29,10 @@ class Hypothesis(BaseModel):
 
     id: str = Field(description="Short stable id, e.g. H1")
     title: str = Field(description="One-line hypothesis, plain language")
-    target_asset: str = Field(description="Which asset (host/path) it applies to")
+    target_asset: str = Field(
+        description="Which asset it applies to — full path WITH query string "
+        "when one exists (e.g. /ListProducts.asp?artist=1)"
+    )
     rationale: str = Field(description="Why recon suggests this (evidence-based)")
     cvss_vector: str = Field(
         default="",

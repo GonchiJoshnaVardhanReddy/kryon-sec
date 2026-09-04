@@ -23,11 +23,19 @@ Your task:
 1. For each asset above, hypothesize plausible vulnerabilities (max 10 total).
 2. Base every rationale ONLY on the evidence above (names, paths, the target itself).
    Never claim a vulnerability was tested or confirmed.
-3. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
-4. Suggest testing tools ONLY from this allowlist:
+3. target_asset MUST be the clean base path WITH its parameter name and a
+   simple value (e.g. "/ListProducts.asp?artist=1"). Archived URLs often
+   contain old attack payloads in the parameter value — propose the CLEAN
+   URL, not the payload. Strip payload characters; keep the parameter.
+4. Prefer parameters that look like they reach a database (id, artist, cat,
+   product, search) over redirect parameters (RetURL, next, url).
+5. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
+6. Suggest testing tools ONLY from this allowlist:
    nmap, dnsx, subfinder, sqlmap, nikto, gobuster, ffuf, curl, wget, nc,
    ncat, openssl, python3, linpeas.sh, bloodhound-python.
-5. Give each hypothesis a confidence between 0.0 and 1.0.
+7. Give each hypothesis a confidence between 0.0 and 1.0.
+8. Do not repeat the same target_asset across hypotheses — each hypothesis
+   targets a different parameter or a different attack on it.
 
 Remember: you are proposing what MIGHT be true. The human operator approves
 or rejects each hypothesis before anything is executed against the target.

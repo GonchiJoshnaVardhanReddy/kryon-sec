@@ -38,6 +38,31 @@ engagement, so every issue below is an unconfirmed suggestion.
 The engagement stopped early. Reason: {{ halt_reason }}.
 {% endif %}
 
+## How the testing was done (steps you can repeat)
+
+{% if attempts %}
+A tester can check any item below by hand. Every test was run inside a
+locked-down sandbox container, one test at a time, against the target
+website only.
+
+{% for a in attempts %}
+### Steps for {{ a.label }}
+
+1. The tool {{ a.properties.tool }} was run with these settings:
+   `{{ a.properties.argv | join(' ') }}`
+2. The tool sent test requests to the target website and watched how
+   it answered.
+3. Result: {% if a.properties.confirmed %}the tool said the issue is real ("confirmed"). The tool's own words:
+   `{{ a.properties.output_excerpt | trim | truncate(200) }}`{% else %}the tool did not find the issue (it checked and got no proof).{% endif %}
+
+To repeat it yourself: run the same command (shown in step 1) in a safe
+test environment and compare what the tool answers. Only test websites
+you are allowed to test.
+{% endfor %}
+{% else %}
+No test steps to show — no tools were run in this engagement.
+{% endif %}
+
 ## What we found about the target
 
 **Subdomains found:** {{ subdomains | length }}
