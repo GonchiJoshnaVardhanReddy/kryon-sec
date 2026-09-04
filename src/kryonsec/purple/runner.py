@@ -22,6 +22,71 @@ log = logging.getLogger(__name__)
 # States that can run without the Kali sandbox (host-side, Zone A)
 SANDBOX_FREE_STATES = {"INIT", "RECON_PASSIVE", "HYPOTHESIZE", "HUMAN_REVIEW"}
 
+# What each state does + which tools it may use (spec §4.2 state table).
+# Display info only — the authoritative tool check is the allowlist.
+STATE_INFO: dict[str, dict[str, str]] = {
+    "INIT": {
+        "agent": "init",
+        "does": "load config, validate scope",
+        "tools": "none",
+        "zone": "—",
+    },
+    "RECON_PASSIVE": {
+        "agent": "passive-recon",
+        "does": "third-party lookups — zero packets to target",
+        "tools": "crt.sh, Wayback (Zone A APIs only)",
+        "zone": "A",
+    },
+    "RECON_ACTIVE": {
+        "agent": "active-recon",
+        "does": "scan the target (packets to target)",
+        "tools": "nmap, httpx, wappalyzer, wafw00f, feroxbuster, nuclei",
+        "zone": "B (sandbox)",
+    },
+    "HYPOTHESIZE": {
+        "agent": "hypothesizer (LLM)",
+        "does": "propose vulnerability hypotheses from recon data",
+        "tools": "none — pure LLM, proposes only",
+        "zone": "—",
+    },
+    "HUMAN_REVIEW": {
+        "agent": "operator (you)",
+        "does": "approve or reject each hypothesis",
+        "tools": "none — blocking approval gate",
+        "zone": "—",
+    },
+    "EXPLOIT": {
+        "agent": "exploit",
+        "does": "execute approved hypotheses only",
+        "tools": "sqlmap, nuclei, ffuf, jwt_tool, dalfox, commix, ssrfmap",
+        "zone": "B (sandbox)",
+    },
+    "POST_EXPLOIT": {
+        "agent": "post-exploit",
+        "does": "enumerate shells (requires separate approval)",
+        "tools": "pwncat, linpeas, bloodhound-python",
+        "zone": "B (sandbox)",
+    },
+    "VERIFY": {
+        "agent": "verifier",
+        "does": "independently confirm findings",
+        "tools": "curl, httpie, python, netcat, openssl",
+        "zone": "B (sandbox)",
+    },
+    "BLUE_TEAM": {
+        "agent": "blue-team (LLM)",
+        "does": "generate fixes and detection rules",
+        "tools": "none — pure LLM",
+        "zone": "—",
+    },
+    "REPORT": {
+        "agent": "reporter",
+        "does": "compile the engagement report",
+        "tools": "Jinja2 templates",
+        "zone": "—",
+    },
+}
+
 
 def _docker_runtimes() -> str | None:
     """Return Docker's registered runtime list, or None if unreachable."""
@@ -85,12 +150,16 @@ def start_engagement(
     cfg: KryonsecConfig,
     engagement_id: str,
     target: str = "",
+    progress: "Callable[[str], None] | None" = None,
 ) -> tuple[PurpleOrchestrator, AuditLog, "object"]:
     """Wire up an engagement. Returns (orchestrator, audit, graph).
 
     The engagement starts on every OS. When the sandbox is unavailable,
     the orchestrator HALTs (with an audited reason) as soon as a state
     needs Zone B.
+
+    progress: optional callback invoked with each state name before it
+    runs (CLI uses it to show which agent is working).
     """
     from .recon_passive import EngagementGraph, ReconPassiveSubagent
 
@@ -111,6 +180,11 @@ def start_engagement(
     })
 
     def loader(state: str):
+        if progress is not None:
+            info = STATE_INFO.get(state, {})
+            progress(f"{info.get('agent', state)}: {info.get('does', '')} "
+                     f"[tools: {info.get('tools', '?')} | zone {info.get('zone', '?')}]")
+
         if state == "RECON_PASSIVE":
             sub = ReconPassiveSubagent(cfg=cfg, graph=graph, audit=audit, target=target)
             return sub.run

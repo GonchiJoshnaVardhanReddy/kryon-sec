@@ -242,7 +242,13 @@ def main(argv: list[str] | None = None) -> int:
             console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
 
         engagement_id = args.id or str(uuid.uuid4())[:8]
-        orch, audit, graph = start_engagement(cfg, engagement_id, target=target)
+
+        def _progress(msg: str) -> None:
+            console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
+
+        orch, audit, graph = start_engagement(
+            cfg, engagement_id, target=target, progress=_progress
+        )
         console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
         completed = orch.run()
         console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
