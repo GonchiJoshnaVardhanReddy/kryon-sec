@@ -86,6 +86,9 @@ class PurpleOrchestrator:
     halt_reason: str | None = None
     # Set by the runtime guard: refuses to leave INIT off-Linux/off-Profile-2.
     execution_allowed: bool = True
+    # Progress callback: called with the state name right before it runs.
+    # Lets the CLI show which agent is working without knowing the loop.
+    on_state: Callable[[str], None] | None = None
 
     def run(self) -> list[str]:
         """Run the loop to HALT. Returns the list of completed states."""
@@ -100,6 +103,11 @@ class PurpleOrchestrator:
                 break
 
             self.completed.append(self.state)
+            if self.on_state:
+                try:
+                    self.on_state(self.state)
+                except Exception:
+                    log.exception("progress callback error (ignored)")
             loader = self.subagent_loader(self.state) if self.subagent_loader else None
             if loader is None:
                 # No subagent wired yet — record the gap and continue
