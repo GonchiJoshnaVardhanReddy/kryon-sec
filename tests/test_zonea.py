@@ -147,6 +147,42 @@ def test_recon_passive_audits_every_call(tmp_path):
     assert "passive_source_ok" in events
 
 
+def test_recon_passive_collects_paths_as_nodes(tmp_path):
+    from kryonsec.purple.zonea import PassiveResult
+
+    def fake_wayback(domain):
+        return PassiveResult(
+            source="wayback",
+            subdomains=[],
+            paths=["/login", "/admin", "/api/v1?x=2"],
+        )
+
+    sub, audit, graph = _make_sub(tmp_path, [fake_wayback])
+    result = sub.run()
+
+    assert result.status == "ok"
+    assert [n["label"] for n in graph.by_type("path")] == ["/login", "/admin", "/api/v1?x=2"]
+
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_prompt_includes_paths():
+    """Thin targets (no subdomains) still give the LLM path evidence."""
+    from kryonsec.purple.hypothesize import render_hypothesize_prompt
+
+    graph = EngagementGraph(engagement_id="e-thin")
+    graph.add_node("target", "testasp.vulnweb.com", {})
+    graph.add_node("path", "/", {"source": "wayback"})
+    graph.add_node("path", "/login.asp", {"source": "wayback"})
+
+    prompt = render_hypothesize_prompt(graph)
+    assert "testasp.vulnweb.com" in prompt
+    assert "/login.asp" in prompt
+    # subdomains section shows the "none found" fallback
+    assert "(none found)" in prompt
+
+
 def test_crt_sh_parses_names(tmp_path):
     """crt.sh JSON parsing: wildcard removal, newline-separated names."""
     import json as _json
@@ -168,14 +204,15 @@ def test_crt_sh_parses_names(tmp_path):
 
 
 def test_wayback_subdomains_extracts_hosts():
-    """Wayback CDX rows -> in-scope subdomain hosts only."""
+    """Wayback CDX rows -> in-scope subdomain hosts + cleaned path list."""
     import json as _json
     from unittest.mock import patch
 
     rows = _json.dumps([
+        ["urlkey", "timestamp", "original"],  # CDX header row
         ["com,target-corp)/", "20200101", "http://target-corp.com/"],
         ["com,target-corp,api)/", "20200102", "http://api.target-corp.com/v1"],
-        ["com,target-corp,www)/", "20200103", "https://www.target-corp.com/login"],
+        ["com,target-corp,www)/", "20200103", "https://www.target-corp.com/login?x=1"],
         ["com,evil)/", "20200104", "http://evil.com/target-corp"],
     ]).encode()
 
@@ -189,6 +226,25 @@ def test_wayback_subdomains_extracts_hosts():
     # the apex and out-of-scope hosts are excluded
     assert "target-corp.com" not in result.subdomains
     assert "evil.com" not in result.subdomains
+    # paths are scheme-less, deduped, in order
+    assert result.paths == ["/", "/v1", "/login?x=1"]
+
+
+def test_wayback_subdomains_dedupes_paths():
+    import json as _json
+    from unittest.mock import patch
+
+    rows = _json.dumps([
+        ["com,target-corp)/", "20200101", "http://target-corp.com/a"],
+        ["com,target-corp)/", "20200201", "http://target-corp.com/a"],  # dup
+    ]).encode()
+
+    from kryonsec.purple.zonea import wayback_subdomains
+
+    with patch("kryonsec.purple.zonea._zone_a_fetch", return_value=rows):
+        result = wayback_subdomains("target-corp.com")
+
+    assert result.paths == ["/a"]
 
 
 def test_wayback_subdomains_network_failure_is_empty():
