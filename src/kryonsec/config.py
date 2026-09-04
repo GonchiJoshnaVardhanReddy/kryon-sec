@@ -15,6 +15,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _load_dotenv() -> None:
+    """Load .env from the project dir or cwd into os.environ (no override).
+
+    Deliberately dependency-free: reads KEY=VALUE lines only.
+    """
+    candidates = [
+        Path(__file__).resolve().parents[2] / ".env",  # repo root (src layout)
+        Path.cwd() / ".env",
+    ]
+    for env_file in candidates:
+        if not env_file.is_file():
+            continue
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        except OSError:
+            continue
+        break
+
+
+_load_dotenv()
+
+
 def _default_home() -> Path:
     return Path(os.environ.get("KRYONSEC_HOME", str(Path.home() / ".kryonsec")))
 
