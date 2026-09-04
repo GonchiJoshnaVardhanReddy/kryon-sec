@@ -115,6 +115,12 @@ def start_engagement(
             sub = ReconPassiveSubagent(cfg=cfg, graph=graph, audit=audit, target=target)
             return sub.run
 
+        if state == "HYPOTHESIZE":
+            from .hypothesize import HypothesizeSubagent
+
+            sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit)
+            return sub.run
+
         if state in SANDBOX_FREE_STATES:
             return subagent_stub(state)
 

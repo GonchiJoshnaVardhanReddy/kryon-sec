@@ -1,0 +1,33 @@
+{#- HYPOTHESIZE prompt (spec v2.1.1 §4.2): pure LLM, proposes hypotheses. -#}
+You are generating vulnerability hypotheses for a purple-team engagement.
+
+TARGET: {{ target }}
+
+PASSIVE RECON FINDINGS (third-party sources only, zero packets sent to target):
+
+Subdomains discovered:
+{% for s in subdomains %}
+- {{ s }}
+{% else %}
+- (none found)
+{% endfor %}
+
+Archived paths (Wayback):
+{% for p in paths %}
+- {{ p }}
+{% else %}
+- (none found)
+{% endfor %}
+
+Your task:
+1. For each asset above, hypothesize plausible vulnerabilities (max 10 total).
+2. Base every rationale ONLY on the evidence above (names, paths, the target itself).
+   Never claim a vulnerability was tested or confirmed.
+3. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
+4. Suggest testing tools ONLY from this allowlist:
+   nmap, dnsx, subfinder, sqlmap, nikto, gobuster, ffuf, curl, wget, nc,
+   ncat, openssl, python3, linpeas.sh, bloodhound-python.
+5. Give each hypothesis a confidence between 0.0 and 1.0.
+
+Remember: you are proposing what MIGHT be true. The human operator approves
+or rejects each hypothesis before anything is executed against the target.
