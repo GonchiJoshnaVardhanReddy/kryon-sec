@@ -36,16 +36,19 @@ gVisor container run). Zone B container files + image probe written.
 
 ## NEXT STEPS (in order)
 1. **Commit + push everything** (Zone A + sandbox stack work from sessions 3–4).
-2. **Build the sandbox image in WSL2** (user runs this, from repo root in WSL):
-   ```bash
-   docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
-   docker run --rm --runtime=runsc kryonsec/sandbox nmap --version
-   # then pin by digest:
-   docker inspect --format '{{index .RepoDigests 0}}' kryonsec/sandbox
-   # → set KRYONSEC_SANDBOX_IMAGE=kryonsec/sandbox@sha256:<digest> in .env
-   ```
-   (Kali apt may be slow/flaky from India — retry if needed; mirror.gcr.io
-   is already set as Docker registry mirror.)
+2. ~~**Build the sandbox image in WSL2**~~ DONE session 4:
+   - Image built + live-verified: `docker run --rm --runtime=runsc
+     kryonsec/sandbox nmap --version` → `{"exit_code": 0, "stdout": "Nmap
+     version 7.99..."}` ✅ and non-allowlisted tool rejected ✅
+   - **Pinned digest (locally built):**
+     `sha256:d91c139c33492f6c09ba41a48bb9c2f93d16efa9a43db37225f24e2661346246`
+   - Pin in use by adding to `.env` (git-ignored, local):
+     `KRYONSEC_SANDBOX_IMAGE=kryonsec/sandbox@sha256:d91c139c33492f6c09ba41a48bb9c2f93d16efa9a43db37225f24e2661346246`
+   - NOTE: local builds have no RepoDigest (never pushed), so the pinned
+     reference uses the image ID digest — `docker image inspect` accepts it.
+     If the image is ever rebuilt, the digest changes: re-pin + update .env.
+   - bloodhound.py failed to install (PyPI unreachable from build network) —
+     build tolerates it; bloodhound-python is optional (AD recon only).
 3. **HYPOTHESIZE subagent** (~8%): LLM proposes hypotheses, Pydantic schema via
    Instructor, orchestrator stays deterministic. Prompt in `templates/`.
    Needs `instructor` package added to pyproject.

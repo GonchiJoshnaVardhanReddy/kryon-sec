@@ -31,7 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN nuclei -update-templates || true
 
 # bloodhound.py is a pip package, not apt; executable is bloodhound-python.
-RUN pip install --no-cache-dir --break-system-packages bloodhound.py
+# Explicit index URL + best-effort: on flaky networks a failed PyPI fetch
+# must not kill the whole image build. If it fails, bloodhound-python is
+# simply absent (calling it then errors inside the sandbox — acceptable,
+# AD/ldap recon is optional in the tool table).
+RUN pip install --no-cache-dir --break-system-packages \
+    --index-url https://pypi.org/simple/ \
+    --timeout 60 --retries 3 \
+    bloodhound.py \
+    || echo "WARN: bloodhound.py not installed (PyPI unreachable?)"
 
 # Create non-root user for tool execution
 RUN useradd -m -s /bin/false kryonsec-runner

@@ -253,6 +253,17 @@ def main(argv: list[str] | None = None) -> int:
             console.print(f"\n[cyan]passive recon found {len(subdomains)} subdomains:[/cyan]")
             for s in subdomains[:30]:
                 console.print(f"  [dim]{s}[/dim]")
+        hypotheses = graph.by_type("hypothesis")
+        if hypotheses:
+            console.print(f"\n[cyan]LLM proposed {len(hypotheses)} hypotheses:[/cyan]")
+            for n in hypotheses:
+                p = n["properties"]
+                console.print(
+                    f"  [magenta]{n['label']}[/magenta] "
+                    f"[bold]{p.get('title', '')}[/bold] "
+                    f"[dim](confidence {p.get('confidence', 0):.1f}; "
+                    f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
+                )
         console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
         return 0
 
