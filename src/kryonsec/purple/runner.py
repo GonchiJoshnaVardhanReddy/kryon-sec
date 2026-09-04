@@ -203,6 +203,27 @@ def start_engagement(
             sub = HumanReviewSubagent(graph=graph, audit=audit)
             return sub.run
 
+        if state == "BLUE_TEAM":
+            from .blue_team import BlueTeamSubagent
+
+            sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit)
+            return sub.run
+
+        if state == "REPORT":
+            from .report import ReportSubagent
+
+            sub = ReportSubagent(
+                cfg=cfg, graph=graph, audit=audit, engagement_id=engagement_id,
+            )
+
+            def run_report() -> SubagentResult:
+                # the report records how far the engagement actually got
+                sub.completed_states = orch.completed
+                sub.halt_reason = orch.halt_reason
+                return sub.run()
+
+            return run_report
+
         if state in SANDBOX_FREE_STATES:
             return subagent_stub(state)
 

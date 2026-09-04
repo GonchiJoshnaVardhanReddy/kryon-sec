@@ -1,0 +1,87 @@
+{#- Engagement report (spec v2.1.1 §4.9). Rendered to report.md. -#}
+# Kryonsec Engagement Report
+
+**Engagement:** {{ engagement_id }}
+**Target:** {{ target }}
+**Generated:** {{ generated_at }}
+
+## Executive Summary
+
+{% if hypotheses %}
+This engagement ran {{ completed_states | length }} states
+({{ completed_states | join(" -> ") }}) against {{ target }}.
+Passive recon (third-party sources, zero packets to the target)
+identified {{ subdomains | length }} subdomains
+and {{ paths | length }} archived paths.
+The LLM proposed {{ hypotheses | length }} vulnerability hypotheses;
+{{ hypotheses | selectattr('approved', 'equalto', true) | list | length }}
+were approved by the operator.
+{% if halt_reason %}
+The engagement halted before completion: {{ halt_reason }}.
+Active testing was {{ "performed" if 'EXPLOIT' in completed_states else "NOT performed" }}
+against the target.
+{% else %}
+Active testing was {{ "performed" if 'EXPLOIT' in completed_states else "NOT performed" }}
+against the target.
+{% endif %}
+{% else %}
+This engagement ran {{ completed_states | length }} states against {{ target }}
+and produced no vulnerability hypotheses. Passive recon identified
+{{ subdomains | length }} subdomains and {{ paths | length }} archived paths.
+{% endif %}
+
+## Passive Reconnaissance (Zone A — zero packets to target)
+
+### Subdomains ({{ subdomains | length }})
+{% for s in subdomains %}
+- {{ s }}
+{% else %}
+- (none found)
+{% endfor %}
+
+### Archived Paths ({{ paths | length }}){% if paths | length > 50 %} (first 50){% endif %}
+{% for p in paths %}
+- {{ p }}
+{% else %}
+- (none found)
+{% endfor %}
+
+## Vulnerability Hypotheses ({{ hypotheses | length }})
+
+{% for h in hypotheses %}
+### {{ h.id }} — {{ h.title }}
+- **Target:** {{ h.target_asset }}
+- **CVSS (proposed):** {{ h.cvss_vector or "(not estimated)" }}
+- **Confidence:** {{ "%.0f" | format((h.confidence or 0) * 100) }}%
+- **Testing tools:** {{ h.tools | join(", ") if h.tools else "none" }}
+- **Operator decision:** {{ "APPROVED" if h.approved | default(false) else "rejected / not approved" }}
+- **Rationale:** {{ h.rationale }}
+- **Status:** {% if h.approved | default(false) %}routed to EXPLOIT phase{% if 'EXPLOIT' not in completed_states %} (exploit did not run){% endif %}{% else %}not tested — defensive recommendation only{% endif %}
+
+{% endfor %}
+
+## Defensive Recommendations (Blue Team)
+
+{% for r in remediations %}
+### Remediation for {{ r.hypothesis_id }} — {{ r.title }}
+- **Severity:** {{ r.severity }}
+- **Fix:** {{ r.fix }}
+{% if r.detection %}- **Detection:** {{ r.detection }}{% endif %}
+
+{% else %}
+(No remediations were generated — the blue-team LLM call may have failed
+or there was nothing to remediate.)
+{% endfor %}
+
+## Audit Trail
+
+- Audit chain head hash: `{{ audit_head }}`
+- The full append-only audit trail is in `engagements/{{ engagement_id }}/audit.jsonl`
+  and can be verified with its built-in chain check.
+
+## Notes
+
+- Hypotheses are LLM proposals from public recon data — they are not
+  confirmed vulnerabilities unless independently verified.
+- Tool execution during this engagement: none on non-sandbox systems;
+  Zone B (sandboxed) tooling requires Linux + Docker + gVisor.

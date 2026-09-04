@@ -271,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
                 )
         console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
+        report_path = cfg.home / "engagements" / engagement_id / "report.md"
+        if report_path.exists():
+            console.print(f"[dim]report written: {report_path}[/dim]")
         return 0
 
     console.print(WELCOME.format(version=__version__))

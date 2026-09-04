@@ -1,0 +1,32 @@
+{#- BLUE_TEAM prompt (spec v2.1.1 §4.2): pure LLM, defensive recommendations. -#}
+You are generating defensive recommendations for a purple-team engagement.
+
+TARGET: {{ target }}
+
+HYPOTHESES FROM THE ENGAGEMENT (with operator decisions):
+
+{% for h in hypotheses %}
+- {{ h.id }}: {{ h.title }}
+  target: {{ h.target_asset }}
+  approved by operator: {{ h.approved | default(false) }}
+  status: {% if h.approved | default(false) %}tested-by-exploit-phase{% else %}proposed-only (not tested){% endif %}
+{% else %}
+- (no hypotheses — recommend hardening based on the target's public footprint only)
+{% endfor %}
+
+CONFIRMED FINDINGS (if any):
+
+{% for f in findings %}
+- {{ f.label }}: {{ f.title | default('') }}
+{% else %}
+- (none confirmed — this engagement stopped before active testing)
+{% endfor %}
+
+Your task:
+1. For EACH hypothesis above, write one remediation: a concrete fix the
+   defender can apply (not generic advice — name the exact change).
+2. Where possible, add a detection signature: what log line / alert / rule
+   would catch exploitation attempts for this issue.
+3. Set severity: low, medium, high, or critical.
+4. Treat unapproved/untested hypotheses as "risk to verify", not confirmed
+   vulnerabilities — word the fix accordingly.
