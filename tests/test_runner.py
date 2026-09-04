@@ -88,3 +88,96 @@ def test_engagement_runs_with_sandbox(tmp_path):
     assert "RECON_PASSIVE" in completed
     ok, reason = audit.verify()
     assert ok, reason
+
+
+def test_full_loop_through_exploit(tmp_path):
+    """Recon -> hypotheses -> approve H1 -> EXPLOIT spawns the tool ->
+    report truthfully says testing happened."""
+    from kryonsec.purple.hypothesize import Hypothesis, HypothesisSet
+
+    cfg = KryonsecConfig(home=tmp_path)
+
+    def fake_llm(prompt):
+        assert "target-corp.com" in prompt
+        return HypothesisSet(hypotheses=[
+            Hypothesis(
+                id="H1", title="SQLi on login", target_asset="/Login.asp",
+                rationale="login form", cvss_vector="",
+                tools=["sqlmap"], confidence=0.8,
+            ),
+        ])
+
+    def approve_all(hypotheses):
+        return {h["label"] for h in hypotheses}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ('{"exit_code": 0, "stdout": '
+                  '"target is vulnerable to boolean-based blind"}')
+        stderr = ""
+
+    class FakeRun:
+        def __init__(self):
+            self.argv = None
+
+        def __call__(self, argv, **kw):
+            self.argv = argv
+            return FakeProc()
+
+    fake_run = FakeRun()
+
+    # Inject fakes for the subagents the loop wires up. Direct monkeypatching
+    # (not patch contexts) because each __init__ wraps the real one.
+    import kryonsec.purple.hypothesize as hyp_mod
+    import kryonsec.purple.human_review as hr_mod
+    import kryonsec.purple.sandbox as sb_mod
+
+    orig_hyp_init = hyp_mod.HypothesizeSubagent.__init__
+    orig_hr_init = hr_mod.HumanReviewSubagent.__init__
+    orig_sb_init = sb_mod.KaliSandbox.__init__
+
+    def _init_hyp(self, cfg, graph, audit, llm_fn=None):
+        orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm)
+
+    def _init_hr(self, graph, audit, reviewer=None):
+        orig_hr_init(self, graph, audit, reviewer=approve_all)
+
+    def _init_sb(self, cfg, **kw):
+        self.cfg = cfg
+        self.image = cfg.sandbox_image
+        self.seccomp_profile = None
+        self.timeout_s = 330
+        self._run = fake_run
+
+    hyp_mod.HypothesizeSubagent.__init__ = _init_hyp
+    hr_mod.HumanReviewSubagent.__init__ = _init_hr
+    sb_mod.KaliSandbox.__init__ = _init_sb
+    try:
+        with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
+            with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+                orch, audit, graph = start_engagement(
+                    cfg, "e-x", target="target-corp.com")
+                completed = orch.run()
+    finally:
+        hyp_mod.HypothesizeSubagent.__init__ = orig_hyp_init
+        hr_mod.HumanReviewSubagent.__init__ = orig_hr_init
+        sb_mod.KaliSandbox.__init__ = orig_sb_init
+
+    assert "EXPLOIT" in completed
+    assert fake_run.argv is not None
+    assert fake_run.argv[0] == "docker"
+    assert "sqlmap" in fake_run.argv
+
+    attempts = graph.by_type("exploit_attempt")
+    assert len(attempts) == 1
+    assert attempts[0]["properties"]["confirmed"] is True
+    assert len(graph.by_type("finding")) == 1
+
+    report_path = cfg.home / "engagements" / "e-x" / "report.md"
+    assert report_path.exists()
+    content = report_path.read_text(encoding="utf-8")
+    assert "Tools were run against the target" in content
+    assert "No testing was done" not in content
+    assert "H1:sqlmap" in content
+    ok, reason = audit.verify()
+    assert ok, reason
