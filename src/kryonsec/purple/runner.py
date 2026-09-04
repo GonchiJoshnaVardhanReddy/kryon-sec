@@ -182,8 +182,10 @@ def start_engagement(
     def loader(state: str):
         if progress is not None:
             info = STATE_INFO.get(state, {})
+            # parentheses, not square brackets: rich would eat [tools: ...]
+            # as a markup tag
             progress(f"{info.get('agent', state)}: {info.get('does', '')} "
-                     f"[tools: {info.get('tools', '?')} | zone {info.get('zone', '?')}]")
+                     f"(tools: {info.get('tools', '?')} | zone {info.get('zone', '?')})")
 
         if state == "RECON_PASSIVE":
             sub = ReconPassiveSubagent(cfg=cfg, graph=graph, audit=audit, target=target)

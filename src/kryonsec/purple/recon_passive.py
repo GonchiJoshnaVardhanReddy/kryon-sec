@@ -13,7 +13,7 @@ from typing import Callable
 from ..config import KryonsecConfig
 from .audit import AuditLog
 from .orchestrator import SubagentResult
-from .zonea import PassiveResult, crt_sh_subdomains
+from .zonea import PassiveResult, crt_sh_subdomains, wayback_subdomains
 
 log = logging.getLogger(__name__)
 
@@ -55,9 +55,10 @@ class ReconPassiveSubagent:
     graph: EngagementGraph
     audit: AuditLog
     target: str
-    # injectable for tests
+    # injectable for tests. Two default sources so one flaky API
+    # (crt.sh is regularly slow/empty) can't starve the LLM of data.
     fetchers: list[Callable[[str], PassiveResult]] = field(
-        default_factory=lambda: [crt_sh_subdomains]
+        default_factory=lambda: [crt_sh_subdomains, wayback_subdomains]
     )
 
     def run(self) -> SubagentResult:

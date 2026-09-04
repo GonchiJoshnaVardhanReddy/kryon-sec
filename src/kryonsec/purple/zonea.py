@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -107,12 +108,16 @@ def crt_sh_subdomains(domain: str, retries: int = 2) -> PassiveResult:
 
     crt.sh logs every TLS certificate ever issued for a domain — asking it
     is like asking a public library; the target never hears about it.
-    crt.sh is occasionally slow/empty on first hit — retry a couple of times.
+    crt.sh is occasionally slow/empty on first hit — retry with backoff.
     """
     import time
 
     domain = normalize_target(domain)
-    url = "https://crt.sh/?q=%" + urllib.parse.quote(domain, safe="") + "&output=json"
+    # NOTE: no '%' wildcard prefix — crt.sh now rejects it ("Unsupported
+    # use of '%'") with an HTML error page. The bare-domain query already
+    # returns every cert whose name_value covers the domain and its
+    # subdomains, so the wildcard was never needed.
+    url = "https://crt.sh/?q=" + urllib.parse.quote(domain, safe="") + "&output=json"
 
     body = b""
     for attempt in range(retries + 1):
@@ -123,9 +128,16 @@ def crt_sh_subdomains(domain: str, retries: int = 2) -> PassiveResult:
         except json.JSONDecodeError:
             if attempt < retries:
                 log.info("crt.sh empty reply for %s (attempt %d) — retrying", domain, attempt + 1)
-                time.sleep(2)
+                time.sleep(4)
                 continue
             log.warning("crt.sh returned non-JSON after %d attempts for %s", retries + 1, domain)
+            return PassiveResult(source="crt.sh", subdomains=[])
+        except urllib.error.HTTPError as e:
+            if 500 <= e.code < 600 and attempt < retries:
+                log.info("crt.sh HTTP %d for %s (attempt %d) — retrying", e.code, domain, attempt + 1)
+                time.sleep(4)
+                continue
+            log.warning("crt.sh HTTP %d after %d attempts for %s — giving up", e.code, attempt + 1, domain)
             return PassiveResult(source="crt.sh", subdomains=[])
         except Exception:
             raise
@@ -145,17 +157,64 @@ def crt_sh_subdomains(domain: str, retries: int = 2) -> PassiveResult:
     return PassiveResult(source="crt.sh", subdomains=sorted(found))
 
 
-def wayback_paths(domain: str, limit: int = 100) -> list[str]:
-    """Query the Wayback Machine for archived URLs of the domain."""
+def wayback_paths(domain: str, limit: int = 100, retries: int = 2) -> list[str]:
+    """Query the Wayback Machine for archived URLs of the domain.
+
+    The CDX API 503s under load and is slow (~15-20s measured from India
+    even for tiny responses) — long timeout, retry with backoff.
+    """
+    import time
+
     url = (
         "http://web.archive.org/cdx/search/cdx"
         f"?url={urllib.parse.quote(domain, safe='')}/*&output=json&limit={limit}"
         "&collapse=urlkey"
     )
-    body = _zone_a_fetch(url)
+    body = b""
+    for attempt in range(retries + 1):
+        try:
+            body = _zone_a_fetch(url, timeout=60)
+            break
+        except urllib.error.HTTPError as e:
+            if 500 <= e.code < 600 and attempt < retries:
+                log.info("wayback CDX %d (attempt %d) — retrying", e.code, attempt + 1)
+                time.sleep(2)
+                continue
+            raise
+        except TimeoutError:
+            if attempt < retries:
+                log.info("wayback CDX timed out (attempt %d) — retrying", attempt + 1)
+                time.sleep(2)
+                continue
+            raise
     try:
         rows = json.loads(body)
     except json.JSONDecodeError:
         return []
     # rows[0] is the header; each row is [urlkey, timestamp, original, ...]
     return [row[2] for row in rows[1:] if len(row) >= 3 and row[2].startswith("http")]
+
+
+def wayback_subdomains(domain: str, limit: int = 500) -> PassiveResult:
+    """Derive subdomains from archived URLs (Wayback CDX, third-party API).
+
+    A second, independent source of subdomain names: the archive's URL
+    list includes hosts like api.example.com that certificates never
+    covered. Zero packets to the target — we ask the archive, not the
+    target's servers.
+    """
+    domain = normalize_target(domain)
+    try:
+        paths = wayback_paths(domain, limit=limit)
+    except Exception:
+        # network/archive hiccup: empty result, never an exception upward
+        log.warning("wayback CDX query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="wayback", subdomains=[])
+
+    found: set[str] = set()
+    for url in paths:
+        host = urllib.parse.urlparse(url).hostname or ""
+        host = host.strip().lower().rstrip(".")
+        if host and _same_domain(host, domain) and host != domain:
+            found.add(host)
+    return PassiveResult(source="wayback", subdomains=sorted(found))
