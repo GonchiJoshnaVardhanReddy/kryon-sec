@@ -1,5 +1,7 @@
 # Kryonsec
 
+**v1.0.0** — first release.
+
 A single-user CLI cybersecurity platform with two modes:
 
 - **Mode A — Copilot:** conversational security assistant (chat, CVE lookup,

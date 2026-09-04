@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kryonsec"
-version = "2.1.1"
+version = "1.0.0"
 description = "Single-user CLI cybersecurity platform: conversational copilot + deterministic purple-team engine"
 readme = "README.md"
 requires-python = ">=3.11"
