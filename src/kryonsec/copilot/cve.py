@@ -69,7 +69,7 @@ def _from_nvd(cve_id: str) -> dict[str, Any] | None:
     try:
         req = urllib.request.Request(
             NVD_URL.format(cve_id=cve_id),
-            headers={"User-Agent": "kryonsec/2.1.1"},
+            headers={"User-Agent": "kryonsec/1.0.0"},
         )
         with urllib.request.urlopen(req, timeout=NVD_TIMEOUT_S) as r:
             data = json.loads(r.read())
