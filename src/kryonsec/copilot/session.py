@@ -78,6 +78,9 @@ class GeneralSession:
             self.cfg,
             [{"role": "user", "content": COMPACTION_PROMPT + "\nMessages to summarize:\n" + redacted_text}],
             model=model,
+            # Secrets present => local model ONLY, never a third-party
+            # fallback, even when the local model is down (spec §6.4).
+            local_only=secrets_present,
         )
         if secrets_present:
             summary = restore(summary, secret_map)
