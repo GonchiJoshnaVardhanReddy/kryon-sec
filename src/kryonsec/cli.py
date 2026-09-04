@@ -285,7 +285,9 @@ def main(argv: list[str] | None = None) -> int:
         if findings:
             console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
             for n in findings:
-                console.print(f"  [magenta]{n['label']}[/magenta]")
+                verified = n["properties"].get("verified")
+                mark = " [bold]verified[/bold]" if verified else ""
+                console.print(f"  [magenta]{n['label']}[/magenta]{mark}")
         console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
         report_path = cfg.home / "engagements" / engagement_id / "report.md"
         if report_path.exists():

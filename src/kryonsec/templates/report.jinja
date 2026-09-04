@@ -91,6 +91,7 @@ information and guessed what might be wrong. Nothing below is confirmed
 - Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
 {% if exploit_ran %}- Tested: {% if h.tested | default(false) %}yes{% else %}no{% endif %}{% endif %}
 {% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
+{% if h.verified | default(false) %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.confirmed | default(false) %}- Double-checked: the second check ran but did not agree or could not run — treat this finding with care{% endif %}
 - Why it thinks this: {{ h.rationale }}
 - How to check it: {{ h.tools | join(", ") if h.tools else "(no tool suggested)" }}
 

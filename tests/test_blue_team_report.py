@@ -234,6 +234,42 @@ def test_report_claims_testing_only_with_real_attempts(tmp_path):
     assert "you are allowed to test" in " ".join(report.split())
 
 
+def test_report_shows_verified_badge(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "exit_code": 0, "confirmed": True,
+        "argv": ["sqlmap", "-u", "http://t/Login.asp", "--batch"],
+        "output_excerpt": "is vulnerable",
+    })
+    graph.add_node("finding", "H1", {"tool": "sqlmap"})
+    graph.add_node("verify_attempt", "H1", {
+        "verified": True, "method": "curl boolean probe",
+        "true_len": 5000, "false_len": 0,
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    assert "second tool re-tested it and agreed" in report
+
+
+def test_report_shows_unverified_warning_when_disagreeing(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "exit_code": 0, "confirmed": True,
+        "argv": ["sqlmap", "-u", "http://t/Login.asp", "--batch"],
+        "output_excerpt": "is vulnerable",
+    })
+    graph.add_node("finding", "H1", {"tool": "sqlmap"})
+    graph.add_node("verify_attempt", "H1", {
+        "verified": False, "method": "curl boolean probe",
+        "true_len": 500, "false_len": 500,
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    assert "treat this finding with care" in report
+
+
 def test_empty_graph_report(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = EngagementGraph(engagement_id="e-empty")

@@ -19,6 +19,13 @@ Archived paths (Wayback):
 - (none found)
 {% endfor %}
 
+Live services found by an active port scan (nmap):
+{% for s in services %}
+- {{ s.label }} — {{ s.service }}{% if s.version %} ({{ s.version }}){% endif %}
+{% else %}
+- (no scan results — the scan did not run)
+{% endfor %}
+
 Your task:
 1. For each asset above, hypothesize plausible vulnerabilities (max 10 total).
 2. Base every rationale ONLY on the evidence above (names, paths, the target itself).
