@@ -55,15 +55,27 @@ def render_report(
     target_nodes = graph.by_type("target")
     import datetime as _dt
 
+    # map hypothesis -> its tool-run outcome (exploit_attempt nodes are
+    # labeled "H1:sqlmap"); only real Zone B execution creates them
+    attempts = graph.by_type("exploit_attempt")
+    tested_ids = {a["label"].split(":")[0] for a in attempts}
+    confirmed_ids = {
+        a["label"].split(":")[0] for a in attempts
+        if a["properties"].get("confirmed")
+    }
+
     return template.render(
         engagement_id=engagement_id,
         target=target_nodes[0]["label"] if target_nodes else "(none)",
         subdomains=sorted(n["label"] for n in graph.by_type("subdomain")),
         paths=sorted(n["label"] for n in graph.by_type("path"))[:50],
         hypotheses=[
-            {"id": n["label"], **n["properties"]}
+            {"id": n["label"], **n["properties"],
+             "tested": n["label"] in tested_ids,
+             "confirmed": n["label"] in confirmed_ids}
             for n in graph.by_type("hypothesis")
         ],
+        attempts=attempts,
         remediations=[
             {"hypothesis_id": n["label"], **n["properties"]}
             for n in graph.by_type("remediation")

@@ -270,6 +270,22 @@ def main(argv: list[str] | None = None) -> int:
                     f"[dim](confidence {p.get('confidence', 0):.1f}; "
                     f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
                 )
+        attempts = graph.by_type("exploit_attempt")
+        if attempts:
+            console.print(f"\n[cyan]tool runs executed: {len(attempts)}[/cyan]")
+            for n in attempts:
+                p = n["properties"]
+                verdict = ("[red]confirmed[/red]" if p.get("confirmed")
+                           else "not confirmed")
+                console.print(
+                    f"  [magenta]{n['label']}[/magenta] "
+                    f"exit {p.get('exit_code', '?')} — {verdict}"
+                )
+        findings = graph.by_type("finding")
+        if findings:
+            console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
+            for n in findings:
+                console.print(f"  [magenta]{n['label']}[/magenta]")
         console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
         report_path = cfg.home / "engagements" / engagement_id / "report.md"
         if report_path.exists():

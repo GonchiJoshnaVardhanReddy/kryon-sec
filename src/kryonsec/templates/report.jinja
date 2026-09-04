@@ -21,8 +21,13 @@ You approved {{ tested }} of them
 {% if not tested %}(you approved none){% endif %}.
 
 {% if exploit_ran %}
-Tools were run against the target to test the approved items —
-details in the sections below.
+Tools were run against the target to test the approved items.
+Here is what each test did:
+
+{% for a in attempts %}
+- **{{ a.label }}** ({{ a.properties.tool }}): ran
+  {%- if a.properties.confirmed %} and **found the issue confirmed**{% endif %}.
+{% endfor %}
 {% else %}
 **No testing was done against the website.** The approved items were
 not checked — the automated testing phase did not run in this
@@ -60,6 +65,7 @@ information and guessed what might be wrong. Nothing below is confirmed
 - How sure the assistant is: {{ "%.0f" | format((h.confidence or 0) * 100) }}%
 - Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
 {% if exploit_ran %}- Tested: {% if h.tested | default(false) %}yes{% else %}no{% endif %}{% endif %}
+{% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
 - Why it thinks this: {{ h.rationale }}
 - How to check it: {{ h.tools | join(", ") if h.tools else "(no tool suggested)" }}
 

@@ -224,6 +224,17 @@ def start_engagement(
 
             return run_report
 
+        if state == "EXPLOIT" and sandbox_ok:
+            from .exploit import ExploitSubagent
+            from .sandbox import KaliSandbox
+
+            sandbox = KaliSandbox(cfg=cfg)
+            sub = ExploitSubagent(
+                cfg=cfg, graph=graph, audit=audit, target=target,
+                sandbox=sandbox,
+            )
+            return sub.run
+
         if state in SANDBOX_FREE_STATES:
             return subagent_stub(state)
 

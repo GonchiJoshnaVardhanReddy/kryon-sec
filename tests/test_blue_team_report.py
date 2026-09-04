@@ -208,6 +208,25 @@ def test_redact_jwt():
     assert jwt not in redact_secrets(f"token={jwt}")
 
 
+def test_report_claims_testing_only_with_real_attempts(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "exit_code": 0, "confirmed": True,
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    assert "Tools were run against the target" in report
+    assert "No testing was done" not in report
+    # the attempt summary lists the tool, and the hypothesis shows
+    # tested/confirmed status
+    assert "H1:sqlmap" in report
+    assert "confirmed by the test tool" in report
+    assert "Tested: yes" in report
+    # H2 was not tested
+    assert "Tested: no" in report
+
+
 def test_empty_graph_report(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = EngagementGraph(engagement_id="e-empty")
