@@ -56,6 +56,13 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
     from .llm import LlmUnavailable, chat
     from .storage import GeneralUserLtm, get_session as db_session
 
+    # create tables on first use — the chat must work out of the box
+    try:
+        from .storage import init_db
+        init_db(cfg, include_purple=False)
+    except Exception as e:
+        err_console.print(f"[yellow]storage init failed: {e} — session will not be persisted[/yellow]")
+
     def _console_approve(req: ApprovalRequest) -> bool:
         console.print(
             f"\n[bold]Approval required[/bold] — read: {req.path}\n"
