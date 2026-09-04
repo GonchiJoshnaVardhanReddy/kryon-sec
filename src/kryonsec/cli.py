@@ -117,7 +117,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             continue
 
         cmd = text.lower()
-        if cmd in ("/quit", "/exit"):
+        if cmd in ("/quit", "/exit", "exit", "quit", "q"):
             _persist_session(cfg, session)
             console.print("[dim]bye[/dim]")
             return
@@ -125,7 +125,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             console.print(
                 "[bold]Commands[/bold]\n"
                 "  /help            show this help\n"
-                "  /quit            exit\n"
+                "  /quit            exit (or just: exit, quit)\n"
                 "  /mode            switch mode (copilot / purple)\n"
                 "  /cve <id>        look up a CVE (NVD, cached)\n"
                 "  /search <query>  web search — results go into context\n"
