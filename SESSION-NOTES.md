@@ -1,47 +1,45 @@
 # Kryonsec — Session Handoff Notes
-**Date:** 2026-09-05 (end of session 6)
+**Date:** 2026-09-05 (end of session 7)
 **Repo:** https://github.com/GonchiJoshnaVardhanReddy/kryon-sec (branch: main)
-**Status: ~95% complete. EXPLOIT IS LIVE — the engine found 2 confirmed
-SQL injection vulnerabilities on testasp.vulnweb.com by itself. 154 tests
-green, pushed through a57471b.**
+**Status: ~98% complete. ALL 10 STATES HAVE REAL SUBAGENTS. Evidence
+ladder complete: suggestion -> tested -> confirmed -> verified
+(independent second tool). 172 tests green, live-verified.**
 **Check `git status` first next session — commit + push if anything is pending.**
 
-## The milestone (live-verified, engagement 5aceb7a9)
-Full automated loop: passive recon → LLM hypotheses → HUMAN_REVIEW
-(y/n) → sqlmap actually running in the gVisor sandbox → 2 CONFIRMED
-findings (showforum.asp?id, showthread.asp?id, MSSQL backend) →
-honest report with repeatable test steps + blue-team advice + audit chain.
-CLI now prints "tool runs executed: N" with per-run confirmed verdicts
-and "confirmed findings" at the end.
+## The complete engine (live-verified, engagement d8107d02)
+Every state runs for real: passive recon (crt.sh+Wayback) -> active recon
+(nmap in sandbox, services feed the LLM prompt) -> LLM hypotheses ->
+HUMAN_REVIEW (y/n) -> EXPLOIT (sqlmap+curl in sandbox) -> VERIFY
+(independent curl boolean probes: AND 1=1 vs AND 1=2) -> BLUE_TEAM ->
+REPORT. Final result: H3/H4 confirmed by sqlmap AND verified by the
+independent probe; 5 other runs honestly "not confirmed".
 
-## The three bugs that mattered (all LLM→tool handoff, all fixed in code)
-1. LLM dropped query strings → prompt demands full path WITH params +
-   `compose_url` seeds `=1` when the value is empty (the big one — two
-   false negatives were empty `id=`).
-2. LLM proposed archive payloads as URLs → prompt asks for clean base
-   URL, prefers DB-ish params (id, artist, cat) over redirect params
-   (RetURL, next, url).
-3. `quote()` double-encoded %-encoded archive paths → `%` in safe set.
+## Session 7 additions
+- **RECON_ACTIVE**: ReconActiveSubagent — one allowlisted nmap -sV scan
+  in the sandbox; open ports -> service graph nodes -> hypothesize.jinja
+  now shows live services (LLM sees the real tech stack).
+- **VERIFY**: VerifySubagent — for each confirmed finding, curl probes
+  `?id=1 AND 1=1` vs `?id=1 AND 1=2`; finding gets `verified: true`
+  only when responses differ. Report shows "Double-checked: yes — a
+  second tool re-tested it and agreed" (or the honest warning).
+- **RetURL unwrap** in compose_url: LLMs wrap everything as
+  `/Login.asp?RetURL=%2Freal%2Fpage` — the wrapper is deterministically
+  unwrapped (double-unquoted) to test the real inner page. This fixed a
+  full false-negative run (engagement 688364d0).
+- **Verdict excerpt**: report's "tool's own words" now shows the actual
+  "is vulnerable" line, not the sqlmap banner (first 500 chars was the
+  banner).
 
-## What works end-to-end
-Run in WSL: `kryonsec purple --target testasp.vulnweb.com`
-- Sandbox spawn: docker run --runtime=runsc (non-root, read-only rootfs,
-  2g/2cpu, seccomp, 330s timeout) → entrypoint JSON → bounded output.
-- EXPLOIT: approved-only, fixed argv templates (sqlmap/nmap/curl), host
-  allowlist validated before every spawn, exploit_attempt + finding
-  nodes, conservative confirmation markers ("is vulnerable", "injection
-  point", "back-end DBMS") — never exit codes.
-- Report: "How the testing was done" section — exact command, plain
-  explanation, tool's own verdict words, safety reminder.
-- crt.sh + Wayback recon, HUMAN_REVIEW, BLUE_TEAM all still solid.
+## The evidence ladder (only claimed when the audit proves it)
+suggestion (LLM) -> tested (exploit_attempt node) -> confirmed (tool's
+own words contain a marker) -> verified (independent second tool agrees).
 
-## REMAINING WORK (~5%)
-1. **RECON_ACTIVE**: nmap in sandbox (spawn machinery exists — build
-   argv templates + wire a subagent, model on ExploitSubagent).
-2. **VERIFY**: re-run confirmed findings with an independent tool
-   (e.g. curl probe) — only then mark "verified" in report.
-3. **TUI** (~2%): Shift+Tab mode toggle.
-4. **Web search tool** (~2%): spec §3.7 (Copilot mode).
+## REMAINING WORK (~2%)
+1. **TUI** (~1%): Shift+Tab mode toggle (Copilot <-> Purple).
+2. **Web search tool** (~1%): spec §3.7 (Copilot mode).
+3. Optional polish: docker socket proxy (spec §8.2 — sandbox currently
+   uses default bridge, noted in audit); POST_EXPLOIT stays stubbed by
+   design (needs separate approval flow).
 
 ## Environment facts
 - Dev on Windows 11; engagement runs in WSL2 Ubuntu (`wsl`).
@@ -61,8 +59,10 @@ Run in WSL: `kryonsec purple --target testasp.vulnweb.com`
 - Bash tool on Windows often gets "classifier unavailable" errors;
   user runs commands via `! <command>` prefix in the session instead.
 
-## Session 6 history (for context)
-EXPLOIT built (KaliSandbox + ExploitSubagent + report/CLI wiring),
-live-ran it, debugged the LLM→tool handoff (empty param values, archive
-payloads, double-encoding), added curl template + repeatable-steps
-report section. 4 commits. First confirmed findings in project history.
+## LLM handoff lessons (all fixed deterministically in code)
+1. LLM drops query strings -> seed `=1` when value empty.
+2. LLM wraps real pages in RetURL=... -> unwrap (double-decode).
+3. LLM proposes archive payloads as URLs -> prompt asks for clean URLs.
+4. `quote()` double-encodes %-paths -> `%` in safe set.
+Rule #1 of the spec proved itself: every LLM quirk got a rigid code
+fix, never a prompt-only hope.
