@@ -213,6 +213,8 @@ def test_report_claims_testing_only_with_real_attempts(tmp_path):
     graph = _graph()
     graph.add_node("exploit_attempt", "H1:sqlmap", {
         "tool": "sqlmap", "exit_code": 0, "confirmed": True,
+        "argv": ["sqlmap", "-u", "http://target-corp.com/Login.asp", "--batch"],
+        "output_excerpt": "parameter 'id' is vulnerable",
     })
 
     report = render_report(graph, audit, "e-bt")
@@ -225,6 +227,11 @@ def test_report_claims_testing_only_with_real_attempts(tmp_path):
     assert "Tested: yes" in report
     # H2 was not tested
     assert "Tested: no" in report
+    # the repeatable-steps section shows the command a tester can re-run
+    assert "How the testing was done" in report
+    assert "### Steps for H1:sqlmap" in report
+    # (the safety reminder wraps across lines — normalize whitespace)
+    assert "you are allowed to test" in " ".join(report.split())
 
 
 def test_empty_graph_report(tmp_path):

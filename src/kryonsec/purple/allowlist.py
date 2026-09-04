@@ -70,6 +70,7 @@ EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
         "--technique={B|E|U|T|Q}", "--timeout={30|60|120}", "--threads={1|2|3|4}",
     ],
     "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
+    "curl": ["-sS", "--max-time", "30", "{url}"],
 }
 
 # Hardline blocklist (safety Layer 8) — regex patterns over the joined argv
