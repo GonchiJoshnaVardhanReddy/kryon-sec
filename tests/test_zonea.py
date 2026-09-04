@@ -165,3 +165,53 @@ def test_crt_sh_parses_names(tmp_path):
     assert "www.target-corp.com" in result.subdomains
     assert "api.target-corp.com" in result.subdomains
     assert "evil.com" not in result.subdomains
+
+
+def test_wayback_subdomains_extracts_hosts():
+    """Wayback CDX rows -> in-scope subdomain hosts only."""
+    import json as _json
+    from unittest.mock import patch
+
+    rows = _json.dumps([
+        ["com,target-corp)/", "20200101", "http://target-corp.com/"],
+        ["com,target-corp,api)/", "20200102", "http://api.target-corp.com/v1"],
+        ["com,target-corp,www)/", "20200103", "https://www.target-corp.com/login"],
+        ["com,evil)/", "20200104", "http://evil.com/target-corp"],
+    ]).encode()
+
+    from kryonsec.purple.zonea import wayback_subdomains
+
+    with patch("kryonsec.purple.zonea._zone_a_fetch", return_value=rows):
+        result = wayback_subdomains("target-corp.com")
+
+    assert result.source == "wayback"
+    assert result.subdomains == ["api.target-corp.com", "www.target-corp.com"]
+    # the apex and out-of-scope hosts are excluded
+    assert "target-corp.com" not in result.subdomains
+    assert "evil.com" not in result.subdomains
+
+
+def test_wayback_subdomains_network_failure_is_empty():
+    from unittest.mock import patch
+
+    from kryonsec.purple.zonea import wayback_subdomains
+
+    with patch(
+        "kryonsec.purple.zonea._zone_a_fetch",
+        side_effect=RuntimeError("archive down"),
+    ):
+        result = wayback_subdomains("target-corp.com")
+
+    assert result.subdomains == []
+    assert result.source == "wayback"
+
+
+def test_default_fetchers_include_both_sources():
+    from kryonsec.purple.recon_passive import ReconPassiveSubagent
+
+    cfg = KryonsecConfig()
+    sub = ReconPassiveSubagent(
+        cfg=cfg, graph=None, audit=None, target="x.com",
+    )
+    names = {f.__name__ for f in sub.fetchers}
+    assert names == {"crt_sh_subdomains", "wayback_subdomains"}
