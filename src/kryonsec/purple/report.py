@@ -68,6 +68,9 @@ def render_report(
             {"hypothesis_id": n["label"], **n["properties"]}
             for n in graph.by_type("remediation")
         ],
+        # the report may only claim testing happened when tools really ran
+        # (exploit_attempt nodes are only created by real Zone B execution)
+        exploit_attempts=graph.by_type("exploit_attempt"),
         completed_states=completed_states or [],
         halt_reason=halt_reason or "",
         audit_head=audit.head_hash(),
@@ -90,7 +93,7 @@ def validate_report(report: str, graph: EngagementGraph) -> list[str]:
             problems.append(f"remediation for {r['label']} missing from report")
 
     # no duplicate remediation sections
-    remediation_markers = report.count("### Remediation for")
+    remediation_markers = report.count("### Fix for")
     if remediation_markers != len(graph.by_type("remediation")):
         problems.append(
             f"remediation count mismatch: {remediation_markers} sections, "

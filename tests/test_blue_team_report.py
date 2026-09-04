@@ -132,13 +132,25 @@ def test_report_renders_everything(tmp_path):
         completed_states=["INIT", "RECON_PASSIVE", "HYPOTHESIZE"],
         halt_reason=None,
     )
-    assert "# Kryonsec Engagement Report" in report
+    assert "# Security Test Report" in report
     assert "target-corp.com" in report
     assert "www.target-corp.com" in report
     assert "SQLi on login" in report
-    assert "fix H1" in report
-    assert "APPROVED" in report
+    assert "Fix for H1" in report
+    assert "approved" in report
     assert audit.head_hash() in report
+    # no exploit_attempt nodes => the report must NOT claim testing happened
+    assert "No testing was done against the website" in report
+
+
+def test_report_claims_testing_only_with_real_attempts(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1-run", {"tool": "sqlmap", "exit_code": 0})
+
+    report = render_report(graph, audit, "e-bt")
+    assert "Tools were run against the target" in report
+    assert "No testing was done" not in report
 
 
 def test_report_validation_clean(tmp_path):
@@ -172,7 +184,8 @@ def test_report_subagent_writes_file(tmp_path):
     report_path = tmp_path / "engagements" / "e-bt" / "report.md"
     assert report_path.exists()
     content = report_path.read_text(encoding="utf-8")
-    assert "Zone B requires Linux" in content
+    assert "The engagement stopped early" in content
+    assert "No testing was done against the website" in content
     events = [json.loads(l)["event"] for l in open(audit.path, encoding="utf-8") if l.strip()]
     assert "report_written" in events
 
@@ -199,5 +212,6 @@ def test_empty_graph_report(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = EngagementGraph(engagement_id="e-empty")
     report = render_report(graph, audit, "e-empty", completed_states=["INIT"])
-    assert "(none found)" in report
+    assert "none found" in report
+    assert "No issues were suggested" in report
     assert validate_report(report, graph) == []
