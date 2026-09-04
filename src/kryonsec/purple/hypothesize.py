@@ -63,11 +63,7 @@ def render_hypothesize_prompt(graph: EngagementGraph) -> str:
     template = env.get_template("hypothesize.jinja")
 
     subdomains = sorted(n["label"] for n in graph.by_type("subdomain"))
-    paths = sorted(
-        p
-        for n in graph.by_type("path")
-        for p in [n["label"]]
-    )
+    paths = sorted(n["label"] for n in graph.by_type("path"))
     target_nodes = graph.by_type("target")
     target = target_nodes[0]["label"] if target_nodes else ""
 

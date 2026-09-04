@@ -15,7 +15,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +68,9 @@ def validate_target(raw: str) -> str:
 class PassiveResult:
     source: str
     subdomains: list[str]
+    # archived URLs (Wayback) — evidence for thin targets that have no
+    # subdomains: "old ASP site, archived since 2013" is real signal.
+    paths: list[str] = field(default_factory=list)
 
 
 def _zone_a_fetch(url: str, timeout: int = TIMEOUT_S) -> bytes:
@@ -195,13 +198,14 @@ def wayback_paths(domain: str, limit: int = 100, retries: int = 2) -> list[str]:
     return [row[2] for row in rows[1:] if len(row) >= 3 and row[2].startswith("http")]
 
 
-def wayback_subdomains(domain: str, limit: int = 500) -> PassiveResult:
-    """Derive subdomains from archived URLs (Wayback CDX, third-party API).
+def wayback_subdomains(domain: str, limit: int = 200) -> PassiveResult:
+    """Derive subdomains AND archived URLs from the Wayback CDX API.
 
     A second, independent source of subdomain names: the archive's URL
     list includes hosts like api.example.com that certificates never
-    covered. Zero packets to the target — we ask the archive, not the
-    target's servers.
+    covered. The archived URLs themselves are evidence too — technology
+    and age hints for targets with no subdomains at all. Zero packets to
+    the target — we ask the archive, not the target's servers.
     """
     domain = normalize_target(domain)
     try:
@@ -209,12 +213,30 @@ def wayback_subdomains(domain: str, limit: int = 500) -> PassiveResult:
     except Exception:
         # network/archive hiccup: empty result, never an exception upward
         log.warning("wayback CDX query failed for %s", domain, exc_info=True)
-        return PassiveResult(source="wayback", subdomains=[])
+        return PassiveResult(source="wayback", subdomains=[], paths=[])
 
     found: set[str] = set()
+    cleaned: list[str] = []
     for url in paths:
         host = urllib.parse.urlparse(url).hostname or ""
         host = host.strip().lower().rstrip(".")
-        if host and _same_domain(host, domain) and host != domain:
+        if not host or not _same_domain(host, domain):
+            # out-of-scope hosts contribute nothing — not even paths
+            continue
+        if host != domain:
             found.add(host)
-    return PassiveResult(source="wayback", subdomains=sorted(found))
+
+        # keep the path+query part (drop scheme/host — the prompt already
+        # knows the target)
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        cleaned.append(path)
+
+    return PassiveResult(
+        source="wayback",
+        subdomains=sorted(found),
+        # dedupe, cap at 100 — enough for the prompt without flooding it
+        paths=list(dict.fromkeys(cleaned))[:100],
+    )

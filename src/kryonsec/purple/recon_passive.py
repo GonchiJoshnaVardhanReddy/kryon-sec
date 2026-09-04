@@ -102,12 +102,22 @@ class ReconPassiveSubagent:
                 )
             total_new += len(fresh)
 
+            known_paths = {n["label"] for n in self.graph.by_type("path")}
+            for path in result.paths:
+                if path not in known_paths:
+                    self.graph.add_node(
+                        node_type="path",
+                        label=path,
+                        properties={"source": result.source},
+                    )
+
             # Audit the CALL (tool, source, counts) — never any API key
             self.audit.write({
                 "event": "passive_source_ok",
                 "source": source,
                 "found": len(result.subdomains),
                 "new": len(fresh),
+                "paths": len(result.paths),
             })
 
         return SubagentResult(status="ok")
