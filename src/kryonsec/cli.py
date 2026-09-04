@@ -95,9 +95,12 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     session = GeneralSession(cfg=cfg)
 
+    # mutable mode holder: "copilot" <-> "purple" via /mode
+    _mode = ["copilot"]
+
     while True:
         try:
-            user_input = console.input("[cyan]\\[COPILOT]>[/cyan] ")
+            user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]bye[/dim]")
             return
@@ -116,7 +119,9 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 "[bold]Commands[/bold]\n"
                 "  /help            show this help\n"
                 "  /quit            exit\n"
-                "  /mode            show current mode\n"
+                "  /mode            switch mode (copilot / purple)\n"
+                "  /cve <id>        look up a CVE (NVD, cached)\n"
+                "  /search <query>  web search — results go into context\n"
                 "  /read <path>     read a file (approval-gated outside workspace)\n"
                 "  /ls <path>       list a directory (approval-gated outside workspace)\n"
                 "  /write <path>    write text to a file in the workspace\n"
@@ -124,7 +129,18 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             )
             continue
         if cmd == "/mode":
-            console.print("[cyan]mode: COPILOT[/cyan] (purple team requires Profile 2 — see `kryonsec doctor`)")
+            from .purple.runner import sandbox_available
+
+            mode = "purple" if _mode[0] == "copilot" else "copilot"
+            if mode == "purple":
+                ok, reason = sandbox_available(cfg.sandbox_image)
+                if not ok:
+                    console.print(f"[red]cannot switch to purple: {reason}[/red]")
+                    console.print("[yellow]staying in copilot[/yellow]")
+                    continue
+            _mode[0] = mode
+            console.print(f"[cyan]mode: {mode.upper()}[/cyan]")
+            console.print("[dim]type a target domain to run an engagement, /mode to switch back[/dim]")
             continue
 
         # ---- CVE lookup (spec §3.6) --------------------------------------
@@ -148,6 +164,27 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             console.print(record.get("description", "")[:500])
             if record.get("references"):
                 console.print("[dim]refs: " + ", ".join(r for r in record["references"] if r) + "[/dim]")
+            continue
+
+        # ---- web search (spec §3.7) --------------------------------------
+        if cmd.startswith("/search "):
+            from .copilot.websearch import search_web
+
+            query = text[len("/search "):].strip()
+            results = search_web(cfg, query)
+            if results is None:
+                console.print("[yellow]search failed (offline or blocked — try again online)[/yellow]")
+                continue
+            if not results:
+                console.print("[yellow]no results[/yellow]")
+                continue
+            for r in results:
+                console.print(f"[bold]{r['title']}[/bold]")
+                console.print(f"[dim]{r['snippet']}[/dim]")
+                console.print(f"[blue]{r['url']}[/blue]\n")
+            session.add("user", f"[web search results for: {query}]\n" + "\n".join(
+                f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results))
+            console.print("[green]results now in context — ask about them[/green]")
             continue
 
         # ---- file tools (spec §3.7) -------------------------------------
@@ -183,6 +220,11 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             err_console.print(f"{e}")
             continue
 
+        # ---- purple mode: typed text is a target domain -------------------
+        if _mode[0] == "purple":
+            _run_purple(cfg, text)
+            continue
+
         session.add("user", text)
         await session.maybe_compact()
 
@@ -200,6 +242,79 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         session.add("assistant", reply)
         console.print(Markdown(reply))
         console.print()
+
+
+def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
+    """Run one Purple Team engagement on a target. Shared by the `purple`
+    subcommand and the /mode toggle inside the chat loop."""
+    import uuid
+
+    from .purple.runner import sandbox_available, start_engagement
+    from .purple.zonea import validate_target
+
+    try:
+        target = validate_target(target_arg)
+    except ValueError as e:
+        err_console.print(f"[red]Invalid target:[/red] {e}")
+        return 2
+
+    sandbox_ok, sandbox_reason = sandbox_available()
+    if not sandbox_ok:
+        console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
+        console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
+
+    engagement_id = str(uuid.uuid4())[:8]
+
+    def _progress(msg: str) -> None:
+        console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
+
+    orch, audit, graph = start_engagement(
+        cfg, engagement_id, target=target, progress=_progress
+    )
+    console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
+    completed = orch.run()
+    console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
+    if orch.halt_reason:
+        console.print(f"[red]halted:[/red] {orch.halt_reason}")
+    subdomains = [n["label"] for n in graph.by_type("subdomain")]
+    if subdomains:
+        console.print(f"\n[cyan]passive recon found {len(subdomains)} subdomains:[/cyan]")
+        for s in subdomains[:30]:
+            console.print(f"  [dim]{s}[/dim]")
+    hypotheses = graph.by_type("hypothesis")
+    if hypotheses:
+        console.print(f"\n[cyan]LLM proposed {len(hypotheses)} hypotheses:[/cyan]")
+        for n in hypotheses:
+            p = n["properties"]
+            console.print(
+                f"  [magenta]{n['label']}[/magenta] "
+                f"[bold]{p.get('title', '')}[/bold] "
+                f"[dim](confidence {p.get('confidence', 0):.1f}; "
+                f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
+            )
+    attempts = graph.by_type("exploit_attempt")
+    if attempts:
+        console.print(f"\n[cyan]tool runs executed: {len(attempts)}[/cyan]")
+        for n in attempts:
+            p = n["properties"]
+            verdict = ("[red]confirmed[/red]" if p.get("confirmed")
+                       else "not confirmed")
+            console.print(
+                f"  [magenta]{n['label']}[/magenta] "
+                f"exit {p.get('exit_code', '?')} — {verdict}"
+            )
+    findings = graph.by_type("finding")
+    if findings:
+        console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
+        for n in findings:
+            verified = n["properties"].get("verified")
+            mark = " [bold]verified[/bold]" if verified else ""
+            console.print(f"  [magenta]{n['label']}[/magenta]{mark}")
+    console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
+    report_path = cfg.home / "engagements" / engagement_id / "report.md"
+    if report_path.exists():
+        console.print(f"[dim]report written: {report_path}[/dim]")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,74 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(cfg)
 
     if args.command == "purple":
-        import uuid
-
-        from .purple.runner import sandbox_available, start_engagement
-        from .purple.zonea import validate_target
-
-        try:
-            target = validate_target(args.target)
-        except ValueError as e:
-            err_console.print(f"[red]Invalid target:[/red] {e}")
-            return 2
-
-        sandbox_ok, sandbox_reason = sandbox_available()
-        if not sandbox_ok:
-            console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
-            console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
-
-        engagement_id = args.id or str(uuid.uuid4())[:8]
-
-        def _progress(msg: str) -> None:
-            console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
-
-        orch, audit, graph = start_engagement(
-            cfg, engagement_id, target=target, progress=_progress
-        )
-        console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
-        completed = orch.run()
-        console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
-        if orch.halt_reason:
-            console.print(f"[red]halted:[/red] {orch.halt_reason}")
-        subdomains = [n["label"] for n in graph.by_type("subdomain")]
-        if subdomains:
-            console.print(f"\n[cyan]passive recon found {len(subdomains)} subdomains:[/cyan]")
-            for s in subdomains[:30]:
-                console.print(f"  [dim]{s}[/dim]")
-        hypotheses = graph.by_type("hypothesis")
-        if hypotheses:
-            console.print(f"\n[cyan]LLM proposed {len(hypotheses)} hypotheses:[/cyan]")
-            for n in hypotheses:
-                p = n["properties"]
-                console.print(
-                    f"  [magenta]{n['label']}[/magenta] "
-                    f"[bold]{p.get('title', '')}[/bold] "
-                    f"[dim](confidence {p.get('confidence', 0):.1f}; "
-                    f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
-                )
-        attempts = graph.by_type("exploit_attempt")
-        if attempts:
-            console.print(f"\n[cyan]tool runs executed: {len(attempts)}[/cyan]")
-            for n in attempts:
-                p = n["properties"]
-                verdict = ("[red]confirmed[/red]" if p.get("confirmed")
-                           else "not confirmed")
-                console.print(
-                    f"  [magenta]{n['label']}[/magenta] "
-                    f"exit {p.get('exit_code', '?')} — {verdict}"
-                )
-        findings = graph.by_type("finding")
-        if findings:
-            console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
-            for n in findings:
-                verified = n["properties"].get("verified")
-                mark = " [bold]verified[/bold]" if verified else ""
-                console.print(f"  [magenta]{n['label']}[/magenta]{mark}")
-        console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
-        report_path = cfg.home / "engagements" / engagement_id / "report.md"
-        if report_path.exists():
-            console.print(f"[dim]report written: {report_path}[/dim]")
-        return 0
+        return _run_purple(cfg, args.target)
 
     console.print(WELCOME.format(version=__version__))
     asyncio.run(_chat_loop(cfg))
