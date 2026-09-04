@@ -102,15 +102,25 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     session = GeneralSession(cfg=cfg)
 
-    # mutable mode holder: "copilot" <-> "purple" via /mode
+    # mutable mode holder: "copilot" <-> "purple" via Shift+Tab or /mode
     _mode = ["copilot"]
+    _notice = [""]  # one-line status shown above the prompt
+
+    from .tui import make_prompt_session
+
+    ps = make_prompt_session(_mode, _notice, cfg)
 
     while True:
         try:
-            user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
-        except (EOFError, KeyboardInterrupt):
+            if ps is not None:
+                user_input = await ps.prompt_async()
+            else:  # prompt_toolkit unavailable — plain input fallback
+                user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
+        except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
             console.print("\n[dim]bye[/dim]")
             return
+        finally:
+            _notice[0] = ""  # notices are one-shot
 
         text = user_input.strip()
         if not text:
@@ -126,7 +136,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 "[bold]Commands[/bold]\n"
                 "  /help            show this help\n"
                 "  /quit            exit (or just: exit, quit)\n"
-                "  /mode            switch mode (copilot / purple)\n"
+                "  /mode            switch mode (copilot / purple) — or press Shift+Tab\n"
                 "  /cve <id>        look up a CVE (NVD, cached)\n"
                 "  /search <query>  web search — results go into context\n"
                 "  /read <path>     read a file (approval-gated outside workspace)\n"
@@ -136,18 +146,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             )
             continue
         if cmd == "/mode":
-            from .purple.runner import sandbox_available
+            from .tui import set_mode
 
-            mode = "purple" if _mode[0] == "copilot" else "copilot"
-            if mode == "purple":
-                ok, reason = sandbox_available(cfg.sandbox_image)
-                if not ok:
-                    console.print(f"[red]cannot switch to purple: {reason}[/red]")
+            target = "purple" if _mode[0] == "copilot" else "copilot"
+            set_mode(_mode, _notice, cfg, target)
+            if _notice[0]:
+                console.print(f"[cyan]{_notice[0]}[/cyan]")
+                if _mode[0] != "purple":
                     console.print("[yellow]staying in copilot[/yellow]")
-                    continue
-            _mode[0] = mode
-            console.print(f"[cyan]mode: {mode.upper()}[/cyan]")
-            console.print("[dim]type a target domain to run an engagement, /mode to switch back[/dim]")
             continue
 
         # ---- CVE lookup (spec §3.6) --------------------------------------
@@ -350,7 +356,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_purple(cfg, args.target)
 
     console.print(WELCOME.format(version=__version__))
-    asyncio.run(_chat_loop(cfg))
+    try:
+        asyncio.run(_chat_loop(cfg))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        console.print("")  # Ctrl+C during shutdown — exit cleanly
     return 0
 
 
