@@ -1,10 +1,22 @@
 # Kryonsec — Session Handoff Notes
-**Date:** 2026-09-05 (end of session 7)
+**Date:** 2026-09-05 (end of session 8)
 **Repo:** https://github.com/GonchiJoshnaVardhanReddy/kryon-sec (branch: main)
-**Status: ~98% complete. ALL 10 STATES HAVE REAL SUBAGENTS. Evidence
-ladder complete: suggestion -> tested -> confirmed -> verified
-(independent second tool). 172 tests green, live-verified.**
-**Check `git status` first next session — commit + push if anything is pending.**
+**Status: 100% of planned features done and live-verified. 191 tests
+green. v1.0.0. Working tree should be clean — check `git status` first.**
+
+## Session 8 additions
+- **Web search FIXED (live-verified in WSL):** the root cause was that
+  DDG's html + lite endpoints AND Mojeek all serve bot-challenge pages
+  to this network. Fix: search now tries 5 sources in order until one
+  answers — DDG html, DDG lite (POST), Mojeek, **DDG Instant Answer
+  JSON API** (api.duckduckgo.com — works here), **Wikipedia search API**
+  (keyless JSON, covers any query). DDG topic redirect URLs
+  (duckduckgo.com/<Topic>) expand to Wikipedia article URLs.
+- **`exit` / `quit` (plain words) now leave the chat** — previously they
+  went to the LLM.
+- README polished for v1.0 (both modes, commands, safety rules, status).
+- Chat loop now calls `init_db(cfg, include_purple=False)` at startup —
+  no more "no such table" warnings on first run.
 
 ## The complete engine (live-verified, engagement d8107d02)
 Every state runs for real: passive recon (crt.sh+Wayback) -> active recon
@@ -34,12 +46,13 @@ independent probe; 5 other runs honestly "not confirmed".
 suggestion (LLM) -> tested (exploit_attempt node) -> confirmed (tool's
 own words contain a marker) -> verified (independent second tool agrees).
 
-## REMAINING WORK (~2%)
-1. **TUI** (~1%): Shift+Tab mode toggle (Copilot <-> Purple).
-2. **Web search tool** (~1%): spec §3.7 (Copilot mode).
-3. Optional polish: docker socket proxy (spec §8.2 — sandbox currently
-   uses default bridge, noted in audit); POST_EXPLOIT stays stubbed by
-   design (needs separate approval flow).
+## REMAINING WORK
+None of the planned features. Optional ideas for a future session:
+- docker socket proxy (spec §8.2 — sandbox currently uses default
+  bridge, noted in audit)
+- POST_EXPLOIT stays stubbed by design (needs separate approval flow)
+- PostgreSQL as system of record (currently SQLite — spec allows it as
+  Profile-1 fallback)
 
 ## Environment facts
 - Dev on Windows 11; engagement runs in WSL2 Ubuntu (`wsl`).
