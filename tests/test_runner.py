@@ -90,6 +90,43 @@ def test_engagement_runs_with_sandbox(tmp_path):
     assert ok, reason
 
 
+def test_engagement_status_factory_wraps_states(tmp_path):
+    """The CLI passes status_factory: every non-interactive state runs
+    inside it (spinner context), HUMAN_REVIEW never does."""
+    from unittest.mock import patch
+
+    cfg = KryonsecConfig(home=tmp_path)
+
+    entered: list[str] = []
+    released: list[str] = []
+
+    class FakeCtx:
+        def __init__(self, state):
+            self.state = state
+
+        def __enter__(self):
+            entered.append(self.state)
+            return self
+
+        def __exit__(self, *exc):
+            released.append(self.state)
+            return False
+
+    with patch("kryonsec.purple.runner.sandbox_available", return_value=(False, "not Linux")):
+        with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+            orch, audit, graph = start_engagement(
+                cfg, "e-spin", target="target-corp.com",
+                status_factory=FakeCtx,
+            )
+            orch.run()
+
+    # loop states that actually ran, in order — no HUMAN_REVIEW
+    assert "RECON_PASSIVE" in entered
+    assert "HUMAN_REVIEW" not in entered
+    assert "REPORT" not in entered  # halted before REPORT (no sandbox)
+    assert entered == released      # every context was properly exited
+
+
 def test_full_loop_through_exploit(tmp_path):
     """Recon -> hypotheses -> approve H1 -> EXPLOIT spawns the tool ->
     report truthfully says testing happened."""

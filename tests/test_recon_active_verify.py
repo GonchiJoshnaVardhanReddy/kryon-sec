@@ -181,6 +181,61 @@ def test_verify_fails_when_responses_identical(tmp_path):
     assert graph.by_type("finding")[0]["properties"].get("verified") is not True
 
 
+def test_verify_retries_http_reset_over_https(tmp_path):
+    """https-only target: probes over http get exit 56, the verifier
+    retries over https and can still verify the finding."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _finding_graph()
+
+    class HttpResetSandbox:
+        def __init__(self):
+            self.urls = []
+
+        def spawn(self, argv):
+            url = argv[-1]
+            self.urls.append(url)
+            if url.startswith("http://"):
+                return SpawnResult(ok=True, exit_code=56, stdout="")
+            is_true = "1%3D1" in url or "+AND+1%3D1" in url
+            return SpawnResult(
+                ok=True, exit_code=0,
+                stdout="full page" if is_true else "empty result",
+            )
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", HttpResetSandbox())
+    sub.run()
+    # 4 probes total: true+false, each retried over https after the http 56
+    assert len(sub.sandbox.urls) == 4
+    # every http probe was immediately followed by an https retry
+    for i, u in enumerate(sub.sandbox.urls):
+        if u.startswith("http://"):
+            assert sub.sandbox.urls[i + 1].startswith("https://")
+    assert graph.by_type("finding")[0]["properties"]["verified"] is True
+
+
+def test_verify_uses_scheme_discovered_by_exploit(tmp_path):
+    """An engagement_note scheme=https (EXPLOIT found the reset) makes the
+    verifier probe https directly — no dead http round-trip first."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _finding_graph()
+    graph.add_node("engagement_note", "scheme", {"scheme": "https", "reason": "reset"})
+
+    class HttpHater:
+        def spawn(self, argv):
+            assert argv[-1].startswith("https://"), "must probe https directly"
+            is_true = "1%3D1" in argv[-1] or "+AND+1%3D1" in argv[-1]
+            return SpawnResult(
+                ok=True, exit_code=0,
+                stdout="full page" if is_true else "empty result",
+            )
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", HttpHater())
+    sub.run()
+    assert graph.by_type("finding")[0]["properties"]["verified"] is True
+
+
 def test_verify_skips_when_probe_fails(tmp_path):
     cfg = KryonsecConfig(home=tmp_path)
     audit = AuditLog(tmp_path / "audit.jsonl")

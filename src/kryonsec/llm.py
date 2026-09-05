@@ -28,10 +28,86 @@ def reset_provider_cache() -> None:
     _ollama_models = None
 
 
+def ollama_models(host: str) -> list[str] | None:
+    """Models pulled on an Ollama server, or None when it is not
+    answering (shared with the setup wizard)."""
+    import json as _json
+    import urllib.request
+
+    normalized = _normalize_host(host)
+    try:
+        with urllib.request.urlopen(f"{normalized}/api/tags", timeout=2) as r:
+            body = _json.loads(r.read())
+            return [m.get("name", "") for m in body.get("models", [])]
+    except Exception:
+        return None
+
+
+def _normalize_host(host: str) -> str:
+    """Litellm requires a scheme; OLLAMA_HOST is often set bare (host:port)."""
+    host = host.strip().rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return host
+
+
+# keep the old private name working (used across modules/tests)
+_normalize_ollama_host = _normalize_host
+
+
+# OpenAI reasoning-era models (gpt-5*, gpt-6*, o1/o3/o4*) have API quirks that
+# are hard 400 errors: they reject `temperature`, and they reject function
+# tools while a reasoning effort is active (must be 'none'). Detected by
+# model id prefix — a rigid code rule, not a prompt hope.
+_REASONING_PREFIXES = ("gpt-5", "gpt-6", "gpt-7", "o1", "o3", "o4", "o5")
+
+
+def is_reasoning_model(model: str) -> bool:
+    base = model.split("/")[-1].lower()
+    return any(base.startswith(p) for p in _REASONING_PREFIXES)
+
+
+def _quiet_litellm() -> None:
+    """Stop litellm printing its 'Give Feedback / Get Help' banner on
+    every failed call — the warning log already has the real error."""
+    try:
+        import litellm
+
+        litellm.suppress_debug_info = True
+    except Exception:
+        pass
+
+
+def completion_kwargs(
+    cfg: KryonsecConfig,
+    model: str,
+    temperature: float = 0.0,
+    tools: bool = False,
+) -> dict[str, Any]:
+    """Provider/shape kwargs shared by every litellm.completion call:
+    the config.toml api key (litellm only reads the env var), the Ollama
+    host, and the reasoning-model quirks above."""
+    kwargs: dict[str, Any] = {}
+    if model.startswith("ollama/"):
+        kwargs["api_base"] = _normalize_host(cfg.ollama_host)
+    elif cfg.openai_api_key:
+        kwargs["api_key"] = cfg.openai_api_key
+    if is_reasoning_model(model):
+        if tools:
+            # OpenAI: function tools need the effort off; litellm only
+            # forwards reasoning_effort when it's in allowed_openai_params
+            kwargs["reasoning_effort"] = "none"
+            kwargs["allowed_openai_params"] = ["reasoning_effort"]
+        # temperature unsupported — leave it out entirely
+    else:
+        kwargs["temperature"] = temperature
+    return kwargs
+
+
 def _ollama_ok(cfg: KryonsecConfig) -> bool:
     global _ollama_available
     if _ollama_available is None:
-        host = _normalize_ollama_host(cfg.ollama_host)
+        host = _normalize_host(cfg.ollama_host)
         try:
             import json as _json
             import urllib.request
@@ -68,28 +144,32 @@ class LlmUnavailable(RuntimeError):
     """No LLM provider could serve the request."""
 
 
-def _normalize_ollama_host(host: str) -> str:
-    """Litellm requires a scheme; OLLAMA_HOST is often set bare (host:port)."""
-    host = host.strip().rstrip("/")
-    if not host.startswith(("http://", "https://")):
-        host = f"http://{host}"
-    return host
-
-
 def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: Any) -> str:
-    """Call litellm.completion; return the assistant text."""
+    """Call litellm.completion; return the assistant text.
+
+    kwargs may include `tools` (list of JSON-schema tool definitions) —
+    passed straight through for the agent loop. The agent loop reads
+    tool_calls itself from the raw response, so this helper stays the
+    plain-text entry point.
+    """
     import litellm
 
+    _quiet_litellm()
+
+    tool_schemas = kwargs.pop("tools", None)
+    temperature = kwargs.pop("temperature", 0.0)
     call_kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": kwargs.pop("temperature", 0.0),
         "timeout": kwargs.pop("timeout", 30),
         "num_retries": kwargs.pop("num_retries", 0),  # we own the fallback chain
         **kwargs,
     }
-    if model.startswith("ollama/"):
-        call_kwargs["api_base"] = _normalize_ollama_host(cfg.ollama_host)
+    if tool_schemas:
+        call_kwargs["tools"] = tool_schemas
+        call_kwargs["tool_choice"] = kwargs.pop("tool_choice", "auto")
+    call_kwargs.update(
+        completion_kwargs(cfg, model, temperature, tools=bool(tool_schemas)))
 
     try:
         resp = litellm.completion(**call_kwargs)
@@ -114,7 +194,10 @@ def chat(
     local_only: bool = False,
     **kwargs: Any,
 ) -> str:
-    """Chat with a preferred model; fall back local -> third-party -> error.
+    """Chat with a preferred model. v1.1 provider isolation: the provider
+    chosen in setup is THE provider — openai config never calls Ollama and
+    an ollama config never calls a hosted API. Fallbacks stay inside the
+    selected provider only.
 
     local_only=True restricts every attempt to the local model — used for
     compaction with secrets (spec §6.4: never a third-party provider).
@@ -131,47 +214,41 @@ def chat(
                 ) from e
             raise
 
-    if model.startswith("gpt") and not cfg.openai_api_key:
-        log.info("OpenAI key absent; routing to local model %s", cfg.local_model)
-        model = cfg.local_model
+    if cfg.provider == "ollama":
+        # ---- ollama config: Ollama only, ever ---------------------------
+        if not model.startswith("ollama/"):
+            model = cfg.local_model
+        if not _ollama_model_ok(cfg, model):
+            # dead server or model not pulled — no other provider to try
+            raise LlmUnavailable(
+                f"Ollama unavailable or {model} not pulled — start it "
+                "(`ollama serve`) and pull the model (`ollama pull llama3.1`)"
+            )
+        return _complete(cfg, model, messages, **kwargs)
 
-    # Dead-but-listening Ollama: skip it instead of waiting out the timeout.
-    # (Also skip when the model simply isn't pulled — /api/chat hangs then.)
-    skip_local = False
-    if model.startswith("ollama/") and not _ollama_model_ok(cfg, model):
-        skip_local = True
-        model = ""  # go straight to the fallback chain
-
-    if model:
+    # ---- openai config: hosted API only ---------------------------------
+    if model.startswith("ollama/"):
+        model = cfg.general_chat_model  # never silently call a local model
+    if not cfg.openai_api_key:
+        raise LlmUnavailable(
+            "OpenAI is the configured provider but no API key is set — "
+            "run `kryonsec setup`"
+        )
+    try:
+        return _complete(cfg, model, messages, **kwargs)
+    except Exception:
+        pass
+    # same-provider fallback: the cheap search model, when it differs
+    if cfg.general_search_model != model:
+        log.warning("LLM %s failed; falling back to %s", model, cfg.general_search_model)
         try:
-            return _complete(cfg, model, messages, **kwargs)
+            return _complete(cfg, cfg.general_search_model, messages, **kwargs)
         except Exception:
             pass
 
-    # Fallback chain: try the other provider before giving up.
-    tried: list[str] = [model] if model else []
-    candidates: list[str] = []
-    if not skip_local and model != cfg.local_model:
-        candidates.append(cfg.local_model)
-    if cfg.openai_api_key and not model.startswith("gpt"):
-        candidates.append(cfg.general_search_model)  # hosted fallback
-    for candidate in candidates:
-        if candidate in tried or (
-            candidate.startswith("ollama/") and not _ollama_model_ok(cfg, candidate)
-        ):
-            continue
-        if model:
-            log.warning("LLM %s failed; falling back to %s", model, candidate)
-        else:
-            log.warning("local model unavailable; using hosted fallback %s", candidate)
-        try:
-            return _complete(cfg, candidate, messages, **kwargs)
-        except Exception:
-            continue
-
     raise LlmUnavailable(
-        "no LLM provider available — start Ollama (`ollama serve`, "
-        "`ollama pull llama3.1`) or set OPENAI_API_KEY"
+        "no OpenAI model answered — check the API key (`kryonsec setup`) "
+        "or the network"
     )
 
 

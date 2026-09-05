@@ -64,9 +64,12 @@ def build_key_bindings(
     mode: list[str],
     notice: list[str],
     cfg: KryonsecConfig,
+    on_change: Any | None = None,
 ) -> Any:
     """Shift+Tab toggles copilot <-> purple without losing what's
-    already typed (the buffer is untouched; only the prompt repaints)."""
+    already typed (the buffer is untouched; only the prompt repaints).
+    on_change(new_mode) is called when the mode actually flips (used to
+    repaint the banner in the new mode's color)."""
     from prompt_toolkit.key_binding import KeyBindings
 
     kb = KeyBindings()
@@ -74,7 +77,8 @@ def build_key_bindings(
     @kb.add("s-tab")
     def _toggle(event: Any) -> None:
         target = "purple" if mode[0] == "copilot" else "copilot"
-        set_mode(mode, notice, cfg, target)
+        if set_mode(mode, notice, cfg, target) and on_change:
+            on_change(mode[0])
         event.app.invalidate()  # repaint with the new indicator now
 
     return kb
@@ -84,6 +88,7 @@ def make_prompt_session(
     mode: list[str],
     notice: list[str],
     cfg: KryonsecConfig,
+    on_change: Any | None = None,
 ) -> Any | None:
     """The PromptSession driving chat input: history file, Shift+Tab
     bindings, and the mode-aware prompt. Returns None if prompt_toolkit
@@ -101,7 +106,7 @@ def make_prompt_session(
     cfg.home.mkdir(parents=True, exist_ok=True)
     return PromptSession(
         history=FileHistory(str(cfg.home / "chat_history")),
-        key_bindings=build_key_bindings(mode, notice, cfg),
+        key_bindings=build_key_bindings(mode, notice, cfg, on_change=on_change),
         message=lambda: prompt_message(mode, notice),
         enable_history_search=True,  # Ctrl+R / up-arrow prefix search
     )

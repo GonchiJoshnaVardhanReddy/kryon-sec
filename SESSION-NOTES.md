@@ -1,8 +1,57 @@
 # Kryonsec — Session Handoff Notes
-**Date:** 2026-09-05 (end of session 9)
+**Date:** 2026-09-05 (end of session 10)
 **Repo:** https://github.com/GonchiJoshnaVardhanReddy/kryon-sec (branch: main)
-**Status: 100% of planned features + TUI live-verified. 201 tests green.
-v1.0.0. Working tree should be clean — check `git status` first.**
+**Status: v1.1.0 — installer + setup wizard + tool-using agent + MCP.
+241 tests green. Working tree: v1.1 changes committed? check `git status`.**
+
+## FIRST THING NEXT SESSION: live-test v1.1 (all built, unit-tested, not live-run)
+1. **Wizard live** (WSL, real terminal): `kryonsec setup` — pick OpenAI,
+   paste key, see the model list, pick one, tool checkboxes, MCP menu,
+   banner, config.toml written to ~/.kryonsec/config.toml
+2. **Agent live**: start `kryonsec`, ask "read <some file> and summarize" —
+   the agent should call file_read (approval prompt if outside workspace),
+   print the `> using file_read(...)` line, then answer using the content
+3. **LTM live**: tell it something durable ("I work mainly with PHP apps"),
+   restart, ask "what do you remember about me" — the fact should be recalled
+4. **Installer live**: in a FRESH WSL home (or after moving ~/.kryonsec),
+   run the curl one-liner from the README
+
+## Session 10 (v1.1) additions
+- **Config (config.py):** ~/.kryonsec/config.toml is THE config source
+  (hand-rolled TOML writer + tomllib reader; [[mcp.servers]] array-of-tables,
+  env dicts stored as JSON strings). .env loading REMOVED — env vars still
+  override TOML. `load_config()` is the app entry; `kryonsec setup` /
+  first-run auto-launch writes it (chmod 600 where supported).
+- **Setup wizard (wizard.py):** provider → API key (live-tested, retry/abort)
+  → model list (OpenAI /v1/models filtered to chat models, sorted newest
+  first; Ollama /api/tags) → tool checkboxes → MCP presets + custom →
+  banner + Rich summary table. prompt_toolkit dialogs on a tty, numbered
+  plain-input fallback otherwise (fully scriptable in tests).
+- **Agent loop (copilot/agent.py):** real LLM function-calling for the
+  copilot. litellm.completion(tools=...), dispatch table (only registered
+  tools exist — unknown names return an error message to the LLM),
+  8-round cap with forced text wrap-up, required-arg validation, output
+  bounding. Chat falls back to plain chat() if the model can't do tools.
+- **FileTools (copilot/tools.py):** writes outside the workspace are now
+  APPROVAL-GATED (was: blocked). ApprovalRequest gained action read/write.
+  Params renamed path/content to match tool schemas.
+- **MCP (copilot/mcp_tools.py):** stdio servers from config; tools become
+  `mcp_*` agent tools; lazy `mcp` import; dead server = skipped, never
+  blocks chat. mcp>=1.0 is now a hard dependency.
+- **LTM:** fact recall into the system prompt (GeneralUserLtm category
+  "fact") + best-effort extraction after each exchange (silent failures).
+- **Installer (install.sh):** py3.11+ check → ~/.kryonsec/venv → pip install
+  git+repo → idempotent PATH in .bashrc → runs wizard. curl one-liner in
+  README.
+- **System prompt rewritten** for the tool-using agent (no more "you have
+  NO shell access" — now it HAS file tools and must handle denials).
+
+## Gotchas found while building (fixed)
+- pytest collects `test_*` functions from SRC modules too — the wizard's
+  key check is named check_openai_key, not test_openai_key
+- litellm fetches a remote model cost map on import (SSL timeout adds ~60s
+  to the suite when offline) — harmless, known slowness
+- .env removal broke test_llm_routing (key now set explicitly in fixture)
 
 ## Session 9: TUI live-tested (all pass)
 The checklist from session 8 is done — all four checks passed live in WSL:

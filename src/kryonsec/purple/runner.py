@@ -151,6 +151,7 @@ def start_engagement(
     engagement_id: str,
     target: str = "",
     progress: "Callable[[str], None] | None" = None,
+    status_factory: "Callable[[str], object] | None" = None,
 ) -> tuple[PurpleOrchestrator, AuditLog, "object"]:
     """Wire up an engagement. Returns (orchestrator, audit, graph).
 
@@ -160,6 +161,11 @@ def start_engagement(
 
     progress: optional callback invoked with each state name before it
     runs (CLI uses it to show which agent is working).
+
+    status_factory: optional — called with the state name, must return a
+    context manager that is entered while the state's subagent runs (the
+    CLI returns a spinner status line). Never wraps HUMAN_REVIEW: that
+    state is interactive and owns the terminal.
     """
     from .recon_passive import EngagementGraph, ReconPassiveSubagent
 
@@ -179,14 +185,8 @@ def start_engagement(
         "reason": sandbox_reason,
     })
 
-    def loader(state: str):
-        if progress is not None:
-            info = STATE_INFO.get(state, {})
-            # parentheses, not square brackets: rich would eat [tools: ...]
-            # as a markup tag
-            progress(f"{info.get('agent', state)}: {info.get('does', '')} "
-                     f"(tools: {info.get('tools', '?')} | zone {info.get('zone', '?')})")
-
+    def resolve(state: str):
+        """State name -> subagent run callable (or None for stubs)."""
         if state == "RECON_PASSIVE":
             sub = ReconPassiveSubagent(cfg=cfg, graph=graph, audit=audit, target=target)
             return sub.run
@@ -242,7 +242,7 @@ def start_engagement(
             sandbox = KaliSandbox(cfg=cfg)
             sub = ExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
-                sandbox=sandbox,
+                sandbox=sandbox, progress=progress,
             )
             return sub.run
 
@@ -274,6 +274,23 @@ def start_engagement(
             return blocked
 
         return subagent_stub(state)
+
+    def loader(state: str):
+        if progress is not None:
+            info = STATE_INFO.get(state, {})
+            # parentheses, not square brackets: rich would eat [tools: ...]
+            # as a markup tag
+            progress(f"{info.get('agent', state)}: {info.get('does', '')} "
+                     f"(tools: {info.get('tools', '?')} | zone {info.get('zone', '?')})")
+
+        run_fn = resolve(state)
+
+        if status_factory is not None and state != "HUMAN_REVIEW":
+            def wrapped() -> SubagentResult:
+                with status_factory(state):
+                    return run_fn()
+            return wrapped
+        return run_fn
 
     orch = PurpleOrchestrator(
         engagement_id=engagement_id,

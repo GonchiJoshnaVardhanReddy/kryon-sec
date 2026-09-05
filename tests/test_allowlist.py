@@ -11,7 +11,7 @@ def allow():
 
 
 def test_valid_nmap_argv(allow):
-    allow.validate("nmap", ["nmap", "-sV", "-sC", "--max-rate", "100", "-p", "80,443", "target.example.com"])
+    allow.validate("nmap", ["nmap", "-Pn", "-sT", "-sV", "-sC", "--max-rate", "100", "-p", "80,443", "target.example.com"])
 
 
 def test_wrong_arg_count_rejected(allow):

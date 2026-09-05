@@ -12,6 +12,11 @@ Subdomains discovered:
 - (none found)
 {% endfor %}
 
+IMPORTANT about subdomains: a hypothesis about a subdomain uses its full
+hostname in target_asset (e.g. "/webmail.{{ target }}/login"), NOT a path on
+{{ target }} — "https://{{ target }}/webmail/" does not exist when webmail
+runs on its own host.
+
 Archived paths (Wayback):
 {% for p in paths %}
 - {{ p }}
@@ -38,8 +43,9 @@ Your task:
    product, search) over redirect parameters (RetURL, next, url).
 5. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
 6. Suggest testing tools ONLY from this allowlist:
-   nmap, dnsx, subfinder, sqlmap, nikto, gobuster, ffuf, curl, wget, nc,
-   ncat, openssl, python3, linpeas.sh, bloodhound-python.
+   sqlmap, nmap, nikto, ffuf, gobuster, curl, wget, nuclei.
+   These are the tools the execution engine can actually run. Any other
+   tool will be skipped.
 7. Give each hypothesis a confidence between 0.0 and 1.0.
 8. Do not repeat the same target_asset across hypotheses — each hypothesis
    targets a different parameter or a different attack on it.
