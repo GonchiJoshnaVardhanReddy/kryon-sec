@@ -160,7 +160,10 @@ def chat(
             candidate.startswith("ollama/") and not _ollama_model_ok(cfg, candidate)
         ):
             continue
-        log.warning("LLM %s failed; falling back to %s", model or "(skipped)", candidate)
+        if model:
+            log.warning("LLM %s failed; falling back to %s", model, candidate)
+        else:
+            log.warning("local model unavailable; using hosted fallback %s", candidate)
         try:
             return _complete(cfg, candidate, messages, **kwargs)
         except Exception:

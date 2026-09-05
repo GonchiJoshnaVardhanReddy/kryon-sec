@@ -8,6 +8,7 @@ a live terminal.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from .config import KryonsecConfig
@@ -85,12 +86,16 @@ def make_prompt_session(
     cfg: KryonsecConfig,
 ) -> Any | None:
     """The PromptSession driving chat input: history file, Shift+Tab
-    bindings, and the mode-aware prompt. Returns None if
-    prompt_toolkit is unavailable (caller falls back to plain input)."""
+    bindings, and the mode-aware prompt. Returns None if prompt_toolkit
+    is unavailable or stdin/stdout is not a real terminal (piped input
+    or captured output) — in all those cases the caller falls back to
+    plain input()."""
     try:
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.shortcuts import PromptSession
     except ImportError:
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
 
     cfg.home.mkdir(parents=True, exist_ok=True)
