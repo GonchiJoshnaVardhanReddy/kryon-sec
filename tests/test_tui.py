@@ -6,6 +6,7 @@ from unittest.mock import patch
 from kryonsec.config import KryonsecConfig
 from kryonsec.tui import (
     build_key_bindings,
+    make_prompt_session,
     prompt_message,
     set_mode,
 )
@@ -90,3 +91,37 @@ def test_shift_tab_binding_toggles_mode(tmp_path):
                side_effect=AssertionError("must not be called")):
         handler(FakeEvent())
     assert mode[0] == "copilot"
+
+
+def test_prompt_session_skipped_without_tty(tmp_path):
+    """Piped stdin or captured stdout (no real terminal) -> no
+    PromptSession; the chat loop must fall back to plain input()
+    instead of printing a warning and EOF-ing immediately."""
+    cfg = KryonsecConfig(home=tmp_path)
+    # stdin piped, stdout a tty -> skipped
+    with patch("sys.stdin") as fake_stdin, patch("sys.stdout") as fake_stdout:
+        fake_stdin.isatty.return_value = False
+        fake_stdout.isatty.return_value = True
+        assert make_prompt_session(["copilot"], [""], cfg) is None
+    # stdout captured (e.g. pytest/pipe), stdin a tty -> also skipped
+    with patch("sys.stdin") as fake_stdin, patch("sys.stdout") as fake_stdout:
+        fake_stdin.isatty.return_value = True
+        fake_stdout.isatty.return_value = False
+        assert make_prompt_session(["copilot"], [""], cfg) is None
+
+
+def test_prompt_session_built_with_tty(tmp_path):
+    """Real terminal on both ends -> PromptSession is constructed. The
+    real PromptSession needs a live console, so we patch it with a stub
+    and assert it got wired up with history and key bindings."""
+    cfg = KryonsecConfig(home=tmp_path)
+    with patch("sys.stdin") as fake_stdin, patch("sys.stdout") as fake_stdout:
+        fake_stdin.isatty.return_value = True
+        fake_stdout.isatty.return_value = True
+        with patch("prompt_toolkit.shortcuts.PromptSession") as fake_ps:
+            ps = make_prompt_session(["copilot"], [""], cfg)
+            assert ps is fake_ps.return_value
+            assert fake_ps.call_count == 1
+            kwargs = fake_ps.call_args.kwargs
+            assert kwargs["enable_history_search"] is True
+            assert kwargs["key_bindings"] is not None

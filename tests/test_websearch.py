@@ -75,6 +75,15 @@ WIKI_JSON = """
 ]}}
 """
 
+# real Wikipedia API snippets start with the (bolded) article title —
+# the display must not show title + title-prefixed snippet
+WIKI_TITLE_PREFIX_JSON = """
+{"query": {"search": [
+  {"title": "User agent", "snippet": "<span class=\\"searchmatch\\">User agent</span> A software agent responsible for facilitating end-user interaction with Web content."},
+  {"title": "Law of agency", "snippet": "An area of commercial law dealing with contractual relationships."}
+]}}
+"""
+
 
 def _patch_urlopen(monkeypatch, page: str):
     class Resp:
@@ -311,6 +320,25 @@ def test_from_wikipedia_parses_results(monkeypatch):
 def test_from_wikipedia_error_json_returns_empty(monkeypatch):
     _patch_urlopen(monkeypatch, '{"error": "unknown"}')
     assert _from_wikipedia("q") == []
+
+
+def test_from_wikipedia_strips_leading_title_from_snippet(monkeypatch):
+    """The Wikipedia API prefixes each snippet with the (bolded) article
+    title — after tag-stripping the display would show the title twice
+    in a row ("User agent User agent A software agent…"). The duplicate
+    prefix is removed; non-prefixed snippets pass through untouched."""
+    _patch_urlopen(monkeypatch, WIKI_TITLE_PREFIX_JSON)
+    results = _from_wikipedia("user agent")
+    assert results is not None
+    assert len(results) == 2
+    # prefixed snippet -> title prefix stripped
+    assert results[0]["title"] == "User agent"
+    assert results[0]["snippet"] == (
+        "A software agent responsible for facilitating end-user "
+        "interaction with Web content."
+    )
+    # non-prefixed snippet -> untouched
+    assert results[1]["snippet"].startswith("An area of commercial law")
 
 
 def test_from_ddg_falls_back_to_wikipedia(monkeypatch):

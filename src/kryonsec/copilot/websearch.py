@@ -269,7 +269,9 @@ def _expand_ddg_topic_url(url: str) -> str:
 def _from_wikipedia(query: str) -> list[dict[str, Any]] | None:
     """Wikipedia's search API — keyless JSON, serves arbitrary queries
     (the DDG Instant Answer API only covers topics it has abstracts
-    for). Article snippets are plain text, URLs are stable."""
+    for). Article snippets are plain text, URLs are stable. The API
+    prefixes each snippet with the (bolded) article title — stripped
+    here so the display doesn't show the title twice."""
     page = _fetch(WIKI_SEARCH_URL.format(
         query=urllib.parse.quote_plus(query), limit=MAX_RESULTS))
     if page is None:
@@ -279,15 +281,19 @@ def _from_wikipedia(query: str) -> list[dict[str, Any]] | None:
         hits = data["query"]["search"]
     except (ValueError, TypeError, KeyError):
         return []
-    return [
-        {
-            "title": hit.get("title", ""),
+    results: list[dict[str, Any]] = []
+    for hit in hits[:MAX_RESULTS]:
+        title = hit.get("title", "")
+        snippet = _strip_tags(hit.get("snippet", ""))
+        if title and snippet.lower().startswith(title.lower()):
+            snippet = snippet[len(title):].lstrip()
+        results.append({
+            "title": title,
             "url": "https://en.wikipedia.org/wiki/"
-                   + urllib.parse.quote(hit["title"].replace(" ", "_")),
-            "snippet": _strip_tags(hit.get("snippet", "")),
-        }
-        for hit in hits[:MAX_RESULTS]
-    ]
+                   + urllib.parse.quote(title.replace(" ", "_")),
+            "snippet": snippet,
+        })
+    return results
 
 
 def _from_ddg(query: str) -> list[dict[str, Any]] | None:
