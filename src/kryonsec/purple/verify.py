@@ -101,6 +101,14 @@ class VerifySubagent:
         })
         return SubagentResult(status="ok")
 
+    def _discovered_scheme(self) -> str:
+        """https when EXPLOIT discovered the target resets plain http
+        (engagement_note node in the graph), else http."""
+        for n in self.graph.by_type("engagement_note"):
+            if n["label"] == "scheme" and n["properties"].get("scheme") == "https":
+                return "https"
+        return "http"
+
     def _verify_one(self, finding_id: str) -> int:
         """Independently check one finding. Returns 1 if verified."""
         # the finding's hypothesis supplies the URL
@@ -111,7 +119,7 @@ class VerifySubagent:
         if hyp is None:  # pragma: no cover — findings always have one
             return 0
         asset = hyp["properties"].get("target_asset", "")
-        url = compose_url(self.target, asset)
+        url = compose_url(self.target, asset, scheme=self._discovered_scheme())
 
         probes = _boolean_probe_urls(url)
         if probes is None:
@@ -180,6 +188,17 @@ class VerifySubagent:
 
     def _curl(self, url: str) -> str | None:
         """Run one curl via the sandbox. None = the run itself failed."""
+        result = self._spawn_curl(url)
+        if result is not None and result.exit_code == 56 and url.startswith("http://"):
+            # https-only target and EXPLOIT never discovered it (no curl
+            # hypothesis ran) — retry over https
+            result = self._spawn_curl("https://" + url[len("http://"):])
+        if result is None or not result.ok:
+            return None
+        return result.stdout
+
+    def _spawn_curl(self, url: str):
+        """One allowlisted sandbox curl; returns SpawnResult or None."""
         argv = ["curl", "-sS", "--max-time", "30", url]
         try:
             self.allowlist.validate(argv[0], argv)
@@ -206,6 +225,4 @@ class VerifySubagent:
             "exit_code": result.exit_code,
             "output_chars": len(result.stdout),
         })
-        if not result.ok:
-            return None
-        return result.stdout
+        return result

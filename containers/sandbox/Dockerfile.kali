@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nikto \
     gobuster \
     ffuf \
+    seclists \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Bake nuclei templates at BUILD time, not runtime (sandbox has no

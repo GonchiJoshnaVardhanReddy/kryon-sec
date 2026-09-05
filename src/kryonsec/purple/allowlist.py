@@ -24,6 +24,9 @@ class AllowlistViolation(Exception):
 
 _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
     "url": re.compile(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$"),
+    "urlfuzz": re.compile(
+        r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*FUZZ"
+        r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*$"),
     "target": re.compile(r"^[A-Za-z0-9._:/-]+$"),
     "ports": re.compile(r"^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$"),
     "rate": re.compile(r"^\d+$"),
@@ -64,13 +67,22 @@ def compile_tool_templates(templates: dict[str, list[str]]) -> dict[str, list[re
 
 # Default EXPLOIT allowlist (spec §4.7; masscan intentionally absent)
 EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
-    "nmap": ["-sV", "-sC", "--max-rate", "{rate}", "-p", "{ports}", "{target}"],
+    # -sT (connect scan): gVisor grants no raw sockets — SYN scan is impossible
+    "nmap": ["-Pn", "-sT", "-sV", "-sC", "--max-rate", "{rate}", "-p", "{ports}", "{target}"],
     "sqlmap": [
         "-u", "{url}", "--batch", "--risk={1|2}", "--level={1|2|3}",
         "--technique={B|E|U|T|Q}", "--timeout={30|60|120}", "--threads={1|2|3|4}",
     ],
     "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
     "curl": ["-sS", "--max-time", "30", "{url}"],
+    "nikto": ["-h", "{url}", "-timeout", "30", "-maxtime", "120"],
+    # ffuf/gobuster: directory fuzzing with the sandbox's common wordlist.
+    # {urlfuzz}: the URL carries the FUZZ position marker.
+    "ffuf": ["-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
+             "-u", "{urlfuzz}", "-t", "5", "-maxtime", "120"],
+    "gobuster": ["dir", "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
+                 "-u", "{urlfuzz}", "-t", "5", "--timeout", "30s"],
+    "wget": ["-q", "-O", "-", "--timeout=30", "{url}"],
 }
 
 # Hardline blocklist (safety Layer 8) — regex patterns over the joined argv

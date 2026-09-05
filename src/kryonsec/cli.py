@@ -22,7 +22,27 @@ from .config import KryonsecConfig
 console = Console()
 err_console = Console(stderr=True, style="red")
 
-WELCOME = """[bold cyan]Kryonsec v{version}[/bold cyan] — dual-mode cybersecurity CLI
+BANNER = r"""██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
+██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
+█████╔╝ ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║███████╗█████╗  ██║
+██╔═██╗ ██╔══██╗  ╚██╔╝  ██║   ██║██║╚██╗██║╚════██║██╔══╝  ██║
+██║  ██╗██║  ██║   ██║   ╚██████╔╝██║ ╚████║███████║███████║╚██████╗
+╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝"""
+
+
+def banner_styled(mode: str) -> str:
+    """The banner, white in copilot mode, purple in purple team mode."""
+    color = "magenta" if mode == "purple" else "white"
+    return f"[bold {color}]{BANNER}[/bold {color}]"
+
+
+def _print_banner(mode: str) -> None:
+    """Re-print the banner whenever the mode flips (Shift+Tab or /mode)."""
+    console.print(banner_styled(mode))
+
+
+WELCOME = f"""{banner_styled("copilot")}
+[bold cyan]v{{version}}[/bold cyan] — dual-mode cybersecurity CLI
 [cyan]\\[COPILOT]>[/cyan] general assistant   [magenta]\\[PURPLE]>[/magenta] purple team (Profile 2, Linux)
 
 Type your question. [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.
@@ -44,6 +64,15 @@ def _persist_session(cfg: KryonsecConfig, session: "GeneralSession") -> None:
             s.commit()
     except Exception as e:
         err_console.print(f"[yellow]session not persisted: {e}[/yellow]")
+
+
+def _build_mcp_extra(cfg: KryonsecConfig) -> dict:
+    """MCP tools as agent-toolbox entries; empty when none configured."""
+    if not cfg.mcp_servers:
+        return {}
+    from .copilot.mcp_tools import build_mcp_toolbox
+
+    return build_mcp_toolbox(cfg)
 
 
 async def _chat_loop(cfg: KryonsecConfig) -> None:
@@ -79,8 +108,9 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         autoescape=False,
     )
 
-    # ---- load user preferences (User LTM) -------------------------------
+    # ---- load user preferences + LTM facts (User LTM) ---------------------
     prefs: dict = {"explain_mode": "technical"}
+    user_facts: list[str] = []
     try:
         with db_session(cfg) as s:
             for row in (
@@ -91,6 +121,15 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 .all()
             ):
                 prefs[row.key] = row.value
+            for row in (
+                s.query(GeneralUserLtm)
+                .filter(GeneralUserLtm.category == "fact")
+                .order_by(GeneralUserLtm.last_accessed.desc())
+                .limit(15)
+                .all()
+            ):
+                fact = row.value if isinstance(row.value, str) else str(row.value)
+                user_facts.append(f"{row.key}: {fact}")
     except Exception as e:  # storage unavailable — chat still works in-memory
         err_console.print(f"[yellow]storage warning: {e} — session will not be persisted[/yellow]")
 
@@ -98,6 +137,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         workspace=str(cfg.workspace),
         explain_mode=str(prefs.get("explain_mode", "technical")),
         recent_topics=[],
+        user_facts=user_facts,
     )
 
     session = GeneralSession(cfg=cfg)
@@ -108,7 +148,11 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     from .tui import make_prompt_session
 
-    ps = make_prompt_session(_mode, _notice, cfg)
+    def _on_mode_change(new_mode: str) -> None:
+        console.clear()  # repaint the banner in the new mode color
+        _print_banner(new_mode)
+
+    ps = make_prompt_session(_mode, _notice, cfg, on_change=_on_mode_change)
 
     while True:
         try:
@@ -149,7 +193,9 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             from .tui import set_mode
 
             target = "purple" if _mode[0] == "copilot" else "copilot"
-            set_mode(_mode, _notice, cfg, target)
+            if set_mode(_mode, _notice, cfg, target):
+                console.clear()  # repaint the banner in the new mode color
+                _print_banner(_mode[0])
             if _notice[0]:
                 console.print(f"[cyan]{_notice[0]}[/cyan]")
                 if _mode[0] != "purple":
@@ -241,20 +287,109 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         session.add("user", text)
         await session.maybe_compact()
 
+        # ---- the agent loop (v1.1): tools when the LLM asks --------------
+        from .copilot.agent import build_toolbox, run_agent
+        from .copilot.tools import FileTools
+        from .status import StatusLine
+
+        file_tools = FileTools(cfg, approver=_console_approve)
         try:
-            reply = chat(cfg, session.as_llm_messages(system_prompt), cfg.general_chat_model)
-        except LlmUnavailable as e:
-            err_console.print(f"LLM unavailable: {e}")
-            console.print(
-                "[yellow]Start Ollama (`ollama serve`) and pull a model "
-                "(`ollama pull llama3.1`), or set OPENAI_API_KEY.[/yellow]"
+            mcp_extra = _build_mcp_extra(cfg)
+        except Exception as e:
+            err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
+            mcp_extra = {}
+        toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
+
+        status = StatusLine(console)
+
+        def _show_tool(name: str, args: dict) -> None:
+            # the spinner gives way: the tool may prompt for approval,
+            # which needs the terminal
+            status.hide()
+            arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in (args or {}).items())
+            console.print(f"  [dim]> using {name}({arg_preview})…[/dim]")
+
+        def _show_round() -> None:
+            status.show(f"[cyan]copilot[/cyan] thinking…")
+
+        try:
+            reply = run_agent(
+                cfg, session.as_llm_messages(system_prompt), toolbox,
+                cfg.general_chat_model,
+                on_tool=_show_tool, on_round=_show_round,
             )
-            session.messages.pop()  # drop the unanswered user turn
-            continue
+        except Exception as e:
+            status.hide()
+            # tool-calling unsupported by the model or provider hiccup —
+            # fall back to the plain chat path (one short warning; the
+            # full error goes to the log)
+            err_console.print(
+                f"[yellow]tools unavailable ({type(e).__name__}) — plain chat[/yellow]")
+            from .llm import chat
+
+            try:
+                with status.running(f"[cyan]copilot[/cyan] thinking…"):
+                    reply = chat(cfg, session.as_llm_messages(system_prompt), cfg.general_chat_model)
+            except LlmUnavailable as e:
+                err_console.print(f"LLM unavailable: {e}")
+                hint = (
+                    "Start Ollama (`ollama serve`) and pull a model "
+                    "(`ollama pull llama3.1`), or run `kryonsec setup` to "
+                    "switch to OpenAI."
+                    if cfg.provider == "ollama"
+                    else "Check your OpenAI key or network — or run "
+                    "`kryonsec setup` to switch providers."
+                )
+                console.print(f"[yellow]{hint}[/yellow]")
+                session.messages.pop()  # drop the unanswered user turn
+                continue
+        finally:
+            status.hide()
 
         session.add("assistant", reply)
         console.print(Markdown(reply))
         console.print()
+        _remember_facts(cfg, text, reply)  # best-effort LTM (never blocks chat)
+
+
+def _remember_facts(cfg: KryonsecConfig, user_text: str, reply: str) -> None:
+    """Long-term memory (v1.1): after each exchange, ask the LLM for any
+    durable fact about the user, save it to GeneralUserLtm. Best effort —
+    any failure is silent (memory must never break the chat)."""
+    try:
+        from .llm import chat
+
+        prompt = (
+            "Does this exchange reveal a durable fact about the user "
+            "(preference, role, ongoing project, environment)? If yes, reply "
+            "with ONE line 'key: value' (short key, concrete value). "
+            "Otherwise reply exactly: none\n\n"
+            f"user: {user_text[:500]}\nassistant: {reply[:500]}"
+        )
+        out = chat(cfg, [{"role": "user", "content": prompt}],
+                   cfg.general_search_model, temperature=0.0)
+        out = (out or "").strip()
+        if not out or out.lower().startswith("none"):
+            return
+        key, _, value = out.partition(":")
+        key, value = key.strip()[:255], value.strip()
+        if not key or not value:
+            return
+        from .storage import GeneralUserLtm as LtmRow, get_session as db_session
+
+        with db_session(cfg) as s:
+            existing = (
+                s.query(LtmRow)
+                .filter(LtmRow.category == "fact", LtmRow.key == key)
+                .one_or_none()
+            )
+            if existing:
+                existing.value = value  # refresh, keep access_count
+            else:
+                s.add(LtmRow(category="fact", key=key, value=value))
+            s.commit()
+    except Exception:
+        pass  # memory is best-effort by design
 
 
 def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
@@ -262,8 +397,10 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
     subcommand and the /mode toggle inside the chat loop."""
     import uuid
 
-    from .purple.runner import sandbox_available, start_engagement
+    from .purple.orchestrator import STATES
+    from .purple.runner import STATE_INFO, sandbox_available, start_engagement
     from .purple.zonea import validate_target
+    from .status import StatusLine
 
     try:
         target = validate_target(target_arg)
@@ -277,15 +414,34 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
         console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
 
     engagement_id = str(uuid.uuid4())[:8]
+    status_line = StatusLine(console)
 
     def _progress(msg: str) -> None:
-        console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
+        # while a state is running, the spinner carries the update;
+        # between states it prints (state-entry lines stay in scrollback)
+        if status_line.active:
+            status_line.update(f"[magenta]purple {pct_holder[0]}%[/magenta] {msg}")
+        else:
+            console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
+
+    def _status_factory(state: str):
+        n = STATES.index(state) + 1
+        info = STATE_INFO.get(state, {})
+        pct_holder[0] = int(100 * n / len(STATES))
+        return status_line.running(
+            f"[magenta]purple {pct_holder[0]}%[/magenta] "
+            f"{info.get('agent', state)}: {info.get('does', '')[:60]}"
+        )
+
+    pct_holder = [0]
 
     orch, audit, graph = start_engagement(
-        cfg, engagement_id, target=target, progress=_progress
+        cfg, engagement_id, target=target, progress=_progress,
+        status_factory=_status_factory,
     )
     console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
     completed = orch.run()
+    status_line.stop_if_active()
     console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
     if orch.halt_reason:
         console.print(f"[red]halted:[/red] {orch.halt_reason}")
@@ -312,10 +468,20 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
             p = n["properties"]
             verdict = ("[red]confirmed[/red]" if p.get("confirmed")
                        else "not confirmed")
-            console.print(
-                f"  [magenta]{n['label']}[/magenta] "
-                f"exit {p.get('exit_code', '?')} — {verdict}"
-            )
+            line = (f"  [magenta]{n['label']}[/magenta] "
+                    f"exit {p.get('exit_code', '?')} — {verdict}")
+            err = (p.get("error_excerpt") or "").strip()
+            if err:
+                line += f" [dim]({err[:80]})[/dim]"
+            console.print(line)
+    # approved but never executed: the operator approved these and the
+    # runner had no tool template for them — must be visible, not silent
+    approved = [n for n in hypotheses if n["properties"].get("approved")]
+    attempted = {n["label"].split(":")[0] for n in attempts}
+    skipped = [n["label"] for n in approved if n["label"] not in attempted]
+    if skipped:
+        console.print(f"\n[yellow]skipped (no runnable tool): {len(skipped)}[/yellow]")
+        console.print(f"  [dim]{', '.join(skipped)}[/dim]")
     findings = graph.by_type("finding")
     if findings:
         console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
@@ -337,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("doctor", help="run preflight checks (storage, LLMs, Purple Team prerequisites)")
 
+    sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
+
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
     purple.add_argument("--id", default=None, help="engagement id (default: auto-generated)")
@@ -345,7 +513,9 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    cfg = KryonsecConfig()
+    from .config import load_config
+
+    cfg = load_config()
 
     if args.command == "doctor":
         from .doctor import run_doctor
@@ -354,6 +524,30 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "purple":
         return _run_purple(cfg, args.target)
+
+    if args.command == "setup":
+        from .wizard import run_setup
+
+        try:
+            run_setup(cfg)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]setup cancelled — run `kryonsec setup` anytime[/yellow]")
+        return 0
+
+    # first run without a config -> wizard before the chat loop
+    from .config import config_path
+
+    if not config_path(cfg.home).is_file():
+        console.print("[dim]no config found — running first-time setup\n[/dim]")
+        from .wizard import run_setup
+
+        try:
+            run_setup(cfg)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]setup cancelled[/yellow]")
+            return 0
+        if not config_path(cfg.home).is_file():
+            return 0  # aborted before writing — nothing to start
 
     console.print(WELCOME.format(version=__version__))
     try:

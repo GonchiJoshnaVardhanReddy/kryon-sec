@@ -1,42 +1,66 @@
 # Kryonsec
 
-**v1.0.0** — first release.
+**v1.1.0** — installer + setup wizard + tool-using agent.
 
 A single-user CLI cybersecurity platform with two modes:
 
-- **Mode A — Copilot:** conversational security assistant (chat, CVE lookup,
-  scoped file ops, web search). Works on Windows, macOS, and Linux.
+- **Mode A — Copilot:** a real tool-using agent (LLM function-calling) — it
+  can read/write files anywhere (approval-gated outside the workspace),
+  search the web, look up CVEs, and call MCP servers. Works on WSL,
+  Linux, and macOS.
 - **Mode B — Purple Team:** deterministic 10-state penetration testing
   engine with a tamper-evident audit chain. Requires Linux + Docker + gVisor
   (Profile 2; WSL2 works).
 
 Design-of-record: [`kryonsec-v2.1.1-dual-mode-architecture.md`](kryonsec-v2.1.1-dual-mode-architecture.md)
 
-## Quick start
+## Install (WSL / Linux / macOS)
+
+One command:
 
 ```bash
-pip install -e .          # from this repo
-kryonsec                  # start the CLI (Copilot mode)
-kryonsec doctor           # preflight checks
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
 ```
 
-Set your LLM backend in `.env` (git-ignored):
+It checks Python 3.11+, creates `~/.kryonsec/venv`, installs kryonsec,
+adds it to PATH, and starts the **setup wizard**:
 
-```
-OPENAI_API_KEY=sk-...     # or use local Ollama instead
-```
+1. pick your LLM provider — OpenAI or Ollama
+2. OpenAI: paste your API key → it is tested → pick a model from the list
+   (most recent first). Ollama: pick from your pulled models
+3. pick the built-in tools (space to select, enter to continue)
+4. pick MCP servers (presets or add your own)
+5. a banner + summary of everything you chose
+
+The wizard writes `~/.kryonsec/config.toml` — that file holds your API
+key, so it is written with owner-only permissions. Re-run anytime with
+`kryonsec setup`; the first run without a config starts the wizard
+automatically. Environment variables (`OPENAI_API_KEY`, `DATABASE_URL`,
+`OLLAMA_HOST`) still override the file for power users.
 
 ## Copilot mode
 
+```bash
+kryonsec                  # start the chat
+kryonsec doctor           # preflight checks
+kryonsec setup            # re-run the wizard
+```
+
 | Command | What it does |
 |---|---|
-| *(just type)* | chat — answers security questions with full context |
+| *(just type)* | agent chat — the LLM decides when to use tools |
 | `/cve CVE-2024-1234` | CVE lookup from NVD, cached locally for offline use |
 | `/search <query>` | web search — results go into chat context |
 | `/read <path>`, `/ls <path>` | read files / list dirs (approval-gated outside the workspace) |
-| `/write <path>` | write text to a file in the workspace |
-| `/mode` | switch between copilot and purple mode |
+| `/write <path>` | write a file (approval-gated outside the workspace) |
+| `/mode` | switch between copilot and purple mode (or Shift+Tab) |
 | `/quit` (or `exit`) | leave |
+
+The agent itself can call `file_read`, `list_dir`, `file_write`,
+`web_search`, and `cve_lookup` on its own when that helps the answer —
+only the tools you enabled in setup, and every file action outside
+`~/kryonsec/workspace` asks you first. It remembers durable facts about
+you (long-term memory) and compacts long chats with secrets redacted.
 
 Web search tries five keyless sources in order (DDG html/lite/API, Mojeek,
 Wikipedia) so it works even when one search engine bot-challenges your
@@ -70,11 +94,13 @@ image. Kryonsec refuses to run tool execution without them.
 
 ## LLM backends
 
-Kryonsec routes through LiteLLM with a fallback chain:
+Kryonsec routes through LiteLLM with a fallback chain, configured by the
+setup wizard:
 
 1. **Ollama (local, preferred):** `ollama serve` + `ollama pull llama3.1`
-2. **OpenAI:** set `OPENAI_API_KEY` (third-party — never used for
-   compaction when secrets are present; those always route locally)
+2. **OpenAI:** API key from the wizard / `OPENAI_API_KEY` (third-party —
+   never used for compaction when secrets are present; those always
+   route locally)
 
 ## Safety rules (v2.1.1)
 
@@ -92,8 +118,12 @@ Kryonsec routes through LiteLLM with a fallback chain:
 
 ```bash
 pip install -e ".[dev]"
-pytest                     # 190 tests
+pytest
 ```
+
+Dev note: since v1.1 config comes from `~/.kryonsec/config.toml` (the old
+`.env` loading is gone). Run `kryonsec setup` once, or export
+`OPENAI_API_KEY` for a quick start.
 
 ## Status
 
@@ -101,9 +131,13 @@ pytest                     # 190 tests
 |---|---|
 | v2.1.1 spec | done |
 | Storage layer (SQLAlchemy) | done |
-| Copilot chat loop + compaction | done |
-| Secret redaction | done |
-| CVE lookup + web search | done |
+| Installer (curl one-liner) + setup wizard | done |
+| Config file (~/.kryonsec/config.toml) | done |
+| Copilot agent loop (LLM function-calling) | done |
+| Built-in agent tools (read/list/write, web search, CVE) | done |
+| MCP server integration | done |
+| Long-term memory (fact recall + extraction) | done |
+| TUI (Shift+Tab mode toggle, history) | done — live-verified |
 | Purple Team state machine (all 10 states) | done — live-verified on WSL2 |
 | Audit chain | done |
 | Tool allowlist + Kali sandbox (Docker/gVisor) | done — live-verified |

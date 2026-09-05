@@ -5,18 +5,25 @@
     {
       "names": [
         "read", "write", "open", "openat", "close", "stat", "fstat", "lstat",
-        "fstatat", "getdents64", "lseek", "access", "readlink",
+        "newfstatat", "fstatat", "readlink", "readlinkat",
+        "getdents64", "getdents", "lseek", "access", "faccessat", "faccessat2",
+        "statfs", "fstatfs",
         "socket", "connect", "getsockopt", "setsockopt", "getsockname", "getpeername",
         "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown",
-        "poll", "ppoll", "select", "pselect6", "epoll_create1", "epoll_ctl", "epoll_wait",
+        "poll", "ppoll", "select", "pselect6", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
+        "eventfd", "eventfd2",
         "fcntl", "ioctl", "mmap", "munmap", "mprotect", "brk", "sbrk", "madvise",
         "execve", "execveat", "exit", "exit_group",
-        "fork", "clone", "clone3", "wait4", "waitid", "waitpid",
-        "sigaction", "sigprocmask", "rt_sigreturn", "kill", "tgkill",
-        "getpid", "getppid", "getuid", "getgid", "geteuid", "getegid",
-        "futex", "getrandom", "clock_gettime", "clock_nanosleep", "nanosleep",
+        "fork", "vfork", "clone", "clone3", "wait4", "waitid", "waitpid",
+        "sigaction", "sigprocmask", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+        "kill", "tgkill",
+        "getpid", "getppid", "gettid", "getuid", "getgid", "geteuid", "getegid",
+        "futex", "getrandom", "clock_gettime", "clock_gettime64",
+        "clock_nanosleep", "nanosleep", "gettimeofday",
         "uname", "getcwd", "chdir", "dup", "dup2", "dup3", "pipe", "pipe2",
-        "rename", "unlink", "ftruncate", "fsync", "fdatasync"
+        "rename", "unlink", "ftruncate", "fsync", "fdatasync",
+        "prctl", "rseq", "set_robust_list", "set_tid_address",
+        "sched_getaffinity", "sched_yield"
       ],
       "action": "SCMP_ACT_ALLOW"
     }
