@@ -1,17 +1,23 @@
 # Kryonsec — Session Handoff Notes
-**Date:** 2026-09-05 (end of session 8)
+**Date:** 2026-09-05 (end of session 9)
 **Repo:** https://github.com/GonchiJoshnaVardhanReddy/kryon-sec (branch: main)
-**Status: 100% of planned features + real TUI built. 198 tests green.
+**Status: 100% of planned features + TUI live-verified. 201 tests green.
 v1.0.0. Working tree should be clean — check `git status` first.**
 
-## FIRST THING NEXT SESSION: live-test the TUI (built, untested live)
-Start `kryonsec` in WSL and check:
-1. `exit` quits cleanly (old bug: went to the LLM)
-2. **Shift+Tab** flips `[COPILOT]>` <-> `[PURPLE]>` — if the terminal
-   swallows the key, wire a fallback (e.g. Ctrl+T) in tui.py
-3. Ctrl+C = clean bye, no traceback (fixed CancelledError escape)
-4. Up-arrow / Ctrl+R history (saved to ~/.kryonsec/chat_history)
-Note: first Ctrl+C inside a prompt may still show one ^C glyph — fine.
+## Session 9: TUI live-tested (all pass)
+The checklist from session 8 is done — all four checks passed live in WSL:
+1. `exit` quits cleanly ✅
+2. Shift+Tab flips `[COPILOT]>` <-> `[PURPLE]>` ✅ (prompt repaints with notice)
+3. Ctrl+C = clean bye, no traceback ✅
+4. Up-arrow history + chat + /search all work ✅
+
+Session 9 fixes:
+- **Non-tty fallback (tui.py):** piped stdin/stdout (e.g. `wsl -e bash -c`) now
+  falls back to plain input() instead of prompt_toolkit warning + instant EOF.
+- **LLM skip log (llm.py):** "LLM (skipped) failed" read like a model named
+  "skipped" — now says "local model unavailable; using hosted fallback X".
+- **Wikipedia snippets (websearch.py):** the API prefixes each snippet with
+  the (bolded) article title, so results displayed the title twice — stripped.
 
 ## Session 8 additions
 - **TUI (spec §5.1):** `src/kryonsec/tui.py` — prompt_toolkit input
