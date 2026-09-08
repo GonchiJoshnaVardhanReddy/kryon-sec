@@ -13,14 +13,39 @@ import asyncio
 import logging
 import sys
 
+log = logging.getLogger(__name__)
+
 from rich.console import Console
 from rich.markdown import Markdown
 
 from . import __version__
 from .config import KryonsecConfig
 
+# Glyphs that legacy code-page consoles (cp1252) can't encode crash Rich
+# mid-print — mid-chat-turn. Detect once at import: UTF-8 consoles get the
+# pretty arrows/checkmarks, everything else gets ASCII lookalikes.
+def _console_supports_utf8() -> bool:
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            "→✓└".encode(stream.encoding or "ascii")
+        except (UnicodeEncodeError, LookupError, AttributeError):
+            return False
+    return True
+
+
+_UTF8_OK = _console_supports_utf8()
+ARROW = "→" if _UTF8_OK else "->"
+OK_MARK = "✓" if _UTF8_OK else "+"
+FAIL_MARK = "✗" if _UTF8_OK else "x"
+TREE_BRANCH = "└─" if _UTF8_OK else "`-"
+
 console = Console()
 err_console = Console(stderr=True, style="red")
+
+# messages exchanged in the current session (for the goodbye line)
+_msg_count = [0]
 
 BANNER = r"""██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
 ██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
@@ -30,10 +55,23 @@ BANNER = r"""██╗  ██╗██████╗ ██╗   ██╗ █
 ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝"""
 
 
+# fallback for legacy code-page consoles (cp1252 etc.) where the
+# box-drawing art would raise UnicodeEncodeError at startup
+BANNER_ASCII = """ .------.  .---.  .-----.  .---. .-.    .------.--------.
+ |K .---/  | .-. \\ | .-.  \\ | |-.'| |    | .---'|  .--.  |
+ |  .'|    | `-' | | `-'.  )| |-' `-'    | `--.| |  \\  |
+ |  `-|    | .-. | | .-.  \\ | |    .     | .---'|  _  7
+ `---'`-'  `-' `-' `-'  `--'`-'    `--.  `-'    `-' `--' KRYONSEC"""
+
+
+def _active_banner() -> str:
+    return BANNER if _UTF8_OK else BANNER_ASCII
+
+
 def banner_styled(mode: str) -> str:
     """The banner, white in copilot mode, purple in purple team mode."""
     color = "magenta" if mode == "purple" else "white"
-    return f"[bold {color}]{BANNER}[/bold {color}]"
+    return f"[bold {color}]{_active_banner()}[/bold {color}]"
 
 
 def _print_banner(mode: str) -> None:
@@ -41,12 +79,24 @@ def _print_banner(mode: str) -> None:
     console.print(banner_styled(mode))
 
 
-WELCOME = f"""{banner_styled("copilot")}
-[bold cyan]v{{version}}[/bold cyan] — dual-mode cybersecurity CLI
-[cyan]\\[COPILOT]>[/cyan] general assistant   [magenta]\\[PURPLE]>[/magenta] purple team (Profile 2, Linux)
-
-Type your question. [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.
-"""
+def welcome(cfg: "KryonsecConfig") -> str:
+    """Startup screen: banner plus the facts a user actually needs before
+    the first message — provider, model, workspace — so a wrong config is
+    visible immediately, not three turns in."""
+    provider = "OpenAI" if cfg.provider == "openai" else "Ollama (local)"
+    return (
+        f"{banner_styled('copilot')}\n"
+        f"[bold cyan]v{__version__}[/bold cyan] — dual-mode cybersecurity CLI\n"
+        f"[cyan]\\[COPILOT]>[/cyan] general assistant   "
+        f"[magenta]\\[PURPLE]>[/magenta] purple team (Profile 2, Linux)\n"
+        f"\n"
+        f"[dim]provider:[/dim] {provider}   "
+        f"[dim]model:[/dim] {cfg.general_chat_model}   "
+        f"[dim]workspace:[/dim] {cfg.workspace}\n"
+        f"\n"
+        f"Type your question. [bold]/help[/bold] for commands — "
+        f"[bold]Shift+Tab[/bold] switches mode."
+    )
 
 
 def _persist_session(cfg: KryonsecConfig, session: "GeneralSession") -> None:
@@ -66,13 +116,36 @@ def _persist_session(cfg: KryonsecConfig, session: "GeneralSession") -> None:
         err_console.print(f"[yellow]session not persisted: {e}[/yellow]")
 
 
-def _build_mcp_extra(cfg: KryonsecConfig) -> dict:
-    """MCP tools as agent-toolbox entries; empty when none configured."""
-    if not cfg.mcp_servers:
-        return {}
-    from .copilot.mcp_tools import build_mcp_toolbox
+def _print_help() -> None:
+    """Command reference, grouped by what the user is trying to do —
+    not alphabetically. Quit/exit are listed last, not first."""
+    from rich.table import Table
 
-    return build_mcp_toolbox(cfg)
+    t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    t.add_column(style="bold cyan", no_wrap=True)  # command
+    t.add_column(style="dim")                      # what it does
+    for cmd_line, what in [
+        ("/cve <id>", "look up a CVE (NVD, cached offline)"),
+        ("/search <query>", "web search — results go into context"),
+        ("/read <path>", "read a file (approval-gated outside workspace)"),
+        ("/ls <path>", "list a directory (approval-gated outside workspace)"),
+        ("/write <path>", "write text to a file in the workspace"),
+        ("/workspace", "show the workspace path"),
+        ("/mode", "switch mode (copilot / purple) — or press Shift+Tab"),
+        ("/quit", "exit (or just: exit, quit, q)"),
+    ]:
+        t.add_row(cmd_line, what)
+    console.print("[bold]Commands[/bold]\n")
+    console.print(t)
+    console.print()  # breathing room before the next prompt
+
+
+def _print_goodbye(cleanup: "Callable[[], None] | None" = None) -> None:
+    """Persist, tear down, and say goodbye with the exchange count —
+    the user shouldn't wonder whether the session was saved."""
+    if cleanup is not None:
+        cleanup()
+    console.print(f"\n[dim]session saved ({_msg_count[0]} messages) — bye[/dim]")
 
 
 async def _chat_loop(cfg: KryonsecConfig) -> None:
@@ -93,11 +166,19 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         err_console.print(f"[yellow]storage init failed: {e} — session will not be persisted[/yellow]")
 
     def _console_approve(req: ApprovalRequest) -> bool:
-        console.print(
-            f"\n[bold]Approval required[/bold] — read: {req.path}\n"
-            f"[dim]reason: {req.reason}[/dim]"
-        )
-        answer = console.input("[bold][A]pprove / [D]eny:[/bold] ")
+        from rich.panel import Panel
+
+        verb = {"read": "Read", "list": "List", "write": "Write"}.get(
+            req.action, req.action.capitalize())
+        console.print(Panel(
+            f"[bold]{verb} this file?[/bold]\n"
+            f"[cyan]{req.path}[/cyan]\n"
+            f"[dim]why: {req.reason}[/dim]",
+            title="[bold yellow]Approval required[/bold yellow]",
+            border_style="yellow",
+        ))
+        answer = console.input(
+            "[bold][A]pprove / [D]eny (Enter = Deny):[/bold] ")
         return answer.strip().lower().startswith("a")
 
 
@@ -142,6 +223,27 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     session = GeneralSession(cfg=cfg)
 
+    # ---- MCP: connect ONCE for the whole session (H9) — one subprocess
+    # per server, torn down on exit. Rebuilding per chat turn leaked a
+    # server process + thread per message.
+    mcp_toolbox = None
+    mcp_extra: dict = {}
+    if cfg.mcp_servers:
+        from .copilot.mcp_tools import McpToolbox
+
+        try:
+            mcp_toolbox = McpToolbox(cfg)
+            mcp_extra = mcp_toolbox.connect_all()
+        except Exception as e:
+            err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
+            mcp_toolbox = None
+            mcp_extra = {}
+
+    def _exit() -> None:
+        _persist_session(cfg, session)
+        if mcp_toolbox is not None:
+            mcp_toolbox.close()
+
     # mutable mode holder: "copilot" <-> "purple" via Shift+Tab or /mode
     _mode = ["copilot"]
     _notice = [""]  # one-line status shown above the prompt
@@ -161,7 +263,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             else:  # prompt_toolkit unavailable — plain input fallback
                 user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
         except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
-            console.print("\n[dim]bye[/dim]")
+            _print_goodbye(_exit)
             return
         finally:
             _notice[0] = ""  # notices are one-shot
@@ -172,22 +274,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
         cmd = text.lower()
         if cmd in ("/quit", "/exit", "exit", "quit", "q"):
-            _persist_session(cfg, session)
-            console.print("[dim]bye[/dim]")
+            _print_goodbye(_exit)
             return
         if cmd == "/help":
-            console.print(
-                "[bold]Commands[/bold]\n"
-                "  /help            show this help\n"
-                "  /quit            exit (or just: exit, quit)\n"
-                "  /mode            switch mode (copilot / purple) — or press Shift+Tab\n"
-                "  /cve <id>        look up a CVE (NVD, cached)\n"
-                "  /search <query>  web search — results go into context\n"
-                "  /read <path>     read a file (approval-gated outside workspace)\n"
-                "  /ls <path>       list a directory (approval-gated outside workspace)\n"
-                "  /write <path>    write text to a file in the workspace\n"
-                "  /workspace       show the workspace path\n"
-            )
+            _print_help()
             continue
         if cmd == "/mode":
             from .tui import set_mode
@@ -204,6 +294,9 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
         # ---- CVE lookup (spec §3.6) --------------------------------------
         if cmd.startswith("/cve "):
+            from rich.panel import Panel
+            from rich.table import Table
+
             from .copilot.cve import lookup_cve
 
             try:
@@ -212,17 +305,27 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 err_console.print(f"{e}")
                 continue
             if not record:
-                console.print("[yellow]not found (offline cache miss and NVD unreachable — try again online)[/yellow]")
+                console.print(
+                    "[yellow]not found (offline cache miss and NVD "
+                    "unreachable — try again online)[/yellow]")
                 continue
+            sev = str(record.get("severity") or "?").lower()
+            sev_color = {"critical": "red", "high": "red",
+                         "medium": "yellow", "low": "green"}.get(sev, "cyan")
             score = record.get("cvss_score")
-            console.print(
-                f"[bold]{record['id']}[/bold] "
-                f"[red]severity: {record.get('severity') or '?'}[/red] "
-                f"[dim]CVSS: {score if score is not None else '?'}[/dim]"
-            )
-            console.print(record.get("description", "")[:500])
-            if record.get("references"):
-                console.print("[dim]refs: " + ", ".join(r for r in record["references"] if r) + "[/dim]")
+            t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+            t.add_column(style="bold")
+            t.add_column()
+            t.add_row("severity", f"[{sev_color}]{sev.upper()}[/]")
+            t.add_row("CVSS", f"{score if score is not None else '?'}")
+            refs = [r for r in (record.get("references") or []) if r]
+            if refs:
+                t.add_row("refs", f"{len(refs)} reference(s)")
+            console.print(Panel(
+                f"{t}\n\n{record.get('description', '')[:500]}",
+                title=f"[bold]{record['id']}[/bold]",
+                border_style=sev_color,
+            ))
             continue
 
         # ---- web search (spec §3.7) --------------------------------------
@@ -237,10 +340,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             if not results:
                 console.print("[yellow]no results[/yellow]")
                 continue
-            for r in results:
-                console.print(f"[bold]{r['title']}[/bold]")
-                console.print(f"[dim]{r['snippet']}[/dim]")
-                console.print(f"[blue]{r['url']}[/blue]\n")
+            from rich.rule import Rule
+
+            console.print(Rule(f"[bold]web results[/bold] — {len(results)} found"))
+            for i, r in enumerate(results, 1):
+                console.print(
+                    f"  [bold cyan]{i}.[/bold cyan] [bold]{r['title']}[/bold]")
+                console.print(f"     [dim]{r['snippet']}[/dim]")
+                console.print(f"     [blue]{r['url']}[/blue]\n")
             session.add("user", f"[web search results for: {query}]\n" + "\n".join(
                 f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results))
             console.print("[green]results now in context — ask about them[/green]")
@@ -272,7 +379,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 # /write <path> then the next line is content
                 path = text[len("/write "):].strip()
                 content = console.input("[dim]content> [/dim]")
-                FileTools(cfg).write_file(path, content)
+                FileTools(cfg, approver=_console_approve).write_file(path, content)
                 console.print(f"[green]wrote {path}[/green]")
                 continue
         except Exception as e:
@@ -285,7 +392,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             continue
 
         session.add("user", text)
-        await session.maybe_compact()
+        try:
+            await session.maybe_compact()
+        except Exception as e:
+            # compaction is an optimization, not a chat dependency — a
+            # broken compaction model must not kill the CLI mid-turn
+            err_console.print(
+                f"[yellow]compaction skipped ({type(e).__name__})[/yellow]")
+            log.warning("compaction failed: %s", e)
 
         # ---- the agent loop (v1.1): tools when the LLM asks --------------
         from .copilot.agent import build_toolbox, run_agent
@@ -293,11 +407,6 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         from .status import StatusLine
 
         file_tools = FileTools(cfg, approver=_console_approve)
-        try:
-            mcp_extra = _build_mcp_extra(cfg)
-        except Exception as e:
-            err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
-            mcp_extra = {}
         toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
 
         status = StatusLine(console)
@@ -307,7 +416,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             # which needs the terminal
             status.hide()
             arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in (args or {}).items())
-            console.print(f"  [dim]> using {name}({arg_preview})…[/dim]")
+            console.print(f"  [dim]{TREE_BRANCH}[/dim] [cyan]{name}[/cyan][dim]({arg_preview})[/dim]")
 
         def _show_round() -> None:
             status.show(f"[cyan]copilot[/cyan] thinking…")
@@ -343,12 +452,22 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 console.print(f"[yellow]{hint}[/yellow]")
                 session.messages.pop()  # drop the unanswered user turn
                 continue
+            except Exception as e:
+                # same contract as the primary path: no crash mid-turn —
+                # report, drop the unanswered turn, keep the session alive
+                status.hide()
+                err_console.print(
+                    f"[red]chat failed ({type(e).__name__}): {e}[/red]")
+                log.exception("fallback chat failed")
+                session.messages.pop()
+                continue
         finally:
             status.hide()
 
         session.add("assistant", reply)
+        _msg_count[0] += 1
         console.print(Markdown(reply))
-        console.print()
+        console.print("\n")  # a blank line separates the reply from the prompt
         _remember_facts(cfg, text, reply)  # best-effort LTM (never blocks chat)
 
 
@@ -392,7 +511,7 @@ def _remember_facts(cfg: KryonsecConfig, user_text: str, reply: str) -> None:
         pass  # memory is best-effort by design
 
 
-def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
+def _run_purple(cfg: KryonsecConfig, target_arg: str, engagement_id: str | None = None) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
     subcommand and the /mode toggle inside the chat loop."""
     import uuid
@@ -408,12 +527,15 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
         err_console.print(f"[red]Invalid target:[/red] {e}")
         return 2
 
-    sandbox_ok, sandbox_reason = sandbox_available()
+    sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     if not sandbox_ok:
         console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
         console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
 
-    engagement_id = str(uuid.uuid4())[:8]
+    # an explicit --id must survive the run: re-running a named engagement
+    # keeps the same audit/report dirs instead of getting a random id
+    if not engagement_id:
+        engagement_id = str(uuid.uuid4())[:8]
     status_line = StatusLine(console)
 
     def _progress(msg: str) -> None:
@@ -442,34 +564,77 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
     console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
     completed = orch.run()
     status_line.stop_if_active()
-    console.print(f"[green]states completed:[/green] {' -> '.join(completed)}")
+    _print_purple_summary(cfg, engagement_id, target, completed, orch, audit, graph)
+    return 0
+
+
+def _print_purple_summary(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    target: str,
+    completed: list[str],
+    orch: "Any",
+    audit: "Any",
+    graph: "Any",
+) -> None:
+    """End-of-engagement summary: a verdict line first (was anything
+    found?), then the evidence sections. A user who reads one line should
+    still know the engagement's outcome."""
+    from rich.panel import Panel
+    from rich.rule import Rule
+
+    findings = graph.by_type("finding")
+    verified = [n for n in findings if n["properties"].get("verified")]
+    attempts = graph.by_type("exploit_attempt")
+
+    # ---- the verdict, in one glance -------------------------------
     if orch.halt_reason:
-        console.print(f"[red]halted:[/red] {orch.halt_reason}")
+        verdict = f"[red]HALTED[/red] — {orch.halt_reason}"
+    elif verified:
+        verdict = f"[red]{len(verified)} verified finding(s)[/red] on {target}"
+    elif findings:
+        verdict = (
+            f"[yellow]{len(findings)} possible finding(s) — "
+            "none independently verified[/yellow]")
+    elif attempts:
+        verdict = f"[green]no findings confirmed[/green] ({len(attempts)} tool runs)"
+    else:
+        verdict = f"[green]no testing performed[/green] (engagement stopped before EXPLOIT)"
+
+    console.print(Panel(
+        f"{verdict}\n"
+        f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]",
+        title=f"[magenta]engagement {engagement_id}[/magenta] — {target}",
+        border_style="magenta",
+    ))
+
     subdomains = [n["label"] for n in graph.by_type("subdomain")]
     if subdomains:
-        console.print(f"\n[cyan]passive recon found {len(subdomains)} subdomains:[/cyan]")
+        console.print(f"\n[cyan]passive recon — {len(subdomains)} subdomains[/cyan]")
         for s in subdomains[:30]:
             console.print(f"  [dim]{s}[/dim]")
+        if len(subdomains) > 30:
+            console.print(f"  [dim]… and {len(subdomains) - 30} more[/dim]")
     hypotheses = graph.by_type("hypothesis")
     if hypotheses:
-        console.print(f"\n[cyan]LLM proposed {len(hypotheses)} hypotheses:[/cyan]")
+        console.print(f"\n[cyan]hypotheses — {len(hypotheses)}[/cyan]")
         for n in hypotheses:
             p = n["properties"]
+            mark = f"[green]{OK_MARK}[/green] " if p.get("approved") else "  "
             console.print(
-                f"  [magenta]{n['label']}[/magenta] "
+                f"  {mark}[magenta]{n['label']}[/magenta] "
                 f"[bold]{p.get('title', '')}[/bold] "
                 f"[dim](confidence {p.get('confidence', 0):.1f}; "
                 f"tools: {', '.join(p.get('tools', [])) or 'none'})[/dim]"
             )
-    attempts = graph.by_type("exploit_attempt")
     if attempts:
-        console.print(f"\n[cyan]tool runs executed: {len(attempts)}[/cyan]")
+        console.print(f"\n[cyan]tool runs — {len(attempts)}[/cyan]")
         for n in attempts:
             p = n["properties"]
-            verdict = ("[red]confirmed[/red]" if p.get("confirmed")
-                       else "not confirmed")
+            verdict_icon = (f"[red]{FAIL_MARK} confirmed[/red]"
+                            if p.get("confirmed") else "not confirmed")
             line = (f"  [magenta]{n['label']}[/magenta] "
-                    f"exit {p.get('exit_code', '?')} — {verdict}")
+                    f"[dim]exit {p.get('exit_code', '?')}[/dim] — {verdict_icon}")
             err = (p.get("error_excerpt") or "").strip()
             if err:
                 line += f" [dim]({err[:80]})[/dim]"
@@ -482,18 +647,15 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str) -> int:
     if skipped:
         console.print(f"\n[yellow]skipped (no runnable tool): {len(skipped)}[/yellow]")
         console.print(f"  [dim]{', '.join(skipped)}[/dim]")
-    findings = graph.by_type("finding")
     if findings:
-        console.print(f"\n[green]confirmed findings: {len(findings)}[/green]")
+        console.print(f"\n[green]findings — {len(findings)}[/green]")
         for n in findings:
-            verified = n["properties"].get("verified")
-            mark = " [bold]verified[/bold]" if verified else ""
-            console.print(f"  [magenta]{n['label']}[/magenta]{mark}")
+            mark = "[bold]verified[/bold]" if n["properties"].get("verified") else ""
+            console.print(f"  [magenta]{n['label']}[/magenta] {mark}")
     console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
     report_path = cfg.home / "engagements" / engagement_id / "report.md"
     if report_path.exists():
         console.print(f"[dim]report written: {report_path}[/dim]")
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -523,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(cfg)
 
     if args.command == "purple":
-        return _run_purple(cfg, args.target)
+        return _run_purple(cfg, args.target, engagement_id=args.id)
 
     if args.command == "setup":
         from .wizard import run_setup
@@ -549,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         if not config_path(cfg.home).is_file():
             return 0  # aborted before writing — nothing to start
 
-    console.print(WELCOME.format(version=__version__))
+    console.print(welcome(cfg))
     try:
         asyncio.run(_chat_loop(cfg))
     except (KeyboardInterrupt, asyncio.CancelledError):

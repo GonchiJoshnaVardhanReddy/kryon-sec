@@ -9,7 +9,7 @@ when available, JSON+validation fallback).
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -32,7 +32,10 @@ class Remediation(BaseModel):
         default="",
         description="Detection rule/log signature for defenders (optional)",
     )
-    severity: str = Field(default="medium", description="low | medium | high | critical")
+    severity: Literal["low", "medium", "high", "critical"] = Field(
+        default="medium",
+        description="low | medium | high | critical",
+    )
 
 
 class RemediationSet(BaseModel):

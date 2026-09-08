@@ -29,7 +29,8 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"
     )),
     ("openai_key", re.compile(
-        r"\bsk-[A-Za-z0-9]{20,}\b"
+        # sk-…, sk-proj-…, sk-svcacct-… (2024+ key formats include hyphens)
+        r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"
     )),
     ("password_assignment", re.compile(
         r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?"

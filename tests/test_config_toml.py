@@ -79,12 +79,49 @@ def test_config_round_trip(tmp_path, clean_env):
     assert loaded.general_chat_model == "gpt-4o"
     assert loaded.openai_api_key == "sk-test"
     assert loaded.enabled_tools == ["file_read", "cve_lookup"]
+    # L23: tunables round-trip too
+    assert loaded.max_session_tokens == cfg.max_session_tokens
+    assert loaded.compaction_trigger_ratio == cfg.compaction_trigger_ratio
+    assert loaded.max_tool_output_chars == cfg.max_tool_output_chars
+    assert loaded.sandbox_image == cfg.sandbox_image
     assert len(loaded.mcp_servers) == 2
     assert loaded.mcp_servers[0]["name"] == "fetch"
     assert loaded.mcp_servers[0]["command"] == "mcp-server-fetch"
     # env dict survives the TOML JSON-encoding round trip
     assert loaded.mcp_servers[1]["args"] == ["--flag"]
     assert loaded.mcp_servers[1]["env"] == {"API_TOKEN": "tok-123"}
+
+
+def test_config_empty_tools_round_trips_as_empty(tmp_path, clean_env):
+    """M13 regression: deselecting ALL tools in the wizard writes
+    enabled = []; on load it must NOT resurrect the default all-tools set
+    (which includes file_write)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.enabled_tools = []
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    assert read_config(path)["tools"]["enabled"] == []
+
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.enabled_tools == []
+
+
+def test_config_changed_tunables_round_trip(tmp_path, clean_env):
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.max_session_tokens = 32000
+    cfg.compaction_trigger_ratio = 0.9
+    cfg.compaction_keep_tokens = 12000
+    cfg.max_messages = 30
+    cfg.max_tool_output_chars = 5000
+    cfg.sandbox_image = "kryonsec/sandbox@sha256:" + "a" * 64
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.max_session_tokens == 32000
+    assert loaded.compaction_trigger_ratio == 0.9
+    assert loaded.compaction_keep_tokens == 12000
+    assert loaded.max_messages == 30
+    assert loaded.max_tool_output_chars == 5000
+    assert loaded.sandbox_image == cfg.sandbox_image
 
 
 def test_from_toml_defaults_when_partial(clean_env):

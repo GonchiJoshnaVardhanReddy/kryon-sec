@@ -72,8 +72,9 @@ def _check_gvisor() -> tuple[bool, str]:
     import subprocess
 
     try:
+        # .Runtimes is a Go map — `join` errors on it (moby#37584); range it
         out = subprocess.run(
-            ["docker", "info", "--format", "{{join .Runtimes \",\"}}"],
+            ["docker", "info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}"],
             capture_output=True, text=True, timeout=10,
         )
         if out.returncode == 0 and "runsc" in out.stdout:
@@ -130,17 +131,44 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
     table.add_column("Needed for")
     table.add_column("Result")
     for name, purpose, ok, msg in checks:
-        table.add_row(
-            name, purpose,
-            f"[green]{'PASS' if ok else 'FAIL'}[/green] {msg}" if ok
-            else f"[red]{'PASS' if ok else 'FAIL'}[/red] {msg}",
-        )
+        # ASCII markers, not ✔/✘: doctor must render in ANY console,
+        # including legacy cp1252 ones (it's the tool you run when
+        # things are already broken)
+        mark = "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
+        table.add_row(name, purpose, f"{mark} {msg}")
     console.print(table)
 
-    all_ok = all(ok for _, _, ok, _ in checks)
-    if not all_ok:
-        console.print(
-            "\n[yellow]Profile 1 (Copilot) works if storage + at least one LLM provider pass.[/yellow]"
-            "\n[yellow]Profile 2 (Purple Team) requires Linux + Docker + gVisor + PostgreSQL.[/yellow]"
-        )
-    return 0 if all_ok else 1
+    # exit code reflects the profile this machine can actually run, not
+    # "every optional check passed": an Ollama-only Copilot user (fully
+    # supported, wizard-configured) must not get exit 1
+    storage_ok = checks[0][2]
+    any_llm = checks[1][2] or checks[2][2]
+    copilot_ok = storage_ok and any_llm
+    purple_ok = all(ok for _, _, ok, _ in checks)
+
+    from rich.panel import Panel
+
+    if purple_ok:
+        console.print(Panel(
+            "[green]PASS — Profile 1 (Copilot) and Profile 2 (Purple Team) "
+            "are both ready.[/green]",
+            border_style="green",
+        ))
+    elif copilot_ok:
+        console.print(Panel(
+            "[green]PASS — Profile 1 (Copilot) is fully working on this machine.[/green]\n"
+            "[yellow]Profile 2 (Purple Team) needs Linux + Docker + gVisor "
+            "+ a PostgreSQL DATABASE_URL.[/yellow]",
+            title="What works here",
+            border_style="green",
+        ))
+    else:
+        console.print(Panel(
+            "[red]FAIL — Profile 1 (Copilot) is NOT usable: storage and at "
+            "least one LLM provider must pass (see above).[/red]\n"
+            "[yellow]Profile 2 (Purple Team) needs Linux + Docker + gVisor "
+            "+ a PostgreSQL DATABASE_URL.[/yellow]",
+            title="What works here",
+            border_style="red",
+        ))
+    return 0 if copilot_ok else 1

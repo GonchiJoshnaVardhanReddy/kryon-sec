@@ -174,10 +174,38 @@ def test_wizard_ollama_flow(scripted_wizard, monkeypatch, tmp_path):
         "",        # no MCP
     ])
     assert cfg.provider == "ollama"
-    assert cfg.general_chat_model == "ollama/llama3.1"  # tag stripped
+    assert cfg.general_chat_model == "ollama/llama3.1"  # implicit :latest stripped
     assert cfg.local_model == "ollama/llama3.1"
     assert cfg.enabled_tools == ["file_write", "cve_lookup"]
     assert cfg.mcp_servers == []
+
+
+def test_wizard_ollama_keeps_explicit_tag(scripted_wizard, monkeypatch, tmp_path):
+    """M12 regression: 'llama3.1:8b' must NOT be stripped to 'llama3.1' —
+    a bare name resolves to :latest, a model the user never pulled."""
+    monkeypatch.setattr("kryonsec.wizard.ollama_model_names",
+                        lambda host: ["llama3.1:8b", "mistral:latest"])
+    cfg = scripted_wizard([
+        "2",       # Ollama
+        "1",       # llama3.1:8b
+        "2,4",     # file_write, cve_lookup
+        "",        # no MCP
+    ])
+    assert cfg.general_chat_model == "ollama/llama3.1:8b"  # tag preserved
+    assert cfg.local_model == "ollama/llama3.1:8b"
+
+
+def test_wizard_provider_o_means_ollama(scripted_wizard, monkeypatch, tmp_path):
+    """L20 regression: plain-mode 'o' reads as Ollama, never OpenAI."""
+    monkeypatch.setattr("kryonsec.wizard.ollama_model_names",
+                        lambda host: ["llama3.1:latest"])
+    cfg = scripted_wizard([
+        "o",       # ambiguous abbreviation — must be Ollama
+        "1",       # llama3.1
+        "",        # no tools
+        "",        # no MCP
+    ])
+    assert cfg.provider == "ollama"
 
 
 def test_wizard_custom_mcp_server(scripted_wizard, tmp_path):

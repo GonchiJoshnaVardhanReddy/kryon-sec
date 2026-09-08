@@ -221,9 +221,22 @@ def test_run_agent_passes_openai_api_key(cfg, monkeypatch):
 def test_run_agent_ollama_gets_api_base_not_key(cfg, monkeypatch):
     cfg.ollama_host = "localhost:11434"
     cfg.openai_api_key = "sk-irrelevant"
+    # run_agent prechecks Ollama availability (chat() parity — an unpulled
+    # model makes /api/chat hang) — the server is irrelevant to this test
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
     responses = [FakeResponse(FakeMessage("answer"))]
     calls = _patch_completion(monkeypatch, responses)
     tb = build_toolbox(cfg, FileTools(cfg))
     run_agent(cfg, [{"role": "user", "content": "hi"}], tb, "ollama/llama3.1")
     assert calls[0].get("api_base", "").endswith(":11434")
     assert "api_key" not in calls[0]
+
+
+def test_run_agent_unpulled_ollama_model_fails_fast(cfg, monkeypatch):
+    """The precheck turns a silent 60s hang into an immediate, clear error."""
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+    from kryonsec.llm import LlmUnavailable
+
+    tb = build_toolbox(cfg, FileTools(cfg))
+    with pytest.raises(LlmUnavailable):
+        run_agent(cfg, [{"role": "user", "content": "hi"}], tb, "ollama/llama3.1")

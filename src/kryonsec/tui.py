@@ -54,7 +54,9 @@ def prompt_message(
     mode-colored indicator."""
     fragments: list[tuple[str, str]] = []
     if notice[0]:
-        fragments.append(("", f"{notice[0]}\n"))
+        # notices are system status, not user content — dim them and
+        # prefix with a marker so they never read as typed text
+        fragments.append(("fg:ansibrightblack", f"· {notice[0]}\n"))
     style = _COPILOT_STYLE if mode[0] == "copilot" else _PURPLE_STYLE
     fragments.append((style, f"[{mode[0].upper()}]> "))
     return fragments

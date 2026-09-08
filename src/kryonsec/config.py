@@ -207,6 +207,20 @@ class KryonsecConfig:
                 "openai_api_key": self.openai_api_key or "",
                 "ollama_host": self.ollama_host,
             },
+            "session": {
+                # round-trip the tunables — previously env-only, silently
+                # dropped on save (L23)
+                "max_session_tokens": self.max_session_tokens,
+                "compaction_trigger_ratio": self.compaction_trigger_ratio,
+                "compaction_keep_tokens": self.compaction_keep_tokens,
+                "max_messages": self.max_messages,
+            },
+            "limits": {
+                "max_tool_output_chars": self.max_tool_output_chars,
+            },
+            "sandbox": {
+                "image": self.sandbox_image,
+            },
             "tools": {
                 "enabled": list(self.enabled_tools),
             },
@@ -223,6 +237,9 @@ class KryonsecConfig:
         llm = data.get("llm", {})
         tools = data.get("tools", {})
         mcp = data.get("mcp", {})
+        session = data.get("session", {})
+        limits = data.get("limits", {})
+        sandbox = data.get("sandbox", {})
 
         cfg = cls(**overrides)
         cfg.provider = llm.get("provider", cfg.provider)
@@ -238,8 +255,24 @@ class KryonsecConfig:
             cfg.openai_api_key = llm["openai_api_key"]
         if llm.get("ollama_host"):
             cfg.ollama_host = llm["ollama_host"]
-        if tools.get("enabled"):
+        if "enabled" in tools:
+            # an explicitly empty list must round-trip as "no tools" —
+            # a falsy check would resurrect the dataclass default
+            # (all tools incl. file_write) on the next launch
             cfg.enabled_tools = list(tools["enabled"])
+        # L23: the tunables round-trip too (env still wins where it exists)
+        if session.get("max_session_tokens"):
+            cfg.max_session_tokens = int(session["max_session_tokens"])
+        if session.get("compaction_trigger_ratio"):
+            cfg.compaction_trigger_ratio = float(session["compaction_trigger_ratio"])
+        if session.get("compaction_keep_tokens"):
+            cfg.compaction_keep_tokens = int(session["compaction_keep_tokens"])
+        if session.get("max_messages"):
+            cfg.max_messages = int(session["max_messages"])
+        if limits.get("max_tool_output_chars"):
+            cfg.max_tool_output_chars = int(limits["max_tool_output_chars"])
+        if sandbox.get("image"):
+            cfg.sandbox_image = str(sandbox["image"])
         cfg.mcp_servers = [_server_from_row(r) for r in mcp.get("servers", [])]
 
         # environment beats TOML (documented behavior for power users / CI)

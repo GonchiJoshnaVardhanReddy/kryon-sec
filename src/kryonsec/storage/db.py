@@ -45,8 +45,21 @@ def get_engine(cfg: KryonsecConfig) -> Engine:
             cur.execute("PRAGMA foreign_keys=ON")
             cur.close()
 
-    log.info("storage backend: %s (%s)", cfg.storage_kind, url)
+    log.info("storage backend: %s (%s)", cfg.storage_kind, _safe_url(url))
     return _engine
+
+
+def _safe_url(url: str) -> str:
+    """The URL for logs — password masked (never log credentials)."""
+    try:
+        from sqlalchemy.engine import make_url
+
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:
+        # non-SQLAlchemy-shaped string: mask after scheme://user:pass@
+        import re
+
+        return re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", url)
 
 
 def init_db(cfg: KryonsecConfig, include_purple: bool | None = None) -> Engine:

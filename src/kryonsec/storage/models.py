@@ -59,7 +59,7 @@ class GeneralUserLtm(Base):
     user_id: Mapped[str] = mapped_column(String(64), default="default")
     category: Mapped[str] = mapped_column(String(64))
     key: Mapped[str] = mapped_column(String(255))
-    value: Mapped[dict | list] = mapped_column(JSON)
+    value: Mapped[str] = mapped_column(JSON)  # JSON column; writers store str/dict/list
     last_accessed: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     access_count: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -75,7 +75,7 @@ class SystemKnowledge(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     category: Mapped[str] = mapped_column(String(64))
     key: Mapped[str] = mapped_column(String(255))
-    value: Mapped[dict | list] = mapped_column(JSON)
+    value: Mapped[str] = mapped_column(JSON)  # JSON column; writers store str/dict/list
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
@@ -128,7 +128,7 @@ class EngagementSecretMap(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     engagement_id: Mapped[str] = mapped_column(String(36))
     placeholder: Mapped[str] = mapped_column(String(64))
-    secret_encrypted: Mapped[bytes] = mapped_column(String)  # base64 ciphertext
+    secret_encrypted: Mapped[str] = mapped_column(String)  # base64 ciphertext (str, not bytes)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

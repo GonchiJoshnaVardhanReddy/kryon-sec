@@ -10,6 +10,7 @@ from kryonsec.config import KryonsecConfig
 from kryonsec.llm import (
     CompactionMustStayLocal,
     LlmUnavailable,
+    SecretsMustStayLocal,
     _ollama_model_ok,
     chat,
     completion_kwargs,
@@ -175,3 +176,51 @@ def test_completion_kwargs_ollama_gets_api_base(cfg):
     kw = completion_kwargs(cfg, "ollama/llama3.1")
     assert kw["api_base"].endswith(":11434")
     assert "api_key" not in kw
+
+
+# ---- secrets gate (spec §6.4 / CLAUDE.md rule 4) --------------------------
+
+def test_hosted_call_with_secrets_routes_to_local(cfg):
+    """A message containing a secret never reaches the hosted provider —
+    the call is re-routed to the local model (chat path, general form)."""
+    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=True),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        out = chat(cfg, messages, "gpt-4o")
+        assert out == "ok"
+        assert complete.call_args[0][1].startswith("ollama/")  # model arg
+
+
+def test_hosted_call_with_secrets_no_local_refuses(cfg):
+    """Secrets + no local model = hard refusal, never a hosted call."""
+    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=False),
+        patch("kryonsec.llm._complete") as complete,
+    ):
+        with pytest.raises(SecretsMustStayLocal):
+            chat(cfg, messages, "gpt-4o")
+        complete.assert_not_called()
+
+
+def test_hosted_call_without_secrets_unchanged(cfg):
+    messages = [{"role": "user", "content": "what is XSS?"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=True),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        chat(cfg, messages, "gpt-4o")
+        assert complete.call_args[0][1] == "gpt-4o"
+
+
+def test_local_call_with_secrets_unchanged(ollama_cfg):
+    """Ollama never leaves the machine — secrets pass through fine."""
+    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=True),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        chat(ollama_cfg, messages, "ollama/llama3.1")
+        assert complete.call_args[0][1] == "ollama/llama3.1"

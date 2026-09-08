@@ -2,7 +2,7 @@
 wrapper — against fake tool/session objects, no real mcp import."""
 
 from kryonsec.config import KryonsecConfig
-from kryonsec.copilot.mcp_tools import McpToolbox
+from kryonsec.copilot.mcp_tools import McpToolbox, _schema
 
 
 class FakeMcpTool:
@@ -40,7 +40,7 @@ def test_schema_conversion_flat():
         "properties": {"url": {"type": "string"}},
         "required": ["url"],
     })
-    schema = McpToolbox._schema(tool)
+    schema = _schema(tool)
     assert schema["type"] == "function"
     fn = schema["function"]
     assert fn["name"] == "fetch"
@@ -51,7 +51,7 @@ def test_schema_conversion_flat():
 
 def test_schema_conversion_empty_schema():
     tool = FakeMcpTool("ping", None, {})
-    schema = McpToolbox._schema(tool)
+    schema = _schema(tool)
     fn = schema["function"]
     assert fn["description"] == ""
     assert fn["parameters"]["properties"] == {}

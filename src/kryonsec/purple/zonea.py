@@ -74,13 +74,31 @@ class PassiveResult:
 
 
 def _zone_a_fetch(url: str, timeout: int = TIMEOUT_S) -> bytes:
-    """Fetch a Zone A URL. Refuses hosts outside the allowlist."""
+    """Fetch a Zone A URL. Refuses hosts outside the allowlist — including
+    the hosts of redirects (urlopen follows 3xx silently otherwise, which
+    would send packets to arbitrary hosts, possibly the target)."""
+    # a redirect handler that re-checks every hop against the allowlist
+    class _ZoneARedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            host = urllib.parse.urlparse(newurl).hostname or ""
+            if host not in ZONE_A_ALLOWED_HOSTS:
+                raise ZoneAViolation(
+                    f"Zone A egress denied: redirect to {host!r} not in allowlist"
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_ZoneARedirectHandler)
     host = urllib.parse.urlparse(url).hostname or ""
     if host not in ZONE_A_ALLOWED_HOSTS:
         raise ZoneAViolation(f"Zone A egress denied: {host!r} not in allowlist")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    with opener.open(req, timeout=timeout) as r:
+        # bounded read — a hostile/compromised source must not be able to
+        # exhaust host memory
+        return r.read(MAX_FETCH_BYTES)
+
+
+MAX_FETCH_BYTES = 20 * 1024 * 1024  # 20 MB cap per Zone A response
 
 
 def _same_domain(subdomain: str, domain: str) -> bool:
@@ -169,7 +187,7 @@ def wayback_paths(domain: str, limit: int = 100, retries: int = 2) -> list[str]:
     import time
 
     url = (
-        "http://web.archive.org/cdx/search/cdx"
+        "https://web.archive.org/cdx/search/cdx"
         f"?url={urllib.parse.quote(domain, safe='')}/*&output=json&limit={limit}"
         "&collapse=urlkey"
     )

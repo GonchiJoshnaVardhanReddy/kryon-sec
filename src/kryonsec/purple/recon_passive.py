@@ -48,6 +48,14 @@ class EngagementGraph:
     def by_type(self, node_type: str) -> list[dict]:
         return [n for n in self.nodes if n["node_type"] == node_type]
 
+    def remove_node(self, node: dict) -> None:
+        """Drop a node (used for deterministic dedup — never used to
+        rewrite history: the audit chain keeps the full record)."""
+        try:
+            self.nodes.remove(node)
+        except ValueError:
+            pass  # already gone
+
 
 @dataclass
 class ReconPassiveSubagent:

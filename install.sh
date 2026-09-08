@@ -48,12 +48,15 @@ say "installing kryonsec (this pulls litellm, mcp, rich, …)"
 
 # ---- 4. PATH (idempotent) ---------------------------------------------------
 SHELL_RC="$HOME/.bashrc"
+case "$SHELL" in
+    *zsh) SHELL_RC="$HOME/.zshrc" ;;
+esac
 MARKER='# kryonsec'
 if ! grep -q "$MARKER" "$SHELL_RC" 2>/dev/null; then
     printf '\n%s\nexport PATH="%s:$PATH"\n' "$MARKER" "$VENV/bin" >> "$SHELL_RC"
-    say "added $VENV/bin to PATH in ~/.bashrc"
+    say "added $VENV/bin to PATH in $SHELL_RC"
 else
-    say "PATH already set up in ~/.bashrc"
+    say "PATH already set up in $SHELL_RC"
 fi
 
 # ---- 5. docker sandbox image (Linux only, optional) ------------------------
@@ -66,11 +69,14 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     else
         say "building the Zone B sandbox image (kali + tools, ~4 min, ~2 GB)"
         TMP=$(mktemp -d)
-        git clone --quiet --depth 1 "$REPO.git" "$TMP/kryonsec-src"
-        docker build -q -t kryonsec/sandbox \
-            -f "$TMP/kryonsec-src/containers/sandbox/Dockerfile.kali" \
-            "$TMP/kryonsec-src" \
-            || say "WARNING: sandbox image build failed — Purple Team will need it (see README)"
+        if git clone --quiet --depth 1 "$REPO.git" "$TMP/kryonsec-src"; then
+            docker build -q -t kryonsec/sandbox \
+                -f "$TMP/kryonsec-src/containers/sandbox/Dockerfile.kali" \
+                "$TMP/kryonsec-src" \
+                || say "WARNING: sandbox image build failed — Purple Team will need it (see README)"
+        else
+            say "WARNING: could not fetch sandbox sources (git missing or network down) — skipping image build"
+        fi
         rm -rf "$TMP"
     fi
 else
