@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 from ..config import KryonsecConfig
 from .audit import AuditLog
 from .hypothesize import _extract_json
-from .orchestrator import SubagentResult
+from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
 
 log = logging.getLogger(__name__)
@@ -87,6 +87,14 @@ def generate_remediations(cfg: KryonsecConfig, prompt: str) -> RemediationSet:
     model = cfg.general_search_model
     if model.startswith("gpt") and not cfg.openai_api_key:
         model = cfg.local_model
+    # engagement data (exploit excerpts, findings) never goes to a
+    # third-party LLM unredacted — spec §6.4 / CLAUDE.md rule 4. The
+    # instructor path below calls the provider directly and would bypass
+    # chat()'s gate, so gate here (same as HYPOTHESIZE): route local,
+    # or redact when no local model is up.
+    from ..llm import secrets_safe_prompt
+
+    model, prompt = secrets_safe_prompt(cfg, model, prompt)
 
     try:
         import instructor  # optional strict path
@@ -150,14 +158,26 @@ class BlueTeamSubagent:
         graph: EngagementGraph,
         audit: AuditLog,
         llm_fn: Callable[[str], RemediationSet] | None = None,
+        budget: BudgetTracker | None = None,
     ):
         self.cfg = cfg
         self.graph = graph
         self.audit = audit
         self.llm_fn = llm_fn or self._default_llm
+        # engagement budget (spec §4.3): LLM states accrue their usage so
+        # the orchestrator's budget guard can actually trip on tokens
+        self.budget = budget
 
     def _default_llm(self, prompt: str) -> RemediationSet:
         return generate_remediations(self.cfg, prompt)
+
+    def _record_budget(self, prompt: str, result: RemediationSet) -> None:
+        if self.budget is None:
+            return
+        from ..llm import count_tokens
+
+        self.budget.record_usage(
+            count_tokens(prompt) + count_tokens(result.model_dump_json()))
 
     def run(self) -> SubagentResult:
         self.audit.write({
@@ -176,6 +196,8 @@ class BlueTeamSubagent:
             })
             log.warning("BLUE_TEAM failed: %s", e)
             return SubagentResult(status="failed")
+
+        self._record_budget(prompt, remediation_set)
 
         for r in remediation_set.remediations:
             node = self.graph.add_node(

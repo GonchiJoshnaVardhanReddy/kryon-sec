@@ -180,6 +180,19 @@ def execute_tool(toolbox: Toolbox, name: str, raw_args: str | None) -> str:
     return str(result)
 
 
+def _redacted_contents(messages: list[dict]) -> list[dict]:
+    """Message copies with secret-looking contents replaced by placeholders
+    (secrets.redact). The placeholder mapping is discarded — it never
+    leaves the machine."""
+    from ..secrets import redact
+
+    return [
+        {**m, "content": redact(m["content"])[0]}
+        if isinstance(m.get("content"), str) else m
+        for m in messages
+    ]
+
+
 def run_agent(
     cfg: KryonsecConfig,
     messages: list[dict],
@@ -200,10 +213,28 @@ def run_agent(
     messages = list(messages)  # work on a copy; caller owns theirs
     import litellm
 
-    from ..llm import _quiet_litellm, completion_kwargs, secrets_safe_model
+    from ..llm import (
+        SecretsMustStayLocal,
+        _quiet_litellm,
+        completion_kwargs,
+        secrets_safe_model,
+    )
+
+    def _gate(model: str) -> tuple[str, list[dict]]:
+        """spec §6.4 on the CURRENT messages: (model, messages) safe to
+        send. Never raises — with no local model up the outbound contents
+        are redacted instead, so raw secrets never reach a hosted provider
+        however they entered the loop."""
+        try:
+            return secrets_safe_model(cfg, model, messages), messages
+        except SecretsMustStayLocal:
+            log.warning(
+                "secrets entered the tool loop and no local model is up — "
+                "redacting the outbound contents (spec §6.4)")
+            return model, _redacted_contents(messages)
 
     _quiet_litellm()
-    model = secrets_safe_model(cfg, model, messages)  # spec §6.4
+    model, messages = _gate(model)
     if model.startswith("ollama/"):
         # same precheck chat() applies: Ollama silently hangs on unpulled models
         from ..llm import LlmUnavailable, _ollama_model_ok
@@ -218,9 +249,16 @@ def run_agent(
     for _ in range(MAX_TOOL_ROUNDS):
         if on_round:
             on_round()
+        # spec §6.4 on EVERY round, not just the first: secrets can enter
+        # mid-loop through tool results (file_read on .env, MCP output).
+        # Re-gate before each call; `outbound` is what actually leaves.
+        round_model, outbound = _gate(model)
+        if round_model != model:
+            model = round_model
+            provider_kwargs = completion_kwargs(cfg, model, tools=True)
         resp = litellm.completion(
             model=model,
-            messages=messages,
+            messages=outbound,
             tools=[toolbox[n][0] for n in toolbox],
             tool_choice="auto",
             timeout=60,

@@ -228,6 +228,32 @@ def secrets_safe_model(
     return cfg.local_model
 
 
+def secrets_safe_prompt(
+    cfg: KryonsecConfig, model: str, prompt: str
+) -> tuple[str, str]:
+    """The (model, prompt) pair that is safe to send (spec §6.4).
+
+    Single-prompt form of the secrets gate for the purple-team LLM states
+    (HYPOTHESIZE, BLUE_TEAM), whose instructor path calls the provider
+    directly and would otherwise bypass chat()'s gate. Secrets in the
+    engagement data route to the local model; when no local model is up
+    the prompt is REDACTED instead — redacted material may go upstream,
+    raw secrets never (CLAUDE.md rule 4). Never raises, so a false-
+    positive secret pattern in recon data cannot kill an LLM state.
+    """
+    from .secrets import detect_secrets, redact
+
+    if model.startswith("ollama/") or not detect_secrets(prompt):
+        return model, prompt
+    if _ollama_model_ok(cfg, cfg.local_model):
+        log.warning("secrets detected — routing this call to the local model (spec §6.4)")
+        return cfg.local_model, prompt
+    log.warning(
+        "secrets detected and no local model up — sending a redacted "
+        "prompt upstream (spec §6.4)")
+    return model, redact(prompt)[0]
+
+
 def chat(
     cfg: KryonsecConfig,
     messages: list[dict],

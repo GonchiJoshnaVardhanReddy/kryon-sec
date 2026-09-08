@@ -225,19 +225,21 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     # ---- MCP: connect ONCE for the whole session (H9) — one subprocess
     # per server, torn down on exit. Rebuilding per chat turn leaked a
-    # server process + thread per message.
+    # server process + thread per message. The toolbox is live: a slow
+    # server's tools merge in when ready and the per-turn snapshot()
+    # picks them up.
     mcp_toolbox = None
-    mcp_extra: dict = {}
     if cfg.mcp_servers:
         from .copilot.mcp_tools import McpToolbox
 
         try:
-            mcp_toolbox = McpToolbox(cfg)
-            mcp_extra = mcp_toolbox.connect_all()
+            mcp_toolbox = McpToolbox(
+                cfg,
+                on_notice=lambda msg: err_console.print(f"[yellow]{msg}[/yellow]"))
+            mcp_toolbox.connect_all()
         except Exception as e:
             err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
             mcp_toolbox = None
-            mcp_extra = {}
 
     def _exit() -> None:
         _persist_session(cfg, session)
@@ -294,8 +296,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
         # ---- CVE lookup (spec §3.6) --------------------------------------
         if cmd.startswith("/cve "):
+            from rich.console import Group
             from rich.panel import Panel
             from rich.table import Table
+            from rich.text import Text
 
             from .copilot.cve import lookup_cve
 
@@ -321,8 +325,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             refs = [r for r in (record.get("references") or []) if r]
             if refs:
                 t.add_row("refs", f"{len(refs)} reference(s)")
+            # a Rich renderable must be a Panel child, never f-string
+            # interpolated — str(Table) is an object repr, not the table
             console.print(Panel(
-                f"{t}\n\n{record.get('description', '')[:500]}",
+                Group(t, Text(""), Text(record.get("description", "")[:500])),
                 title=f"[bold]{record['id']}[/bold]",
                 border_style=sev_color,
             ))
@@ -407,6 +413,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         from .status import StatusLine
 
         file_tools = FileTools(cfg, approver=_console_approve)
+        mcp_extra = mcp_toolbox.snapshot() if mcp_toolbox is not None else None
         toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
 
         status = StatusLine(console)

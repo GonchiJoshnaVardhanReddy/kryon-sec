@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+import threading
+from typing import Any, Callable
 
 from ..config import KryonsecConfig
 
@@ -29,6 +30,10 @@ log = logging.getLogger(__name__)
 # but never hang the chat forever
 TOOL_CALL_TIMEOUT_S = 120
 
+# how long a slow server (cold npx cache, …) may still take AFTER the
+# connect-timeout before we give up on it for the session
+LATE_BOOT_TIMEOUT_S = 60
+
 
 class _ServerConnection:
     """One live stdio server: its background loop, stop event, entries."""
@@ -36,7 +41,7 @@ class _ServerConnection:
     def __init__(self) -> None:
         self.loop: Any = None            # the asyncio loop (anyio backend)
         self.stop_event: Any = None      # asyncio.Event set by close()
-        self.ready: Any = None           # threading.Event: tools listed
+        self.ready = threading.Event()   # set once tools are listed (or the session ended)
         self.entry: dict[str, tuple[dict, Any]] = {}
         self.error: str = ""
 
@@ -123,37 +128,98 @@ def _split_command(command: str) -> list[str]:
 
 class McpToolbox:
     """Holds live connections for enabled MCP servers and exposes their
-    tools in agent-toolbox format: name -> (schema, executor)."""
+    tools in agent-toolbox format: name -> (schema, executor).
 
-    def __init__(self, cfg: KryonsecConfig):
+    The toolbox is LIVE: a server slower than the 10s connect timeout
+    (cold npx cache, …) keeps booting in the background, and its tools
+    are merged in when they arrive — the next chat turn's snapshot()
+    sees them. Callers take a snapshot per turn instead of holding the
+    dict, so a background merge can never mutate a dict mid-iteration.
+    """
+
+    def __init__(
+        self,
+        cfg: KryonsecConfig,
+        on_notice: Callable[[str], None] | None = None,
+    ):
         self.cfg = cfg
         self.connections: list[_ServerConnection] = []
+        self.tools: dict[str, tuple[dict, Any]] = {}
+        self.on_notice = on_notice  # user-visible notices (CLI console)
+        self._lock = threading.Lock()
+
+    def _notice(self, message: str) -> None:
+        """Slow/dead servers must be VISIBLE, not just a log line."""
+        if self.on_notice:
+            try:
+                self.on_notice(message)
+            except Exception:
+                log.exception("MCP notice callback failed")
+        else:
+            log.warning("%s", message)
+
+    def snapshot(self) -> dict[str, tuple[dict, Any]]:
+        """A thread-safe copy of the current tool entries."""
+        with self._lock:
+            return dict(self.tools)
 
     def connect_all(self) -> dict[str, tuple[dict, Any]]:
-        """Start every enabled server; returns the toolbox entries
-        (name -> (schema, executor)). Failures are logged and skipped."""
-        toolbox: dict[str, tuple[dict, Any]] = {}
+        """Start every enabled server; returns the tool entries known at
+        connect time (late booters merge into snapshot() afterwards).
+        Failures are logged, noticed, and skipped."""
         servers = [s for s in self.cfg.mcp_servers if s.get("enabled", True)]
         for server in servers:
+            name = server.get("name", "?")
             try:
-                conn = self._connect_one(server)
+                conn, slow = self._connect_one(server)
             except Exception as e:
-                log.warning("MCP server %r failed to start: %s", server.get("name"), e)
+                log.warning("MCP server %r failed to start: %s", name, e)
+                self._notice(f"MCP server {name!r} failed to start: {e}")
                 continue
             self.connections.append(conn)
-            for name, tool_entry in conn.entry.items():
-                if name in toolbox:
+            self._merge(conn.entry)
+            if slow:
+                self._notice(
+                    f"MCP server {name!r} is still starting — its tools "
+                    "will appear when ready")
+                threading.Thread(
+                    target=self._wait_late, args=(conn, name), daemon=True,
+                ).start()
+        return self.snapshot()
+
+    def _merge(self, entries: dict[str, tuple[dict, Any]]) -> None:
+        with self._lock:
+            for name, entry in entries.items():
+                if name in self.tools:
                     log.warning(
                         "MCP tool name collision on %r — keeping the first", name)
                     continue
-                toolbox[name] = tool_entry
-        return toolbox
+                self.tools[name] = entry
 
-    def _connect_one(self, server: dict) -> _ServerConnection:
-        """Start one stdio server, list tools, build executors."""
+    def _wait_late(self, conn: _ServerConnection, name: str) -> None:
+        """Background waiter for a slow-boot server: register its tools
+        when they land (v1.1.0 rebuilt the toolbox per turn, so late
+        servers used to appear next message — this restores that without
+        the per-turn process leak)."""
+        if not conn.ready.wait(timeout=LATE_BOOT_TIMEOUT_S):
+            self._notice(
+                f"MCP server {name!r} never became ready — dropped for this session")
+            return
+        if conn.entry:
+            self._merge(conn.entry)
+            self._notice(
+                f"MCP server {name!r} ready — {len(conn.entry)} tool(s) now available")
+        else:
+            self._notice(
+                f"MCP server {name!r} exited before listing any tools")
+
+    def _connect_one(self, server: dict) -> tuple[_ServerConnection, bool]:
+        """Start one stdio server, list tools, build executors.
+
+        Returns (connection, slow): slow=True when the tool list had not
+        arrived within the connect timeout — the connection is kept and
+        its tools merge in later via _wait_late."""
         from mcp import StdioServerParameters
-
-        import threading
 
         command = server["command"]
         parts = _split_command(command) + [
@@ -187,12 +253,14 @@ class McpToolbox:
         self._thread = threading.Thread(
             target=self._run_bg, args=(conn, params, errlog), daemon=True)
         self._thread.start()
-        # wait briefly for the tool list (or failure) to arrive
-        if not conn.ready.wait(timeout=10):  # pragma: no cover — slow boots
+        # wait briefly for the tool list (or failure) to arrive; a server
+        # that overruns it is NOT dropped — see _wait_late
+        slow = not conn.ready.wait(timeout=10)
+        if slow:
             log.warning("MCP server %r: tool list timed out", server.get("name"))
         if conn.error and not conn.entry:
             raise RuntimeError(conn.error)
-        return conn
+        return conn, slow
 
     def _run_bg(self, conn: _ServerConnection, params: Any, errlog: Any) -> None:
         import anyio

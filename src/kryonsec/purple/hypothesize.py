@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..config import KryonsecConfig
 from .audit import AuditLog
-from .orchestrator import SubagentResult
+from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
 
 log = logging.getLogger(__name__)
@@ -27,12 +27,15 @@ log = logging.getLogger(__name__)
 class Hypothesis(BaseModel):
     """One vulnerability hypothesis proposed by the LLM."""
 
-    # id format is rigid (spec rule: LLM output is data, not identifiers
-    # we parse): ids join labels like "H1:sqlmap" — colons/wild chars
-    # would silently corrupt the tested/confirmed/verify joins
+    # id format is rigid where it MATTERS: ids join labels like
+    # "H1:sqlmap", so a ':' in an id would silently corrupt the
+    # tested/confirmed/verify joins (split(":")). Everything else is
+    # deliberately loose so ids LLMs naturally emit ('1', 'H1',
+    # 'sqli-showthread-id') all pass — the tight ^H…$ pattern was a
+    # v1.1.1 regression that zeroed whole hypothesis sets.
     id: str = Field(
-        pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,19}$",
-        description="Short stable id, e.g. H1 (letters/digits/-/_ only)",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$",
+        description="Short stable id, e.g. H1 (letters/digits/-/_ only, no colon)",
     )
     title: str = Field(description="One-line hypothesis, plain language")
     target_asset: str = Field(
@@ -124,11 +127,15 @@ def propose_hypotheses(
     if model.startswith("gpt") and not cfg.openai_api_key:
         model = cfg.local_model
     # engagement data (subdomains, Wayback paths with query strings) never
-    # goes to a third-party LLM unredacted — spec §6.4 / CLAUDE.md rule 4
-    from ..llm import secrets_safe_model
+    # goes to a third-party LLM unredacted — spec §6.4 / CLAUDE.md rule 4.
+    # secrets_safe_prompt never raises: a false-positive secret pattern in
+    # recon data (e.g. '/login?password=forgot') must not kill the whole
+    # HYPOTHESIZE state — it routes local, or redacts when no local model
+    # is up (v1.1.1 regression: SecretsMustStayLocal crashed the state
+    # and the engagement ended with zero hypotheses).
+    from ..llm import secrets_safe_prompt
 
-    model = secrets_safe_model(
-        cfg, model, [{"role": "user", "content": prompt}])
+    model, prompt = secrets_safe_prompt(cfg, model, prompt)
 
     try:
         import instructor  # optional strict path
@@ -194,15 +201,30 @@ class HypothesizeSubagent:
         graph: EngagementGraph,
         audit: AuditLog,
         llm_fn: Callable[[str], HypothesisSet] | None = None,
+        budget: BudgetTracker | None = None,
     ):
         self.cfg = cfg
         self.graph = graph
         self.audit = audit
         # injectable for tests; default does the real LLM call
         self.llm_fn = llm_fn or self._default_llm
+        # engagement budget (spec §4.3): LLM states accrue their usage so
+        # the orchestrator's budget guard can actually trip on tokens
+        self.budget = budget
 
     def _default_llm(self, prompt: str) -> HypothesisSet:
         return propose_hypotheses(self.cfg, prompt)
+
+    def _record_budget(self, prompt: str, result: HypothesisSet) -> None:
+        """Approximate token accounting (prompt + response); provider
+        usage objects never reach this layer. Better an honest estimate
+        than a budget guard that can only ever trip on wall-clock."""
+        if self.budget is None:
+            return
+        from ..llm import count_tokens
+
+        self.budget.record_usage(
+            count_tokens(prompt) + count_tokens(result.model_dump_json()))
 
     def run(self) -> SubagentResult:
         self.audit.write({
@@ -223,6 +245,8 @@ class HypothesizeSubagent:
             })
             log.warning("HYPOTHESIZE failed: %s", e)
             return SubagentResult(status="failed")
+
+        self._record_budget(prompt, hypothesis_set)
 
         for h in hypothesis_set.hypotheses:
             node = self.graph.add_node(

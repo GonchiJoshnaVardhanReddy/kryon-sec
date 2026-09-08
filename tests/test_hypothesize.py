@@ -77,6 +77,21 @@ def test_confidence_bounds():
         Hypothesis(id="H1", title="t", target_asset="a", rationale="r", confidence=1.5)
 
 
+def test_hypothesis_id_accepts_natural_llm_formats():
+    """v1.1.1 regression: the tight ^H…$ pattern rejected ids LLMs
+    naturally emit ('1', hyphenated, 21+ chars) — and one bad id zeroed
+    the whole hypothesis set via all-or-nothing validation."""
+    for natural in ("1", "H1", "h-12", "SQLI-showthread-id-param-extended"):
+        Hypothesis(id=natural, title="t", target_asset="a", rationale="r")
+
+
+def test_hypothesis_id_rejects_colon():
+    """A ':' corrupts the H1:sqlmap label joins — the one format rule
+    that must stay rigid."""
+    with pytest.raises(ValidationError):
+        Hypothesis(id="H1:sqlmap", title="t", target_asset="a", rationale="r")
+
+
 # --- JSON extraction (the no-instructor fallback) ---
 
 def test_extract_json_plain():
@@ -206,3 +221,64 @@ def test_propose_hypotheses_json_repair_retry(monkeypatch, tmp_path):
 
     result = propose_hypotheses(cfg, "prompt text")
     assert result.hypotheses[0].id == "H2"
+
+
+def test_propose_hypotheses_secret_prompt_redacted_not_fatal(monkeypatch, tmp_path):
+    """v1.1.1 regression: a false-positive secret pattern in recon data
+    (a Wayback path like /login?password=forgot123) raised
+    SecretsMustStayLocal OUTSIDE the try and killed the whole HYPOTHESIZE
+    state. With no local model up the prompt must go out redacted — the
+    state must never die on a pattern match."""
+    import builtins
+    import sys
+
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.general_search_model = "gpt-4o-mini"
+    cfg.openai_api_key = "sk-test"
+
+    monkeypatch.setitem(sys.modules, "instructor", None)
+    real_import = builtins.__import__
+
+    def no_instructor(name, *args, **kwargs):
+        if name == "instructor":
+            raise ImportError("forced for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_instructor)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+
+    captured = {}
+
+    def fake_chat(cfg, messages, model, **kw):
+        captured["messages"] = messages
+        return ('{"hypotheses": [{"id": "H1", "title": "t", '
+                '"target_asset": "/login", "rationale": "r"}]}')
+
+    monkeypatch.setattr("kryonsec.llm.chat", fake_chat)
+
+    prompt = "recon found the path /login?password=forgot123 on the target"
+    result = propose_hypotheses(cfg, prompt)
+
+    assert result.hypotheses[0].id == "H1"  # the state survived
+    sent = json.dumps(captured["messages"], ensure_ascii=False)
+    assert "forgot123" not in sent  # the secret never left redacted
+    assert "password=" in sent      # the label survives redaction
+
+
+def test_hypothesize_records_budget_usage(tmp_path):
+    """The engagement budget guard only works if LLM states accrue usage
+    (spec §4.3) — v1.1.1 had record_usage with zero call sites."""
+    from kryonsec.purple.orchestrator import BudgetTracker
+
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+    budget = BudgetTracker(max_tokens=10)
+
+    sub = HypothesizeSubagent(
+        cfg=cfg, graph=graph, audit=audit, llm_fn=_good_llm, budget=budget)
+    result = sub.run()
+
+    assert result.status == "ok"
+    assert budget.used_tokens > 0
+    assert budget.exhausted()  # the tiny cap is now actually enforced

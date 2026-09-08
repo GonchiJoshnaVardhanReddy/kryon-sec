@@ -8,7 +8,6 @@ strings, and writes report.md into the engagement directory.
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 
 from ..config import KryonsecConfig
@@ -18,22 +17,19 @@ from .recon_passive import EngagementGraph
 
 log = logging.getLogger(__name__)
 
-# §4.9: credential/secret pattern redaction before the report is written.
-# Left boundary (?<![A-Za-z0-9_-]) so ordinary hyphenated prose words
-# ("risk-assessment-methodology") are never eaten by the sk- pattern.
-_SECRET_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"(?<![A-Za-z0-9_-])(?:sk-proj-|sk-)[A-Za-z0-9_-]{20,}"),  # API keys
-    re.compile(r"(?i)(password|passwd|pwd|secret|token)\s*[:=]\s*\S+",),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),  # JWTs
-]
-
 
 def redact_secrets(text: str) -> str:
-    """Replace secret-looking strings with a placeholder (§4.9)."""
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub("[REDACTED]", text)
-    return text
+    """Replace secret-looking strings with placeholders (§4.9).
+
+    Delegates to the shared detector (secrets.py) so the pattern list can
+    never drift from the one the LLM gates use — the report is the
+    artifact most likely to be shared, and a private copy here was
+    already missing AWS keys, GitHub tokens and connection strings that
+    detect_secrets catches. Passwords/keys keep their label; only the
+    value is replaced («SECRET_n»)."""
+    from ..secrets import redact
+
+    return redact(text)[0]
 
 
 def render_report(
