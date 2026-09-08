@@ -111,6 +111,13 @@ def test_boolean_probe_urls_none_without_query():
 
 # ---- VERIFY subagent -----------------------------------------------------
 
+def _is_probe(url: str) -> bool:
+    """A boolean probe carries the encoded AND 1=1 / AND 1=2 injection;
+    the baseline fetch is the original URL untouched."""
+    return "1%3D1" in url or "1%3D2" in url
+
+
+
 def _finding_graph():
     graph = EngagementGraph(engagement_id="e-v")
     graph.add_node("target", "target-corp.com", {})
@@ -141,7 +148,7 @@ def test_verify_confirms_when_responses_differ(tmp_path):
 
         def spawn(self, argv):
             self.calls.append(argv[-1])
-            if "?" not in argv[-1]:  # baseline fetch (no injection)
+            if not _is_probe(argv[-1]):  # baseline fetch (original URL)
                 return SpawnResult(ok=True, exit_code=0,
                                    stdout="full page content")
             is_true = "1%3D1" in argv[-1] or "+AND+1%3D1" in argv[-1]
@@ -226,7 +233,7 @@ def test_verify_retries_http_reset_over_https(tmp_path):
             self.urls.append(url)
             if url.startswith("http://"):
                 return SpawnResult(ok=True, exit_code=56, stdout="")
-            if "?" not in url:  # baseline fetch (no injection)
+            if not _is_probe(url):  # baseline fetch (original URL)
                 return SpawnResult(ok=True, exit_code=0, stdout="full page")
             is_true = "1%3D1" in url or "+AND+1%3D1" in url
             return SpawnResult(
@@ -257,7 +264,7 @@ def test_verify_uses_scheme_discovered_by_exploit(tmp_path):
     class HttpHater:
         def spawn(self, argv):
             assert argv[-1].startswith("https://"), "must probe https directly"
-            if "?" not in argv[-1]:  # baseline fetch (no injection)
+            if not _is_probe(argv[-1]):  # baseline fetch (original URL)
                 return SpawnResult(ok=True, exit_code=0, stdout="full page")
             is_true = "1%3D1" in argv[-1] or "+AND+1%3D1" in argv[-1]
             return SpawnResult(
@@ -300,3 +307,35 @@ def test_verify_no_findings_is_ok(tmp_path):
     result = VerifySubagent(cfg, graph, audit, "t.com", UnusedSandbox()).run()
     assert result.status == "ok"
     assert "verify_done" in _events(audit)
+
+
+def test_verify_baseline_keeps_query_string(tmp_path):
+    """v1.1.1 regression: the baseline stripped the ENTIRE query string,
+    fetching a different page (missing-param error), so true_out ==
+    base_out could never hold — genuine boolean-SQLi findings
+    systematically 'failed' verification. The baseline is the original
+    URL with its original query."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _finding_graph()
+
+    class BaselineSandbox:
+        def __init__(self):
+            self.urls = []
+
+        def spawn(self, argv):
+            url = argv[-1]
+            self.urls.append(url)
+            if _is_probe(url):
+                is_true = "1%3D1" in url
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="full page" if is_true else "empty result")
+            # the baseline must be the original URL WITH its query string
+            assert url == "http://target-corp.com/showthread.asp?id=1", url
+            return SpawnResult(ok=True, exit_code=0, stdout="full page")
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", BaselineSandbox())
+    sub.run()
+    assert len(sub.sandbox.urls) == 3  # true + false + baseline
+    assert graph.by_type("finding")[0]["properties"]["verified"] is True

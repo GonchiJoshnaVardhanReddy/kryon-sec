@@ -176,11 +176,12 @@ class VerifySubagent:
         # raw true!=false would "verify" those. The vulnerable signature
         # is: the TRUE injection changes nothing vs baseline (1 AND 1=1
         # is a no-op) while the FALSE injection changes the page.
-        base_url = urlsplit(true_url)._replace(query="").geturl()
-        if base_url.startswith(("http://", "https://")) and "?" not in base_url:
-            base_out = self._curl(base_url)
-        else:  # pragma: no cover — probes always have a scheme+path
-            base_out = None
+        # the baseline is the ORIGINAL url with its ORIGINAL query string:
+        # stripping the query fetches a different page (missing-param
+        # error / default view), and then true_out == base_out could never
+        # hold — every genuine boolean-SQLi finding would "fail"
+        # verification (v1.1.1 regression)
+        base_out = self._curl(url)
         if base_out is not None:
             responses_differ = (
                 true_out != false_out

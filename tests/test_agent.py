@@ -240,3 +240,53 @@ def test_run_agent_unpulled_ollama_model_fails_fast(cfg, monkeypatch):
     tb = build_toolbox(cfg, FileTools(cfg))
     with pytest.raises(LlmUnavailable):
         run_agent(cfg, [{"role": "user", "content": "hi"}], tb, "ollama/llama3.1")
+
+
+# ---- secrets entering the loop through tool results (spec §6.4) ------------
+
+def _secret_round_setup(cfg, monkeypatch):
+    """file_read returns a secret in round 1; the LLM answers in round 2."""
+    secret_file = cfg.workspace / ".env"
+    secret_file.write_text("password=hunter2secret", encoding="utf-8")
+    tool_call = FakeToolCall("c1", "file_read", json.dumps({"path": str(secret_file)}))
+    responses = [
+        FakeResponse(FakeMessage(None, [tool_call])),
+        FakeResponse(FakeMessage("it holds a password")),
+    ]
+    calls = _patch_completion(monkeypatch, responses)
+    return calls
+
+
+def _tool_message(call):
+    return [m for m in call["messages"] if m.get("role") == "tool"][0]
+
+
+def test_run_agent_routes_to_local_when_tool_result_has_secrets(cfg, monkeypatch):
+    """Secrets appear only in round 2 (the tool result): the loop must
+    re-gate per round and switch to the local model — not send the raw
+    secret back to the hosted provider."""
+    calls = _secret_round_setup(cfg, monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    tb = build_toolbox(cfg, FileTools(cfg))
+    reply = run_agent(cfg, [{"role": "user", "content": "read .env"}], tb,
+                      "gpt-4o-mini")
+    assert reply == "it holds a password"
+    # round 1 went hosted, round 2 went local (secrets gate re-checked)
+    assert calls[0]["model"] == "gpt-4o-mini"
+    assert calls[1]["model"].startswith("ollama/")
+    assert "hunter2secret" in _tool_message(calls[1])["content"]
+
+
+def test_run_agent_redacts_tool_secrets_when_no_local_model(cfg, monkeypatch):
+    """Same leak path but Ollama is down: the loop must not crash and must
+    not leak — the outbound messages are redacted (spec §6.4: redacted
+    material may go upstream, raw secrets never)."""
+    calls = _secret_round_setup(cfg, monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+    tb = build_toolbox(cfg, FileTools(cfg))
+    reply = run_agent(cfg, [{"role": "user", "content": "read .env"}], tb,
+                      "gpt-4o-mini")
+    assert reply == "it holds a password"
+    out = _tool_message(calls[1])["content"]
+    assert "hunter2secret" not in out
+    assert "«SECRET_" in out  # placeholder, mapping never leaves the machine

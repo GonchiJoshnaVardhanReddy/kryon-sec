@@ -1,8 +1,11 @@
 """Tests for MCP tool wiring (v1.1): schema conversion and the toolbox
 wrapper — against fake tool/session objects, no real mcp import."""
 
+import threading
+import time
+
 from kryonsec.config import KryonsecConfig
-from kryonsec.copilot.mcp_tools import McpToolbox, _schema
+from kryonsec.copilot.mcp_tools import McpToolbox, _ServerConnection, _schema
 
 
 class FakeMcpTool:
@@ -65,10 +68,58 @@ def test_connect_all_skips_disabled_servers(tmp_path, monkeypatch):
     ]
     tb = McpToolbox(cfg)
     attempted = []
-    monkeypatch.setattr(tb, "_connect_one",
-                        lambda server: attempted.append(server) or {})
+    monkeypatch.setattr(
+        tb, "_connect_one",
+        lambda server: attempted.append(server) or (_ServerConnection(), False))
     assert tb.connect_all() == {}
     assert attempted == []  # disabled server never started
+
+
+def test_slow_server_tools_merge_late(tmp_path, monkeypatch):
+    """A server slower than the 10s connect timeout is not dropped: its
+    tools merge into the toolbox when they land, and the next snapshot()
+    sees them (v1.1.1 silently dropped slow servers for the session)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.mcp_servers = [{"name": "slow", "command": "x", "args": []}]
+    notices: list[str] = []
+    tb = McpToolbox(cfg, on_notice=notices.append)
+
+    conn = _ServerConnection()  # ready Event exists, not yet set
+    monkeypatch.setattr(tb, "_connect_one", lambda server: (conn, True))
+
+    assert tb.connect_all() == {}  # nothing known at connect time
+    assert any("still starting" in n for n in notices)
+
+    # the server finishes booting 15s "later": tools listed, ready set
+    conn.entry["mcp_fetch"] = (
+        {"type": "function", "function": {"name": "mcp_fetch"}}, lambda **kw: "ok")
+    conn.ready.set()
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not tb.snapshot():
+        time.sleep(0.01)
+    assert "mcp_fetch" in tb.snapshot()
+    assert any("now available" in n for n in notices)
+
+
+def test_dead_slow_server_notice(tmp_path, monkeypatch):
+    """A slow server that never becomes ready is dropped WITH a visible
+    notice — never a silent log line."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.mcp_servers = [{"name": "hung", "command": "x", "args": []}]
+    notices: list[str] = []
+    tb = McpToolbox(cfg, on_notice=notices.append)
+
+    conn = _ServerConnection()
+    monkeypatch.setattr(tb, "_connect_one", lambda server: (conn, True))
+    monkeypatch.setattr("kryonsec.copilot.mcp_tools.LATE_BOOT_TIMEOUT_S", 0.05)
+    tb.connect_all()
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not any("never became ready" in n for n in notices):
+        time.sleep(0.01)
+    assert any("never became ready" in n for n in notices)
+    assert tb.snapshot() == {}
 
 
 def test_build_mcp_toolbox_import_error_is_empty(tmp_path, monkeypatch):

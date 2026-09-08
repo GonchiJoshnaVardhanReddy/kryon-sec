@@ -16,6 +16,7 @@ from kryonsec.llm import (
     completion_kwargs,
     is_reasoning_model,
     reset_provider_cache,
+    secrets_safe_prompt,
 )
 
 
@@ -224,3 +225,37 @@ def test_local_call_with_secrets_unchanged(ollama_cfg):
     ):
         chat(ollama_cfg, messages, "ollama/llama3.1")
         assert complete.call_args[0][1] == "ollama/llama3.1"
+
+
+# ---- secrets_safe_prompt (the purple-team LLM-state gate, spec §6.4) --------
+
+def test_secrets_safe_prompt_routes_to_local(cfg):
+    """Secrets in engagement data + local model up -> local, prompt raw
+    (it never leaves the machine)."""
+    with patch("kryonsec.llm._ollama_model_ok", return_value=True):
+        model, prompt = secrets_safe_prompt(
+            cfg, "gpt-4o", "recon: password=hunter2secret")
+    assert model.startswith("ollama/")
+    assert prompt == "recon: password=hunter2secret"
+
+
+def test_secrets_safe_prompt_redacts_when_no_local(cfg):
+    """Secrets + no local model: never raises (a false-positive pattern
+    must not kill an LLM state) — the prompt goes out redacted instead."""
+    with patch("kryonsec.llm._ollama_model_ok", return_value=False):
+        model, prompt = secrets_safe_prompt(
+            cfg, "gpt-4o", "recon: password=hunter2secret")
+    assert model == "gpt-4o"
+    assert "hunter2secret" not in prompt
+    assert "password=" in prompt  # label kept, value placeholdered
+
+
+def test_secrets_safe_prompt_no_secrets_unchanged(cfg):
+    model, prompt = secrets_safe_prompt(cfg, "gpt-4o", "what is XSS?")
+    assert (model, prompt) == ("gpt-4o", "what is XSS?")
+
+
+def test_secrets_safe_prompt_local_model_passes_through(ollama_cfg):
+    model, prompt = secrets_safe_prompt(
+        ollama_cfg, "ollama/llama3.1", "recon: password=hunter2secret")
+    assert (model, prompt) == ("ollama/llama3.1", "recon: password=hunter2secret")

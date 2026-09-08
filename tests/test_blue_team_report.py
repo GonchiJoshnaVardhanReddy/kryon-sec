@@ -11,8 +11,10 @@ from kryonsec.purple.blue_team import (
     BlueTeamSubagent,
     Remediation,
     RemediationSet,
+    generate_remediations,
     render_blue_team_prompt,
 )
+from kryonsec.purple.orchestrator import BudgetTracker
 from kryonsec.purple.recon_passive import EngagementGraph
 from kryonsec.purple.report import (
     ReportSubagent,
@@ -109,6 +111,63 @@ def test_remediation_set_caps_at_20():
         RemediationSet(remediations=items)
 
 
+def test_generate_remediations_gates_secrets(monkeypatch, tmp_path):
+    """v1.1.1 leak: the instructor path called the hosted provider
+    directly, so an exploit excerpt containing a secret bypassed chat()'s
+    gate. With no local model up the prompt must go out redacted."""
+    import builtins
+    import sys
+
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.general_search_model = "gpt-4o-mini"
+    cfg.openai_api_key = "sk-test"
+
+    monkeypatch.setitem(sys.modules, "instructor", None)
+    real_import = builtins.__import__
+
+    def no_instructor(name, *args, **kwargs):
+        if name == "instructor":
+            raise ImportError("forced for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_instructor)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+
+    captured = {}
+
+    def fake_chat(cfg, messages, model, **kw):
+        captured["messages"] = messages
+        return ('{"remediations": [{"hypothesis_id": "H1", '
+                '"title": "t", "fix": "f"}]}')
+
+    monkeypatch.setattr("kryonsec.llm.chat", fake_chat)
+
+    result = generate_remediations(
+        cfg, "finding excerpt: the response leaked password=hunter2secret")
+    assert result.remediations[0].hypothesis_id == "H1"
+    sent = json.dumps(captured["messages"], ensure_ascii=False)
+    assert "hunter2secret" not in sent
+    assert "password=" in sent
+
+
+def test_blue_team_records_budget_usage(tmp_path):
+    """LLM states accrue usage so the budget guard can trip (spec §4.3)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    budget = BudgetTracker(max_tokens=10)
+
+    def llm(prompt):
+        return RemediationSet(remediations=[
+            Remediation(hypothesis_id="H1", title="t", fix="f")])
+
+    sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit,
+                           llm_fn=llm, budget=budget)
+    assert sub.run().status == "ok"
+    assert budget.used_tokens > 0
+    assert budget.exhausted()
+
+
 # ---- REPORT ----------------------------------------------------------
 
 def _remediated_graph():
@@ -195,13 +254,25 @@ def test_report_subagent_writes_file(tmp_path):
     ("sk-proj-abc123def456ghi789jkl", True),
     ("password: hunter2secret", True),
     ("BEGIN PRIVATE KEY", False),  # partial text — must not redact innocuous text
+    # patterns only the SHARED detector (secrets.py) has — the report's
+    # old private list missed all three
+    ("AKIAABCDEFGHIJKLMNOP", True),          # AWS access key
+    ("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij", True),  # GitHub token
+    ("postgres://user:hunter2secret@db.example/x", True),  # conn string
 ])
 def test_redact_secrets(secret, expected):
     text = f"leak: {secret}"
     redacted = redact_secrets(text)
     assert (secret not in redacted) is expected
     if expected:
-        assert "[REDACTED]" in redacted
+        assert "«SECRET_" in redacted
+
+
+def test_redact_secrets_keeps_password_label():
+    """Only the value goes; the label stays so the report stays readable."""
+    redacted = redact_secrets("config: password=hunter2secret end")
+    assert "password=" in redacted
+    assert "hunter2secret" not in redacted
 
 
 def test_redact_jwt():

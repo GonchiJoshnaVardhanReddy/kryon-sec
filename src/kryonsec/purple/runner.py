@@ -195,7 +195,8 @@ def start_engagement(
         if state == "HYPOTHESIZE":
             from .hypothesize import HypothesizeSubagent
 
-            sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit)
+            sub = HypothesizeSubagent(
+                cfg=cfg, graph=graph, audit=audit, budget=orch.budget)
             return sub.run
 
         if state == "HUMAN_REVIEW":
@@ -207,7 +208,8 @@ def start_engagement(
         if state == "BLUE_TEAM":
             from .blue_team import BlueTeamSubagent
 
-            sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit)
+            sub = BlueTeamSubagent(
+                cfg=cfg, graph=graph, audit=audit, budget=orch.budget)
             return sub.run
 
         if state == "REPORT":
