@@ -66,7 +66,9 @@ def test_prompt_message_shows_mode_indicator():
 def test_prompt_message_notice_line():
     mode, notice = (["copilot"], ["cannot switch to purple: no runsc"])
     fragments = prompt_message(mode, notice)
-    assert fragments[0][1].startswith("cannot switch to purple")
+    # the notice is dim system text with a leading marker, not bare text
+    assert fragments[0][1].lstrip("· ").startswith("cannot switch to purple")
+    assert fragments[0][1].endswith("\n")
     assert fragments[-1][1] == "[COPILOT]> "  # still copilot
 
 

@@ -96,8 +96,9 @@ def _docker_runtimes() -> str | None:
     if not shutil.which("docker"):
         return None
     try:
+        # .Runtimes is a Go map — `join` errors on it (moby#37584); range it
         out = subprocess.run(
-            ["docker", "info", "--format", "{{join .Runtimes \",\"}}"],
+            ["docker", "info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:

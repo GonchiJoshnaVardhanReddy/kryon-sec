@@ -28,7 +28,7 @@ $pyCmd = if ($py.Source -match "py.exe$") { @($py.Source, "-3") } else { @($py.S
 
 $version = & $pyCmd -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
 if (-not $version -or [version]$version -lt [version]"3.11") {
-    Die "Python 3.11+ required (found: $($version ?? 'unknown')). https://www.python.org/downloads/"
+    Die "Python 3.11+ required (found: $(if ($version) { $version } else { 'unknown' })). https://www.python.org/downloads/"
 }
 Say "using Python $version"
 

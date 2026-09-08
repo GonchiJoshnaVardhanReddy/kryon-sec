@@ -144,7 +144,8 @@ def _pick_provider(answers: list[str] | None = None) -> str:
     answer = (answers or []).pop(0) if answers else input(
         "LLM provider?\n  1. OpenAI (needs an API key)\n  2. Ollama (local, free)\n> ")
     answer = answer.strip().lower()
-    return "openai" if answer in ("1", "openai", "o") else "ollama"
+    # "o" is NOT an OpenAI abbreviation — it reads as Ollama. Spell it out.
+    return "openai" if answer in ("1", "openai") else "ollama"
 
 
 def _ask_key(answers: list[str] | None = None) -> str:
@@ -269,7 +270,10 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
             )
             return cfg
         model = _pick_model(names, answers)
-        base = model.split(":")[0]  # tag suffix (':latest') is not part of the id
+        # only the implicit ':latest' tag can be dropped — 'llama3.1:8b'
+        # stripped to 'llama3.1' resolves to :latest (a different model
+        # the user never pulled) and fails at run time
+        base = model[:-len(":latest")] if model.endswith(":latest") else model
         cfg.general_chat_model = f"ollama/{base}"
         cfg.local_model = f"ollama/{base}"
         # strict provider isolation: ollama config never calls a hosted API
@@ -327,8 +331,14 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     cfg.ensure_dirs()
     cfg.save()
 
-    console.print(f"[bold white]{BANNER}[/bold white]")
-    table = Table(title="KRYONSEC IS READY", show_header=False)
+    from rich.panel import Panel
+
+    # banner: box art on UTF-8 consoles, ASCII on legacy code pages
+    from .cli import BANNER_ASCII, _UTF8_OK
+
+    console.print(
+        f"[bold white]{BANNER if _UTF8_OK else BANNER_ASCII}[/bold white]")
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_column(style="dim")
     table.add_column(style="bold")
     table.add_row("provider", cfg.provider)
@@ -337,8 +347,14 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     table.add_row("tools", ", ".join(cfg.enabled_tools) or "none")
     table.add_row("mcp servers", ", ".join(s["name"] for s in cfg.mcp_servers) or "none")
     table.add_row("workspace", str(cfg.workspace))
-    table.add_row("config", str(Path(cfg.home) / "config.toml"))
-    console.print(table)
-    console.print("[green]type `kryonsec` to start.[/green]")
+    console.print(Panel(
+        table,
+        title="[bold cyan]KRYONSEC IS READY[/bold cyan]",
+        border_style="green",
+    ))
+    console.print(
+        f"[dim]config: {Path(cfg.home) / 'config.toml'}[/dim]\n"
+        "[green]type `kryonsec` to start — `kryonsec doctor` checks "
+        "everything again anytime.[/green]")
     return cfg
 

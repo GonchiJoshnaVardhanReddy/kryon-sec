@@ -182,9 +182,50 @@ def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: A
         raise LlmUnavailable(f"malformed response from {model}: {e}") from e
 
 
-class CompactionMustStayLocal(RuntimeError):
+class SecretsMustStayLocal(RuntimeError):
+    """Secrets are in the outgoing messages and no local model is up —
+    refuse rather than send them to a third-party LLM (spec §6.4,
+    CLAUDE.md rule 4)."""
+
+
+class CompactionMustStayLocal(SecretsMustStayLocal):
     """Secrets present and no local model available — refuse rather than
     send redacted-material upstream (spec §6.4)."""
+
+
+def _secrets_in_messages(messages: list[dict]) -> bool:
+    """True when any message content matches a secret pattern."""
+    from .secrets import detect_secrets
+
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and detect_secrets(content):
+            return True
+    return False
+
+
+def secrets_safe_model(
+    cfg: KryonsecConfig, model: str, messages: list[dict]
+) -> str:
+    """The model to actually call for these messages (spec §6.4).
+
+    When the outgoing messages contain secrets and the selected model is
+    hosted, route to the local model; refuse (SecretsMustStayLocal) when
+    no local model is available. Local (ollama/*) models pass through
+    unchanged — this gate is the general form of the compaction rule.
+    """
+    if model.startswith("ollama/"):
+        return model
+    if not _secrets_in_messages(messages):
+        return model
+    if not _ollama_model_ok(cfg, cfg.local_model):
+        raise SecretsMustStayLocal(
+            "secrets detected in the conversation and the local model is "
+            "unavailable — refusing to send them to a third-party provider "
+            "(start Ollama: `ollama serve` and pull a model)"
+        )
+    log.warning("secrets detected — routing this call to the local model (spec §6.4)")
+    return cfg.local_model
 
 
 def chat(
@@ -214,6 +255,12 @@ def chat(
                 ) from e
             raise
 
+    # ---- provider isolation first (v1.1): pick the branch's model ---------
+    # secrets gate (spec §6.4 / CLAUDE.md rule 4) applies AFTER, so it can
+    # override the branch's hosted choice with the local model — the one
+    # sanctioned cross-provider move (secrets never leave the machine).
+    secrets_present = _secrets_in_messages(messages)
+
     if cfg.provider == "ollama":
         # ---- ollama config: Ollama only, ever ---------------------------
         if not model.startswith("ollama/"):
@@ -229,6 +276,10 @@ def chat(
     # ---- openai config: hosted API only ---------------------------------
     if model.startswith("ollama/"):
         model = cfg.general_chat_model  # never silently call a local model
+    if secrets_present:
+        # never send the hosted call; local model or hard refusal
+        model = secrets_safe_model(cfg, model, messages)
+        return _complete(cfg, model, messages, **kwargs)
     if not cfg.openai_api_key:
         raise LlmUnavailable(
             "OpenAI is the configured provider but no API key is set — "

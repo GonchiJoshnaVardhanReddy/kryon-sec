@@ -28,7 +28,7 @@ class FileAccessDenied(Exception):
 class ApprovalRequest:
     path: Path
     reason: str
-    action: str = "read"  # "read" | "write"
+    action: str = "read"  # "read" | "list" | "write"
 
 
 class FileTools:
@@ -83,7 +83,7 @@ class FileTools:
         if not target.exists() or not target.is_dir():
             raise FileAccessDenied(f"not a readable directory: {target}")
         if self._needs_approval(target):
-            if not self._approver(ApprovalRequest(path=target, reason="Agent directory listing")):
+            if not self._approver(ApprovalRequest(path=target, reason="Agent directory listing", action="list")):
                 raise FileAccessDenied(f"user denied listing: {target}")
         return sorted(p.name for p in target.iterdir())[:500]
 

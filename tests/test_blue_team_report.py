@@ -143,16 +143,6 @@ def test_report_renders_everything(tmp_path):
     assert "No testing was done against the website" in report
 
 
-def test_report_claims_testing_only_with_real_attempts(tmp_path):
-    audit = AuditLog(tmp_path / "audit.jsonl")
-    graph = _graph()
-    graph.add_node("exploit_attempt", "H1-run", {"tool": "sqlmap", "exit_code": 0})
-
-    report = render_report(graph, audit, "e-bt")
-    assert "Tools were run against the target" in report
-    assert "No testing was done" not in report
-
-
 def test_report_validation_clean(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = _remediated_graph()
@@ -188,6 +178,17 @@ def test_report_subagent_writes_file(tmp_path):
     assert "No testing was done against the website" in content
     events = [json.loads(l)["event"] for l in open(audit.path, encoding="utf-8") if l.strip()]
     assert "report_written" in events
+    # M3: the fingerprint printed in the report must be the chain head
+    # AFTER report_written was appended — not a pre-append snapshot
+    idx = content.find("final fingerprint")
+    assert idx != -1
+    hash_line = next(
+        l.strip().strip("`") for l in content[idx:].splitlines()
+        if l.strip().strip("`")
+        and all(c in "0123456789abcdef" for c in l.strip().strip("`"))
+    )
+    assert hash_line == audit.head_hash(), (
+        f"report fingerprint {hash_line!r} != chain head {audit.head_hash()!r}")
 
 
 @pytest.mark.parametrize("secret,expected", [

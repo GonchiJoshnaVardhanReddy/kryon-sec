@@ -27,7 +27,13 @@ log = logging.getLogger(__name__)
 class Hypothesis(BaseModel):
     """One vulnerability hypothesis proposed by the LLM."""
 
-    id: str = Field(description="Short stable id, e.g. H1")
+    # id format is rigid (spec rule: LLM output is data, not identifiers
+    # we parse): ids join labels like "H1:sqlmap" — colons/wild chars
+    # would silently corrupt the tested/confirmed/verify joins
+    id: str = Field(
+        pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,19}$",
+        description="Short stable id, e.g. H1 (letters/digits/-/_ only)",
+    )
     title: str = Field(description="One-line hypothesis, plain language")
     target_asset: str = Field(
         description="Which asset it applies to — full path WITH query string "
@@ -49,6 +55,11 @@ class HypothesisSet(BaseModel):
     """Structured LLM response for HYPOTHESIZE."""
 
     hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=10)
+
+    @property
+    def has_unique_ids(self) -> bool:
+        ids = [h.id for h in self.hypotheses]
+        return len(ids) == len(set(ids))
 
 
 def render_hypothesize_prompt(graph: EngagementGraph) -> str:
@@ -112,6 +123,12 @@ def propose_hypotheses(
     model = cfg.general_search_model
     if model.startswith("gpt") and not cfg.openai_api_key:
         model = cfg.local_model
+    # engagement data (subdomains, Wayback paths with query strings) never
+    # goes to a third-party LLM unredacted — spec §6.4 / CLAUDE.md rule 4
+    from ..llm import secrets_safe_model
+
+    model = secrets_safe_model(
+        cfg, model, [{"role": "user", "content": prompt}])
 
     try:
         import instructor  # optional strict path
@@ -228,6 +245,23 @@ class HypothesizeSubagent:
                 "confidence": h.confidence,
                 "node_size": node["size_bytes"],
             })
+        # duplicate ids would corrupt the finding->hypothesis joins
+        # (EXPLOIT labels, VERIFY lookups, the report's tested/confirmed
+        # sets) — dedupe deterministically instead of trusting the LLM
+        if not hypothesis_set.has_unique_ids:
+            self.audit.write({
+                "event": "hypothesize_duplicate_ids",
+                "note": "LLM returned duplicate hypothesis ids — deduped",
+            })
+            seen: set[str] = set()
+            deduped = []
+            for n in self.graph.by_type("hypothesis"):
+                if n["label"] in seen:
+                    self.graph.remove_node(n)
+                else:
+                    seen.add(n["label"])
+                    deduped.append(n)
+            log.warning("hypothesize: duplicate ids deduped (%d kept)", len(deduped))
 
         self.audit.write({
             "event": "hypothesize_done",

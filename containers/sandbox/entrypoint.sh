@@ -16,7 +16,8 @@ ALLOWED_TOOLS=(
 )
 
 if [[ -z "$TOOL" ]] || [[ ! " ${ALLOWED_TOOLS[*]} " =~ " ${TOOL} " ]]; then
-    printf '{"error": "tool_not_in_allowlist", "tool": "%s"}\n' "$TOOL" >&2
+    # stdout (not stderr): the host parses exactly one JSON payload there
+    printf '{"error": "tool_not_in_allowlist", "tool": "%s"}\n' "$TOOL"
     exit 125
 fi
 

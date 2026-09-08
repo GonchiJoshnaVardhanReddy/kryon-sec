@@ -139,7 +139,8 @@ def build_toolbox(
             bounded(lambda query: search_web(cfg, query) or []))
     if "cve_lookup" in cfg.enabled_tools:
         toolbox["cve_lookup"] = (
-            TOOL_SCHEMAS["cve_lookup"], bounded(lookup_cve))
+            TOOL_SCHEMAS["cve_lookup"],
+            bounded(lambda cve_id: lookup_cve(cfg, cve_id)))
     if extra:
         toolbox.update(extra)
     return toolbox
@@ -163,17 +164,18 @@ def execute_tool(toolbox: Toolbox, name: str, raw_args: str | None) -> str:
         return f"error: unknown tool {name!r} — available: {sorted(toolbox)}"
     schema, executor = toolbox[name]
     args = _parse_tool_args(raw_args)
-    # required-argument check: rigid validation, no LLM goodwill assumed
+    # required-argument check: rigid validation, no LLM goodwill assumed.
+    # "" / 0 / False are PRESENT values — only absence/None is missing.
     for req in schema["function"].get("parameters", {}).get("required", []):
-        if not args.get(req):
+        if req not in args or args[req] is None:
             return f"error: missing required argument {req!r} for {name}"
     try:
         result = executor(**args)
     except FileAccessDenied as e:
         return f"error: access denied: {e}"
-    except TypeError as e:
-        return f"error: bad arguments for {name}: {e}"
     except Exception as e:
+        # tool-body bugs (TypeError included) surface as themselves —
+        # a mislabeled "bad arguments" hides real defects from the LLM
         return f"error: {name} failed: {e}"
     return str(result)
 
@@ -198,9 +200,19 @@ def run_agent(
     messages = list(messages)  # work on a copy; caller owns theirs
     import litellm
 
-    from ..llm import _quiet_litellm, completion_kwargs
+    from ..llm import _quiet_litellm, completion_kwargs, secrets_safe_model
 
     _quiet_litellm()
+    model = secrets_safe_model(cfg, model, messages)  # spec §6.4
+    if model.startswith("ollama/"):
+        # same precheck chat() applies: Ollama silently hangs on unpulled models
+        from ..llm import LlmUnavailable, _ollama_model_ok
+
+        if not _ollama_model_ok(cfg, model):
+            raise LlmUnavailable(
+                f"Ollama unavailable or {model} not pulled — start it "
+                "(`ollama serve`) and pull the model (`ollama pull llama3.1`)"
+            )
     provider_kwargs = completion_kwargs(cfg, model, tools=True)
 
     for _ in range(MAX_TOOL_ROUNDS):

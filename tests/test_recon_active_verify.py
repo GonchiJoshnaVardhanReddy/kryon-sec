@@ -141,6 +141,9 @@ def test_verify_confirms_when_responses_differ(tmp_path):
 
         def spawn(self, argv):
             self.calls.append(argv[-1])
+            if "?" not in argv[-1]:  # baseline fetch (no injection)
+                return SpawnResult(ok=True, exit_code=0,
+                                   stdout="full page content")
             is_true = "1%3D1" in argv[-1] or "+AND+1%3D1" in argv[-1]
             return SpawnResult(
                 ok=True, exit_code=0,
@@ -151,8 +154,8 @@ def test_verify_confirms_when_responses_differ(tmp_path):
     result = sub.run()
 
     assert result.status == "ok"
-    # both probes ran (true + false)
-    assert len(sub.sandbox.calls) == 2
+    # three fetches: true + false + baseline (no injection)
+    assert len(sub.sandbox.calls) == 3
     verify_nodes = graph.by_type("verify_attempt")
     assert len(verify_nodes) == 1
     assert verify_nodes[0]["properties"]["verified"] is True
@@ -161,6 +164,32 @@ def test_verify_confirms_when_responses_differ(tmp_path):
     assert "finding_verified" in _events(audit)
     ok, reason = audit.verify()
     assert ok, reason
+
+
+def test_verify_rejects_dynamic_pages_as_verified(tmp_path):
+    """Rotating content (timestamp/CSRF/ads) makes ANY two fetches differ —
+    raw true!=false would false-verify those. The true page must match the
+    baseline (1 AND 1=1 is a SQL no-op); a nonce-only difference must not."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _finding_graph()
+
+    class RotatingSandbox:
+        def __init__(self):
+            self.n = 0
+
+        def spawn(self, argv):
+            self.n += 1
+            # every fetch differs (nonce), so true != false, but true also
+            # != baseline — the injection is NOT what changed the page
+            return SpawnResult(ok=True, exit_code=0,
+                               stdout=f"page nonce-{self.n}")
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", RotatingSandbox())
+    sub.run()
+    verify_nodes = graph.by_type("verify_attempt")
+    assert verify_nodes[0]["properties"]["verified"] is False
+    assert "finding_verification_failed" in _events(audit)
 
 
 def test_verify_fails_when_responses_identical(tmp_path):
@@ -197,6 +226,8 @@ def test_verify_retries_http_reset_over_https(tmp_path):
             self.urls.append(url)
             if url.startswith("http://"):
                 return SpawnResult(ok=True, exit_code=56, stdout="")
+            if "?" not in url:  # baseline fetch (no injection)
+                return SpawnResult(ok=True, exit_code=0, stdout="full page")
             is_true = "1%3D1" in url or "+AND+1%3D1" in url
             return SpawnResult(
                 ok=True, exit_code=0,
@@ -205,8 +236,9 @@ def test_verify_retries_http_reset_over_https(tmp_path):
 
     sub = VerifySubagent(cfg, graph, audit, "target-corp.com", HttpResetSandbox())
     sub.run()
-    # 4 probes total: true+false, each retried over https after the http 56
-    assert len(sub.sandbox.urls) == 4
+    # 6 fetches total: true + false + baseline, each retried over https
+    # after the http 56
+    assert len(sub.sandbox.urls) == 6
     # every http probe was immediately followed by an https retry
     for i, u in enumerate(sub.sandbox.urls):
         if u.startswith("http://"):
@@ -225,6 +257,8 @@ def test_verify_uses_scheme_discovered_by_exploit(tmp_path):
     class HttpHater:
         def spawn(self, argv):
             assert argv[-1].startswith("https://"), "must probe https directly"
+            if "?" not in argv[-1]:  # baseline fetch (no injection)
+                return SpawnResult(ok=True, exit_code=0, stdout="full page")
             is_true = "1%3D1" in argv[-1] or "+AND+1%3D1" in argv[-1]
             return SpawnResult(
                 ok=True, exit_code=0,

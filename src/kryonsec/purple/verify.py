@@ -119,7 +119,24 @@ class VerifySubagent:
         if hyp is None:  # pragma: no cover — findings always have one
             return 0
         asset = hyp["properties"].get("target_asset", "")
-        url = compose_url(self.target, asset, scheme=self._discovered_scheme())
+        # subdomain-aware like EXPLOIT: '/webmail/x' means webmail.<target> —
+        # without this the probe hits the wrong vhost on the main host
+        subs = [n["label"] for n in self.graph.by_type("subdomain")]
+        url = compose_url(self.target, asset, subs, scheme=self._discovered_scheme())
+        if url is None:
+            # asset is out of engagement scope — never probe it
+            self.audit.write({
+                "event": "verify_skipped",
+                "finding_id": finding_id,
+                "reason": "hypothesis asset outside engagement scope",
+            })
+            self.graph.add_node(
+                node_type="verify_attempt",
+                label=finding_id,
+                properties={"verified": False, "method": "n/a",
+                            "reason": "asset outside engagement scope"},
+            )
+            return 0
 
         probes = _boolean_probe_urls(url)
         if probes is None:
@@ -137,7 +154,7 @@ class VerifySubagent:
             return 0
 
         true_url, false_url = probes
-        # run both curls through the sandbox + allowlist (fixed argv)
+        # run all three curls through the sandbox + allowlist (fixed argv)
         true_out = self._curl(true_url)
         false_out = self._curl(false_url)
         if true_out is None or false_out is None:
@@ -154,7 +171,29 @@ class VerifySubagent:
             )
             return 0
 
-        responses_differ = true_out != false_out
+        # boolean verdict with a BASELINE: pages with rotating content
+        # (timestamps, CSRF tokens, ads) differ between ANY two fetches —
+        # raw true!=false would "verify" those. The vulnerable signature
+        # is: the TRUE injection changes nothing vs baseline (1 AND 1=1
+        # is a no-op) while the FALSE injection changes the page.
+        base_url = urlsplit(true_url)._replace(query="").geturl()
+        if base_url.startswith(("http://", "https://")) and "?" not in base_url:
+            base_out = self._curl(base_url)
+        else:  # pragma: no cover — probes always have a scheme+path
+            base_out = None
+        if base_out is not None:
+            responses_differ = (
+                true_out != false_out
+                and true_out == base_out
+                and false_out != base_out
+            )
+        else:
+            # no baseline possible — fall back to plain difference, but
+            # only when the difference is substantial (not nonce churn)
+            responses_differ = abs(len(true_out) - len(false_out)) > max(
+                32, int(0.02 * max(len(true_out), len(false_out)))
+            )
+
         self.graph.add_node(
             node_type="verify_attempt",
             label=finding_id,
@@ -163,6 +202,7 @@ class VerifySubagent:
                 "method": "curl boolean probe",
                 "true_len": len(true_out),
                 "false_len": len(false_out),
+                "baseline_len": len(base_out) if base_out is not None else None,
             },
         )
         if responses_differ:

@@ -100,7 +100,11 @@ class ToolAllowlist:
     """Layer 2: per-subagent tool + argv template validation."""
 
     def __init__(self, templates: dict[str, list[str]] | None = None):
-        self._compiled = compile_tool_templates(templates or EXPLOIT_ALLOWLIST_TEMPLATES)
+        # None = the shipped defaults; {} = deliberately NO tools (fail
+        # closed — an empty mapping must never expand to the full set)
+        self._compiled = compile_tool_templates(
+            templates if templates is not None else EXPLOIT_ALLOWLIST_TEMPLATES
+        )
 
     def validate(self, tool_name: str, argv: list[str]) -> None:
         """Raise AllowlistViolation unless argv matches the tool's template."""

@@ -38,13 +38,26 @@ class BudgetTracker:
     used_tokens: int = 0
     used_cost_usd: float = 0.0
     elapsed_s: float = 0.0
+    # wall-clock accounting start — set on first check, not on __init__,
+    # so a tracker built long before run() still measures the run
+    _started_at: float | None = None
 
     def exhausted(self) -> bool:
+        import time
+
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        self.elapsed_s = time.monotonic() - self._started_at
         return (
             self.used_tokens >= self.max_tokens
             or self.elapsed_s >= self.max_time_s
             or self.used_cost_usd >= self.max_cost_usd
         )
+
+    def record_usage(self, tokens: int, cost_usd: float = 0.0) -> None:
+        """LLM call sites accrue their usage here (spec §4.3 budget guard)."""
+        self.used_tokens += tokens
+        self.used_cost_usd += cost_usd
 
 
 def next_state(state: str, result: SubagentResult) -> str:

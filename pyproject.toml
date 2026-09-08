@@ -29,5 +29,10 @@ kryonsec = "kryonsec.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# templates/ and containers/ are loaded at runtime relative to the package
+# (__file__), so they must ship inside the wheel — not just the repo.
+kryonsec = ["templates/*.jinja", "containers/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
