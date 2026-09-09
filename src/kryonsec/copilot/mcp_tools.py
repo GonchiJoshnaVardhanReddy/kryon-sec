@@ -147,6 +147,7 @@ class McpToolbox:
         self.tools: dict[str, tuple[dict, Any]] = {}
         self.on_notice = on_notice  # user-visible notices (CLI console)
         self._lock = threading.Lock()
+        self._closing = False
 
     def _notice(self, message: str) -> None:
         """Slow/dead servers must be VISIBLE, not just a log line."""
@@ -166,17 +167,30 @@ class McpToolbox:
     def connect_all(self) -> dict[str, tuple[dict, Any]]:
         """Start every enabled server; returns the tool entries known at
         connect time (late booters merge into snapshot() afterwards).
-        Failures are logged, noticed, and skipped."""
+        Failures are logged, noticed, and skipped. Safe to call on a
+        daemon thread — close() can interrupt it between servers."""
         servers = [s for s in self.cfg.mcp_servers if s.get("enabled", True)]
         for server in servers:
+            torn_down = False
+            if self._closing:
+                return self.snapshot()
             name = server.get("name", "?")
             try:
                 conn, slow = self._connect_one(server)
             except Exception as e:
-                log.warning("MCP server %r failed to start: %s", name, e)
+                # log at info: the user already sees the notice below —
+                # a log.warning here made every failure print TWICE
+                log.info("MCP server %r failed to start: %s", name, e)
                 self._notice(f"MCP server {name!r} failed to start: {e}")
                 continue
-            self.connections.append(conn)
+            with self._lock:
+                if self._closing:  # close() raced us mid-connect
+                    conn.close()
+                    torn_down = True
+                else:
+                    self.connections.append(conn)
+            if torn_down:
+                return dict(self.tools)  # plain copy: the lock is released
             self._merge(conn.entry)
             if slow:
                 self._notice(
@@ -227,13 +241,17 @@ class McpToolbox:
         ]
         if not parts:
             raise ValueError("empty command")
-        # bare names like 'npx' must resolve to the real .cmd/.exe on
-        # Windows before CreateProcess sees them
         import shutil
 
         resolved = shutil.which(parts[0])
         if resolved:
             parts[0] = resolved
+        else:
+            # shutil.which checks OUR PATH; a missing binary surfaces later
+            # as a cryptic ENOENT — say plainly what is missing instead
+            raise RuntimeError(
+                f"command {parts[0]!r} not found on PATH (install it, or "
+                "log out/in after installing so PATH includes it)")
         params = StdioServerParameters(
             command=parts[0],
             args=parts[1:],
@@ -276,8 +294,12 @@ class McpToolbox:
                 errlog.close()
 
     def close(self) -> None:
-        """Tear down every connection (ends the server processes)."""
-        for conn in self.connections:
+        """Tear down every connection (ends the server processes).
+        connect_all() may still be running on its daemon thread — set the
+        flag first so it stops instead of appending to a list mid-clear.
+        """
+        self._closing = True
+        for conn in list(self.connections):
             conn.close()
         self.connections.clear()
 

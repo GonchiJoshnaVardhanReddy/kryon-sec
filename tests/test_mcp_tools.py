@@ -75,6 +75,40 @@ def test_connect_all_skips_disabled_servers(tmp_path, monkeypatch):
     assert attempted == []  # disabled server never started
 
 
+def test_missing_command_is_a_clear_error(tmp_path):
+    """A command that is not on PATH fails with a plain 'not found'
+    message, not a cryptic ENOENT (the uvx-in-WSL bug)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.mcp_servers = [{"name": "gone", "command": "no-such-bin-xyz", "args": []}]
+    notices: list[str] = []
+    tb = McpToolbox(cfg, on_notice=notices.append)
+
+    entries = tb.connect_all()
+    assert entries == {}
+    assert any("not found on PATH" in n for n in notices)
+
+
+def test_connect_all_survives_close_mid_connect(tmp_path, monkeypatch):
+    """connect_all() runs on a daemon thread while the user may quit:
+    close() during the connect loop must not crash it, and any server
+    started after close() is torn down, not leaked."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.mcp_servers = [{"name": "a", "command": "x", "args": []}]
+    tb = McpToolbox(cfg)
+
+    closed: list[_ServerConnection] = []
+
+    def fake_connect_one(server):
+        tb.close()  # user quits while this server is starting
+        conn = _ServerConnection()
+        monkeypatch.setattr(conn, "close", lambda: closed.append(conn))
+        return conn, False
+
+    monkeypatch.setattr(tb, "_connect_one", fake_connect_one)
+    assert tb.connect_all() == {}
+    assert len(closed) == 1  # the late server was torn down
+
+
 def test_slow_server_tools_merge_late(tmp_path, monkeypatch):
     """A server slower than the 10s connect timeout is not dropped: its
     tools merge into the toolbox when they land, and the next snapshot()
