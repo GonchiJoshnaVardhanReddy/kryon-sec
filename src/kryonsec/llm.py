@@ -8,6 +8,8 @@ local fallback when the preferred provider is unavailable.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from typing import Any
 
 from .config import KryonsecConfig
@@ -65,6 +67,41 @@ _REASONING_PREFIXES = ("gpt-5", "gpt-6", "gpt-7", "o1", "o3", "o4", "o5")
 def is_reasoning_model(model: str) -> bool:
     base = model.split("/")[-1].lower()
     return any(base.startswith(p) for p in _REASONING_PREFIXES)
+
+
+def preload_litellm() -> threading.Thread:
+    """Warm the litellm import in a daemon thread.
+
+    `import litellm` loads every provider adapter and takes seconds (4-9s
+    on a slow disk) — kryonsec imports it lazily at the first LLM call,
+    which used to park that cost on the user's FIRST message. Starting
+    the import here, while the user is still reading the banner/typing,
+    hides it entirely. The thread is a no-op when litellm is already in
+    sys.modules.
+    """
+    import sys
+
+    if "litellm" in sys.modules:
+        return _PRELOAD_DONE
+
+    def _load() -> None:
+        try:
+            # litellm fetches its cost map over the network on import
+            # (~3s extra) unless told to use the bundled copy
+            os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            import litellm  # noqa: F401 — the import IS the point
+
+            _quiet_litellm()
+        except Exception as e:  # not installed / broken env — the lazy
+            # import later raises the same error with a real traceback
+            log.info("litellm preload failed (will surface on first call): %s", e)
+
+    t = threading.Thread(target=_load, name="litellm-preload", daemon=True)
+    t.start()
+    return t
+
+
+_PRELOAD_DONE = threading.Thread()  # already-finished sentinel
 
 
 def _quiet_litellm() -> None:

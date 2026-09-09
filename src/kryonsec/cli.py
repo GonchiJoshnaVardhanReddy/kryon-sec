@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -228,6 +229,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
     # server process + thread per message. The toolbox is live: a slow
     # server's tools merge in when ready and the per-turn snapshot()
     # picks them up.
+    # connect_all() blocks up to 10s PER slow server (cold npx/uvx cache)
+    # — that used to sit between the banner and the first prompt. It now
+    # runs in a daemon thread: the chat is usable immediately and MCP
+    # tools appear (with a notice) when each server lands.
     mcp_toolbox = None
     if cfg.mcp_servers:
         from .copilot.mcp_tools import McpToolbox
@@ -236,10 +241,19 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             mcp_toolbox = McpToolbox(
                 cfg,
                 on_notice=lambda msg: err_console.print(f"[yellow]{msg}[/yellow]"))
-            mcp_toolbox.connect_all()
+            threading.Thread(
+                target=mcp_toolbox.connect_all, name="mcp-connect", daemon=True,
+            ).start()
         except Exception as e:
             err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
             mcp_toolbox = None
+
+    # ---- warm the litellm import while the user reads the banner -------
+    # `import litellm` takes seconds and is lazy-loaded at the first LLM
+    # call — preload it in the background so the first reply is fast.
+    from .llm import preload_litellm
+
+    preload_litellm()
 
     def _exit() -> None:
         _persist_session(cfg, session)
