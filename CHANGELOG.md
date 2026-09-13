@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.2.0 — Purple Team tool expansion (7 phases)
+
+Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:
+**496 tests green** (was 321).
+
+The Purple Team tool inventory grew from ~10 to **~40 sandboxed tools**,
+every spawn allowlisted (argv templates, never shell strings), audited
+(SHA256-chained), and run inside the gVisor sandbox. Highlights:
+
+- **Zone B tool inventory** (Phase 1): passive subdomain tools (subfinder /
+  amass / assetfinder, forced `-passive`), active recon (naabu, rustscan,
+  whatweb, katana, hakrawler, sslscan, testssl.sh, dnsx), exploit
+  specialists (dalfox, commix, ssrfmap, arjun, tplmap, jwt_tool, wfuzz,
+  kiterunner, graphql-cop), verify tools (http, dig, nc, ncat), and a
+  per-subagent template split so each state validates against its own set.
+- **Passive recon expansion** (Phase 2): OTX passive DNS, RIPEstat
+  whois/ASN, Shodan + Censys (API keys via config/wizard, never logged),
+  all through the bounded, redirect-rechecked Zone A fetcher.
+- **Hypothesis enrichment** (Phase 3): NVD/CPE, CISA KEV, EPSS, and
+  sandboxed searchsploit per hypothesis — free public APIs, cached 24h,
+  failures are audited skips, unknown ≠ absent.
+- **POST_EXPLOIT** (Phase 4): wired-but-dormant (no current tool yields a
+  shell). Fixed evidence-collection plan behind a separate terminal
+  approval gate; the EXPLOIT boundary decides via shell detection +
+  Gate 3.
+- **Blue-team code scanners** (Phase 5): `purple --code FOLDER` mounts
+  the folder read-only at `/code`; semgrep, bandit, gitleaks, trivy,
+  checkov, hadolint run before the LLM, whose remediations are grounded
+  in real scanner evidence. Remediations may carry suggested
+  CWE/OWASP/ATT&CK mappings.
+- **Report enrichment** (Phase 6): known-risk block per hypothesis (KEV /
+  EPSS / exploit availability / CPE), pure-Python CVSS 3.1 base-score
+  calculator (verified against FIRST examples), evidence normalizer
+  (ANSI/whitespace/uniform truncation), duplicate-hypothesis merging with
+  pointer remapping, and validate_report checks for dropped enrichment,
+  unmerged duplicates, and ANSI leaks.
+- **Docs & version** (Phase 7): this changelog, README tool tables,
+  version 1.2.0.
+
+**Known limitations** (recorded in the expansion doc): sandbox egress
+still uses the default docker bridge (the target-scope-only proxy is not
+built yet); POST_EXPLOIT is dormant pending a shell-yielding tool;
+semgrep `--config=auto` and trivy DB need sandbox internet egress;
+`--code` is CLI-only (not reachable from the chat loop).
+
 ## v1.1.2 — code-review fixes (10 findings + 1 bonus bug)
 
 All fixes verified against the review of commit `f286273` (v1.1.1).
