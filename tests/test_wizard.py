@@ -142,13 +142,14 @@ def scripted_wizard(monkeypatch, tmp_path):
 
 
 def test_wizard_openai_flow_writes_config(scripted_wizard, tmp_path):
-    # provider -> key -> model number -> tools -> mcp -> (no custom)
+    # provider -> key -> model number -> tools -> mcp -> (no custom) -> no api keys
     cfg = scripted_wizard([
         "1",            # OpenAI
         "sk-test-123",  # api key
         "1",            # first model (gpt-4o-mini, most recent)
         "1,4",          # tools: file_read (1) + cve_lookup (4)
         "1",            # mcp: fetch preset only
+        "n",            # skip passive-recon API keys
     ])
     assert cfg.provider == "openai"
     assert cfg.openai_api_key == "sk-test-123"
@@ -172,6 +173,7 @@ def test_wizard_ollama_flow(scripted_wizard, monkeypatch, tmp_path):
         "1",       # llama3.1:latest
         "2,4",     # file_write, cve_lookup
         "",        # no MCP
+        "n",       # no passive-recon API keys
     ])
     assert cfg.provider == "ollama"
     assert cfg.general_chat_model == "ollama/llama3.1"  # implicit :latest stripped
@@ -190,6 +192,7 @@ def test_wizard_ollama_keeps_explicit_tag(scripted_wizard, monkeypatch, tmp_path
         "1",       # llama3.1:8b
         "2,4",     # file_write, cve_lookup
         "",        # no MCP
+        "n",       # no passive-recon API keys
     ])
     assert cfg.general_chat_model == "ollama/llama3.1:8b"  # tag preserved
     assert cfg.local_model == "ollama/llama3.1:8b"
@@ -204,6 +207,7 @@ def test_wizard_provider_o_means_ollama(scripted_wizard, monkeypatch, tmp_path):
         "1",       # llama3.1
         "",        # no tools
         "",        # no MCP
+        "n",       # no passive-recon API keys
     ])
     assert cfg.provider == "ollama"
 
@@ -215,6 +219,7 @@ def test_wizard_custom_mcp_server(scripted_wizard, tmp_path):
         "3,1",               # custom + fetch — picks __custom__ and fetch
         "myserver",          # custom name
         "python my_mcp.py",  # custom command
+        "n",                 # no passive-recon API keys
     ])
     names = [s["name"] for s in cfg.mcp_servers]
     assert "myserver" in names
@@ -228,6 +233,7 @@ def test_wizard_filesystem_mcp_asks_allowed_dir(scripted_wizard, tmp_path):
         "4",        # cve_lookup
         "2",        # mcp: filesystem preset
         "/home/me/projects",  # allowed directory
+        "n",        # no passive-recon API keys
     ])
     fs = next(s for s in cfg.mcp_servers if s["name"] == "filesystem")
     assert fs["args"] == ["/home/me/projects"]
@@ -239,6 +245,7 @@ def test_wizard_filesystem_mcp_blank_uses_home(scripted_wizard, tmp_path):
         "4",   # cve_lookup
         "2",   # mcp: filesystem
         "",    # blank -> home directory
+        "n",   # no passive-recon API keys
     ])
     fs = next(s for s in cfg.mcp_servers if s["name"] == "filesystem")
     assert fs["args"] == [str(Path.home())]
@@ -250,6 +257,7 @@ def test_wizard_filesystem_mcp_none_skips_server(scripted_wizard, tmp_path):
         "4",     # cve_lookup
         "1,2",   # fetch + filesystem
         "none",  # skip the filesystem tool
+        "n",     # no passive-recon API keys
     ])
     names = [s["name"] for s in cfg.mcp_servers]
     assert names == ["fetch"]
@@ -269,6 +277,7 @@ def test_wizard_retries_bad_key(scripted_wizard, tmp_path, monkeypatch):
         "y",            # retry
         "sk-good",      # second key works
         "1", "1,2,3,4", "1",
+        "n",            # no passive-recon API keys
     ])
     assert cfg.openai_api_key == "sk-good"
     assert len(calls) == 2

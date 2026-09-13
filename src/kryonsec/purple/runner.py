@@ -34,7 +34,9 @@ STATE_INFO: dict[str, dict[str, str]] = {
     "RECON_PASSIVE": {
         "agent": "passive-recon",
         "does": "third-party lookups — zero packets to target",
-        "tools": "crt.sh, Wayback (Zone A APIs only)",
+        "tools": "crt.sh, Wayback, OTX, RIPEstat (whois/ASN), Shodan, "
+                 "Censys (Zone A APIs; last two need keys); "
+                 "subfinder/amass/assetfinder -passive in sandbox",
         "zone": "A",
     },
     "RECON_ACTIVE": {
@@ -192,7 +194,25 @@ def start_engagement(
     def resolve(state: str):
         """State name -> subagent run callable (or None for stubs)."""
         if state == "RECON_PASSIVE":
-            sub = ReconPassiveSubagent(cfg=cfg, graph=graph, audit=audit, target=target)
+            from .recon_passive import (
+                ReconPassiveSubagent,
+                sandbox_passive_fetcher,
+                zone_a_fetchers,
+            )
+
+            fetchers = zone_a_fetchers(cfg)
+            if sandbox_ok:
+                # passive subdomain tools in the sandbox (-passive flags;
+                # zero packets to the target) — skipped cleanly elsewhere
+                from .sandbox import KaliSandbox
+
+                sandbox = KaliSandbox(cfg=cfg)
+                fetchers.append(
+                    sandbox_passive_fetcher(sandbox, audit))
+            sub = ReconPassiveSubagent(
+                cfg=cfg, graph=graph, audit=audit, target=target,
+                fetchers=fetchers,
+            )
             return sub.run
 
         if state == "HYPOTHESIZE":

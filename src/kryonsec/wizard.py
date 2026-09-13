@@ -219,6 +219,30 @@ def _pick_many(
     return picked
 
 
+def _ask_optional_key(title: str, answers: list[str] | None = None) -> str:
+    """Ask for an optional API key. Blank = skip (the source is simply
+    not configured — keyless passive sources always run either way)."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import input_dialog
+
+        result = input_dialog(title=title, text=f"{title} (blank = skip):",
+                              password=True).run()
+        if result is None:
+            return ""
+        return result.strip()
+    raw = (answers or []).pop(0) if answers else input(f"{title} (blank = skip): ")
+    return raw.strip()
+
+
+def _ask_yes_no(question: str, answers: list[str] | None = None) -> bool:
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import yes_no_dialog
+
+        return bool(yes_no_dialog(title=question, text=question).run())
+    raw = (answers or []).pop(0) if answers else input(f"{question} [y/N]: ")
+    return raw.strip().lower() in ("y", "yes", "1")
+
+
 def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> KryonsecConfig:
     """The full wizard flow. Mutates and returns cfg; writes config.toml
     on success. answers: scripted plain-mode input (tests / pipes)."""
@@ -327,7 +351,29 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
             servers.append({"name": name.strip(), "command": command.strip(), "args": [], "env": {}})
     cfg.mcp_servers = servers
 
-    # ---- 4. banner + summary + write --------------------------------------
+    # ---- 4. passive-recon API keys (optional) ---------------------------
+    # Keyless Zone A sources (crt.sh, Wayback, OTX, RIPEstat) always run;
+    # these keys only add Shodan/Censys subdomain discovery.
+    console.print(
+        "[dim]Passive-recon API keys (optional) — Shodan/Censys add more "
+        "subdomain sources; keyless sources always run.[/dim]")
+    if _ask_yes_no("Add passive-recon API keys (Shodan / Censys)?", answers):
+        shodan = _ask_optional_key("Shodan API key", answers)
+        censys_id = _ask_optional_key("Censys API ID", answers)
+        censys_secret = _ask_optional_key("Censys API secret", answers)
+        if shodan:
+            cfg.shodan_api_key = shodan
+        if censys_id and censys_secret:
+            cfg.censys_api_id = censys_id
+            cfg.censys_api_secret = censys_secret
+            if not shodan:
+                console.print("[yellow]censys keys saved, shodan skipped[/yellow]")
+        elif censys_id or censys_secret:
+            console.print("[yellow]censys needs BOTH an ID and a secret — skipped[/yellow]")
+    else:
+        console.print("[dim]skipped — keyless passive sources only[/dim]")
+
+    # ---- 5. banner + summary + write --------------------------------------
     cfg.ensure_dirs()
     cfg.save()
 
@@ -346,6 +392,12 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     table.add_row("local model", cfg.local_model)
     table.add_row("tools", ", ".join(cfg.enabled_tools) or "none")
     table.add_row("mcp servers", ", ".join(s["name"] for s in cfg.mcp_servers) or "none")
+    passive_keys = []
+    if cfg.shodan_api_key:
+        passive_keys.append("shodan")
+    if cfg.censys_api_id and cfg.censys_api_secret:
+        passive_keys.append("censys")
+    table.add_row("passive-recon keys", ", ".join(passive_keys) or "none (keyless sources only)")
     table.add_row("workspace", str(cfg.workspace))
     console.print(Panel(
         table,

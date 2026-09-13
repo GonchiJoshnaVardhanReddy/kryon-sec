@@ -17,7 +17,10 @@ from kryonsec.config import (
 @pytest.fixture()
 def clean_env(monkeypatch):
     """These env vars override TOML — clear them for a clean test."""
-    for var in ("OPENAI_API_KEY", "DATABASE_URL", "OLLAMA_HOST"):
+    for var in (
+        "OPENAI_API_KEY", "DATABASE_URL", "OLLAMA_HOST",
+        "SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -148,6 +151,37 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
     cfg = KryonsecConfig.from_toml(read_config(path))
     assert cfg.openai_api_key == "sk-from-env"
     assert cfg.ollama_host == "http://env-host:11434"
+
+
+def test_api_keys_round_trip(tmp_path, clean_env):
+    """Phase 2: Shodan/Censys keys land in the [api] table and reload."""
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.shodan_api_key = "sh-test-key"
+    cfg.censys_api_id = "censys-id-1"
+    cfg.censys_api_secret = "censys-secret-1"
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    text = path.read_text(encoding="utf-8")
+    assert "[api]" in text
+
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.shodan_api_key == "sh-test-key"
+    assert loaded.censys_api_id == "censys-id-1"
+    assert loaded.censys_api_secret == "censys-secret-1"
+
+
+def test_api_keys_env_overrides_toml(tmp_path, monkeypatch):
+    for var in ("SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SHODAN_API_KEY", "sh-from-env")
+    monkeypatch.setenv("CENSYS_API_ID", "cid-from-env")
+
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.shodan_api_key = "sh-from-toml"
+    cfg.censys_api_id = "cid-from-toml"
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.shodan_api_key == "sh-from-env"
+    assert loaded.censys_api_id == "cid-from-env"
 
 
 def test_env_absent_toml_wins(tmp_path, clean_env):

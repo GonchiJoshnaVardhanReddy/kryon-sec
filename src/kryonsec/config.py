@@ -150,6 +150,19 @@ class KryonsecConfig:
         default_factory=lambda: os.environ.get("OPENAI_API_KEY")
     )
 
+    # --- Passive-recon API sources (tool expansion Phase 2) ---
+    # Keyless sources (crt.sh, Wayback, OTX, RIPEstat) always run; these
+    # keys only enable Shodan/Censys. Never logged, never audited.
+    shodan_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("SHODAN_API_KEY")
+    )
+    censys_api_id: str | None = field(
+        default_factory=lambda: os.environ.get("CENSYS_API_ID")
+    )
+    censys_api_secret: str | None = field(
+        default_factory=lambda: os.environ.get("CENSYS_API_SECRET")
+    )
+
     # --- LLM routing (spec §7.1) ---
     provider: str = "openai"  # "openai" | "ollama"
     general_chat_model: str = "ollama/llama3.1"
@@ -221,6 +234,11 @@ class KryonsecConfig:
             "sandbox": {
                 "image": self.sandbox_image,
             },
+            "api": {
+                "shodan_api_key": self.shodan_api_key or "",
+                "censys_api_id": self.censys_api_id or "",
+                "censys_api_secret": self.censys_api_secret or "",
+            },
             "tools": {
                 "enabled": list(self.enabled_tools),
             },
@@ -240,6 +258,7 @@ class KryonsecConfig:
         session = data.get("session", {})
         limits = data.get("limits", {})
         sandbox = data.get("sandbox", {})
+        api = data.get("api", {})
 
         cfg = cls(**overrides)
         cfg.provider = llm.get("provider", cfg.provider)
@@ -273,12 +292,23 @@ class KryonsecConfig:
             cfg.max_tool_output_chars = int(limits["max_tool_output_chars"])
         if sandbox.get("image"):
             cfg.sandbox_image = str(sandbox["image"])
+        if api.get("shodan_api_key"):
+            cfg.shodan_api_key = api["shodan_api_key"]
+        if api.get("censys_api_id"):
+            cfg.censys_api_id = api["censys_api_id"]
+        if api.get("censys_api_secret"):
+            cfg.censys_api_secret = api["censys_api_secret"]
         cfg.mcp_servers = [_server_from_row(r) for r in mcp.get("servers", [])]
 
         # environment beats TOML (documented behavior for power users / CI)
         cfg.openai_api_key = os.environ.get("OPENAI_API_KEY") or cfg.openai_api_key
         cfg.database_url = os.environ.get("DATABASE_URL") or cfg.database_url
         cfg.ollama_host = os.environ.get("OLLAMA_HOST") or cfg.ollama_host
+        cfg.shodan_api_key = os.environ.get("SHODAN_API_KEY") or cfg.shodan_api_key
+        cfg.censys_api_id = os.environ.get("CENSYS_API_ID") or cfg.censys_api_id
+        cfg.censys_api_secret = (
+            os.environ.get("CENSYS_API_SECRET") or cfg.censys_api_secret
+        )
         return cfg
 
     # ---- lifecycle --------------------------------------------------------

@@ -83,11 +83,18 @@ def render_hypothesize_prompt(graph: EngagementGraph) -> str:
     paths = sorted(n["label"] for n in graph.by_type("path"))
     target_nodes = graph.by_type("target")
     target = target_nodes[0]["label"] if target_nodes else ""
+    # supporting OSINT context (registrar, ASN, registration age…) from
+    # notes-only sources — flatten to bounded prompt lines
+    notes: list[str] = []
+    for node in graph.by_type("osint_note"):
+        for note in node.get("properties", {}).get("notes", []):
+            notes.append(f"[{node['label']}] {note}")
 
     return template.render(
         target=target,
         subdomains=subdomains[:50],
         paths=paths[:50],
+        notes=notes[:20],
         services=[
             {"label": n["label"], **n["properties"]}
             for n in graph.by_type("service")

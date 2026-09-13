@@ -96,4 +96,99 @@ Completed this phase (across sessions 2026-09-13):
   scripts) get wired with the subagent in Phase 4; the scripts are already
   baked (`containers/sandbox/scripts/`).
 
-_(updated as phases land)_
+---
+
+## Phase 2 — Passive recon expansion (Zone A + sandboxed passive)
+
+**Status: COMPLETE — full suite green (396 passed, `py -3.13 -m pytest -q`,
+2026-09-13).**
+
+### New Zone A sources (`src/kryonsec/purple/zonea.py`)
+
+All third-party APIs — zero packets to the target by construction. Hosts
+added to `ZONE_A_ALLOWED_HOSTS`: `api.shodan.io`, `search.censys.io`,
+`stat.ripe.net` (redirect re-check unchanged).
+
+- `otx_passive_dns(domain)` — AlienVault OTX passive DNS hostnames
+  (keyless).
+- `ripestat_whois(domain)` — registrar, registration dates, nameservers.
+  **Notes-only source** (no subdomains).
+- `ripestat_asn(domain)` — resolved IPs (per RIPEstat's server-side DNS
+  chain) → AS number / prefix / holder.
+- `shodan_subdomains(domain, api_key)` — `api.shodan.io/dns/domain/<d>`;
+  labels expanded to full names. Returns a **skipped** result when no key
+  is configured — a visible audit notice, never a failure.
+- `censys_subdomains(domain, api_id, api_secret)` — Search v2 hosts API
+  (POST, Basic auth); `names:` query.
+
+`PassiveResult` gained two fields:
+
+- `notes: list[str]` — free-form evidence lines (whois/ASN) that become
+  `osint_note` graph nodes; `render_hypothesize_prompt` flattens them into
+  an "Other OSINT evidence" prompt section (capped at 20 lines).
+- `skipped: str | None` — set when a source did not run (no API key);
+  `ReconPassiveSubagent.run` audits it as `passive_source_skipped` and
+  continues. `passive_source_ok` now also records a `notes` count.
+
+### Sandboxed passive enumeration (`src/kryonsec/purple/recon_passive.py`)
+
+- `sandbox_passive_fetcher(sandbox, audit)` — subfinder / amass / assetfinder
+  spawned **inside the gVisor sandbox** with `-passive` flags. Same safety
+  pattern as every Zone B spawn: allowlist + blocklist validation, argv
+  lists, audited `tool_spawn`/`tool_result` with state `RECON_PASSIVE`.
+  Output lines are scope-filtered to hosts strictly under the target
+  (`host.endswith("." + domain)` — the apex is the target node, not a
+  subdomain). Wired in `runner.py` only when the sandbox exists; elsewhere
+  the engagement simply runs without it.
+- `zone_a_fetchers(cfg)` — the Zone A source list for a config: crt.sh,
+  Wayback, OTX, RIPEstat ×2 always; shodan/censys closures read
+  `cfg.shodan_api_key` / `cfg.censys_api_id` / `cfg.censys_api_secret`.
+  The dataclass default fetchers stay `[crt_sh, wayback]` (tests inject).
+
+### Config + wizard
+
+- `src/kryonsec/config.py`: `shodan_api_key`, `censys_api_id`,
+  `censys_api_secret` fields (env defaults `SHODAN_API_KEY`,
+  `CENSYS_API_ID`, `CENSYS_API_SECRET`), `[api]` TOML table, env-beats-TOML
+  on load (same policy as the OpenAI key).
+- `src/kryonsec/wizard.py`: new step 4 (after MCP) — optional Shodan key +
+  Censys ID/secret. Censys needs BOTH id and secret or it is skipped with
+  a clear message. Summary table row "passive-recon keys". Blank = skip;
+  keyless sources always run either way.
+
+### Decisions made during Phase 2
+
+- **rdap.org → RIPEstat (deviation from plan).** The plan called for
+  WHOIS via rdap.org; in practice it 302-redirects to arbitrary per-TLD
+  registry hosts (rdap.verisign.com, rdap.nic.uk, …) which cannot be
+  safely allowlisted ahead of time. RIPEstat's whois data call serves the
+  same data from one fixed host (`stat.ripe.net`), so the Zone A egress
+  allowlist stays small and enumerable.
+- **RIPEstat resolves the domain server-side.** `ripestat_asn` asks
+  RIPEstat's dns-chain endpoint for the target's addresses — WE never
+  query the target's DNS ourselves, so the zero-packets invariant holds.
+- **Keyless sources ship first-class.** A missing Shodan/Censys key is a
+  skip notice in the audit log (the operator sees exactly what did not run
+  and why), not a failure — one missing key can never fail the state.
+- **Sandbox passive tools run with `-passive` flags only.** subfinder and
+  amass both have active modes; the allowlist templates
+  (`PASSIVE_TOOL_TEMPLATES`) hard-require the flag and a test
+  (`test_passive_templates_require_passive_flag`) enforces it.
+- **Runner tests patch `zone_a_fetchers`** instead of `crt_sh_subdomains`:
+  the fetcher list grew from 2 to 7 sources, and the old patch target
+  would have sent the other 5 to the real network during tests.
+- **Wizard scripted answers grew by one.** The new step consumes one
+  answer; every scripted wizard test gained a trailing `"n"` so the queue
+  never falls back to blocking `input()` under pytest.
+
+### Tests (`tests/test_zonea.py`, `tests/test_config_toml.py`)
+
+New: `_in_scope_subdomains` filtering (lookalikes/wildcards/other TLDs),
+shodan keyless-skip + label parsing, censys keyless-skip + POST body +
+scoping, OTX parsing + scoping, RIPEstat whois notes, RIPEstat ASN notes
+(chain + network-info), `zone_a_fetchers` list/keys-through (fully
+offline — every source patched), skipped-source audit notice,
+notes→osint_note nodes, prompt includes notes, sandbox passive fetcher
+(argv shapes, allowlist validation, scoping, failed tool continues).
+Config: `[api]` round-trip + env overrides (fixture extended with the
+three new env vars).
