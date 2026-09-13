@@ -2,6 +2,13 @@
 
 Allowlists, not blocklists: argv must match the per-tool template exactly.
 masscan is NOT allowlisted (v2.1.1 §9.1 — faster than canaries can react).
+
+Templates are grouped by the state that spawns them (passive tools, active
+recon, exploit, verify, post-exploit, enrichment); the ToolAllowlist default
+is the union — one tool name, one template, everywhere.
+
+The sandbox entrypoint re-checks tool names as defense-in-depth; the sync
+test in tests/test_allowlist.py keeps the two lists from drifting.
 """
 
 from __future__ import annotations
@@ -17,10 +24,18 @@ class AllowlistViolation(Exception):
 #   "literal"       must match exactly
 #   "{a|b|c}"       alternation: must be one of a, b, c
 #   "{url}"         http(s) URL
+#   "{urlfuzz}"     http(s) URL containing the FUZZ marker
 #   "{target}"      scope target (hostname / IP / CIDR-ish token)
 #   "{ports}"       port spec like "80,443" or "1-1000"
-#   "{rate}"        positive integer (rate limit)
+#   "{port}"        single TCP port
+#   "{rate}"        positive integer (rate limit / sleep ms)
+#   "{depth}"       crawl depth (1-3)
 #   "{template}"    nuclei template path token (no shell metacharacters)
+#   "{hostport}"    host:port (openssl s_client -connect)
+#   "{token}"       JWT-shaped token (three base64url segments)
+#   "{term}"        searchsploit search term (no shell metacharacters)
+# {…} segments may sit inside a larger literal: "--severity={low|medium}"
+# or "/opt/kryonsec/{probe}.py".
 
 _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
     "url": re.compile(r"^https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$"),
@@ -29,22 +44,17 @@ _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
         r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*$"),
     "target": re.compile(r"^[A-Za-z0-9._:/-]+$"),
     "ports": re.compile(r"^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$"),
+    "port": re.compile(r"^\d{1,5}$"),
     "rate": re.compile(r"^\d+$"),
+    "depth": re.compile(r"^[1-3]$"),
     "template": re.compile(r"^[A-Za-z0-9_./-]+$"),
+    "hostport": re.compile(r"^[A-Za-z0-9._-]+:\d{1,5}$"),
+    "token": re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"),
+    "term": re.compile(r"^[A-Za-z0-9 .:+,-]+$"),
 }
 
-
-def _compile_template_arg(arg: str) -> re.Pattern[str]:
-    # Prefix-value form: "--risk={1|2}" or "--timeout={30|60|120}"
-    m = re.match(r"^(-+)([A-Za-z0-9_-]+)=\{(.+)\}$", arg)
-    if m:
-        prefix, name, inner = m.group(1) + m.group(2) + "=", m.group(2), m.group(3)
-        value_re = _alternation_or_pattern(inner)
-        return re.compile("^" + re.escape(prefix) + value_re + "$")
-
-    if arg.startswith("{") and arg.endswith("}"):
-        return re.compile("^" + _alternation_or_pattern(arg[1:-1]) + "$")
-    return re.compile("^" + re.escape(arg) + "$")
+# {…} segments inside an argument (may be the whole argument)
+_SEGMENT_RE = re.compile(r"\{([^{}]+)\}")
 
 
 def _alternation_or_pattern(inner: str) -> str:
@@ -57,6 +67,20 @@ def _alternation_or_pattern(inner: str) -> str:
     raise ValueError(f"unknown template placeholder: {{{inner}}}")
 
 
+def _compile_template_arg(arg: str) -> re.Pattern[str]:
+    """Compile one template argument: literal parts escaped, every {…}
+    segment expanded (alternation or named pattern). Subsumes the old
+    prefix-value ("--risk={1|2}") and full-brace ("{url}") special cases."""
+    body: list[str] = []
+    i = 0
+    for m in _SEGMENT_RE.finditer(arg):
+        body.append(re.escape(arg[i:m.start()]))
+        body.append(_alternation_or_pattern(m.group(1)))
+        i = m.end()
+    body.append(re.escape(arg[i:]))
+    return re.compile("^" + "".join(body) + "$")
+
+
 def compile_tool_templates(templates: dict[str, list[str]]) -> dict[str, list[re.Pattern[str]]]:
     """Precompile a {tool: [template args]} mapping."""
     return {
@@ -65,25 +89,104 @@ def compile_tool_templates(templates: dict[str, list[str]]) -> dict[str, list[re
     }
 
 
-# Default EXPLOIT allowlist (spec §4.7; masscan intentionally absent)
-EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
+# Wordlists baked into the sandbox image (seclists is installed there)
+SECLISTS_WEB = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+# Enumeration/probe scripts baked into the image (executable, shebang)
+SANDBOX_SCRIPT_DIR = "/opt/kryonsec"
+
+# Passive subdomain tools — run ONLY inside the sandbox with -passive flags
+# (they query third-party sources; zero packets to the target by design).
+PASSIVE_TOOL_TEMPLATES: dict[str, list[str]] = {
+    "subfinder": ["-d", "{target}", "-passive", "-silent"],
+    "amass": ["enum", "-passive", "-d", "{target}"],
+    "assetfinder": ["-silent", "{target}"],
+}
+
+# First contact with the target (Zone B). dnsx lives HERE, not in passive —
+# resolving the target's DNS names sends packets to the target's resolvers.
+ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     # -sT (connect scan): gVisor grants no raw sockets — SYN scan is impossible
     "nmap": ["-Pn", "-sT", "-sV", "-sC", "--max-rate", "{rate}", "-p", "{ports}", "{target}"],
+    "naabu": ["-host", "{target}", "-p", "{ports}", "-rate", "{rate}", "-silent"],
+    "httpx": ["-u", "{url}", "-silent", "-status-code", "-title", "-tech-detect"],
+    "rustscan": ["-a", "{target}", "-p", "{ports}", "--no-banner", "-t", "2000"],
+    "whatweb": ["-a", "{1|2|3}", "--no-errors", "--color=never", "{url}"],
+    "katana": ["-u", "{url}", "-d", "{depth}", "-silent"],
+    "hakrawler": ["-url", "{url}", "-depth", "{depth}"],
+    "feroxbuster": ["-u", "{urlfuzz}", "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"],
+    "sslscan": ["--no-failed", "--sleep", "{rate}", "{target}"],
+    "testssl.sh": ["--batch", "--severity={low|medium|high|critical}", "--no-color", "{url}"],
+    "dnsx": ["-d", "{target}", "-silent"],
+}
+
+# Exploit/testing tools (spec §4.7; masscan intentionally absent)
+EXPLOIT_TEMPLATES: dict[str, list[str]] = {
+    "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
     "sqlmap": [
         "-u", "{url}", "--batch", "--risk={1|2}", "--level={1|2|3}",
         "--technique={B|E|U|T|Q}", "--timeout={30|60|120}", "--threads={1|2|3|4}",
     ],
-    "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
-    "curl": ["-sS", "--max-time", "30", "{url}"],
     "nikto": ["-h", "{url}", "-timeout", "30", "-maxtime", "120"],
-    # ffuf/gobuster: directory fuzzing with the sandbox's common wordlist.
-    # {urlfuzz}: the URL carries the FUZZ position marker.
-    "ffuf": ["-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
-             "-u", "{urlfuzz}", "-t", "5", "-maxtime", "120"],
-    "gobuster": ["dir", "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
-                 "-u", "{urlfuzz}", "-t", "5", "--timeout", "30s"],
+    "curl": ["-sS", "--max-time", "30", "{url}"],
     "wget": ["-q", "-O", "-", "--timeout=30", "{url}"],
+    # ffuf/gobuster/wfuzz: directory fuzzing with the sandbox's common wordlist.
+    # {urlfuzz}: the URL carries the FUZZ position marker.
+    "ffuf": ["-w", SECLISTS_WEB, "-u", "{urlfuzz}", "-t", "5", "-maxtime", "120"],
+    "gobuster": ["dir", "-w", SECLISTS_WEB, "-u", "{urlfuzz}", "-t", "5", "--timeout", "30s"],
+    "wfuzz": ["-w", SECLISTS_WEB, "--hc", "404", "{urlfuzz}", "-t", "5"],
+    # injection specialists
+    "dalfox": ["url", "{url}", "--silence"],
+    "commix": ["--url", "{url}", "--batch"],
+    "ssrfmap": ["-u", "{url}", "-m", "fetch"],
+    "arjun": ["-u", "{url}"],
+    "tplmap": ["-u", "{url}"],
+    # jwt_tool takes a captured token (three-segment JWT), not a URL
+    "jwt_tool": ["{token}"],
+    # kiterunner scans API routes from a .kx wordlist file ({template} token)
+    "kr": ["scan", "{template}", "--host", "{url}"],
+    "graphql-cop": ["-u", "{url}", "-o", "json"],
+    # ExploitDB search (local database inside the image — no egress)
+    "searchsploit": ["--colorless", "{term}"],
 }
+
+# Independent confirmation tools (a finding is only "verified" when a tool
+# DIFFERENT from the one that found it agrees).
+VERIFY_TEMPLATES: dict[str, list[str]] = {
+    "curl": ["-sS", "--max-time", "30", "{url}"],
+    "http": ["--ignore-stdin", "--check-status", "{url}"],
+    "openssl": ["s_client", "-connect", "{hostport}", "-brief"],
+    "dig": ["{target}", "+short"],
+    "nc": ["-z", "-w", "30", "{target}", "{port}"],
+    "ncat": ["-z", "-w", "30", "{target}", "{port}"],
+    # the baked probe script (python) — fixed argv, never free-form code
+    f"{SANDBOX_SCRIPT_DIR}/probe.py": ["{url}"],
+}
+
+# Post-exploit enumeration (Phase 4): evidence collection only, nothing
+# destructive. linpeas/pspy/LES run with no or fixed flags; the enum_*.py /
+# find_secrets.py scripts are baked into the image and take the target as
+# context (they enumerate the sandbox-visible environment, e.g. mounted
+# evidence, not the engagement target's network).
+POST_EXPLOIT_TEMPLATES: dict[str, list[str]] = {
+    "linpeas.sh": ["-a"],
+    "pspy64": [],
+    "linux-exploit-suggester.sh": [],
+    f"{SANDBOX_SCRIPT_DIR}/enum_processes.py": ["{target}"],
+    f"{SANDBOX_SCRIPT_DIR}/enum_fs.py": ["{target}"],
+    f"{SANDBOX_SCRIPT_DIR}/enum_network.py": ["{target}"],
+    f"{SANDBOX_SCRIPT_DIR}/find_secrets.py": ["{target}"],
+}
+
+# Historical name kept (tests / callers import it): the union of everything
+# above — one ToolAllowlist validates every state's spawns.
+EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
+    **PASSIVE_TOOL_TEMPLATES,
+    **ACTIVE_RECON_TEMPLATES,
+    **EXPLOIT_TEMPLATES,
+    **VERIFY_TEMPLATES,
+    **POST_EXPLOIT_TEMPLATES,
+}
+
 
 # Hardline blocklist (safety Layer 8) — regex patterns over the joined argv
 BLOCKLIST_PATTERNS: list[re.Pattern[str]] = [

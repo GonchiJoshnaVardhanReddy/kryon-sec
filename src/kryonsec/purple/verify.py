@@ -140,6 +140,11 @@ class VerifySubagent:
 
         probes = _boolean_probe_urls(url)
         if probes is None:
+            # No numeric query parameter to boolean-probe. Gather what
+            # SECONDARY evidence exists (asset reachable / TLS up) with
+            # tools other than curl — honest reachability evidence, but
+            # it never marks a finding "verified" by itself.
+            secondary = self._secondary_probes(url)
             self.audit.write({
                 "event": "verify_skipped",
                 "finding_id": finding_id,
@@ -149,7 +154,8 @@ class VerifySubagent:
                 node_type="verify_attempt",
                 label=finding_id,
                 properties={"verified": False, "method": "n/a",
-                            "reason": "no numeric query parameter"},
+                            "reason": "no numeric query parameter",
+                            "secondary_evidence": secondary},
             )
             return 0
 
@@ -227,20 +233,60 @@ class VerifySubagent:
         })
         return 0
 
+    def _secondary_probes(self, url: str) -> dict:
+        """Reachability evidence with tools OTHER than curl: httpie fetch,
+        raw TCP connect (nc), TLS handshake (openssl, https only), and a
+        DNS resolution (dig). Each probe is allowlist-validated and
+        audited like every other spawn.
+
+        These prove the ASSET is live — never that the vulnerability is
+        real. They attach as supporting evidence only; "verified" stays
+        the boolean probe's call.
+        """
+        parts = urlsplit(url)
+        host = parts.hostname or self.target
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+
+        probes: list[tuple[str, list[str]]] = [
+            ("http", ["http", "--ignore-stdin", "--check-status", url]),
+            ("nc", ["nc", "-z", "-w", "30", host, str(port)]),
+            ("dig", ["dig", host, "+short"]),
+        ]
+        if parts.scheme == "https":
+            probes.append(
+                ("openssl", ["openssl", "s_client", "-connect",
+                             f"{host}:{port}", "-brief"]))
+
+        evidence: dict[str, dict] = {}
+        for tool, argv in probes:
+            result = self._spawn_tool(tool, argv)
+            if result is None:
+                evidence[tool] = {"ran": False}
+                continue
+            evidence[tool] = {
+                "ran": True,
+                "ok": result.ok,
+                "exit_code": result.exit_code,
+            }
+        return evidence
+
     def _curl(self, url: str) -> str | None:
         """Run one curl via the sandbox. None = the run itself failed."""
-        result = self._spawn_curl(url)
+        result = self._spawn_tool("curl", ["curl", "-sS", "--max-time", "30", url])
         if result is not None and result.exit_code == 56 and url.startswith("http://"):
             # https-only target and EXPLOIT never discovered it (no curl
             # hypothesis ran) — retry over https
-            result = self._spawn_curl("https://" + url[len("http://"):])
+            result = self._spawn_tool(
+                "curl",
+                ["curl", "-sS", "--max-time", "30",
+                 "https://" + url[len("http://"):]],
+            )
         if result is None or not result.ok:
             return None
         return result.stdout
 
-    def _spawn_curl(self, url: str):
-        """One allowlisted sandbox curl; returns SpawnResult or None."""
-        argv = ["curl", "-sS", "--max-time", "30", url]
+    def _spawn_tool(self, tool: str, argv: list[str]):
+        """One allowlisted sandbox spawn; returns SpawnResult or None."""
         try:
             self.allowlist.validate(argv[0], argv)
             self.allowlist.check_blocklist(argv)
@@ -254,14 +300,14 @@ class VerifySubagent:
         self.audit.write({
             "event": "tool_spawn",
             "state": "VERIFY",
-            "tool": "curl",
+            "tool": tool,
             "argv": argv,
         })
         result = self.sandbox.spawn(argv)
         self.audit.write({
             "event": "tool_result",
             "state": "VERIFY",
-            "tool": "curl",
+            "tool": tool,
             "ok": result.ok,
             "exit_code": result.exit_code,
             "output_chars": len(result.stdout),

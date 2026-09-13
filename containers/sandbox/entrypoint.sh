@@ -2,17 +2,38 @@
 # Kryonsec Zone B sandbox entrypoint (spec v2.1.1 §8.5).
 # Receives tool argv as CONTAINER ARGUMENTS (docker run IMAGE tool arg1 arg2).
 # Executes ONLY allowlisted tools. Defense-in-depth only — the authoritative
-# allowlist check is ToolRunner Layer 2 on the host.
+# allowlist check is ToolRunner Layer 2 on the host (src/kryonsec/purple/allowlist.py).
+#
+# KEEP IN SYNC with the host allowlist: tests/test_allowlist.py
+# (test_entrypoint_allowlist_in_sync) fails the build when a host-allowlisted
+# tool is missing here. Baked scripts (/opt/kryonsec/*.py) are listed by full path.
 
 set -uo pipefail   # NOT -e: we must capture the tool's real exit code
 
 TOOL="${1:-}"
 
 ALLOWED_TOOLS=(
-    "nmap" "dnsx" "subfinder"
-    "sqlmap" "nikto" "gobuster" "ffuf"
-    "curl" "wget" "nc" "ncat" "openssl" "python3"
-    "linpeas.sh" "bloodhound-python"
+    # passive subdomain tools (run with -passive flags only)
+    "subfinder" "amass" "assetfinder"
+    # active recon
+    "nmap" "naabu" "httpx" "rustscan" "whatweb" "katana" "hakrawler"
+    "feroxbuster" "sslscan" "testssl.sh" "dnsx"
+    # exploit / testing
+    "nuclei" "sqlmap" "nikto" "curl" "wget" "ffuf" "gobuster" "wfuzz"
+    "dalfox" "commix" "ssrfmap" "arjun" "tplmap" "jwt_tool" "kr"
+    "graphql-cop" "searchsploit"
+    # verify
+    "http" "openssl" "dig" "nc" "ncat"
+    "/opt/kryonsec/probe.py"
+    # post-exploit (evidence collection only)
+    "linpeas.sh" "pspy64" "linux-exploit-suggester.sh"
+    "/opt/kryonsec/enum_processes.py" "/opt/kryonsec/enum_fs.py"
+    "/opt/kryonsec/enum_network.py" "/opt/kryonsec/find_secrets.py"
+    # blue-team static analyzers (Phase 5) — run against /code read-only
+    "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint" "kube-bench"
+    # image-side extras kept from the original image (not host-allowlisted
+    # today, harmless here — the HOST allowlist is the authoritative gate)
+    "python3" "bloodhound-python"
 )
 
 if [[ -z "$TOOL" ]] || [[ ! " ${ALLOWED_TOOLS[*]} " =~ " ${TOOL} " ]]; then

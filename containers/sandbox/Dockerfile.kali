@@ -11,6 +11,8 @@ FROM kalilinux/kali-rolling:latest
 # jq is REQUIRED (entrypoint uses it) and is NOT in the base image.
 # Minimal toolset only: no metasploit-framework/beef-xss/setoolkit
 # (never installed here — the allowlist + image contents are the control).
+# Core block = the original, known-good set. Keep it separate so a flaky
+# extended block can never regress the core tools.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     nmap \
@@ -26,22 +28,80 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffuf \
     seclists \
     wget \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Tool-expansion block (2026-09-13). Kali package names drift; if the
+# batch install fails, retry per-package so ONE bad name doesn't drop the
+# whole extended set. Unavailable packages log a WARN and are simply
+# absent (spawning them then fails inside the sandbox — audited, safe).
+# ncat ships with the nmap package; nc comes from netcat-traditional.
+# searchsploit ships with exploitdb.
+RUN EXTENDED_TOOLS=" \
+    amass subfinder assetfinder naabu httpx-toolkit rustscan whatweb \
+    katana hakrawler feroxbuster sslscan testssl.sh dalfox commix \
+    wfuzz arjun exploitdb httpie \
+    semgrep bandit gitleaks trivy checkov hadolint kube-bench \
+    " && apt-get update && \
+    (apt-get install -y --no-install-recommends $EXTENDED_TOOLS || \
+     for t in $EXTENDED_TOOLS; do \
+        apt-get install -y --no-install-recommends "$t" \
+          || echo "WARN: $t unavailable in this Kali snapshot"; \
+     done) && rm -rf /var/lib/apt/lists/*
+
 # Bake nuclei templates at BUILD time, not runtime (sandbox has no
-# internet egress to template sources).
-RUN nuclei -update-templates || true
+# internet egress to template sources). The tool runs as
+# kryonsec-runner (non-root), so move the templates OUT of /root into a
+# world-readable dir — otherwise every nuclei spawn dies on permissions.
+RUN nuclei -update-templates || true; \
+    mkdir -p /opt/nuclei-templates && \
+    cp -r /root/nuclei-templates/* /opt/nuclei-templates/ 2>/dev/null || true; \
+    chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
 
 # bloodhound.py is a pip package, not apt; executable is bloodhound-python.
 # Explicit index URL + best-effort: on flaky networks a failed PyPI fetch
 # must not kill the whole image build. If it fails, bloodhound-python is
 # simply absent (calling it then errors inside the sandbox — acceptable,
 # AD/ldap recon is optional in the tool table).
+# jwt_tool (ticarpi) and graphql-cop are pip-only too. checkov/semgrep are
+# pip-installable as a fallback when the apt name is missing above.
 RUN pip install --no-cache-dir --break-system-packages \
     --index-url https://pypi.org/simple/ \
     --timeout 60 --retries 3 \
-    bloodhound.py \
-    || echo "WARN: bloodhound.py not installed (PyPI unreachable?)"
+    bloodhound.py jwt-tool graphql-cop \
+    || echo "WARN: some pip tools not installed (PyPI unreachable?)"
+
+# GitHub-hosted tools (no apt package). All best-effort with the same
+# rule as pip above: absent tool = audited spawn failure, never a silent
+# security hole. Pinned release tags where they exist; branch tarballs
+# (SSRFmap/tplmap) may drift — rebuild after reviewing the diff.
+RUN mkdir -p /opt/tools && cd /opt/tools && \
+    (wget -q https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -O /usr/local/bin/linpeas.sh \
+      || echo "WARN: linpeas.sh not installed") && \
+    (wget -q https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64 -O /usr/local/bin/pspy64 \
+      || echo "WARN: pspy64 not installed") && \
+    (wget -q https://raw.githubusercontent.com/jondonas/linux-exploit-suggester/master/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
+      || echo "WARN: linux-exploit-suggester not installed") && \
+    (wget -q https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kr_linux_amd64.tar.gz -O kr.tar.gz \
+      && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
+      || echo "WARN: kiterunner (kr) not installed") && \
+    (wget -q https://github.com/swisskyrepo/SSRFmap/archive/refs/heads/master.tar.gz -O ssrfmap.tar.gz \
+      && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
+      && cd /opt/tools/SSRFmap && pip install --no-cache-dir --break-system-packages -r requirements.txt \
+      && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
+      || echo "WARN: ssrfmap not installed") && \
+    (wget -q https://github.com/epinna/tplmap/archive/refs/heads/master.tar.gz -O tplmap.tar.gz \
+      && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
+      && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
+      || echo "WARN: tplmap not installed") ; \
+    chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
+      /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
+
+# Baked enumeration/probe scripts — fixed argv, no free-form shell.
+# The host allowlist lists these by FULL PATH (never a bare python3
+# invocation with a file argument).
+COPY containers/sandbox/scripts/ /opt/kryonsec/
+RUN chmod 0755 /opt/kryonsec/*.py
 
 # Create non-root user for tool execution
 RUN useradd -m -s /bin/false kryonsec-runner

@@ -155,10 +155,10 @@ def test_full_loop_through_exploit(tmp_path):
 
     class FakeRun:
         def __init__(self):
-            self.argv = None
+            self.argvs = []
 
         def __call__(self, argv, **kw):
-            self.argv = argv
+            self.argvs.append(argv)
             return FakeProc()
 
     fake_run = FakeRun()
@@ -201,9 +201,10 @@ def test_full_loop_through_exploit(tmp_path):
         sb_mod.KaliSandbox.__init__ = orig_sb_init
 
     assert "EXPLOIT" in completed
-    assert fake_run.argv is not None
-    assert fake_run.argv[0] == "docker"
-    assert "sqlmap" in fake_run.argv
+    assert fake_run.argvs  # sandbox spawns happened
+    # EXPLOIT spawned sqlmap (VERIFY's probes may run after it, so check
+    # every recorded argv, not just the last one)
+    assert any("sqlmap" in argv for argv in fake_run.argvs)
 
     attempts = graph.by_type("exploit_attempt")
     assert len(attempts) == 1
