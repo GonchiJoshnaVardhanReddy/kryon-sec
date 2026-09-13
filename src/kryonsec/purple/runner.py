@@ -34,8 +34,10 @@ STATE_INFO: dict[str, dict[str, str]] = {
     "RECON_PASSIVE": {
         "agent": "passive-recon",
         "does": "third-party lookups — zero packets to target",
-        "tools": "crt.sh, Wayback, OTX, RIPEstat (whois/ASN), Shodan, "
-                 "Censys (Zone A APIs; last two need keys); "
+        "tools": "crt.sh (+ issuer/validity), Wayback, OTX, RIPEstat "
+                 "(whois/ASN), Shodan, Censys (keys), RDAP WHOIS, GitHub "
+                 "recon (optional token), HackerTarget DNS history, "
+                 "cloud-asset analysis (local pass); "
                  "subfinder/amass/assetfinder -passive in sandbox",
         "zone": "A",
     },
@@ -51,8 +53,9 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "agent": "hypothesizer (LLM)",
         "does": "propose vulnerability hypotheses from recon data, then "
                 "enrich with public risk data",
-        "tools": "LLM proposes only; enrichment: NVD/CPE, CISA KEV, EPSS "
-                 "(free APIs) + searchsploit in sandbox",
+        "tools": "LLM proposes only; enrichment: NVD/CPE/CWE, CISA KEV, "
+                 "EPSS, OSV, GitHub Advisory (free APIs) + searchsploit "
+                 "and nuclei-template lookup in sandbox",
         "zone": "A (third-party APIs) + B for searchsploit",
     },
     "HUMAN_REVIEW": {
@@ -73,7 +76,9 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "does": "enumerate inside an obtained shell (separate approval; "
                 "dormant — no current tool yields a shell)",
         "tools": "linpeas, pspy, linux-exploit-suggester, baked enum "
-                 "scripts (evidence collection only, never destructive)",
+                 "scripts + cloud metadata probe (evidence collection "
+                 "only, never destructive; impacket/bloodhound-python "
+                 "allowlisted but dormant)",
         "zone": "B (sandbox)",
     },
     "VERIFY": {
@@ -86,7 +91,8 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "agent": "blue-team (LLM)",
         "does": "generate fixes and detection rules, grounded in scanner "
                 "evidence when a --code folder is provided",
-        "tools": "semgrep, bandit, gitleaks, trivy, checkov, hadolint "
+        "tools": "semgrep, bandit, gitleaks, trivy, checkov, hadolint, "
+                 "syft (SBOM), osv-scanner, grype "
                  "(read-only /code mount) + LLM",
         "zone": "B for scanners (sandbox), LLM is host-side",
     },

@@ -7,8 +7,8 @@
 **A single-user CLI cybersecurity platform with two modes: an AI copilot and a deterministic purple-team engine.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.2.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryon-sec)
-[![Tests](https://img.shields.io/badge/tests-496%20passing-brightgreen)](#development)
+[![Version](https://img.shields.io/badge/version-1.3.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryon-sec)
+[![Tests](https://img.shields.io/badge/tests-559%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
 [Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [Safety design](#safety-design) · [Configuration](#configuration-reference)
@@ -239,15 +239,15 @@ The engine walks a fixed state machine — **no LLM-driven transitions, ever**:
 | # | State | Agent | What it does | Zone |
 |---|---|---|---|---|
 | 1 | `INIT` | init | load config, validate scope | — |
-| 2 | `RECON_PASSIVE` | passive-recon | third-party lookups — **zero packets to target** (crt.sh, Wayback, OTX, RIPEstat, Shodan, Censys; subfinder/amass/assetfinder `-passive` in sandbox) | A + B (passive) |
-| 3 | `RECON_ACTIVE` | active-recon | scan the target — nmap, naabu, rustscan, dnsx, httpx, whatweb, katana, hakrawler, feroxbuster, sslscan, testssl.sh | B (sandbox) |
-| 4 | `HYPOTHESIZE` | hypothesizer (LLM) | **propose** hypotheses from recon data, then enrich with NVD/CPE, CISA KEV, EPSS + sandboxed searchsploit | A + B |
+| 2 | `RECON_PASSIVE` | passive-recon | third-party lookups — **zero packets to target** (crt.sh + issuer/validity, Wayback, OTX, RIPEstat, Shodan, Censys, RDAP WHOIS, GitHub recon, HackerTarget DNS history, cloud-asset analysis; subfinder/amass/assetfinder `-passive` in sandbox) | A + B (passive) |
+| 3 | `RECON_ACTIVE` | active-recon | scan the target — nmap, naabu, rustscan, dnsx, httpx, whatweb, katana, hakrawler, feroxbuster, sslscan, testssl.sh, openapi_probe (API discovery), gowitness (screenshots → `/evidence`) | B (sandbox) |
+| 4 | `HYPOTHESIZE` | hypothesizer (LLM) | **propose** hypotheses from recon data, then enrich with NVD/CPE/CWE, CISA KEV, EPSS, OSV, GitHub Advisory + sandboxed searchsploit and nuclei-template lookup | A + B |
 | 5 | `HUMAN_REVIEW` | operator (you) | **approve or reject each hypothesis** — blocking gate | — |
 | 6 | `EXPLOIT` | exploit | execute **approved hypotheses only** — sqlmap, nuclei, nikto, ffuf, gobuster, wfuzz, curl, wget, dalfox, commix, ssrfmap, arjun, tplmap, jwt_tool, kiterunner, graphql-cop | B (sandbox) |
-| 7 | `POST_EXPLOIT` | post-exploit | evidence collection in an obtained shell — needs **separate approval** (dormant: no current tool yields a shell) | B (sandbox) |
+| 7 | `POST_EXPLOIT` | post-exploit | evidence collection in an obtained shell — needs **separate approval** (dormant: no current tool yields a shell; impacket/bloodhound allowlisted for when one does) | B (sandbox) |
 | 8 | `VERIFY` | verifier | **independently confirm** findings — curl, http, dig, nc, ncat, openssl, baked probe script | B (sandbox) |
-| 9 | `BLUE_TEAM` | blue-team (LLM) | fixes + detection rules, grounded in scanner evidence with `--code` (semgrep, bandit, gitleaks, trivy, checkov, hadolint on a read-only `/code` mount) | B (scanners) + LLM |
-| 10 | `REPORT` | reporter | compile the engagement report (Jinja2) with enrichment, CVSS scores, dedup | — |
+| 9 | `BLUE_TEAM` | blue-team (LLM) | fixes + detection rules, grounded in scanner evidence with `--code` (semgrep, bandit, gitleaks, trivy, checkov, hadolint, syft, osv-scanner, grype on a read-only `/code` mount) | B (scanners) + LLM |
+| 10 | `REPORT` | reporter | compile the engagement report (Jinja2) with enrichment, CVSS scores, timeline, dedup | — |
 | — | `HALT` | — | terminal absorbing state | — |
 
 Deterministic transition table (plain Python in `purple/orchestrator.py`):
@@ -279,24 +279,32 @@ by hand.
 ### Zones
 
 - **Zone A (host):** passive recon and enrichment run host-side using only
-  third-party APIs (crt.sh certificates, Wayback Machine archives, OTX passive
-  DNS, RIPEstat whois/ASN, NVD, CISA KEV, EPSS, Shodan and Censys with keys).
+  third-party APIs (crt.sh certificates + issuer/validity, Wayback Machine
+  archives, OTX passive DNS, RIPEstat whois/ASN, NVD, CISA KEV, EPSS, OSV,
+  GitHub Advisory, Shodan and Censys with keys, RDAP WHOIS via the IANA
+  bootstrap, GitHub recon with an optional token, HackerTarget DNS history).
   **Zero packets to the target.** API keys are injected per-call and never
   logged.
 - **Zone B (sandbox):** all active tool execution happens inside a Kali-based
   Docker container under the **gVisor `runsc` runtime**, with a seccomp profile,
   a **non-root** user, and a read-only root filesystem. The sandbox image is
   pinned by digest. With `--code`, your source folder is mounted **read-only**
-  at a fixed `/code` path for the static analyzers.
+  at a fixed `/code` path for the static analyzers. Screenshots (gowitness) go
+  to a read-write `/evidence` mount — the only one — landing under
+  `~/.kryonsec/engagements/<id>/evidence/`.
 
 ### Enrichment and the report
 
 Hypotheses that name a CVE get public-risk context automatically: NVD
-score/CPE, CISA KEV (actively-exploited list), EPSS (probability of
-exploitation), and whether public exploit code exists (searchsploit in the
-sandbox). The engagement report shows all of it, plus a CVSS 3.1 base score
-calculated locally from each hypothesis's vector, deduplicated findings, and
-normalized evidence — with a tamper-evident fingerprint of the audit chain.
+score/CPE/CWE, CISA KEV (actively-exploited list), EPSS (probability of
+exploitation), OSV and GitHub Advisory severity + affected packages, whether
+public exploit code exists (searchsploit in the sandbox), and matching nuclei
+templates. The engagement report shows all of it, plus a CVSS 3.1 base score
+calculated locally from each hypothesis's vector, a timeline built from the
+audit chain, deduplicated findings, and normalized evidence — with a
+tamper-evident fingerprint of the audit chain. With `--code`, the report also
+has a "Code scanning results" section with an SBOM summary (syft) and one row
+per scanner.
 
 ### The audit chain
 
@@ -470,7 +478,7 @@ kryon-sec/
 │   ├── storage/                      # SQLAlchemy models + db session layer
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 30 files, 496 tests
+└── tests/                            # 30 files, 559 tests
 ```
 
 ---
@@ -486,7 +494,7 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 496 tests across 30 files
+- **Every safety layer has at least one unit test** — 559 tests across 30 files
   covering the audit chain, allowlist, secrets redaction, orchestrator
   transitions, compaction, sandbox, enrichment, scanners, report validation,
   CVSS calculator, TUI, wizard, and more
@@ -506,9 +514,12 @@ kryonsec purple --target example.com --code ~/src/my-app
 ```
 
 Watch the BLUE_TEAM state in the run output — it should report the
-scanners that ran (semgrep/bandit/gitleaks/trivy/checkov, plus hadolint
-when the folder has a Dockerfile), and the report's fix list should be
-grounded in that scanner evidence.
+scanners that ran (semgrep/bandit/gitleaks/trivy/checkov/syft/osv-scanner/
+grype, plus hadolint when the folder has a Dockerfile), and the report's
+fix list should be grounded in that scanner evidence. The report also gets
+an SBOM summary line and a timeline table. After the first run on a new
+version, rebuild the sandbox image (new tools are baked in):
+`docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .`
 
 ---
 
@@ -529,8 +540,9 @@ grounded in that scanner evidence.
 | Audit chain | ✅ done |
 | Tool allowlist + Kali sandbox (Docker/gVisor) | ✅ done — live-verified |
 | Tool expansion (~40 tools, 7 phases) | ✅ done — see `docs/TOOL-EXPANSION-2026-09-13.md` |
-| Passive recon sources (crt.sh, Wayback, OTX, RIPEstat, Shodan, Censys) | ✅ done |
-| Hypothesis enrichment (NVD/CPE, KEV, EPSS, searchsploit) | ✅ done |
+| Tool expansion Phase 8 (RDAP, GitHub recon, DNS history, cloud assets, gowitness, openapi_probe, OSV/GHSA/CWE/nuclei enrichment, syft/osv-scanner/grype, timeline, owasp_api) | ✅ done — ~50 tools total |
+| Passive recon sources (crt.sh, Wayback, OTX, RIPEstat, Shodan, Censys, RDAP, GitHub, HackerTarget, cloud assets) | ✅ done |
+| Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GitHub Advisory, searchsploit, nuclei templates) | ✅ done |
 | Blue-team code scanners (`--code`, read-only mount) | ✅ done |
 | Report enrichment (CVSS 3.1 calculator, dedup, evidence normalizer) | ✅ done |
 | Evidence ladder (tested → confirmed → verified) | ✅ done — live-verified |
