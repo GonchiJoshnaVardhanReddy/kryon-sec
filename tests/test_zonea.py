@@ -442,28 +442,352 @@ def test_ripestat_asn_no_ips_is_empty_not_error():
     assert result.notes == []
 
 
+def test_zone_a_allowlist_includes_phase8_hosts():
+    from kryonsec.purple.zonea import ZONE_A_ALLOWED_HOSTS
+
+    # Phase 8 passive sources: RDAP bootstrap, GitHub API, HackerTarget DNS
+    # history — every new fetch goes through the same host allowlist
+    assert "data.iana.org" in ZONE_A_ALLOWED_HOSTS
+    assert "api.github.com" in ZONE_A_ALLOWED_HOSTS
+    assert "api.hackertarget.com" in ZONE_A_ALLOWED_HOSTS
+
+
+# ---- RDAP WHOIS (Phase 8) --------------------------------------------------
+
+def test_rdap_whois_extracts_registry_notes():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import rdap_whois
+
+    bootstrap = _json.dumps({
+        "services": [[["com", "net"], ["https://rdap.example-registry.net"]]],
+    }).encode()
+    rdap_record = _json.dumps({
+        "events": [
+            {"eventAction": "registration", "eventDate": "2020-01-02T03:04:05Z"},
+            {"eventAction": "expiration", "eventDate": "2027-01-02T00:00:00Z"},
+        ],
+        "entities": [{
+            "roles": ["registrar"],
+            "vcardArray": ["vcard", [["fn", {}, "text", "Example Registrar Inc."]]],
+        }],
+        "status": ["client transfer prohibited"],
+        "nameservers": [{"ldhName": "NS1.target-corp.com"}],
+    }).encode()
+    calls: list = []
+
+    def fake_fetch(url, timeout=20, headers=None, data=None, **kw):
+        calls.append((url, kw))
+        return bootstrap if "data.iana.org" in url else rdap_record
+
+    with patch.object(zonea, "_zone_a_fetch", side_effect=fake_fetch):
+        result = rdap_whois("target-corp.com")
+
+    assert result.subdomains == []  # whois is notes-only
+    assert "registrar: Example Registrar Inc." in result.notes
+    assert "registration: 2020-01-02" in result.notes
+    assert "expiration: 2027-01-02" in result.notes
+    assert "status: client transfer prohibited" in result.notes
+    assert "nameservers: ns1.target-corp.com" in result.notes
+    # the registry query went to the IANA-derived base, not a fixed host
+    registry_calls = [c for c in calls if "iana.org" not in c[0]]
+    assert len(registry_calls) == 1
+    assert registry_calls[0][0] == "https://rdap.example-registry.net/domain/target-corp.com"
+
+
+def test_rdap_whois_extends_allowlist_only_with_bootstrap_host():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import ZONE_A_ALLOWED_HOSTS, rdap_whois
+
+    bootstrap = _json.dumps({
+        "services": [[["com"], ["https://rdap.verisign.com"]]],
+    }).encode()
+
+    def fake_fetch(url, timeout=20, headers=None, data=None, **kw):
+        if "data.iana.org" in url:
+            return bootstrap
+        # the RDAP query must allow ONLY base list + the bootstrap host
+        assert kw.get("allowed_hosts") == set(ZONE_A_ALLOWED_HOSTS) | {"rdap.verisign.com"}
+        return b'{"events": []}'
+
+    with patch.object(zonea, "_zone_a_fetch", side_effect=fake_fetch):
+        result = rdap_whois("target-corp.com")
+
+    assert result.notes == []
+
+
+def test_rdap_whois_failures_are_empty_not_errors():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import rdap_whois
+
+    # bootstrap unreachable -> empty
+    with patch.object(zonea, "_zone_a_fetch", side_effect=OSError("down")):
+        assert rdap_whois("target-corp.com").subdomains == []
+    # TLD absent from bootstrap -> empty, no second fetch
+    with patch.object(
+        zonea, "_zone_a_fetch",
+        return_value=b'{"services": [["zzz", ["https://rdap.nowhere"]]]}',
+    ):
+        assert rdap_whois("target-corp.com").subdomains == []
+
+
+# ---- GitHub recon (Phase 8) ------------------------------------------------
+
+def test_github_recon_keyless_finds_orgs_and_repos():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import github_recon
+
+    users = _json.dumps({"items": [{"login": "target-corp"}]}).encode()
+    repos = _json.dumps({"items": [
+        # repo whose name hides a subdomain-shaped hostname
+        {"full_name": "target-corp/www.target-corp.com",
+         "name": "www.target-corp.com"},
+        # ordinary repo — note only, no subdomain
+        {"full_name": "target-corp/legacy-api", "name": "legacy-api"},
+    ]}).encode()
+    code = _json.dumps({"items": []}).encode()
+
+    def fake_fetch(url, timeout=20, headers=None, data=None, **kw):
+        # every request stays on the allowlisted GitHub API host
+        assert url.startswith("https://api.github.com/")
+        for path, payload in (
+            ("/search/users", users), ("/search/repositories", repos),
+            ("/search/code", code),
+        ):
+            if path in url:
+                return payload
+        raise AssertionError(f"unexpected url {url}")
+
+    with patch.object(zonea, "_zone_a_fetch", side_effect=fake_fetch):
+        result = github_recon("target-corp.com")  # no token
+
+    assert result.subdomains == ["www.target-corp.com"]
+    assert "github org/user: target-corp" in result.notes
+    assert "github repo: target-corp/www.target-corp.com" in result.notes
+    assert "github repo: target-corp/legacy-api" in result.notes
+    # keyless code search is an explicit operator hint, not a silent gap
+    assert any("GITHUB_TOKEN" in n for n in result.notes)
+
+
+def test_github_recon_token_adds_code_hits_without_fetching_them():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import github_recon
+
+    empty = _json.dumps({"items": []}).encode()
+    code = _json.dumps({"items": [{
+        "repository": {"full_name": "ex-employee/scripts"},
+        "path": "deploy/config.env",
+    }]}).encode()
+    seen_headers: list = []
+    seen_urls: list = []
+
+    def fake_fetch(url, timeout=20, headers=None, data=None, **kw):
+        seen_urls.append(url)
+        if "/search/code" in url:
+            seen_headers.append(headers or {})
+            return code
+        return empty
+
+    with patch.object(zonea, "_zone_a_fetch", side_effect=fake_fetch):
+        result = github_recon("target-corp.com", token="gh-token")
+
+    assert "github code hit (not fetched): ex-employee/scripts/deploy/config.env" \
+        in result.notes
+    assert not any("GITHUB_TOKEN" in n for n in result.notes)  # token present
+    # the token went out as a bearer header and was never logged anywhere
+    assert seen_headers[0]["Authorization"] == "Bearer gh-token"
+    # raw file contents are NEVER fetched — only the three search endpoints
+    assert len(seen_urls) == 3
+
+
+def test_github_recon_rate_limit_is_empty_not_error():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import github_recon
+
+    with patch.object(zonea, "_zone_a_fetch", side_effect=OSError("rate limited")):
+        result = github_recon("target-corp.com", token="gh-token")
+
+    assert result.subdomains == []
+    assert result.skipped is None  # a fact of life for the free API, not a skip
+
+
+# ---- HackerTarget DNS history (Phase 8) -------------------------------------
+
+def test_hackertarget_hostsearch_parses_host_ip_pairs():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import hackertarget_hostsearch
+
+    body = (
+        "www.target-corp.com,1.2.3.4\n"
+        "mail.target-corp.com,5.6.7.8\n"
+        "evil.com,9.9.9.9\n"          # out of scope — dropped
+        "not-a-host\n"                # malformed line — ignored
+    ).encode()
+
+    with patch.object(zonea, "_zone_a_fetch", return_value=body):
+        result = hackertarget_hostsearch("target-corp.com")
+
+    assert result.subdomains == ["mail.target-corp.com", "www.target-corp.com"]
+    assert result.notes == ["historical records point at: 1.2.3.4, 5.6.7.8"]
+
+
+def test_hackertarget_rate_limit_is_clean_empty():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import hackertarget_hostsearch
+
+    for body in (b"API count exceeded - increase quota", b"error check params"):
+        with patch.object(zonea, "_zone_a_fetch", return_value=body):
+            result = hackertarget_hostsearch("target-corp.com")
+        assert result.subdomains == []
+        assert result.notes == []
+        assert result.skipped is None  # audited empty, not a failure
+
+
+# ---- cloud asset discovery (Phase 8) ----------------------------------------
+
+def test_cloud_asset_notes_classifies_by_provider():
+    from kryonsec.purple.zonea import cloud_asset_notes
+
+    result = cloud_asset_notes([
+        "cdn.target-corp.com.s3.amazonaws.com",
+        "app.target-corp.com.azurewebsites.net",
+        "www.target-corp.com",  # not cloud — ignored
+    ])
+
+    assert result.subdomains == []  # notes-only source
+    assert result.notes == [
+        "cloud (amazonaws): 1 asset(s): cdn.target-corp.com.s3.amazonaws.com",
+        "cloud (azurewebsites): 1 asset(s): app.target-corp.com.azurewebsites.net",
+    ]
+
+
+def test_cloud_asset_notes_empty_when_no_cloud_hosts():
+    from kryonsec.purple.zonea import cloud_asset_notes
+
+    result = cloud_asset_notes(["www.target-corp.com", "mail.target-corp.com"])
+    assert result.notes == []
+    assert cloud_asset_notes(None).notes == []
+
+
+def test_recon_passive_runs_cloud_asset_pass_and_audits_it(tmp_path):
+    from kryonsec.purple.zonea import PassiveResult
+
+    def s3ish(domain):
+        return PassiveResult(
+            source="crt.sh",
+            subdomains=["cdn.target-corp.com.s3.amazonaws.com",
+                        "www.target-corp.com"],
+        )
+
+    s3ish.__name__ = "crt_sh_subdomains"
+    sub, audit, graph = _make_sub(tmp_path, [s3ish])
+    sub.run()
+
+    # the cloud pass becomes an osint note in the graph
+    cloud_nodes = [n for n in graph.by_type("osint_note")
+                   if n["label"] == "cloud-assets"]
+    assert len(cloud_nodes) == 1
+    assert any("amazonaws" in note for note in cloud_nodes[0]["properties"]["notes"])
+    # ...and a passive_source_ok audit event, like every source
+    import json as _json
+    events = [_json.loads(line) for line in audit.path.read_text().splitlines()]
+    assert any(
+        e.get("event") == "passive_source_ok" and e.get("source") == "cloud-assets"
+        for e in events)
+
+
+# ---- crt.sh certificate enrichment (Phase 8) --------------------------------
+
+def test_crt_sh_notes_latest_certificate_issuer():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import crt_sh_subdomains
+
+    payload = _json.dumps([
+        {"name_value": "old.target-corp.com",
+         "entry_timestamp": "2024-01-01T00:00:00Z",
+         "issuer_name": "CN=Old CA", "not_before": "2023-12-01T00:00:00Z",
+         "not_after": "2024-03-01T00:00:00Z"},
+        {"name_value": "www.target-corp.com\napi.target-corp.com",
+         "entry_timestamp": "2026-06-01T00:00:00Z",
+         "issuer_name": "CN=Let's Encrypt R11",
+         "not_before": "2026-06-01T00:00:00Z",
+         "not_after": "2026-09-01T00:00:00Z"},
+    ]).encode()
+
+    with patch.object(zonea, "_zone_a_fetch", return_value=payload):
+        result = crt_sh_subdomains("target-corp.com")
+
+    assert result.notes == [
+        "latest cert issuer: Let's Encrypt R11 "
+        "(2026-06-01 → 2026-09-01, 2 name(s))"
+    ]
+
+
+def test_crt_sh_enrichment_never_fails_the_source():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+    from kryonsec.purple.zonea import crt_sh_subdomains
+
+    # entry_timestamp missing entirely — max() over defaults must not crash
+    payload = _json.dumps([{"name_value": "www.target-corp.com"}]).encode()
+    with patch.object(zonea, "_zone_a_fetch", return_value=payload):
+        result = crt_sh_subdomains("target-corp.com")
+
+    assert result.subdomains == ["www.target-corp.com"]
+    # issuer is empty -> no note, but the subdomains still land
+    assert result.notes == []
+
+
 def test_zone_a_fetchers_list_for_config():
     from kryonsec.purple.recon_passive import zone_a_fetchers
 
     cfg = KryonsecConfig()
     fetchers = zone_a_fetchers(cfg)
-    # keyed sources are included even without keys — they skip visibly
+    # keyed sources are included even without keys — they skip visibly;
+    # Phase 8 adds rdap, github, hackertarget (cloud-assets is a local pass,
+    # not a fetcher in this list)
     assert {f.__name__ for f in fetchers} == {
         "crt_sh_subdomains", "wayback_subdomains", "otx_passive_dns",
-        "ripestat_whois", "ripestat_asn", "shodan", "censys",
+        "ripestat_whois", "ripestat_asn", "rdap_whois", "github",
+        "hackertarget_hostsearch", "shodan", "censys",
     }
 
 
 def test_zone_a_fetchers_pass_keys_through():
     from unittest.mock import patch
 
-    from kryonsec.purple import zonea
+    from kryonsec.purple import recon_passive, zonea
     from kryonsec.purple.recon_passive import zone_a_fetchers
 
     cfg = KryonsecConfig()
     cfg.shodan_api_key = "sh-key"
     cfg.censys_api_id = "cid"
     cfg.censys_api_secret = "csecret"
+    cfg.github_token = "gh-token"
 
     seen: dict = {}
 
@@ -475,19 +799,37 @@ def test_zone_a_fetchers_pass_keys_through():
         seen["censys"] = (api_id, api_secret)
         return _pr("censys")
 
-    # patch every source the list runs so the test stays offline
+    def fake_github(domain, token=None):
+        seen["github"] = token
+        return _pr("github")
+
+    # patch every source the list runs so the test stays offline: the plain
+    # functions are bound in recon_passive's namespace (imported at module
+    # load), the closures (shodan/censys/github) import from zonea at call
+    # time — so both namespaces need patching
     with patch.object(zonea, "shodan_subdomains", fake_shodan), \
          patch.object(zonea, "censys_subdomains", fake_censys), \
-         patch.object(zonea, "crt_sh_subdomains", lambda d, **k: _pr("crt.sh")), \
-         patch.object(zonea, "wayback_subdomains", lambda d, **k: _pr("wayback")), \
-         patch.object(zonea, "otx_passive_dns", lambda d: _pr("otx")), \
-         patch.object(zonea, "ripestat_whois", lambda d: _pr("ripestat-whois")), \
-         patch.object(zonea, "ripestat_asn", lambda d: _pr("ripestat-asn")):
+         patch.object(zonea, "github_recon", fake_github), \
+         patch.object(recon_passive, "crt_sh_subdomains",
+                      lambda d, **k: _pr("crt.sh")), \
+         patch.object(recon_passive, "wayback_subdomains",
+                      lambda d, **k: _pr("wayback")), \
+         patch.object(recon_passive, "otx_passive_dns",
+                      lambda d: _pr("otx")), \
+         patch.object(recon_passive, "ripestat_whois",
+                      lambda d: _pr("ripestat-whois")), \
+         patch.object(recon_passive, "ripestat_asn",
+                      lambda d: _pr("ripestat-asn")), \
+         patch.object(recon_passive, "rdap_whois",
+                      lambda d: _pr("rdap")), \
+         patch.object(recon_passive, "hackertarget_hostsearch",
+                      lambda d: _pr("hackertarget")):
         for fetcher in zone_a_fetchers(cfg):
             fetcher("target-corp.com")
 
     assert seen["shodan"] == "sh-key"
     assert seen["censys"] == ("cid", "csecret")
+    assert seen["github"] == "gh-token"
 
 
 def _pr(source):

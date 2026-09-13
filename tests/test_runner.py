@@ -317,3 +317,81 @@ def test_run_purple_rejects_missing_code_folder(tmp_path):
     rc = _run_purple(cfg, "target-corp.com",
                      code_folder=str(tmp_path / "does-not-exist"))
     assert rc == 2
+
+
+def test_engagement_evidence_dir_wiring(tmp_path):
+    """Phase 8: every evidence-PRODUCING state (active recon, exploit,
+    post-exploit, verify) builds its sandbox with the rw /evidence mount
+    pointing into the engagement folder; passive/hypothesize sandboxes
+    stay mount-free."""
+    from kryonsec.purple.hypothesize import Hypothesis, HypothesisSet
+
+    import kryonsec.purple.hypothesize as hyp_mod
+    import kryonsec.purple.human_review as hr_mod
+    import kryonsec.purple.sandbox as sb_mod
+
+    cfg = KryonsecConfig(home=tmp_path)
+
+    evidence_dirs: list = []
+
+    def fake_llm(prompt):
+        return HypothesisSet(hypotheses=[
+            Hypothesis(
+                id="H1", title="SQLi on login", target_asset="/Login.asp",
+                rationale="login form", cvss_vector="", tools=["sqlmap"],
+                confidence=0.8,
+            ),
+        ])
+
+    def approve_all(hypotheses):
+        return {h["label"] for h in hypotheses}
+
+    class FakeProc:
+        returncode = 0
+        stdout = '{"exit_code": 0, "stdout": "vulnerable"}'
+        stderr = ""
+
+    orig_hyp_init = hyp_mod.HypothesizeSubagent.__init__
+    orig_hr_init = hr_mod.HumanReviewSubagent.__init__
+    orig_sb_init = sb_mod.KaliSandbox.__init__
+
+    def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None,
+                  sandbox=None):
+        orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm, budget=budget,
+                      sandbox=None)
+
+    def _init_hr(self, graph, audit, reviewer=None):
+        orig_hr_init(self, graph, audit, reviewer=approve_all)
+
+    def _init_sb(self, cfg, code_dir=None, evidence_dir=None, **kw):
+        orig_sb_init(self, cfg, code_dir=code_dir,
+                     evidence_dir=evidence_dir, **kw)
+        evidence_dirs.append(evidence_dir)
+        self._run = lambda argv, **kw2: FakeProc()
+
+    hyp_mod.HypothesizeSubagent.__init__ = _init_hyp
+    hr_mod.HumanReviewSubagent.__init__ = _init_hr
+    sb_mod.KaliSandbox.__init__ = _init_sb
+    try:
+        with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
+            with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
+                orch, audit, graph = start_engagement(
+                    cfg, "e-ev", target="target-corp.com")
+                completed = orch.run()
+    finally:
+        hyp_mod.HypothesizeSubagent.__init__ = orig_hyp_init
+        hr_mod.HumanReviewSubagent.__init__ = orig_hr_init
+        sb_mod.KaliSandbox.__init__ = orig_sb_init
+
+    assert "RECON_ACTIVE" in completed
+    # POST_EXPLOIT is dormant (no tool yields a shell, so shell_obtained
+    # never fires) — the three evidence-producing states that actually run
+    # are active recon, exploit, verify. Passive/hypothesize get no mount.
+    expected = str(cfg.home / "engagements" / "e-ev" / "evidence")
+    producers = [d for d in evidence_dirs if d is not None]
+    assert producers == [expected] * 3
+    assert evidence_dirs[0] is None  # passive recon needs no evidence mount
+    # the folder was actually created on disk
+    assert (cfg.home / "engagements" / "e-ev" / "evidence").is_dir()
+    ok, reason = audit.verify()
+    assert ok, reason

@@ -18,6 +18,8 @@ ALLOWED_TOOLS=(
     # active recon
     "nmap" "naabu" "httpx" "rustscan" "whatweb" "katana" "hakrawler"
     "feroxbuster" "sslscan" "testssl.sh" "dnsx"
+    # active recon (Phase 8): screenshots, DNS brute-force, API discovery
+    "gowitness" "massdns" "/opt/kryonsec/openapi_probe.py"
     # exploit / testing
     "nuclei" "sqlmap" "nikto" "curl" "wget" "ffuf" "gobuster" "wfuzz"
     "dalfox" "commix" "ssrfmap" "arjun" "tplmap" "jwt_tool" "kr"

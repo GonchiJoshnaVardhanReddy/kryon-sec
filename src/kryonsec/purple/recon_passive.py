@@ -16,7 +16,9 @@ from .orchestrator import SubagentResult
 from .zonea import (
     PassiveResult,
     crt_sh_subdomains,
+    hackertarget_hostsearch,
     otx_passive_dns,
+    rdap_whois,
     ripestat_asn,
     ripestat_whois,
     wayback_subdomains,
@@ -38,14 +40,22 @@ def zone_a_fetchers(cfg: KryonsecConfig) -> list[Callable[[str], PassiveResult]]
         return censys_subdomains(
             domain, api_id=cfg.censys_api_id, api_secret=cfg.censys_api_secret)
 
+    def github(domain: str) -> PassiveResult:
+        from .zonea import github_recon
+        return github_recon(domain, token=cfg.github_token)
+
     shodan.__name__ = "shodan"
     censys.__name__ = "censys"
+    github.__name__ = "github"
     return [
         crt_sh_subdomains,
         wayback_subdomains,
         otx_passive_dns,
         ripestat_whois,
         ripestat_asn,
+        rdap_whois,
+        github,
+        hackertarget_hostsearch,
         shodan,
         censys,
     ]
@@ -243,5 +253,26 @@ class ReconPassiveSubagent:
                 "paths": len(result.paths),
                 "notes": len(result.notes),
             })
+
+        # cloud asset discovery (Phase 8): a LOCAL pass over everything the
+        # real sources collected — zero fetches, so it runs last, source-shaped
+        # purely to flow through the same audit trail
+        from .zonea import cloud_asset_notes
+        collected = [n["label"] for n in self.graph.by_type("subdomain")]
+        cloud = cloud_asset_notes(collected)
+        if cloud.notes:
+            self.graph.add_node(
+                node_type="osint_note",
+                label=cloud.source,
+                properties={"notes": cloud.notes},
+            )
+        self.audit.write({
+            "event": "passive_source_ok",
+            "source": cloud.source,
+            "found": 0,
+            "new": 0,
+            "paths": 0,
+            "notes": len(cloud.notes),
+        })
 
         return SubagentResult(status="ok")

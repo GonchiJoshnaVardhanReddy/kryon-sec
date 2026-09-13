@@ -55,6 +55,7 @@ class KaliSandbox:
         seccomp_profile: Path | None = None,
         timeout_s: int = DEFAULT_TIMEOUT_S,
         code_dir: str | None = None,
+        evidence_dir: str | None = None,
     ):
         self.cfg = cfg
         self.image = cfg.sandbox_image
@@ -77,6 +78,19 @@ class KaliSandbox:
             self.code_dir = code_dir
         else:
             self.code_dir = None
+        # Evidence capture (Phase 8): gowitness screenshots etc. — an
+        # ABSOLUTE host path mounted READ-WRITE at the fixed /evidence.
+        # It is the ONLY read-write mount (rootfs and /code stay read-only);
+        # the path comes from the runner (engagement folder), never the LLM.
+        if evidence_dir is not None:
+            import posixpath
+
+            if not (Path(evidence_dir).is_absolute() or posixpath.isabs(evidence_dir)):
+                raise ValueError(
+                    f"evidence_dir must be an absolute path (got {evidence_dir!r})")
+            self.evidence_dir = evidence_dir  # verbatim, same rule as code_dir
+        else:
+            self.evidence_dir = None
         if "@sha256:" not in self.image:
             # rule 7: the image should be digest-pinned — a tag is mutable.
             # Still runnable (install.sh builds a local :latest) but flagged.
@@ -111,6 +125,11 @@ class KaliSandbox:
         # default cwd still find the code
         if getattr(self, "code_dir", None):
             argv += ["-v", f"{self.code_dir}:/code:ro", "-w", "/code"]
+        # read-write evidence mount (Phase 8): gowitness screenshots etc.
+        # land in the engagement folder. The ONLY rw mount — rootfs and
+        # /code stay read-only, so a tool can only write here.
+        if getattr(self, "evidence_dir", None):
+            argv += ["-v", f"{self.evidence_dir}:/evidence:rw"]
         # NOTE: full spec adds network_mode=container:kryonsec-proxy for
         # target-scope-only egress (§8.2). The proxy does not exist yet —
         # containers use the default bridge. Recorded in the audit chain
