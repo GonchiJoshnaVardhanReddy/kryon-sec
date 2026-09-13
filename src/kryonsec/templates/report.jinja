@@ -92,6 +92,17 @@ information and guessed what might be wrong. Nothing below is confirmed
 {% if exploit_ran %}- Tested: {% if h.tested | default(false) %}yes{% else %}no{% endif %}{% endif %}
 {% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
 {% if h.verified | default(false) %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.confirmed | default(false) %}- Double-checked: the second check ran but did not agree or could not run — treat this finding with care{% endif %}
+{% if h.cvss_vector %}- Severity guess (CVSS vector): {{ h.cvss_vector }}
+{% if h.cvss_score is not none %}  (calculated base score: {{ h.cvss_score }} — {{ h.cvss_qual }})
+{% else %}  (score could not be calculated)
+{% endif %}{% endif %}
+{% if h.enrichment.cve %}- Known risk data for {{ h.enrichment.cve }} (from public databases, looked up during the engagement):
+  - In CISA's list of actively-exploited bugs (KEV): {{ "YES — fix first" if h.enrichment.kev else ("no" if h.enrichment.kev is not none else "unknown (lookup failed)") }}
+  - Chance it gets exploited soon (EPSS score): {{ h.enrichment.epss if h.enrichment.epss is not none else "unknown" }}
+  - Public exploit code available: {{ "yes" if h.enrichment.exploit_available else "not found" }}
+{% if h.enrichment.cpes %}  - Affected software (CPE): {{ h.enrichment.cpes | join(", ") }}
+{% endif %}
+{% endif %}
 - Why it thinks this: {{ h.rationale }}
 - How to check it: {{ h.tools | join(", ") if h.tools else "(no tool suggested)" }}
 
@@ -106,6 +117,7 @@ No issues were suggested for this target.
 - How serious: {{ r.severity }}
 - What to do: {{ r.fix }}
 {% if r.detection %}- How to spot attacks: {{ r.detection }}{% endif %}
+{% if r.cwe or r.owasp or r.attack %}- Weakness types (suggested, not verified): {{ r.cwe if r.cwe else "—" }}{{ "; " if r.cwe and r.owasp }}{{ r.owasp if r.owasp else "—" }}{{ "; " if (r.cwe or r.owasp) and r.attack }}{{ r.attack if r.attack else "—" }}{% endif %}
 
 {% else %}
 No fix advice was generated.
