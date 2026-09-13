@@ -167,21 +167,31 @@ def test_api_keys_round_trip(tmp_path, clean_env):
     assert loaded.shodan_api_key == "sh-test-key"
     assert loaded.censys_api_id == "censys-id-1"
     assert loaded.censys_api_secret == "censys-secret-1"
+    # Phase 8: the GitHub token rides along in the same [api] table
+    cfg.github_token = "gh-test-token"
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    assert "github_token" in path.read_text(encoding="utf-8")
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.github_token == "gh-test-token"
 
 
 def test_api_keys_env_overrides_toml(tmp_path, monkeypatch):
-    for var in ("SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET"):
+    for var in ("SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET",
+                "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SHODAN_API_KEY", "sh-from-env")
     monkeypatch.setenv("CENSYS_API_ID", "cid-from-env")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-from-env")
 
     cfg = KryonsecConfig(home=tmp_path)
     cfg.shodan_api_key = "sh-from-toml"
     cfg.censys_api_id = "cid-from-toml"
+    cfg.github_token = "gh-from-toml"
     path = write_config(config_path(tmp_path), cfg.to_toml_dict())
     loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
     assert loaded.shodan_api_key == "sh-from-env"
     assert loaded.censys_api_id == "cid-from-env"
+    assert loaded.github_token == "gh-from-env"
 
 
 def test_env_absent_toml_wins(tmp_path, clean_env):

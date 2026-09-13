@@ -5,8 +5,8 @@ the sandbox (the only place packets to the target are ever allowed):
 
   stage 1 (discovery):  nmap → naabu → dnsx
   stage 2 (web probes): per discovered http(s) service — httpx → whatweb
-                        → katana → feroxbuster; sslscan + testssl.sh when
-                        the service is TLS
+                        → katana → feroxbuster → openapi_probe → gowitness;
+                        sslscan + testssl.sh when the service is TLS
 
 Every argv is built here as a fixed constant list, validated against the
 host-side ToolAllowlist (Layer 2), and audited. The LLM has no say in
@@ -15,7 +15,8 @@ just has less evidence (each failure is audited).
 
 rustscan is allowlisted but not in the default plan (nmap + naabu already
 cover port discovery; one of them failing is not worth a third scanner's
-runtime). hakrawler duplicates katana.
+runtime). hakrawler duplicates katana. massdns (Phase 8) is allowlisted
+but likewise not in the plan — dnsx covers resolution.
 """
 
 from __future__ import annotations
@@ -175,6 +176,14 @@ class ReconActiveSubagent:
             plan.append(("feroxbuster",
                          ["feroxbuster", "-u", base.rstrip("/") + "/FUZZ",
                           "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"]))
+            # Phase 8: API surface discovery + a screenshot per web port —
+            # the PNG lands in the rw /evidence mount (engagement folder)
+            plan.append(("openapi_probe",
+                         ["/opt/kryonsec/openapi_probe.py", base]))
+            plan.append(("gowitness",
+                         ["gowitness", "scan", "website", "--url", base,
+                          "--screenshot-path", "/evidence", "--no-console",
+                          "--disable-db"]))
             if port in TLS_PORTS:
                 plan.append(("sslscan",
                              ["sslscan", "--no-failed", "--sleep", "100",
@@ -292,6 +301,44 @@ class ReconActiveSubagent:
                         label=p["path"],
                         properties={"status": p["status"], "source": "feroxbuster"},
                     )
+            elif tool == "openapi_probe":
+                # JSON summary from the baked script — parse defensively;
+                # found endpoints become path nodes for HYPOTHESIZE
+                try:
+                    import json as _json
+
+                    payload = _json.loads(result.stdout)
+                except ValueError:
+                    payload = {}
+                for found in payload.get("found") or []:
+                    for ep in found.get("endpoints") or []:
+                        self.graph.add_node(
+                            node_type="path",
+                            label=str(ep).split(" ", 1)[-1][:300],
+                            properties={
+                                "source": "openapi_probe",
+                                "doc_path": found.get("path"),
+                                "spec_version": found.get("spec_version", ""),
+                            },
+                        )
+                if any(f.get("status") == 200 for f in payload.get("found") or []):
+                    self.audit.write({
+                        "event": "recon_active_openapi",
+                        "found": [
+                            f.get("path") for f in payload.get("found") or []
+                            if f.get("status") == 200
+                        ],
+                    })
+            elif tool == "gowitness":
+                # the screenshot itself is the evidence — in the rw /evidence
+                # mount (engagement folder), not in tool output. A graph node
+                # records that it was taken (and where to find it).
+                url = argv[argv.index("--url") + 1] if "--url" in argv else self.target
+                self.graph.add_node(
+                    node_type="screenshot",
+                    label=url,
+                    properties={"source": "gowitness", "dir": "/evidence"},
+                )
             elif tool in ("sslscan", "testssl.sh"):
                 self.graph.add_node(
                     node_type="tls_observation",

@@ -101,6 +101,14 @@ def test_blocklist_allows_normal_argv(allow):
     ("trivy", ["trivy", "fs", "--scanners", "vuln", "/code"]),
     ("checkov", ["checkov", "-d", "/code"]),
     ("hadolint", ["hadolint", "/code/Dockerfile"]),
+    # Phase 8 active recon: screenshots, DNS brute-force, API discovery
+    ("gowitness", ["gowitness", "scan", "website", "--url", "http://target.com:8080/",
+                   "--screenshot-path", "/evidence", "--no-console", "--disable-db"]),
+    ("massdns", ["massdns", "-r", "/usr/share/seclists/Miscellaneous/dns-resolvers.txt",
+                 "-t", "A", "-o", "S", "-w", "/tmp/massdns.out",
+                 "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"]),
+    ("/opt/kryonsec/openapi_probe.py",
+     ["/opt/kryonsec/openapi_probe.py", "http://target.com:8080/"]),
 ])
 def test_new_template_accepts_valid_argv(allow, tool, argv):
     allow.validate(tool, argv)
@@ -161,6 +169,44 @@ def test_embedded_alternation_rejects_unknown_choice(allow):
         allow.validate("testssl.sh",
                        ["testssl.sh", "--batch", "--severity=info", "--no-color",
                         "https://target.com/"])
+
+
+# ---- Phase 8 templates ------------------------------------------------------
+
+def test_gowitness_screenshot_path_is_pinned_to_evidence(allow):
+    """Screenshots go to the rw /evidence mount ONLY — any other path
+    (e.g. /tmp, or a host path) must be rejected."""
+    with pytest.raises(AllowlistViolation):
+        allow.validate("gowitness", [
+            "gowitness", "scan", "website", "--url", "http://target.com/",
+            "--screenshot-path", "/tmp", "--no-console", "--disable-db"])
+    with pytest.raises(AllowlistViolation):
+        # --disable-db is required: the rootfs is read-only, a SQLite
+        # result DB would crash the run
+        allow.validate("gowitness", [
+            "gowitness", "scan", "website", "--url", "http://target.com/",
+            "--screenshot-path", "/evidence", "--no-console"])
+
+
+def test_massdns_rejects_arbitrary_wordlist(allow):
+    """The wordlist and resolvers are FIXED literals from the image — an
+    attacker-influenced list must never validate."""
+    with pytest.raises(AllowlistViolation):
+        allow.validate("massdns", [
+            "massdns", "-r", "/usr/share/seclists/Miscellaneous/dns-resolvers.txt",
+            "-t", "A", "-o", "S", "-w", "/tmp/massdns.out",
+            "/etc/passwd"])
+
+
+def test_openapi_probe_takes_only_a_url(allow):
+    """Fixed argv [script, url] — extra args or options are rejected."""
+    with pytest.raises(AllowlistViolation):
+        allow.validate("/opt/kryonsec/openapi_probe.py",
+                       ["/opt/kryonsec/openapi_probe.py",
+                        "http://target.com/", "--extra"])
+    with pytest.raises(AllowlistViolation):
+        allow.validate("/opt/kryonsec/openapi_probe.py",
+                       ["/opt/kryonsec/openapi_probe.py", "target.com"])
 
 
 # ---- entrypoint ↔ host allowlist sync (defense-in-depth Layer 2b) ---------

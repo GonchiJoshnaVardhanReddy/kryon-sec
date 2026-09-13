@@ -43,6 +43,7 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "agent": "active-recon",
         "does": "scan the target (packets to target)",
         "tools": "nmap, naabu, dnsx, httpx, whatweb, katana, feroxbuster, "
+                 "openapi_probe, gowitness (screenshots → /evidence), "
                  "sslscan, testssl.sh",
         "zone": "B (sandbox)",
     },
@@ -203,6 +204,14 @@ def start_engagement(
         "reason": sandbox_reason,
     })
 
+    # Evidence capture (Phase 8): screenshots and other artifacts land in
+    # the engagement folder, mounted rw at the fixed /evidence in every
+    # sandbox that produces evidence (active recon, exploit, post-exploit,
+    # verify). The path is host-side Python — never from the LLM or argv.
+    evidence_dir = cfg.home / "engagements" / engagement_id / "evidence"
+    if sandbox_ok:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+
     def resolve(state: str):
         """State name -> subagent run callable (or None for stubs)."""
         if state == "RECON_PASSIVE":
@@ -286,7 +295,7 @@ def start_engagement(
             from .recon_active import ReconActiveSubagent
             from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg)
+            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = ReconActiveSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox,
@@ -297,7 +306,7 @@ def start_engagement(
             from .exploit import ExploitSubagent
             from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg)
+            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = ExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox, progress=progress,
@@ -308,7 +317,7 @@ def start_engagement(
             from .post_exploit import PostExploitSubagent
             from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg)
+            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = PostExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox,
@@ -319,7 +328,7 @@ def start_engagement(
             from .sandbox import KaliSandbox
             from .verify import VerifySubagent
 
-            sandbox = KaliSandbox(cfg=cfg)
+            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = VerifySubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox,

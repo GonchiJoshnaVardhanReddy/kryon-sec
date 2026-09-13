@@ -91,6 +91,8 @@ def compile_tool_templates(templates: dict[str, list[str]]) -> dict[str, list[re
 
 # Wordlists baked into the sandbox image (seclists is installed there)
 SECLISTS_WEB = "/usr/share/seclists/Discovery/Web-Content/common.txt"
+SECLISTS_DNS = "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+DNS_RESOLVERS = "/usr/share/seclists/Miscellaneous/dns-resolvers.txt"
 # Enumeration/probe scripts baked into the image (executable, shebang)
 SANDBOX_SCRIPT_DIR = "/opt/kryonsec"
 
@@ -117,6 +119,23 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     "sslscan": ["--no-failed", "--sleep", "{rate}", "{target}"],
     "testssl.sh": ["--batch", "--severity={low|medium|high|critical}", "--no-color", "{url}"],
     "dnsx": ["-d", "{target}", "-silent"],
+    # gowitness (Phase 8): headless-Chrome screenshots into the rw /evidence
+    # mount. --disable-db: the rootfs is read-only — no SQLite result DB,
+    # the PNG itself is the evidence. NOT in the default web plan's first
+    # stage; it runs per discovered web port.
+    "gowitness": [
+        "scan", "website", "--url", "{url}",
+        "--screenshot-path", "/evidence", "--no-console", "--disable-db",
+    ],
+    # massdns (Phase 8): brute-force DNS resolution with the image's FIXED
+    # wordlist + resolvers. Allowlisted but NOT in the default plan — dnsx
+    # already covers resolution; this is here for future plan use.
+    "massdns": [
+        "-r", DNS_RESOLVERS, "-t", "A", "-o", "S", "-w", "/tmp/massdns.out",
+        SECLISTS_DNS,
+    ],
+    # OpenAPI/API discovery (Phase 8): baked probe script, fixed argv
+    f"{SANDBOX_SCRIPT_DIR}/openapi_probe.py": ["{url}"],
 }
 
 # Exploit/testing tools (spec §4.7; masscan intentionally absent)

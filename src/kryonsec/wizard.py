@@ -370,6 +370,10 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
                 console.print("[yellow]censys keys saved, shodan skipped[/yellow]")
         elif censys_id or censys_secret:
             console.print("[yellow]censys needs BOTH an ID and a secret — skipped[/yellow]")
+        # GitHub recon (Phase 8): optional — code search needs a token
+        github = _ask_optional_key("GitHub token (code search, optional)", answers)
+        if github:
+            cfg.github_token = github
     else:
         console.print("[dim]skipped — keyless passive sources only[/dim]")
 

@@ -162,6 +162,11 @@ class KryonsecConfig:
     censys_api_secret: str | None = field(
         default_factory=lambda: os.environ.get("CENSYS_API_SECRET")
     )
+    # GitHub recon (Phase 8): optional — code search needs a token; org/repo
+    # search works without. Never logged, never audited.
+    github_token: str | None = field(
+        default_factory=lambda: os.environ.get("GITHUB_TOKEN")
+    )
 
     # --- LLM routing (spec §7.1) ---
     provider: str = "openai"  # "openai" | "ollama"
@@ -238,6 +243,7 @@ class KryonsecConfig:
                 "shodan_api_key": self.shodan_api_key or "",
                 "censys_api_id": self.censys_api_id or "",
                 "censys_api_secret": self.censys_api_secret or "",
+                "github_token": self.github_token or "",
             },
             "tools": {
                 "enabled": list(self.enabled_tools),
@@ -298,6 +304,8 @@ class KryonsecConfig:
             cfg.censys_api_id = api["censys_api_id"]
         if api.get("censys_api_secret"):
             cfg.censys_api_secret = api["censys_api_secret"]
+        if api.get("github_token"):
+            cfg.github_token = api["github_token"]
         cfg.mcp_servers = [_server_from_row(r) for r in mcp.get("servers", [])]
 
         # environment beats TOML (documented behavior for power users / CI)
@@ -309,6 +317,7 @@ class KryonsecConfig:
         cfg.censys_api_secret = (
             os.environ.get("CENSYS_API_SECRET") or cfg.censys_api_secret
         )
+        cfg.github_token = os.environ.get("GITHUB_TOKEN") or cfg.github_token
         return cfg
 
     # ---- lifecycle --------------------------------------------------------

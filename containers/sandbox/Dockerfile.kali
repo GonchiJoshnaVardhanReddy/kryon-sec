@@ -42,6 +42,7 @@ RUN EXTENDED_TOOLS=" \
     katana hakrawler feroxbuster sslscan testssl.sh dalfox commix \
     wfuzz arjun exploitdb httpie \
     semgrep bandit gitleaks trivy checkov hadolint kube-bench \
+    gowitness massdns \
     " && apt-get update && \
     (apt-get install -y --no-install-recommends $EXTENDED_TOOLS || \
      for t in $EXTENDED_TOOLS; do \

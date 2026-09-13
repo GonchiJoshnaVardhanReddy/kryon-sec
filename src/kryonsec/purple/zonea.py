@@ -30,7 +30,16 @@ ZONE_A_ALLOWED_HOSTS = {
     "api.shodan.io",
     "search.censys.io",
     "stat.ripe.net",
+    "data.iana.org",  # RDAP bootstrap (Phase 8): TLD -> registry RDAP server
+    "api.github.com",  # GitHub recon (Phase 8): org/repo/code search
+    "api.hackertarget.com",  # DNS history (Phase 8): hostsearch
 }
+
+# Registry RDAP servers (Phase 8): data.iana.org/rdap/dns.json maps every TLD
+# to its registry's RDAP host. Those hosts are added per-call to the fetch
+# allowlist — they come from IANA's official bootstrap file, never from a
+# redirect or from untrusted data.
+_IANA_RDAP_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
 
 
 class ZoneAViolation(Exception):
@@ -198,7 +207,24 @@ def crt_sh_subdomains(domain: str, retries: int = 2) -> PassiveResult:
             if name and _same_domain(name, domain) and re.match(r"^[a-z0-9.-]+$", name):
                 found.add(name)
 
-    return PassiveResult(source="crt.sh", subdomains=sorted(found))
+    # certificate enrichment (Phase 8): issuer + validity + SAN count of the
+    # most recent cert — bounded notes for HYPOTHESIZE, not per-cert detail
+    notes: list[str] = []
+    try:
+        latest = max(
+            records, key=lambda r: str(r.get("entry_timestamp", "")))
+        issuer = str(latest.get("issuer_name", "")).split("CN=")[-1][:80]
+        not_before = str(latest.get("not_before", ""))[:10]
+        not_after = str(latest.get("not_after", ""))[:10]
+        san_count = len(latest.get("name_value", "").splitlines())
+        if issuer:
+            notes.append(
+                f"latest cert issuer: {issuer} ({not_before} → {not_after}, "
+                f"{san_count} name(s))")
+    except Exception:  # enrichment only — never fail the source over it
+        pass
+
+    return PassiveResult(source="crt.sh", subdomains=sorted(found), notes=notes)
 
 
 def wayback_paths(domain: str, limit: int = 100, retries: int = 2) -> list[str]:
@@ -455,3 +481,189 @@ def ripestat_asn(domain: str) -> PassiveResult:
             f" in prefix {info.get('prefix', '?')}"
         )
     return PassiveResult(source="ripestat-asn", subdomains=[], notes=notes)
+
+
+# ---- Phase 8 additions (2026-09-13 tool map) -------------------------------
+
+
+def rdap_whois(domain: str) -> PassiveResult:
+    """Registry RDAP WHOIS (Phase 8): registrar, dates, statuses, nameservers.
+
+    The TLD's RDAP server comes from IANA's official bootstrap file — the
+    only extra host ever added to the fetch allowlist, and never from a
+    redirect. Complements ripestat_whois with the registry-level record."""
+    domain = normalize_target(domain)
+    tld = domain.rsplit(".", 1)[-1]
+    try:
+        bootstrap = json.loads(_zone_a_fetch(_IANA_RDAP_BOOTSTRAP))
+        rdap_base = None
+        for entry in bootstrap.get("services", []):
+            tlds, urls = entry[0], entry[1]
+            if tld in tlds and urls:
+                rdap_base = urls[0].rstrip("/")
+                break
+        if not rdap_base:
+            return PassiveResult(source="rdap", subdomains=[])
+    except Exception:
+        log.warning("RDAP bootstrap fetch failed", exc_info=True)
+        return PassiveResult(source="rdap", subdomains=[])
+    rdap_host = urllib.parse.urlparse(rdap_base).hostname or ""
+    if not rdap_host:
+        return PassiveResult(source="rdap", subdomains=[])
+    hosts = set(ZONE_A_ALLOWED_HOSTS) | {rdap_host}
+    url = f"{rdap_base}/domain/{urllib.parse.quote(domain)}"
+    try:
+        data = json.loads(_zone_a_fetch(url, allowed_hosts=hosts))
+    except Exception:
+        log.warning("rdap query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="rdap", subdomains=[])
+
+    notes: list[str] = []
+    for event in data.get("events") or []:
+        action = str(event.get("eventAction", "")).strip()
+        date = str(event.get("eventDate", ""))[:10]  # date only, not time
+        if action and date:
+            notes.append(f"{action}: {date}")
+    for ent in data.get("entities") or []:
+        roles = {str(r).lower() for r in ent.get("roles") or []}
+        if "registrar" in roles:
+            vcard = ent.get("vcardArray") or [None, []]
+            for item in (vcard[1] if len(vcard) > 1 else []) or []:
+                # ["fn", {}, "text", "Example Registrar Inc."]
+                if len(item) >= 4 and item[0] == "fn" and item[3]:
+                    notes.append(f"registrar: {str(item[3])[:120]}")
+                    break
+            break
+    statuses = [str(s) for s in data.get("status") or []][:6]
+    if statuses:
+        notes.append("status: " + ", ".join(statuses))
+    nss = sorted({
+        str(ns.get("ldhName", "")).lower().rstrip(".")
+        for ns in data.get("nameservers") or [] if ns.get("ldhName")
+    })[:8]
+    if nss:
+        notes.append("nameservers: " + ", ".join(nss))
+    return PassiveResult(source="rdap", subdomains=[], notes=notes[:20])
+
+
+def github_recon(domain: str, token: str | None = None) -> PassiveResult:
+    """GitHub recon (Phase 8): orgs/repos named after the domain, plus code
+    search (leaked-config references — NOTES only, contents never fetched)
+    when a token is configured. Rate limits are facts of life for the free
+    API: any failure is an empty result, audited by the caller like every
+    flaky source."""
+    domain = normalize_target(domain)
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        # injected per-call, never logged/audited (same rule as shodan/censys)
+        headers["Authorization"] = f"Bearer {token}"
+
+    def _search(path: str, query: str) -> list[dict]:
+        url = f"https://api.github.com{path}?" + urllib.parse.urlencode(
+            {"q": query, "per_page": 10})
+        try:
+            return json.loads(_zone_a_fetch(url, headers=headers)).get("items") or []
+        except Exception:
+            log.info("github %s search failed for %s", path, domain)
+            return []
+
+    notes: list[str] = []
+    subdomains: list[str] = []
+    # subdomain-like hostnames hiding in repo names (e.g. target-corp/www)
+    host_re = re.compile(
+        r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?" + re.escape("." + domain) + r"$")
+
+    for user in _search("/search/users", domain):
+        login = str(user.get("login", "")).strip()
+        if login:
+            notes.append(f"github org/user: {login[:60]}")
+    for repo in _search("/search/repositories", domain):
+        full = str(repo.get("full_name", "")).strip()
+        if full:
+            notes.append(f"github repo: {full[:100]}")
+        for part in str(repo.get("name", "")).lower().replace("_", ".").split("/"):
+            if host_re.match(part):
+                subdomains.append(part)
+    if token:
+        for hit in _search("/search/code", domain):
+            repo = str((hit.get("repository") or {}).get("full_name", "")).strip()
+            path = str(hit.get("path", "")).strip()
+            # a NOTE only — the file content is NEVER fetched (a found
+            # secret reference is signal for the operator, not for us)
+            if repo and path:
+                notes.append(f"github code hit (not fetched): {repo}/{path[:80]}")
+    else:
+        notes.append("github code search needs a GITHUB_TOKEN (kryonsec setup)")
+    return PassiveResult(
+        source="github",
+        subdomains=_in_scope_subdomains(subdomains, domain),
+        notes=notes[:20],
+    )
+
+
+def hackertarget_hostsearch(domain: str) -> PassiveResult:
+    """DNS record history (Phase 8): HackerTarget hostsearch — historical
+    host/IP pairs from its crawled DNS data. Keyless but heavily
+    rate-limited; the free-tier 'limit reached' answer is a clean empty
+    result, not a failure."""
+    domain = normalize_target(domain)
+    url = (
+        "https://api.hackertarget.com/hostsearch/"
+        f"?q={urllib.parse.quote(domain)}"
+    )
+    try:
+        body = _zone_a_fetch(url).decode("utf-8", "replace")
+    except Exception:
+        log.info("hackertarget hostsearch failed for %s", domain)
+        return PassiveResult(source="hackertarget", subdomains=[])
+    if "error" in body.lower() or "limit" in body.lower():
+        # rate limited / API check failed — an audited empty, never an error
+        return PassiveResult(source="hackertarget", subdomains=[])
+    hosts: list[str] = []
+    ips: set[str] = set()
+    for line in body.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0] and _same_domain(parts[0], domain):
+            hosts.append(parts[0].lower().rstrip("."))
+            if _IP4_RE.match(parts[1]):
+                ips.add(parts[1])
+    notes = []
+    if ips:
+        notes.append(f"historical records point at: {', '.join(sorted(ips)[:5])}")
+    return PassiveResult(
+        source="hackertarget",
+        subdomains=_in_scope_subdomains(hosts, domain),
+        notes=notes,
+    )
+
+
+# Cloud provider suffixes for cloud_asset_notes (Phase 8): a local analysis
+# pass — zero fetches, it only re-reads what the other sources collected.
+_CLOUD_SUFFIXES = (
+    ".amazonaws.com", ".cloudfront.net", ".azurewebsites.net",
+    ".blob.core.windows.net", ".herokuapp.com", ".netlify.app",
+    ".fastly.net", ".appspot.com", ".storage.googleapis.com",
+)
+
+
+def cloud_asset_notes(subdomains: "list[str] | None" = None) -> PassiveResult:
+    """Cloud asset discovery (Phase 8): classify collected subdomains by
+    cloud provider suffix. LOCAL ONLY — this source never fetches anything;
+    the runner calls it last with the subdomains gathered so far. It is a
+    source-shaped function purely so it flows through the same audit
+    (passive_source_ok) as the real fetchers."""
+    assets: dict[str, list[str]] = {}
+    for sub in subdomains or []:
+        low = str(sub).lower().rstrip(".")
+        for suffix in _CLOUD_SUFFIXES:
+            if low.endswith(suffix):
+                assets.setdefault(suffix, []).append(low)
+                break
+    notes: list[str] = []
+    for suffix in sorted(assets):
+        provider = suffix.lstrip(".").split(".")[0]
+        notes.append(
+            f"cloud ({provider}): {len(assets[suffix])} asset(s): "
+            + ", ".join(sorted(assets[suffix])[:5])
+        )
+    return PassiveResult(source="cloud-assets", subdomains=[], notes=notes[:10])

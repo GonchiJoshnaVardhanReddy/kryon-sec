@@ -205,8 +205,195 @@ def test_recon_active_no_web_ports_still_runs_default_probe(tmp_path):
     assert fake.tools.count("whatweb") == 1  # only the port-80 default
 
 
+# ---- Phase 8: gowitness + openapi_probe in the web plan --------------------
 
-# ---- VERIFY: probe URL building ------------------------------------------def test_boolean_probe_urls_builds_true_false_pair():
+def test_web_plan_includes_openapi_and_gowitness_per_web_port(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    graph = EngagementGraph(engagement_id="e-ra6")
+    sub = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "a.jsonl"), "t.com",
+        FakeSandbox(SpawnResult(ok=False, exit_code=-1, stdout="")))
+
+    plan = sub._web_plan({80, 443, 5432})
+    tools = [tool for tool, _ in plan]
+    # every web port gets both new probes; 5432 (postgres) gets none
+    assert tools.count("openapi_probe") == 2
+    assert tools.count("gowitness") == 2
+
+    from kryonsec.purple.allowlist import ToolAllowlist
+    allow = ToolAllowlist()
+    for tool, argv in plan:
+        # argv from the actual plan is always allowlist-valid
+        allow.validate(argv[0], argv)
+        if tool == "gowitness":
+            assert "--screenshot-path" in argv
+            assert argv[argv.index("--screenshot-path") + 1] == "/evidence"
+
+
+def test_web_plan_gowitness_arg_is_exactly_the_template(tmp_path):
+    """The argv matches the gowitness allowlist template token-for-token
+    (a drifting flag here would silently break every real engagement)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    graph = EngagementGraph(engagement_id="e-ra7")
+    sub = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "a.jsonl"), "t.com",
+        FakeSandbox(SpawnResult(ok=False, exit_code=-1, stdout="")))
+
+    for tool, argv in sub._web_plan({80}):
+        if tool == "gowitness":
+            assert argv == ["gowitness", "scan", "website",
+                            "--url", "http://t.com:80/",
+                            "--screenshot-path", "/evidence",
+                            "--no-console", "--disable-db"]
+
+
+def test_recon_active_openapi_endpoints_become_path_nodes(tmp_path):
+    import json as _json
+
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra8")
+
+    class OpenApiSandbox:
+        OUTPUTS = {
+            "nmap": "80/tcp open http\n",
+            "/opt/kryonsec/openapi_probe.py": _json.dumps({
+                "url": "http://t.com:80/",
+                "probed": ["/openapi.json"],
+                "found": [{
+                    "path": "/openapi.json", "status": 200,
+                    "spec_version": "3.0.1",
+                    "endpoints": ["GET /api/v1/users", "POST /api/v1/login"],
+                }],
+            }),
+        }
+
+        def __init__(self):
+            self.tools = []
+
+        def spawn(self, argv):
+            self.tools.append(argv[0])
+            return SpawnResult(ok=True, exit_code=0,
+                               stdout=self.OUTPUTS.get(argv[0], ""))
+
+    fake = OpenApiSandbox()
+    result = ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+    assert result.status == "ok"
+
+    paths = {p["label"] for p in graph.by_type("path")}
+    assert "/api/v1/users" in paths
+    assert "/api/v1/login" in paths
+    api_paths = [p for p in graph.by_type("path")
+                 if p["properties"].get("source") == "openapi_probe"]
+    assert api_paths[0]["properties"]["doc_path"] == "/openapi.json"
+    assert api_paths[0]["properties"]["spec_version"] == "3.0.1"
+    # the found doc is audited
+    events = _events(audit)
+    assert "recon_active_openapi" in events
+
+
+def test_recon_active_gowitness_creates_screenshot_node(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra9")
+
+    class GowitnessSandbox:
+        OUTPUTS = {
+            "nmap": "80/tcp open http\n",
+            "gowitness": "[info] screenshot saved",
+        }
+
+        def __init__(self):
+            self.tools = []
+
+        def spawn(self, argv):
+            self.tools.append(argv[0])
+            return SpawnResult(ok=True, exit_code=0,
+                               stdout=self.OUTPUTS.get(argv[0], ""))
+
+    fake = GowitnessSandbox()
+    result = ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+    assert result.status == "ok"
+    assert "gowitness" in fake.tools
+
+    shots = graph.by_type("screenshot")
+    assert shots and shots[0]["label"] == "http://t.com:80/"
+    assert shots[0]["properties"]["dir"] == "/evidence"
+
+
+def test_recon_active_openapi_bad_json_is_skipped_not_fatal(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra10")
+
+    class BadJsonSandbox:
+        def __init__(self):
+            self.tools = []
+
+        def spawn(self, argv):
+            self.tools.append(argv[0])
+            out = "80/tcp open http\n" if argv[0] == "nmap" else "<<not json>>"
+            return SpawnResult(ok=True, exit_code=0, stdout=out)
+
+    result = ReconActiveSubagent(
+        cfg, graph, audit, "t.com", BadJsonSandbox()).run()
+    assert result.status == "ok"  # unparseable output never fails the state
+    assert graph.by_type("path") == []
+
+
+
+# ---- Phase 8: the baked openapi_probe script -------------------------------
+
+def _load_openapi_probe():
+    """Load containers/sandbox/scripts/openapi_probe.py as a module (it's
+    baked into the image, not part of the package)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = (Path(__file__).resolve().parents[1]
+            / "containers" / "sandbox" / "scripts" / "openapi_probe.py")
+    spec = importlib.util.spec_from_file_location("openapi_probe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_openapi_probe_script_extracts_endpoints():
+    mod = _load_openapi_probe()
+    spec = {
+        "openapi": "3.0.1",
+        "paths": {
+            "/api/v1/users": {"get": {}, "post": {}},
+            "/api/v1/login": {"post": {}},
+            "not-a-dict": "ignore me",
+        },
+    }
+    eps = mod._endpoints_from_spec(spec)
+    assert eps == ["GET,POST /api/v1/users", "POST /api/v1/login"]
+
+
+def test_openapi_probe_script_bounds_endpoint_list():
+    mod = _load_openapi_probe()
+    spec = {"paths": {f"/p{i}": {"get": {}} for i in range(100)}}
+    eps = mod._endpoints_from_spec(spec)
+    assert len(eps) == mod.MAX_ENDPOINTS  # 50 — a verbose spec can't flood
+    assert all(len(e) <= mod.MAX_ENDPOINT_LEN for e in eps)
+
+
+def test_openapi_probe_script_rejects_bad_url(monkeypatch):
+    import io
+    import contextlib
+
+    mod = _load_openapi_probe()
+    monkeypatch.setattr("sys.argv", ["openapi_probe.py", "ftp://nope/"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main()
+    assert rc == 2
+    assert "not an http(s) url" in buf.getvalue()
+
+
+def test_boolean_probe_urls_builds_true_false_pair():
     true_url, false_url = _boolean_probe_urls(
         "http://t.com/showthread.asp?id=1")
     assert "id=1+AND+1%3D1" in true_url or "id=1%20AND%201%3D1" in true_url

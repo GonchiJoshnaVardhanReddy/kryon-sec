@@ -94,6 +94,46 @@ def test_code_dir_must_be_absolute(tmp_path):
                     seccomp_profile=tmp_path / "n.json")
 
 
+# ---- evidence mount (tool expansion Phase 8) -------------------------------
+
+def test_docker_argv_mounts_evidence_dir_read_write(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    s = KaliSandbox(cfg=cfg, evidence_dir="/opt/eng/evidence",
+                    seccomp_profile=tmp_path / "n.json")
+    argv = s._docker_argv(["gowitness", "scan", "website"])
+    # the engagement evidence folder is the ONLY rw mount, at the FIXED
+    # /evidence path (gowitness screenshots land there)
+    assert argv[argv.index("-v") + 1] == "/opt/eng/evidence:/evidence:rw"
+    assert "--read-only" in argv  # rootfs stays read-only
+    assert not any(a.endswith(":/code:ro") for a in argv)  # no /code here
+
+
+def test_docker_argv_without_evidence_dir_has_no_mount(tmp_path):
+    s = _sandbox(tmp_path)
+    argv = s._docker_argv(["nmap", "x"])
+    assert not any(a.endswith(":/evidence:rw") for a in argv)
+
+
+def test_evidence_dir_must_be_absolute(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    with pytest.raises(ValueError):
+        KaliSandbox(cfg=cfg, evidence_dir="evidence",
+                    seccomp_profile=tmp_path / "n.json")
+
+
+def test_code_and_evidence_mounts_coexist(tmp_path):
+    """Both mounts at once: /code stays read-only, /evidence rw — a
+    scanner must never be able to write into the user's code folder."""
+    cfg = KryonsecConfig(home=tmp_path)
+    s = KaliSandbox(cfg=cfg, code_dir="/opt/victim-code",
+                    evidence_dir="/opt/eng/evidence",
+                    seccomp_profile=tmp_path / "n.json")
+    argv = s._docker_argv(["bandit", "-r", "/code"])
+    mounts = [a for a in argv if ":" in a and a.startswith(("/opt/", "/"))]
+    assert "/opt/victim-code:/code:ro" in mounts
+    assert "/opt/eng/evidence:/evidence:rw" in mounts
+
+
 # ---- spawn result parsing ----------------------------------------------
 
 def test_spawn_parses_json_payload(tmp_path):
