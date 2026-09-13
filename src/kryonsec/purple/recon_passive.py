@@ -13,9 +13,107 @@ from typing import Callable
 from ..config import KryonsecConfig
 from .audit import AuditLog
 from .orchestrator import SubagentResult
-from .zonea import PassiveResult, crt_sh_subdomains, wayback_subdomains
+from .zonea import (
+    PassiveResult,
+    crt_sh_subdomains,
+    otx_passive_dns,
+    ripestat_asn,
+    ripestat_whois,
+    wayback_subdomains,
+)
 
 log = logging.getLogger(__name__)
+
+
+def zone_a_fetchers(cfg: KryonsecConfig) -> list[Callable[[str], PassiveResult]]:
+    """The Zone A source list for a config. Keyless sources always run;
+    Shodan/Censys are included even without keys — they return a skipped
+    result that lands in the audit log as a visible notice."""
+    def shodan(domain: str) -> PassiveResult:
+        from .zonea import shodan_subdomains
+        return shodan_subdomains(domain, api_key=cfg.shodan_api_key)
+
+    def censys(domain: str) -> PassiveResult:
+        from .zonea import censys_subdomains
+        return censys_subdomains(
+            domain, api_id=cfg.censys_api_id, api_secret=cfg.censys_api_secret)
+
+    shodan.__name__ = "shodan"
+    censys.__name__ = "censys"
+    return [
+        crt_sh_subdomains,
+        wayback_subdomains,
+        otx_passive_dns,
+        ripestat_whois,
+        ripestat_asn,
+        shodan,
+        censys,
+    ]
+
+
+def sandbox_passive_fetcher(
+    sandbox,
+    audit: AuditLog,
+    allowlist=None,
+) -> Callable[[str], PassiveResult]:
+    """Passive subdomain enumeration INSIDE the gVisor sandbox (Phase 2):
+    subfinder/amass/assetfinder with -passive flags — they query third-
+    party sources, never the target. Only wired when the sandbox exists.
+
+    Same safety pattern as every Zone B spawn: allowlist validation, argv
+    lists, audited. The tools' output lines become subdomain candidates.
+    """
+    from .allowlist import AllowlistViolation, ToolAllowlist
+
+    allow = allowlist or ToolAllowlist()
+
+    def fetch(domain: str) -> PassiveResult:
+        found: set[str] = set()
+        for tool, argv in (
+            ("subfinder", ["subfinder", "-d", domain, "-passive", "-silent"]),
+            ("amass", ["amass", "enum", "-passive", "-d", domain]),
+            ("assetfinder", ["assetfinder", "-silent", domain]),
+        ):
+            try:
+                allow.validate(argv[0], argv)
+                allow.check_blocklist(argv)
+            except AllowlistViolation as e:  # pragma: no cover — fixed argv
+                audit.write({
+                    "event": "passive_sandbox_rejected_by_allowlist",
+                    "tool": tool,
+                    "reason": str(e)[:200],
+                })
+                continue
+            audit.write({
+                "event": "tool_spawn",
+                "state": "RECON_PASSIVE",
+                "tool": tool,
+                "argv": argv,
+            })
+            result = sandbox.spawn(argv)
+            audit.write({
+                "event": "tool_result",
+                "state": "RECON_PASSIVE",
+                "tool": tool,
+                "ok": result.ok,
+                "exit_code": result.exit_code,
+                "output_chars": len(result.stdout),
+            })
+            if not result.ok:
+                continue
+            for line in result.stdout.splitlines():
+                host = line.strip().lower().rstrip(".")
+                # scope by construction: only hosts under the target count
+                if host.endswith("." + domain.lower()) and "." in host:
+                    found.add(host)
+        return PassiveResult(
+            source="sandbox-passive", subdomains=sorted(found),
+            notes=["enumerated by sandbox subfinder/amass/assetfinder "
+                   "(-passive flags; zero packets to the target)"],
+        )
+
+    fetch.__name__ = "sandbox_passive"
+    return fetch
 
 
 @dataclass
@@ -96,6 +194,16 @@ class ReconPassiveSubagent:
                 })
                 continue
 
+            if result.skipped:
+                # source didn't run (e.g. no API key) — a notice, not a
+                # failure; the operator can add the key in kryonsec setup
+                self.audit.write({
+                    "event": "passive_source_skipped",
+                    "source": source,
+                    "reason": result.skipped,
+                })
+                continue
+
             known = {n["label"] for n in self.graph.by_type("subdomain")}
             # The apex domain is already the target node — not a subdomain node
             fresh = [
@@ -119,6 +227,13 @@ class ReconPassiveSubagent:
                         properties={"source": result.source},
                     )
 
+            if result.notes:
+                self.graph.add_node(
+                    node_type="osint_note",
+                    label=result.source,
+                    properties={"notes": result.notes},
+                )
+
             # Audit the CALL (tool, source, counts) — never any API key
             self.audit.write({
                 "event": "passive_source_ok",
@@ -126,6 +241,7 @@ class ReconPassiveSubagent:
                 "found": len(result.subdomains),
                 "new": len(fresh),
                 "paths": len(result.paths),
+                "notes": len(result.notes),
             })
 
         return SubagentResult(status="ok")

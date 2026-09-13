@@ -56,7 +56,7 @@ def test_sandbox_available_non_linux():
 def test_engagement_halts_after_recon_without_sandbox(tmp_path):
     cfg = KryonsecConfig(home=tmp_path)
     with patch("kryonsec.purple.runner.sandbox_available", return_value=(False, "not Linux")):
-        with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+        with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
             orch, audit, graph = start_engagement(cfg, "e-run", target="target-corp.com")
             completed = orch.run()
 
@@ -78,7 +78,7 @@ def test_engagement_halts_after_recon_without_sandbox(tmp_path):
 def test_engagement_runs_with_sandbox(tmp_path):
     cfg = KryonsecConfig(home=tmp_path)
     with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
-        with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+        with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
             orch, audit, graph = start_engagement(cfg, "e-run2", target="target-corp.com")
             completed = orch.run()
 
@@ -113,7 +113,7 @@ def test_engagement_status_factory_wraps_states(tmp_path):
             return False
 
     with patch("kryonsec.purple.runner.sandbox_available", return_value=(False, "not Linux")):
-        with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+        with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
             orch, audit, graph = start_engagement(
                 cfg, "e-spin", target="target-corp.com",
                 status_factory=FakeCtx,
@@ -191,7 +191,7 @@ def test_full_loop_through_exploit(tmp_path):
     sb_mod.KaliSandbox.__init__ = _init_sb
     try:
         with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
-            with patch("kryonsec.purple.recon_passive.crt_sh_subdomains", side_effect=_fake_recon):
+            with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
                 orch, audit, graph = start_engagement(
                     cfg, "e-x", target="target-corp.com")
                 completed = orch.run()

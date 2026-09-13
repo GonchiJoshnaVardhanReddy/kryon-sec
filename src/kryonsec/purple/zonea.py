@@ -29,6 +29,7 @@ ZONE_A_ALLOWED_HOSTS = {
     "otx.alienvault.com",
     "api.shodan.io",
     "search.censys.io",
+    "stat.ripe.net",
 }
 
 
@@ -71,12 +72,24 @@ class PassiveResult:
     # archived URLs (Wayback) — evidence for thin targets that have no
     # subdomains: "old ASP site, archived since 2013" is real signal.
     paths: list[str] = field(default_factory=list)
+    # free-form context lines (registrar, ASN, registration age…) —
+    # HYPOTHESIZE reads them as supporting evidence
+    notes: list[str] = field(default_factory=list)
+    # set when the source did not run (e.g. no API key) — audited as a
+    # skip notice, distinct from a failure
+    skipped: str | None = None
 
 
-def _zone_a_fetch(url: str, timeout: int = TIMEOUT_S) -> bytes:
+def _zone_a_fetch(
+    url: str,
+    timeout: int = TIMEOUT_S,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+) -> bytes:
     """Fetch a Zone A URL. Refuses hosts outside the allowlist — including
     the hosts of redirects (urlopen follows 3xx silently otherwise, which
-    would send packets to arbitrary hosts, possibly the target)."""
+    would send packets to arbitrary hosts, possibly the target).
+    data != None makes this a POST (Censys search)."""
     # a redirect handler that re-checks every hop against the allowlist
     class _ZoneARedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -91,7 +104,10 @@ def _zone_a_fetch(url: str, timeout: int = TIMEOUT_S) -> bytes:
     host = urllib.parse.urlparse(url).hostname or ""
     if host not in ZONE_A_ALLOWED_HOSTS:
         raise ZoneAViolation(f"Zone A egress denied: {host!r} not in allowlist")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    all_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        all_headers.update(headers)
+    req = urllib.request.Request(url, headers=all_headers, data=data)
     with opener.open(req, timeout=timeout) as r:
         # bounded read — a hostile/compromised source must not be able to
         # exhaust host memory
@@ -258,3 +274,177 @@ def wayback_subdomains(domain: str, limit: int = 200) -> PassiveResult:
         # dedupe, cap at 100 — enough for the prompt without flooding it
         paths=list(dict.fromkeys(cleaned))[:100],
     )
+
+
+# ---- tool-expansion Phase 2 (2026-09-13): new Zone A sources ----------------
+# All third-party APIs; zero packets to the target by construction. Keyed
+# sources return a skipped result (audited notice) instead of failing.
+
+_IP4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _in_scope_subdomains(names, domain: str) -> list[str]:
+    """Filter a source's raw names to in-scope, well-formed subdomains."""
+    out = set()
+    for name in names:
+        name = str(name).strip().lower().rstrip(".")
+        if name.startswith("*."):
+            name = name[2:]
+        if name and _same_domain(name, domain) and re.match(r"^[a-z0-9.-]+$", name):
+            out.add(name)
+    return sorted(out)
+
+
+def shodan_subdomains(domain: str, api_key: str | None = None) -> PassiveResult:
+    """Shodan DNS domain data (https://api.shodan.io/dns/domain/<domain>).
+
+    Shodan already scanned the internet — asking it is passive. Returns a
+    skipped result when no API key is configured (never a failure)."""
+    domain = normalize_target(domain)
+    if not api_key:
+        return PassiveResult(
+            source="shodan", subdomains=[],
+            skipped="no shodan_api_key configured (kryonsec setup)",
+        )
+    url = f"https://api.shodan.io/dns/domain/{urllib.parse.quote(domain)}?key={urllib.parse.quote(api_key)}"
+    try:
+        body = _zone_a_fetch(url)
+        data = json.loads(body)
+    except Exception:
+        log.warning("shodan dns/domain query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="shodan", subdomains=[])
+    # {"domain": "x.com", "subdomains": ["www", "api"], "data": [...]}
+    labels = data.get("subdomains") or []
+    return PassiveResult(
+        source="shodan",
+        subdomains=_in_scope_subdomains(
+            (f"{label}.{domain}" for label in labels), domain),
+    )
+
+
+def censys_subdomains(
+    domain: str,
+    api_id: str | None = None,
+    api_secret: str | None = None,
+) -> PassiveResult:
+    """Censys Search v2 hosts API — certificates/hostnames it has observed.
+
+    Needs an API ID + secret (search.censys.io account)."""
+    domain = normalize_target(domain)
+    if not api_id or not api_secret:
+        return PassiveResult(
+            source="censys", subdomains=[],
+            skipped="no censys_api_id/censys_api_secret configured (kryonsec setup)",
+        )
+    import base64
+
+    auth = base64.b64encode(f"{api_id}:{api_secret}".encode()).decode()
+    url = "https://search.censys.io/api/v2/hosts/search"
+    body = json.dumps({"q": f"names: {domain}", "per_page": 100}).encode()
+    try:
+        resp = _zone_a_fetch(
+            url, headers={"Authorization": f"Basic {auth}"}, data=body,
+        )
+        data = json.loads(resp)
+    except Exception:
+        log.warning("censys hosts search failed for %s", domain, exc_info=True)
+        return PassiveResult(source="censys", subdomains=[])
+    names: list[str] = []
+    for hit in (data.get("result") or {}).get("hits") or []:
+        names.extend(hit.get("names") or [])
+    return PassiveResult(
+        source="censys", subdomains=_in_scope_subdomains(names, domain),
+    )
+
+
+def otx_passive_dns(domain: str) -> PassiveResult:
+    """AlienVault OTX passive DNS — hostnames seen in exchanged indicators."""
+    domain = normalize_target(domain)
+    url = (
+        "https://otx.alienvault.com/api/v1/indicators/domain/"
+        f"{urllib.parse.quote(domain)}/passive_dns?limit=200"
+    )
+    try:
+        resp = _zone_a_fetch(url)
+        data = json.loads(resp)
+    except Exception:
+        log.warning("otx passive dns query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="otx", subdomains=[])
+    hostnames = [
+        entry.get("hostname") for entry in data.get("passive_dns") or []
+    ]
+    return PassiveResult(
+        source="otx", subdomains=_in_scope_subdomains(hostnames, domain),
+    )
+
+
+def ripestat_whois(domain: str) -> PassiveResult:
+    """RIPEstat whois — registrar, registration dates, nameservers.
+
+    Notes-only source (no subdomains). Deviation from the plan recorded
+    in docs/TOOL-EXPANSION-2026-09-13.md: rdap.org redirects to arbitrary
+    per-TLD registry hosts, which cannot be safely allowlisted; RIPEstat
+    serves the same data from one fixed host."""
+    domain = normalize_target(domain)
+    url = (
+        "https://stat.ripe.net/data/whois/data.json"
+        f"?resource={urllib.parse.quote(domain)}"
+    )
+    try:
+        resp = _zone_a_fetch(url)
+        data = json.loads(resp)
+    except Exception:
+        log.warning("ripestat whois query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="ripestat-whois", subdomains=[])
+    notes: list[str] = []
+    for record in (data.get("data") or {}).get("records") or []:
+        key = str(record.get("key", "")).strip()
+        value = str(record.get("value", "")).strip()
+        if key and value and key.lower() in (
+            "registrar", "creation date", "expiration date",
+            "updated date", "nameservers", "domain status",
+        ):
+            notes.append(f"{key}: {value[:120]}")
+    return PassiveResult(source="ripestat-whois", subdomains=[], notes=notes[:20])
+
+
+def ripestat_asn(domain: str) -> PassiveResult:
+    """RIPEstat ASN/BGP context — the AS number + prefix the domain's
+    addresses sit in (resolved server-side by RIPE, not by us)."""
+    domain = normalize_target(domain)
+    chain_url = (
+        "https://stat.ripe.net/data/dns-chain/data.json"
+        f"?resource={urllib.parse.quote(domain)}"
+    )
+    try:
+        resp = _zone_a_fetch(chain_url)
+        data = json.loads(resp)
+    except Exception:
+        log.warning("ripestat dns-chain query failed for %s", domain, exc_info=True)
+        return PassiveResult(source="ripestat-asn", subdomains=[])
+
+    # collect resolved v4 addresses from the chain (structure varies)
+    ips: list[str] = []
+    for entry in (data.get("data") or {}).get("resolve") or []:
+        records = (entry.get("A") or {}).get("records") or []
+        ips.extend(a for a in records if _IP4_RE.match(str(a)))
+    ips = sorted(set(ips))[:3]  # a few are plenty for the prompt
+    if not ips:
+        return PassiveResult(source="ripestat-asn", subdomains=[])
+
+    notes = [f"resolves (per RIPEstat) to: {', '.join(ips)}"]
+    info_url = (
+        "https://stat.ripe.net/data/network-info/data.json"
+        f"?resource={urllib.parse.quote(ips[0])}"
+    )
+    try:
+        resp = _zone_a_fetch(info_url)
+        info = json.loads(resp).get("data") or {}
+    except Exception:
+        info = {}
+    if info.get("asn"):
+        notes.append(
+            f"announced by {info.get('asn')} ({info.get('holder', 'unknown holder')})"
+            f" in prefix {info.get('prefix', '?')}"
+        )
+    return PassiveResult(source="ripestat-asn", subdomains=[], notes=notes)
