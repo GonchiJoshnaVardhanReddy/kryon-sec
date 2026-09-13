@@ -268,3 +268,62 @@ skips with `kev` absent not False, ExploitDB hits mark
 `exploit_available`, KEV catalog fetched once for many hypotheses, empty
 graph noop), NVD CPE extraction, and two HYPOTHESIZE integrations
 (enrichment after proposing; enrichment crash never fails the state).
+
+---
+
+## Phase 4 — POST_EXPLOIT subagent (evidence collection only)
+
+**Status: COMPLETE — full suite green (431 passed, `py -3.13 -m pytest -q`,
+2026-09-13). Wired-but-dormant: no current tool yields a shell (see the
+honest limitation below).**
+
+New `src/kryonsec/purple/post_exploit.py`:
+
+- **Fixed, deterministic plan** (no LLM input): linpeas.sh `-a`, pspy64,
+  linux-exploit-suggester.sh, and the four baked scripts
+  (`/opt/kryonsec/enum_processes.py`, `enum_fs.py`, `enum_network.py`,
+  `find_secrets.py`, each with `{target}` as a context label). Every spawn
+  is allowlist-validated (POST_EXPLOIT_TEMPLATES from Phase 1) + blocklist
+  checked + audited with state POST_EXPLOIT; a rejected tool fails closed
+  (audited, never spawned).
+- **Evidence nodes**: each run adds a `post_exploit_evidence` node with
+  `{tool, ok, exit_code, stdout_chars}` plus either a bounded JSON
+  `summary` (the baked scripts print JSON; lists capped at 50 items) or a
+  2000-char `excerpt` for text tools like linpeas. The subagent never
+  claims a finding or a shell — collection only.
+- **Separate approval gate (Gate 3)** — `terminal_post_exploit_approver`:
+  distinct from HUMAN_REVIEW (approving a hypothesis is not approving
+  post-exploitation of a shell it might yield). Non-TTY stdin approves
+  nothing — silence is never consent, same rule as `terminal_reviewer`.
+
+### EXPLOIT boundary wiring (`purple/exploit.py`)
+
+- `ExploitSubagent._detect_shell()` is the single shell detection point.
+  It returns False today — nothing in the inventory (sqlmap, nuclei,
+  dalfox…) hands over an interactive session; they confirm vulnerabilities.
+- When a shell IS detected, the approval gate runs at the EXPLOIT/POST_EXPLOIT
+  boundary and the result carries `post_exploit_approved` (the orchestrator
+  transition was already in place from v1: `shell_obtained AND
+  post_exploit_approved → POST_EXPLOIT`, otherwise `→ VERIFY`). The gate
+  decision is audited as `post_exploit_gate`.
+- Runner: POST_EXPLOIT now wires the real subagent when a sandbox exists
+  (was a stub); STATE_INFO updated.
+
+### Honest limitation (recorded per plan)
+
+No tool in the current inventory produces a shell, so `shell_obtained`
+stays False and engagements route EXPLOIT → VERIFY directly. The state is
+complete and fully tested; when a shell-yielding tool lands, the one-line
+change is `_detect_shell()`.
+
+### Tests (`tests/test_post_exploit.py` — new)
+
+Plan argv shapes validate against the real allowlist; `{target}`
+substitution is element-wise (never spliced into a string); plan covers
+every POST_EXPLOIT template (no dead tools in the image); full-plan run
+with a fake sandbox (evidence nodes, bounded excerpt/summary, audit
+spawn/result/done events, chain verifies); failed tool still records its
+node and never fails the state; empty allowlist rejects everything
+(fail-closed, zero spawns); gate non-TTY/default/yes behavior; EXPLOIT
+boundary (no shell today → VERIFY and gate never consulted; patched
+shell detection → gate decides, denied → VERIFY, approved → POST_EXPLOIT).
