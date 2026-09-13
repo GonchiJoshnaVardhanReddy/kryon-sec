@@ -28,3 +28,6 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+
+# commit-message scratch files (never track)
+COMMIT_MSG*
