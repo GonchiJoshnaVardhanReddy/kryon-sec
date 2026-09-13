@@ -105,6 +105,14 @@ def _from_nvd(cve_id: str) -> dict[str, Any] | None:
                 cpe = str(match.get("criteria", "")).strip()
                 if cpe.startswith("cpe:") and cpe not in cpes:
                     cpes.append(cpe)
+    # weakness types (Phase 8): CWE ids from the record's weaknesses list —
+    # e.g. [{"description": [{"value": "CWE-79"}}], ...]
+    cwes: list[str] = []
+    for weakness in cve.get("weaknesses", []):
+        for desc in weakness.get("description", []):
+            value = str(desc.get("value", "")).strip().upper()
+            if value.startswith("CWE-") and value not in cwes:
+                cwes.append(value)
     return {
         "id": cve_id,
         "published": cve.get("published"),
@@ -114,6 +122,7 @@ def _from_nvd(cve_id: str) -> dict[str, Any] | None:
         "description": descriptions[0] if descriptions else "",
         "references": [r.get("url") for r in cve.get("references", [])[:10]],
         "cpes": cpes[:10],
+        "cwes": cwes[:5],
     }
 
 

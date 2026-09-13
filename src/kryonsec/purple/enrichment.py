@@ -1,14 +1,16 @@
-"""Hypothesis enrichment (tool expansion Phase 3, 2026-09-13).
+"""Hypothesis enrichment (tool expansion Phase 3 + Phase 8, 2026-09).
 
 After the LLM proposes hypotheses, this module adds public-risk context
-to each one: NVD/CPE data, CISA KEV membership, EPSS score, and public
-exploit availability (ExploitDB via searchsploit in the sandbox).
+to each one: NVD/CPE/CWE data, CISA KEV membership, EPSS score, OSV
+(aliases/severity/affected packages), GitHub Advisory (GHSA id/severity/
+patched versions), and public exploit availability (ExploitDB via
+searchsploit + nuclei template metadata, both sandbox-local).
 
 RAG was deliberately deferred (user decision) — these are free public
-APIs only. Every fetch goes to a third party (NVD, CISA, FIRST, or the
-sandbox-local ExploitDB database); the TARGET is never contacted. Every
-lookup is audited; every failure is an audited skip — enrichment can
-never fail the HYPOTHESIZE state.
+APIs only. Every fetch goes to a third party (NVD, CISA, FIRST, OSV,
+GitHub, or the sandbox-local databases); the TARGET is never contacted.
+Every lookup is audited; every failure is an audited skip — enrichment
+can never fail the HYPOTHESIZE state.
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ log = logging.getLogger(__name__)
 ENRICHMENT_ALLOWED_HOSTS = {
     "www.cisa.gov",  # KEV catalog
     "api.first.org",  # EPSS
+    "api.osv.dev",  # OSV (Phase 8)
+    "api.github.com",  # GitHub Advisory Database (Phase 8)
 }
 # NVD is reached through copilot.cve.lookup_cve (existing approved path,
 # spec §3.2) — it keeps its own cache + fetch.
@@ -41,6 +45,8 @@ KEV_URL = (
     "known_exploited_vulnerabilities.json"
 )
 EPSS_URL = "https://api.first.org/data/v1/epss?cve={cve_id}"
+OSV_URL = "https://api.osv.dev/v1/vulns/{cve_id}"
+GHSA_URL = "https://api.github.com/advisories?cve_id={cve_id}"
 ENRICHMENT_TIMEOUT_S = 30
 CACHE_TTL_S = 24 * 3600  # KEV/EPSS change daily at most
 KEV_CACHE = ("kev", "catalog")
@@ -157,6 +163,81 @@ def epss_for(cfg: KryonsecConfig, cve_id: str) -> dict[str, Any] | None:
     return record
 
 
+def osv_record(cfg: KryonsecConfig, cve_id: str) -> dict[str, Any] | None:
+    """OSV (Phase 8): aliases, severity, affected packages for a CVE.
+    Keyless. None = fetch failed or CVE unknown — never a state failure."""
+    cve_id = cve_id.strip().upper()
+    cached = _cache_get(cfg, "osv", cve_id)
+    if cached is not None:
+        return cached
+    try:
+        body = _zone_a_fetch(
+            OSV_URL.format(cve_id=cve_id),
+            timeout=ENRICHMENT_TIMEOUT_S,
+            allowed_hosts=ENRICHMENT_ALLOWED_HOSTS,
+        )
+        data = json.loads(body)
+    except Exception as e:
+        log.info("OSV fetch failed for %s: %s", cve_id, e)
+        return None
+    record: dict[str, Any] = {}
+    aliases = [str(a) for a in data.get("aliases", []) if a][:5]
+    if aliases:
+        record["osv_aliases"] = aliases
+    # severity: the database_specific string (e.g. "HIGH") or the first
+    # CVSS vector's base score pulled from the vector string
+    severity = data.get("database_specific", {}).get("severity")
+    if severity:
+        record["osv_severity"] = str(severity)[:20]
+    packages: list[str] = []
+    for affected in data.get("affected", [])[:10]:
+        pkg = affected.get("package", {}).get("name")
+        if pkg and pkg not in packages:
+            packages.append(str(pkg)[:80])
+    if packages:
+        record["affected_packages"] = packages[:10]
+    if not record:
+        return None  # record exists but nothing worth surfacing
+    _cache_put(cfg, "osv", cve_id, record)
+    return record
+
+
+def ghsa_record(cfg: KryonsecConfig, cve_id: str) -> dict[str, Any] | None:
+    """GitHub Advisory Database (Phase 8): GHSA id, severity, patched
+    versions. Keyless. None = fetch failed or no advisory."""
+    cve_id = cve_id.strip().upper()
+    cached = _cache_get(cfg, "ghsa", cve_id)
+    if cached is not None:
+        return cached
+    try:
+        body = _zone_a_fetch(
+            GHSA_URL.format(cve_id=cve_id),
+            timeout=ENRICHMENT_TIMEOUT_S,
+            allowed_hosts=ENRICHMENT_ALLOWED_HOSTS,
+        )
+        advisories = json.loads(body)
+    except Exception as e:
+        log.info("GHSA fetch failed for %s: %s", cve_id, e)
+        return None
+    if not advisories:
+        return None
+    adv = advisories[0]
+    record: dict[str, Any] = {"ghsa_id": str(adv.get("ghsa_id", ""))[:30]}
+    if adv.get("severity"):
+        record["ghsa_severity"] = str(adv["severity"])[:20]
+    patched = [
+        str(v) for v in adv.get("vulnerabilities", [])
+        if v.get("patched_versions")
+    ][:5]
+    if patched:
+        record["patched_versions"] = [
+            str(v["patched_versions"])[:80] for v in adv.get(
+                "vulnerabilities", []) if v.get("patched_versions")
+        ][:5]
+    _cache_put(cfg, "ghsa", cve_id, record)
+    return record
+
+
 def sanitize_searchsploit_term(text: str) -> str:
     """Reduce hypothesis text to a safe searchsploit term: the {term}
     allowlist pattern is alnum/space/dash/dot — anything else is dropped
@@ -216,6 +297,64 @@ def searchsploit_hits(
     return lines
 
 
+def nuclei_template_matches(
+    sandbox,
+    audit: AuditLog,
+    term: str,
+    allowlist=None,
+) -> "list[dict] | None":
+    """Search the baked nuclei templates inside the sandbox (local files,
+    no egress). Returns the parsed match list ([] = ran, nothing matched;
+    None = could not run)."""
+    import json as _json
+
+    from .allowlist import AllowlistViolation, ToolAllowlist
+
+    allow = allowlist or ToolAllowlist()
+    argv = [f"{_SCRIPT_DIR()}/nuclei_meta.py", term]
+    try:
+        allow.validate(argv[0], argv)
+        allow.check_blocklist(argv)
+    except AllowlistViolation as e:
+        audit.write({
+            "event": "enrichment_lookup",
+            "kind": "nuclei_meta",
+            "term": term,
+            "ok": False,
+            "reason": f"rejected by allowlist: {str(e)[:150]}",
+        })
+        return None
+    audit.write({
+        "event": "tool_spawn",
+        "state": "HYPOTHESIZE",
+        "tool": "nuclei_meta",
+        "argv": argv,
+    })
+    result = sandbox.spawn(argv)
+    audit.write({
+        "event": "tool_result",
+        "state": "HYPOTHESIZE",
+        "tool": "nuclei_meta",
+        "ok": result.ok,
+        "exit_code": result.exit_code,
+        "output_chars": len(result.stdout),
+    })
+    if not result.ok:
+        return None
+    try:
+        payload = _json.loads(result.stdout)
+    except ValueError:
+        return None
+    matches = payload.get("matches")
+    return matches if isinstance(matches, list) else None
+
+
+def _SCRIPT_DIR() -> str:
+    from .allowlist import SANDBOX_SCRIPT_DIR
+
+    return SANDBOX_SCRIPT_DIR
+
+
 def enrich_hypotheses(
     cfg: KryonsecConfig,
     graph: EngagementGraph,
@@ -262,6 +401,10 @@ def enrich_hypotheses(
             cpes = record.get("cpes") or []
             if cpes:
                 enrichment["cpes"] = cpes
+            # weakness types (Phase 8): CWE ids from the NVD record
+            cwes = record.get("cwes") or []
+            if cwes:
+                enrichment["cwes"] = cwes
         audit.write({
             "event": "enrichment_lookup",
             "kind": "nvd",
@@ -270,6 +413,32 @@ def enrich_hypotheses(
             "ok": record is not None,
         })
         counts["lookups"] += 1
+
+        # OSV (Phase 8): aliases / severity / affected packages
+        osv = osv_record(cfg, cve_id)
+        audit.write({
+            "event": "enrichment_lookup",
+            "kind": "osv",
+            "hypothesis_id": node["label"],
+            "cve": cve_id,
+            "ok": osv is not None,
+        })
+        counts["lookups"] += 1
+        if osv:
+            enrichment.update(osv)
+
+        # GitHub Advisory Database (Phase 8): GHSA id / severity / patches
+        ghsa = ghsa_record(cfg, cve_id)
+        audit.write({
+            "event": "enrichment_lookup",
+            "kind": "ghsa",
+            "hypothesis_id": node["label"],
+            "cve": cve_id,
+            "ok": ghsa is not None,
+        })
+        counts["lookups"] += 1
+        if ghsa:
+            enrichment.update(ghsa)
 
         # KEV membership (catalog fetched at most once per run)
         if kev is None:
@@ -322,6 +491,31 @@ def enrich_hypotheses(
             counts["lookups"] += 1
             if hits:
                 enrichment["exploits"] = hits
+                enrichment["exploit_available"] = True
+
+        # Nuclei template metadata (Phase 8): is there a public template?
+        # Another exploit-availability signal, local to the image.
+        if sandbox is None:
+            audit.write({
+                "event": "enrichment_lookup",
+                "kind": "nuclei_meta",
+                "term": term,
+                "ok": False,
+                "reason": "no sandbox available (template search skipped)",
+            })
+        elif term:
+            tmpl_matches = nuclei_template_matches(sandbox, audit, term)
+            audit.write({
+                "event": "enrichment_lookup",
+                "kind": "nuclei_meta",
+                "hypothesis_id": node["label"],
+                "term": term,
+                "ok": tmpl_matches is not None,
+                "matches": len(tmpl_matches) if tmpl_matches else 0,
+            })
+            counts["lookups"] += 1
+            if tmpl_matches:
+                enrichment["nuclei_templates"] = tmpl_matches
                 enrichment["exploit_available"] = True
 
         props["enrichment"] = enrichment
