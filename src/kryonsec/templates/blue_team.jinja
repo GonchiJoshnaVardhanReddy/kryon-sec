@@ -22,6 +22,20 @@ CONFIRMED FINDINGS (if any):
 - (none confirmed — this engagement stopped before active testing)
 {% endfor %}
 
+SCANNER EVIDENCE (static analysis of the provided code folder, mounted read-only):
+
+{% for s in scanners %}
+- {{ s.label }}: exit code {{ s.exit_code }}{% if s.findings_count is not none %}, ~{{ s.findings_count }} findings{% endif %}
+
+  {{ s.excerpt }}
+{% else %}
+- (no code folder scanned — recommend based on the engagement above)
+{% endfor %}
+
+Note: bandit and gitleaks EXIT 1 when they FIND something — that is a
+finding, not a tool failure. Scanner output is evidence to reason from;
+do not invent scanner results that are not shown.
+
 Your task:
 1. For EACH hypothesis above, write one remediation: a concrete fix the
    defender can apply (not generic advice — name the exact change).
@@ -30,3 +44,10 @@ Your task:
 3. Set severity: low, medium, high, or critical.
 4. Treat unapproved/untested hypotheses as "risk to verify", not confirmed
    vulnerabilities — word the fix accordingly.
+5. Ground fixes in the scanner evidence when it is relevant; you may also
+   write remediations for scanner findings that no hypothesis covers
+   (use the scanner tool name as hypothesis_id, e.g. "semgrep").
+6. Where you are confident, suggest mappings — cwe (e.g. CWE-89), owasp
+   (e.g. A03:2021-Injection), attack (MITRE ATT&CK, e.g. T1190). These
+   are SUGGESTIONS for the defender to verify, not established fact —
+   leave them empty rather than guess.

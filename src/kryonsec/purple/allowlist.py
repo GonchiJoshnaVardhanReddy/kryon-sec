@@ -177,6 +177,19 @@ POST_EXPLOIT_TEMPLATES: dict[str, list[str]] = {
     f"{SANDBOX_SCRIPT_DIR}/find_secrets.py": ["{target}"],
 }
 
+# Blue-team static analyzers (Phase 5): run against the read-only /code
+# mount of a user-provided code folder. The mount point is the FIXED
+# literal /code — the host path comes from the CLI (--code), never the
+# LLM, and the sandbox mounts it read-only.
+BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
+    "semgrep": ["--config=auto", "/code"],
+    "bandit": ["-r", "/code"],
+    "gitleaks": ["detect", "--source", "/code"],
+    "trivy": ["fs", "--scanners", "vuln", "/code"],
+    "checkov": ["-d", "/code"],
+    "hadolint": ["/code/Dockerfile"],
+}
+
 # Historical name kept (tests / callers import it): the union of everything
 # above — one ToolAllowlist validates every state's spawns.
 EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
@@ -185,6 +198,7 @@ EXPLOIT_ALLOWLIST_TEMPLATES: dict[str, list[str]] = {
     **EXPLOIT_TEMPLATES,
     **VERIFY_TEMPLATES,
     **POST_EXPLOIT_TEMPLATES,
+    **BLUE_TEAM_TEMPLATES,
 }
 
 

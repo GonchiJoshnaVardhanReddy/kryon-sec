@@ -327,3 +327,91 @@ node and never fails the state; empty allowlist rejects everything
 (fail-closed, zero spawns); gate non-TTY/default/yes behavior; EXPLOIT
 boundary (no shell today → VERIFY and gate never consulted; patched
 shell detection → gate decides, denied → VERIFY, approved → POST_EXPLOIT).
+
+## Phase 5 — Blue-team code scanners (`--code` folder)
+
+**Status: COMPLETE — full suite green (465 passed, `py -3.13 -m pytest -q`,
+2026-09-13).**
+
+BLUE_TEAM gained a pre-LLM tool phase: when the operator passes
+`kryonsec purple --target t --code FOLDER`, six static analyzers scan the
+folder through a read-only sandbox mount before the LLM writes
+remediations, so fixes are grounded in real scanner evidence instead of
+guesses.
+
+### What runs (`src/kryonsec/purple/blue_team.py`)
+
+- **Fixed plan** (no LLM input): semgrep `--config=auto`, bandit `-r`,
+  gitleaks `detect --source`, trivy `fs --scanners vuln`, checkov `-d` —
+  all against the fixed `/code` mount; hadolint runs only when a
+  `Dockerfile` exists in the folder. Every spawn is allowlist-validated
+  (new `BLUE_TEAM_TEMPLATES`, unioned into `EXPLOIT_ALLOWLIST_TEMPLATES`)
+  + blocklist checked + audited with state BLUE_TEAM; a rejection fails
+  closed (audited `scanner_rejected_by_allowlist`, never spawned).
+- **Scanner evidence nodes** (`scanner_result`): `{tool, exit_code,
+  stdout_chars, excerpt (2000-char cap), findings_count?}`. `_count_findings`
+  parses JSON first (trivy `Results[].Vulnerabilities`, checkov
+  `failed_checks`), then per-tool text regexes; unknown output shape →
+  no count, never a guess presented as one.
+- **Remediation model** gained optional `cwe` / `owasp` / `attack`
+  (MITRE ATT&CK) fields — LLM-suggested mappings shown as suggestions to
+  verify, never established fact. The prompt instructs the LLM to leave
+  them empty rather than guess, and it may write remediations for scanner
+  findings using the tool name as `hypothesis_id` (e.g. "semgrep").
+
+### Sandbox mount (`src/kryonsec/purple/sandbox.py`)
+
+`KaliSandbox(code_dir=...)` adds `-v <abs>:/code:ro -w /code` to the
+docker argv: read-only (no scanner can write to the user's folder), fixed
+`/code` literal inside the templates (a different path never validates),
+absolute paths only (relative is refused — it would silently resolve
+against an unknown cwd). Absolute is accepted on either platform:
+production is Linux, but Windows dev machines hand `C:\...` paths in
+tests. The rootfs stays `--read-only` too.
+
+### CLI (`src/kryonsec/cli.py`)
+
+`kryonsec purple --target t --code FOLDER` — the path is expanded and
+resolved; a non-folder is a hard error (exit 2), never a silent wrong
+scan. Without a sandbox the run prints that `--code` is ignored
+(scanners need the sandbox) and continues. `engagement_created` audits
+`code_scan: true/false`.
+
+### Decisions made during Phase 5
+
+1. **kube-bench is deliberately NOT in the scan plan.** It audits a live
+   node's kubelet configuration, not a code folder — inside this sandbox
+   it would test the sandbox itself. Its entrypoint registration and
+   allowlist template remain for future node-audit work.
+2. **bandit and gitleaks EXIT 1 when they FIND something** — that is a
+   finding, not a tool failure. Evidence nodes are written for ok spawns
+   regardless of exit code; the count regexes read the output, not the
+   exit code. The prompt tells the LLM this explicitly.
+3. **`--code` is CLI-only.** The `/mode` chat-loop invocation stays
+   target-only — a chat message is not a trustworthy path source.
+4. **Failing scanner = audited skip, never fatal** — same semantics as a
+   flaky passive source; the LLM phase runs regardless, and a scanner
+   phase crash is caught (`scanners_failed`) with the LLM phase still
+   running.
+5. **Sandbox egress note:** semgrep `--config=auto` (registry fetch) and
+   trivy (vuln DB download) need outbound internet from the sandbox.
+   Containers currently use the default docker bridge (the
+   target-scope-only proxy does not exist yet, same caveat as EXPLOIT);
+   on the default bridge both have egress, but when the proxy lands an
+   allowlist entry for registry/database hosts will be required.
+6. **Findings counts are approximate** (regex over text output) — they
+   are labelled `~N` in the prompt and meant for grounding, not for
+   exact reporting.
+
+### Tests
+
+`tests/test_sandbox.py` (mount flags, no-mount default, relative-path
+refusal), `tests/test_blue_team_report.py` (`_count_findings` unit
+cases, plan-vs-allowlist drift guard, full-run evidence + audit chain,
+hadolint gating, failing-scanner skip, exit-1-is-findings, empty
+allowlist fail-closed, prompt scanner-evidence section, mapping fields
+optional, scanners-before-LLM ordering, scanner crash resilience, pure
+LLM without sandbox), `tests/test_runner.py` (code-folder wiring: only
+the BLUE_TEAM sandbox gets the mount, audit `code_scan` flag, missing
+folder rejected), `tests/test_allowlist.py` (6 valid argv cases + other
+paths rejected).
