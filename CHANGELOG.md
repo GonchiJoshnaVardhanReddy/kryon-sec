@@ -1,5 +1,55 @@
 # Changelog
 
+## v1.3.0 — Purple Team tool expansion Phase 8 (user tool map)
+
+Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:
+**559 tests green** (was 496).
+
+The user supplied a complete tool map for every state; Phase 8 closes the
+gaps against the ~40 tools already present. Every addition keeps the hard
+invariants: argv templates (never shell strings), fixed plans (no LLM-driven
+tool choice), every spawn audited, sandbox hardening unchanged.
+
+- **Passive recon** (8A): RDAP WHOIS (IANA bootstrap-derived registry hosts),
+  GitHub recon (free API, optional `GITHUB_TOKEN`), HackerTarget DNS history,
+  cloud asset discovery (local pass, zero fetch), certificate issuer/validity
+  enrichment. Zone A is now 10 sources.
+- **Active recon** (8B): gowitness screenshots (new read-write `/evidence`
+  mount — the only one; screenshots land under
+  `engagements/<id>/evidence/`), massdns (allowlisted, not in the default
+  plan), and a baked `openapi_probe.py` that finds OpenAPI/Swagger/GraphQL
+  endpoints per web port (found paths become graph nodes).
+- **Hypothesis enrichment** (8C): OSV and GitHub Advisory lookups, CWE ids
+  from the NVD record, and nuclei template metadata (front-matter scan of the
+  baked templates) — all rendered in the report's known-risk block.
+- **Post-exploit** (8D): controlled impacket subset + bloodhound-python
+  allowlisted and in the image but **dormant** (excluded from the plan — they
+  need shell/domain context that does not exist today); cloud metadata
+  enumeration script added to the plan (probes the sandbox's own metadata
+  service, which is none).
+- **Blue-team scanners** (8E): syft (SBOM), osv-scanner, grype join the scan
+  plan as pinned binaries — syft offline, the other two need vuln-DB egress
+  (same caveat as trivy). The report gained a "Code scanning results" section
+  with an SBOM summary line.
+- **Report** (8F): audit entries now carry an ISO-8601 UTC `ts` (informational
+  — the hash chain remains the ordering guarantee, old chains still verify),
+  a Timeline table built from the chain, and an `owasp_api` suggestion field
+  (e.g. API1:2023-BOLA) in the fixes section.
+- **Docs & version** (8G): expansion doc Phase 8 section, README tool tables,
+  version 1.3.0.
+
+**Deferred / skipped** (reasons in the expansion doc): Playwright (breaks the
+argv-only rule; gowitness covers screenshots), Interactsh + Burp Community
+(need listening services / callback traffic — revisit with the egress proxy),
+kube-bench (audits live nodes, not code folders).
+
+**Sandbox image changed** — rebuild required in WSL2:
+`docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .`
+
+**Known limitations**: gowitness 3.x flags could not be live-verified during
+development (drift would surface as an audited spawn failure); sandbox egress
+still uses the default docker bridge (proxy pending); POST_EXPLOIT dormant.
+
 ## v1.2.0 — Purple Team tool expansion (7 phases)
 
 Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:

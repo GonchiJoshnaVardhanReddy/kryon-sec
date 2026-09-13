@@ -540,3 +540,188 @@ attempt excerpts, mapping tags render with the "suggested" label.
 5. Blue-team code scanners (--code, read-only /code mount)
 6. Report enrichment (CVSS 3.1 calculator, dedup, normalizer)
 7. CHANGELOG, README tool tables, version 1.2.0
+
+---
+
+# Phase 8 — User tool map (2026-09-14)
+
+Approved plan: `~/.claude/plans/shiny-singing-hanrahan.md`. The user supplied a
+complete tool map for every state; comparing it to the codebase, ~40 tools were
+already present (v1.2.0). Phase 8 closes the gaps. Commits:
+`v1.3.0-1` (8A+8B) → `v1.3.0-2` (8C+8D) → `v1.3.0-3` (8E+8F) → `v1.3.0` (8G).
+Suite: **496 → 559 tests**.
+
+User decisions locked before implementation:
+- Browser tool → **gowitness only** (Playwright skipped — needs driver code,
+  breaks the argv-only rule).
+- **Interactsh + Burp Community deferred** — they need listening services /
+  external callback traffic; revisit when the egress proxy exists.
+- GitHub recon → **free API only**, optional `github_token` in config (same
+  pattern as Shodan/Censys keys).
+- BloodHound CE / impacket → **allowlist + image now, dormant** (no shell
+  exists; same status as the rest of POST_EXPLOIT).
+
+## Phase 8A — Passive recon (Zone A) additions
+
+**Status: COMPLETE — commit 6f2ee8c (v1.3.0-1), suite 530.**
+
+New sources in `zonea.py` + `recon_passive.py::zone_a_fetchers` (now 10):
+
+- **RDAP WHOIS** (`rdap_whois`) — fetches the IANA RDAP bootstrap
+  (`data.iana.org/rdap/dns.json`), finds the registry RDAP server for the TLD,
+  queries it via `_zone_a_fetch` with the IANA-derived host added to the
+  allowlist (the host comes from IANA's official bootstrap file, never from a
+  redirect). Notes: registrar, dates, nameservers, status.
+- **GitHub recon** (`github_recon`) — `api.github.com` (free tier): org + repo
+  search named after the domain; with `github_token` configured, code search
+  for the domain (leaked-config references → notes only, never fetched).
+  Repo-name subdomain-like hostnames become subdomains.
+- **DNS history** (`hackertarget_hostsearch`) — keyless, heavily rate-limited;
+  a failure is an audited skip like every source. Host,IP pairs → subdomains.
+- **Cloud asset discovery** (`cloud_asset_notes`) — **zero fetch**: a local
+  pass over already-collected subdomains matching cloud provider suffixes
+  (`.amazonaws.com`, `.cloudfront.net`, `.azurewebsites.net`,
+  `.blob.core.windows.net`, `.herokuapp.com`, `.netlify.app`, `.fastly.net`,
+  `.appspot.com`) → one `osint_note` listing cloud-hosted assets. Runs last.
+- **Certificate enrichment** — `crt_sh_subdomains` now parses issuer/validity
+  into bounded notes.
+
+Config/wizard: `github_token` (`[api]`, env `GITHUB_TOKEN`), wizard step with
+the Shodan/Censys keys. Token never logged or audited.
+
+## Phase 8B — Active recon additions
+
+**Status: COMPLETE — commit 6f2ee8c (v1.3.0-1).**
+
+- **gowitness** (screenshots) — `KaliSandbox` gained `evidence_dir`:
+  `-v <abs>:/evidence:rw`, the **only read-write mount** in the system
+  (`/code` stays `:ro`, rootfs stays `--read-only`). Runner wires
+  `cfg.home/engagements/<id>/evidence` for RECON_ACTIVE/EXPLOIT/POST_EXPLOIT/
+  VERIFY sandboxes. One gowitness run per web port in `_web_plan`; screenshot
+  node label = the `--url` argument, `dir=/evidence`.
+  **Known caveat:** gowitness 3.x flags could not be live-verified during
+  development (documented usage: `scan website --url X --screenshot-path Y
+  --no-console --disable-db`); flag drift would surface as an audited spawn
+  failure, never a safety issue.
+- **massdns** — apt package; allowlist template with fixed literal wordlist +
+  resolver paths (seclists). NOT in the default plan (dnsx covers resolution);
+  allowlisted for future plan use.
+- **OpenAPI/API discovery** — baked script `containers/sandbox/scripts/
+  openapi_probe.py` (argv `{url}` only): probes `/openapi.json`,
+  `/swagger.json`, `/api-docs`, `/graphql`, prints a JSON summary of found
+  endpoints (bounded 50 endpoints, 120-char labels). Added to `_web_plan`
+  stage 2 per web port; found paths become `path` nodes (source
+  `openapi_probe`).
+
+## Phase 8C — Hypothesis enrichment additions
+
+**Status: COMPLETE — commit 2a4d66c (v1.3.0-2), suite 549.**
+
+`enrichment.py`, after the Phase 3 lookups:
+
+- **OSV** (`osv_record`) — `api.osv.dev/v1/vulns/{cve}` (keyless):
+  `osv_aliases`, `osv_severity`, `affected_packages` (bounded). Audited as
+  kind "osv".
+- **GitHub Advisory Database** (`ghsa_record`) — `api.github.com/advisories?
+  cve_id=…` (keyless): `ghsa_id`, `ghsa_severity`, `patched_versions`.
+- **CWE** — `copilot/cve.py::_from_nvd` extracts CWE ids from the record's
+  `weaknesses` list → `enrichment["cwes"]` (bounded, deduped).
+- **Nuclei template metadata** — baked script `containers/sandbox/scripts/
+  nuclei_meta.py` (argv `{term}`): front-matter scan of the baked
+  `/opt/nuclei-templates` for the CVE/term, prints `{matches: [{id, severity,
+  tags}]}` (bounded 10). Called from `enrich_hypotheses` exactly like
+  searchsploit; matches → `enrichment["nuclei_templates"]` and
+  `exploit_available=True`.
+
+Report: `_normalize_enrichment` + `report.jinja` gained the OSV / GHSA / CWE /
+nuclei rows (same "unknown ≠ absent" semantics as Phase 3).
+
+## Phase 8D — Post-exploit (dormant) additions
+
+**Status: COMPLETE — commit 2a4d66c (v1.3.0-2).**
+
+- **Impacket (controlled subset)** — apt `impacket-scripts`; allowlist
+  templates for `GetNPUsers.py`, `GetUserSPNs.py`, `GetADUsers.py`,
+  `findDelegation.py` (each `["{term}", "-dc-ip", "{target}"]` shaped).
+  Deliberately NOT in `POST_EXPLOIT_PLAN` — they need operator-provided
+  domain/credential context that does not exist without a shell. The
+  dangerous remainder (secretsdump, atexec/wmiexec/smbexec/psexec, GetST,
+  ticketer) is NOT allowlisted and a test pins that.
+- **bloodhound-python** — already in image + entrypoint; added the missing
+  host template `["--collection", "All", "--domain", "{term}", "--dc-ip",
+  "{target}"]`, dormant.
+- **POST_EXPLOIT_DORMANT_TOOLS** set in `post_exploit.py` — the plan-coverage
+  test excludes it, and a dedicated test asserts none of them is ever in the
+  plan.
+- **Cloud metadata enumeration** — baked script
+  `containers/sandbox/scripts/cloud_meta.py` (argv `{target}` label): probes
+  `169.254.169.254` / `metadata.google.internal` etc. from inside the
+  sandbox, JSON out (bounded 2000 chars). IS in `POST_EXPLOIT_PLAN` —
+  harmless, it probes the sandbox's own (nonexistent) metadata service.
+
+## Phase 8E — Blue-team scanner additions
+
+**Status: COMPLETE — commit (v1.3.0-3), suite 559.**
+
+`BLUE_TEAM_SCAN_PLAN` grew from 6 to 9 (+ conditional hadolint):
+
+- **syft v1.26.0** (SBOM) — `["scan", "/code", "-o", "json"]`, offline.
+- **osv-scanner v2.0.2** — `["-r", "/code", "--format", "json"]`; needs
+  egress to api.osv.dev (default bridge works today — same caveat as trivy;
+  fails as an audited skip offline).
+- **grype v0.95.0** — `["dir:/code", "-o", "json"]`; needs vuln-DB download
+  (same egress caveat).
+
+All three are pinned GitHub release binaries in `Dockerfile.kali` (same wget
+pattern, WARN fallbacks). `_count_findings` gained JSON parsers: syft
+`artifacts` (a **package count, not vulns** — rendered as the SBOM line),
+osv-scanner `results→packages→vulnerabilities`, grype `matches`. The report
+gained a "Code scanning results (blue team)" section with an SBOM summary
+line ("SBOM: N packages identified (syft)") and one row per scanner.
+
+## Phase 8F — Report additions
+
+**Status: COMPLETE — commit (v1.3.0-3).**
+
+- **Timeline** — `audit.py::write()` stamps every entry with an ISO-8601 UTC
+  `ts` field (informational; the hash chain, not wall clock, remains the
+  ordering guarantee — old chains still verify since `verify()` hashes
+  whatever fields exist). `report.py::build_timeline()` reads
+  `engagement_created` / `state_enter` / `report_written` milestones (bounded
+  100 rows); `report.jinja` renders the Timeline table after the halt reason.
+- **OWASP API mapping** — `Remediation` gained optional `owasp_api` (e.g.
+  `API1:2023-BOLA`), prompted in `blue_team.jinja`, rendered in the same
+  "suggested, not verified" mapping line.
+
+## Phase 8G — Docs, version, final verification
+
+**Status: COMPLETE — v1.3.0.**
+
+- This Phase 8 section; README tool tables + badges; CHANGELOG v1.3.0;
+  version 1.2.0 → 1.3.0 (`__init__.py` + `pyproject.toml`).
+- Sandbox image changed (gowitness, massdns, syft, grype, osv-scanner,
+  impacket-scripts, baked scripts) → **rebuild required in WSL2**:
+  `docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .`
+
+### Covered by existing tools (documented, not re-added)
+
+- **Wappalyzer** — whatweb `-a 3` + httpx `-tech-detect` cover tech
+  fingerprinting.
+- **OWASP/ATT&CK "knowledge"** — the blue-team LLM suggestion fields from
+  Phase 5 (+ `owasp_api` in 8F).
+- **Custom HTTP/DNS probes** — baked `probe.py` + `dig`.
+- **Response comparison** — VERIFY's boolean baseline probe.
+- **Container/K8s analyzers** — trivy FS + checkov + hadolint cover images /
+  manifests / Dockerfiles; kube-bench deliberately excluded (audits live
+  nodes, not code folders — it would test the sandbox itself).
+
+### Deferred / skipped (with reasons)
+
+| Tool | Decision | Reason |
+|---|---|---|
+| Playwright | skipped | Needs driver code in the sandbox; breaks the argv-only rule. gowitness covers screenshots. |
+| Interactsh | deferred | Needs a listening client server / external callback traffic; revisit with the egress proxy. |
+| Burp Community | deferred | Needs a listening proxy service and operator-driven traffic; same egress-proxy prerequisite. |
+| kube-bench | excluded | Audits live kubelet config, not a code folder. |
+| massdns | allowlisted, not planned | dnsx covers resolution in the default plan. |
+| impacket / bloodhound-python | allowlisted + image, dormant | Need shell + operator domain/cred context that does not exist today. |
