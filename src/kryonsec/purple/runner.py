@@ -69,9 +69,10 @@ STATE_INFO: dict[str, dict[str, str]] = {
     },
     "POST_EXPLOIT": {
         "agent": "post-exploit",
-        "does": "enumerate shells (requires separate approval)",
+        "does": "enumerate inside an obtained shell (separate approval; "
+                "dormant — no current tool yields a shell)",
         "tools": "linpeas, pspy, linux-exploit-suggester, baked enum "
-                 "scripts (evidence collection only)",
+                 "scripts (evidence collection only, never destructive)",
         "zone": "B (sandbox)",
     },
     "VERIFY": {
@@ -281,6 +282,17 @@ def start_engagement(
             sub = ExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox, progress=progress,
+            )
+            return sub.run
+
+        if state == "POST_EXPLOIT" and sandbox_ok:
+            from .post_exploit import PostExploitSubagent
+            from .sandbox import KaliSandbox
+
+            sandbox = KaliSandbox(cfg=cfg)
+            sub = PostExploitSubagent(
+                cfg=cfg, graph=graph, audit=audit, target=target,
+                sandbox=sandbox,
             )
             return sub.run
 
