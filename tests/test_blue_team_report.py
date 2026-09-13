@@ -628,3 +628,218 @@ def test_empty_graph_report(tmp_path):
     assert "none found" in report
     assert "No issues were suggested" in report
     assert validate_report(report, graph) == []
+
+
+# ---- Phase 6: evidence normalizer, CVSS calculator, dedup, enrichment ----
+
+def test_normalize_evidence_strips_ansi_and_whitespace():
+    from kryonsec.purple.report import normalize_evidence
+    noisy = "\x1b[31m[!]\x1b[0m vulnerable\r\n   to  \t SQL\r\ninjection"
+    assert normalize_evidence(noisy) == "[!] vulnerable to SQL injection"
+
+
+def test_normalize_evidence_truncates_uniformly():
+    from kryonsec.purple.report import normalize_evidence
+    out = normalize_evidence("A" * 500, max_chars=200)
+    assert len(out) == 201  # 200 chars + ellipsis
+    assert out.endswith("…")
+
+
+def test_normalize_evidence_empty():
+    from kryonsec.purple.report import normalize_evidence
+    assert normalize_evidence("") == ""
+
+
+@pytest.mark.parametrize("vector,expected", [
+    # official CVSS 3.1 examples (first.org calculator)
+    ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+    ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+    ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1),
+    ("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 1.8),
+    ("AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),  # no prefix
+    # malformed / missing -> None, never a guess
+    ("", None),
+    ("AV:N/AC:L/PR:N/UI:N/S:U", None),          # missing C/I/A
+    ("AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", None),  # bad metric value
+    ("not a vector at all", None),
+])
+def test_cvss_base_score(vector, expected):
+    from kryonsec.purple.report import cvss_base_score
+    assert cvss_base_score(vector) == expected
+
+
+@pytest.mark.parametrize("score,expected", [
+    (None, "unknown"), (0.0, "none"), (3.9, "low"), (4.0, "medium"),
+    (6.9, "medium"), (7.0, "high"), (8.99, "high"), (9.0, "critical"),
+    (10.0, "critical"),
+])
+def test_cvss_severity(score, expected):
+    from kryonsec.purple.report import cvss_severity
+    assert cvss_severity(score) == expected
+
+
+def test_report_shows_calculated_score_and_enrichment(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    # _graph's H1 already carries the 9.8 vector
+    graph.by_type("hypothesis")[0]["properties"]["enrichment"] = {
+        "cve": "CVE-2024-1234",
+        "cvss_score": 9.8, "severity": "CRITICAL",
+        "kev": True, "epss": 0.94, "epss_percentile": 0.99,
+        "cpes": ["cpe:2.3:a:vendor:product:1.0"],
+        "exploits": ["Exploit-DB 12345"], "exploit_available": True,
+    }
+    report = render_report(graph, audit, "e-bt")
+    assert "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" in report
+    assert "calculated base score: 9.8" in report
+    assert "critical" in report
+    assert "CVE-2024-1234" in report
+    assert "YES — fix first" in report  # KEV
+    assert "cpe:2.3:a:vendor:product:1.0" in report
+    assert validate_report(report, graph) == []
+
+
+def test_report_enrichment_partial_data(tmp_path):
+    """A failed lookup leaves keys out — unknown must never look like 'no'."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.by_type("hypothesis")[0]["properties"]["enrichment"] = {
+        "cve": "CVE-2024-5678", "kev": None, "epss": None,
+    }
+    report = render_report(graph, audit, "e-bt")
+    assert "CVE-2024-5678" in report
+    assert "unknown (lookup failed)" in report
+    assert "Chance it gets exploited soon (EPSS score): unknown" in report
+
+
+def test_dedup_merges_same_tools_and_asset(tmp_path):
+    from kryonsec.purple.report import dedup_hypotheses
+
+    graph = _graph()
+    # H2 in _graph is (ffuf, target-corp.com) — add a duplicate suggestion
+    graph.add_node("hypothesis", "H3", {
+        "title": "search page may reflect input",
+        "target_asset": "target-corp.com",
+        "rationale": "same idea again",
+        "cvss_vector": "",
+        "cve": "CVE-2024-0001",
+        "tools": ["ffuf"],
+        "confidence": 0.9,  # higher than H2's 0.6 — must win
+    })
+    # nodes pointing at H3 must be remapped to H2
+    graph.add_node("remediation", "H3", {"title": "t", "fix": "f"})
+    graph.add_node("exploit_attempt", "H3:ffuf", {"tool": "ffuf"})
+    graph.add_node("finding", "H3", {"tool": "ffuf"})
+    audit = AuditLog(tmp_path / "audit.jsonl")
+
+    merged = dedup_hypotheses(graph, audit)
+    assert merged == 1
+    labels = [n["label"] for n in graph.by_type("hypothesis")]
+    assert labels == ["H1", "H2"]
+    # H2 kept the higher confidence and gained the CVE
+    h2 = graph.by_type("hypothesis")[1]["properties"]
+    assert h2["confidence"] == 0.9
+    assert h2["cve"] == "CVE-2024-0001"
+    assert h2["merged_from"] == ["H3"]
+    # every pointer was remapped, nothing orphaned
+    assert [n["label"] for n in graph.by_type("remediation")] == ["H2"]
+    assert [n["label"] for n in graph.by_type("exploit_attempt")] == ["H2:ffuf"]
+    assert [n["label"] for n in graph.by_type("finding")] == ["H2"]
+    events = [json.loads(l)["event"]
+              for l in open(audit.path, encoding="utf-8") if l.strip()]
+    assert "hypotheses_merged" in events
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_dedup_noop_when_unique(tmp_path):
+    from kryonsec.purple.report import dedup_hypotheses
+
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()  # H1 (sqlmap) and H2 (ffuf) differ in tools
+    assert dedup_hypotheses(graph, audit) == 0
+    assert len(graph.by_type("hypothesis")) == 2
+    # nothing merged -> no hypotheses_merged event (audit has no file yet
+    # because zero events were written — that IS the assertion)
+    assert not audit.path.exists()
+
+
+def test_report_subagent_merges_duplicates_before_rendering(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("hypothesis", "H3", {
+        "title": "dup", "target_asset": "target-corp.com",
+        "rationale": "r", "cvss_vector": "", "tools": ["ffuf"],
+        "confidence": 0.5,
+    })
+    sub = ReportSubagent(cfg=cfg, graph=graph, audit=audit, engagement_id="e-d")
+    assert sub.run().status == "ok"
+    assert len(graph.by_type("hypothesis")) == 2
+    content = (tmp_path / "engagements" / "e-d" / "report.md").read_text(
+        encoding="utf-8")
+    assert "H3" not in content
+    assert validate_report(content, graph) == []
+
+
+def test_validate_report_catches_unmerged_duplicate(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("hypothesis", "H3", {
+        "title": "dup", "target_asset": "target-corp.com",
+        "rationale": "r", "cvss_vector": "", "tools": ["ffuf"],
+        "confidence": 0.5,
+    })
+    # render WITHOUT the subagent's dedup — validation must flag it
+    report = render_report(graph, audit, "e-dup")
+    problems = validate_report(report, graph)
+    assert any("H3" in p and "not merged" in p for p in problems)
+
+
+def test_validate_report_catches_missing_enrichment(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.by_type("hypothesis")[0]["properties"]["enrichment"] = {
+        "cve": "CVE-2024-9999"}
+    report = render_report(graph, audit, "e-enr")
+    broken = report.replace("CVE-2024-9999", "CVE-0000-0000")
+    problems = validate_report(broken, graph)
+    assert any("CVE-2024-9999" in p for p in problems)
+
+
+def test_validate_report_rejects_ansi_in_output(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    report = render_report(graph, audit, "e-ansi")
+    problems = validate_report(report + "\n\x1b[31mred\x1b[0m\n", graph)
+    assert any("ANSI" in p for p in problems)
+
+
+def test_report_attempt_excerpts_are_normalized(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "exit_code": 0, "confirmed": True,
+        "argv": ["sqlmap", "-u", "http://t/Login.asp", "--batch"],
+        "output_excerpt": "\x1b[33m[WARNING]\x1b[0m the   \t parameter\n'id' is vulnerable",
+    })
+    report = render_report(graph, audit, "e-norm")
+    assert "\x1b[" not in report
+    assert "the parameter 'id' is vulnerable" in report
+    assert validate_report(report, graph) == []
+
+
+def test_report_fixes_show_mapping_suggestions(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("remediation", "H1", {
+        "title": "Parameterize queries", "fix": "prepared statements",
+        "detection": "waf rule", "severity": "critical",
+        "cwe": "CWE-89", "owasp": "A03:2021-Injection", "attack": "T1190",
+    })
+    report = render_report(graph, audit, "e-map")
+    assert "CWE-89" in report
+    assert "A03:2021-Injection" in report
+    assert "T1190" in report
+    assert "suggested, not verified" in report
+    assert validate_report(report, graph) == []

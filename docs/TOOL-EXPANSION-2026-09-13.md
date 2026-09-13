@@ -415,3 +415,95 @@ LLM without sandbox), `tests/test_runner.py` (code-folder wiring: only
 the BLUE_TEAM sandbox gets the mount, audit `code_scan` flag, missing
 folder rejected), `tests/test_allowlist.py` (6 valid argv cases + other
 paths rejected).
+
+## Phase 6 — Report enrichment
+
+**Status: COMPLETE — full suite green (496 passed, `py -3.13 -m pytest -q`,
+2026-09-13).**
+
+The report now shows the public-risk context Phase 3 gathered, computes a
+numeric CVSS score from the hypothesis vector, merges duplicate
+hypotheses, and normalizes tool evidence — all in `purple/report.py` +
+`templates/report.jinja`.
+
+### Enrichment rows (per hypothesis)
+
+When a hypothesis carries `enrichment` (from Phase 3), the report renders
+a "Known risk data for CVE-…" block: CISA KEV status (YES — fix first /
+no / unknown-lookup-failed — unknown is never rendered as "no"), EPSS
+score (unknown when the lookup failed), public exploit availability, and
+CPE software list. Failed lookups leave keys absent;
+`_normalize_enrichment` gives the template a fixed shape so
+StrictUndefined can never crash REPORT.
+
+### CVSS 3.1 base-score calculator
+
+`cvss_base_score(vector)` — pure Python (~80 lines), no new dependency.
+Full v3.1 math: scope-changed impact formula, the official Appendix A
+`Roundup` (5-decimal intermediate, ceiling to 1 decimal), metric tables.
+Missing/unknown metric → None, never a guessed score. `cvss_severity`
+buckets to none/low/medium/high/critical. The report shows the LLM's
+vector, the calculated score, and the bucket; when the vector is
+unparseable it falls back to NVD's own score, and when neither exists it
+says "score could not be calculated".
+
+### Evidence normalizer
+
+`normalize_evidence(text)` — ANSI escape codes stripped, whitespace
+collapsed to single spaces, uniform truncation (200 chars + ellipsis).
+Applied to `exploit_attempt.output_excerpt` in the repeatable-steps
+section; raw output stays in the audit chain (this is only the report's
+view). `validate_report` now also rejects any ANSI codes in the rendered
+report.
+
+### Hypothesis dedup
+
+`dedup_hypotheses(graph, audit)` runs at the top of REPORT (before
+rendering): hypotheses with the same (sorted tool set, target asset) are
+merged into the first occurrence — keeping the max confidence and the
+first non-empty cve / cvss_vector / enrichment — with `merged_from`
+recording the absorbed ids. Every node pointing at a merged id
+(remediation, finding, verify_attempt, exploit_attempt "H2:tool" labels)
+is remapped so report joins stay correct. The merge count lands on the
+audit chain as `hypotheses_merged`. Dedup runs in the REPORT state, not
+HYPOTHESIZE: the hypothesis-time id dedup (same id twice) stays where it
+was; this one catches the same *idea* proposed twice with different ids,
+which only matters once the report renders.
+
+### Mapping tags
+
+The fixes section shows CWE / OWASP / ATT&CK when BLUE_TEAM suggested
+them, labelled "suggested, not verified". Old remediation nodes without
+the fields render fine (defaults, not StrictUndefined crashes).
+
+### validate_report extensions
+
+(1) every enriched hypothesis's CVE must appear in the report; (2) an
+unmerged duplicate (same tools/asset) is a problem; (3) ANSI escape
+codes anywhere in the output are a problem.
+
+### Decisions made during Phase 6
+
+1. **Score source is labeled.** A calculated score is shown as
+   "calculated base score"; NVD's own score is only used when the vector
+   is missing/unparseable. The reader can always tell what was computed
+   vs looked up.
+2. **Dedup merges in the graph, not just at render time** — so the
+   remediation joins, the report's tested/confirmed sets, and any future
+   consumer all see the merged view. The audit chain keeps the full
+   pre-merge history.
+3. **`hypotheses_merged` audit event carries the alias map** — a
+   verifier can reconstruct exactly which suggestions were absorbed into
+   which.
+4. **KEV "unknown" ≠ "no".** Same semantics as Phase 3: a failed lookup
+   must never read as "not exploited".
+
+### Tests (`tests/test_blue_team_report.py`)
+
+normalize_evidence (ANSI/whitespace/truncation/empty), cvss_base_score
+parametrized over official FIRST examples + malformed vectors,
+cvss_severity buckets, enrichment rendering (full + partial data with
+unknown-not-no semantics), dedup (merge + pointer remapping + audit
+event + noop), subagent merges before rendering, validate_report catches
+unmerged duplicates / dropped enrichment / ANSI in output, normalized
+attempt excerpts, mapping tags render with the "suggested" label.
