@@ -187,8 +187,17 @@ def _normalize_enrichment(e: dict) -> dict:
         "epss": e.get("epss"),
         "epss_percentile": e.get("epss_percentile"),
         "cpes": e.get("cpes") or [],
+        "cwes": e.get("cwes") or [],  # Phase 8: from the NVD record
         "exploits": e.get("exploits") or [],
         "exploit_available": bool(e.get("exploit_available")),
+        # Phase 8 lookups (each empty when the fetch failed or found nothing)
+        "osv_aliases": e.get("osv_aliases") or [],
+        "osv_severity": e.get("osv_severity", ""),
+        "affected_packages": e.get("affected_packages") or [],
+        "ghsa_id": e.get("ghsa_id", ""),
+        "ghsa_severity": e.get("ghsa_severity", ""),
+        "patched_versions": e.get("patched_versions") or [],
+        "nuclei_templates": e.get("nuclei_templates") or [],
     }
 
 

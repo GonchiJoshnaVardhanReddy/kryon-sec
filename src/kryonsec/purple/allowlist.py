@@ -166,6 +166,9 @@ EXPLOIT_TEMPLATES: dict[str, list[str]] = {
     "graphql-cop": ["-u", "{url}", "-o", "json"],
     # ExploitDB search (local database inside the image — no egress)
     "searchsploit": ["--colorless", "{term}"],
+    # Nuclei template metadata search (Phase 8): local template files in
+    # the image — used by HYPOTHESIZE enrichment, same shape as searchsploit
+    f"{SANDBOX_SCRIPT_DIR}/nuclei_meta.py": ["{term}"],
 }
 
 # Independent confirmation tools (a finding is only "verified" when a tool
@@ -186,6 +189,12 @@ VERIFY_TEMPLATES: dict[str, list[str]] = {
 # find_secrets.py scripts are baked into the image and take the target as
 # context (they enumerate the sandbox-visible environment, e.g. mounted
 # evidence, not the engagement target's network).
+# Phase 8 DORMANT additions: impacket AD recon + bloodhound-python +
+# cloud_meta.py are allowlisted and in the image but NOT in the fixed
+# POST_EXPLOIT_PLAN — no current tool yields a shell, and AD tools need
+# operator-provided domain/credential context that cannot exist without
+# one. They activate the day a shell-producing tool exists (same rule as
+# the rest of POST_EXPLOIT: the plan, never the LLM, decides).
 POST_EXPLOIT_TEMPLATES: dict[str, list[str]] = {
     "linpeas.sh": ["-a"],
     "pspy64": [],
@@ -194,6 +203,20 @@ POST_EXPLOIT_TEMPLATES: dict[str, list[str]] = {
     f"{SANDBOX_SCRIPT_DIR}/enum_fs.py": ["{target}"],
     f"{SANDBOX_SCRIPT_DIR}/enum_network.py": ["{target}"],
     f"{SANDBOX_SCRIPT_DIR}/find_secrets.py": ["{target}"],
+    # cloud metadata enumeration (Phase 8): probes the sandbox's OWN
+    # metadata service from inside — inert by design (there is none), it
+    # exists so the check exists the day a shell lands somewhere real.
+    f"{SANDBOX_SCRIPT_DIR}/cloud_meta.py": ["{target}"],
+    # impacket AD recon (Phase 8, dormant — read-only enumeration only;
+    # no secretsdump/atexec/wmiexec or anything that writes/extracts)
+    "GetNPUsers.py": ["-dc-ip", "{target}", "{term}"],
+    "GetUserSPNs.py": ["-dc-ip", "{target}", "{term}"],
+    "GetADUsers.py": ["-dc-ip", "{target}", "{term}"],
+    "findDelegation.py": ["-dc-ip", "{target}", "{term}"],
+    # bloodhound-python (Phase 8, dormant): full collection needs domain
+    # creds; the template pins the collection method to All
+    "bloodhound-python": [
+        "--collection", "All", "--domain", "{term}", "--dc-ip", "{target}"],
 }
 
 # Blue-team static analyzers (Phase 5): run against the read-only /code

@@ -109,6 +109,21 @@ def test_blocklist_allows_normal_argv(allow):
                  "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"]),
     ("/opt/kryonsec/openapi_probe.py",
      ["/opt/kryonsec/openapi_probe.py", "http://target.com:8080/"]),
+    # Phase 8D post-exploit (dormant — allowlisted + in image, not in the
+    # fixed plan): impacket AD recon, bloodhound-python, cloud metadata.
+    # The trailing context arg is a {term} (alnum + . : + , - space) — no
+    # slashes, no credentials inline; creds arrive via operator context.
+    ("GetNPUsers.py", ["GetNPUsers.py", "-dc-ip", "10.0.0.1",
+                       "target-corp.com"]),
+    ("GetUserSPNs.py", ["GetUserSPNs.py", "-dc-ip", "10.0.0.1",
+                        "target-corp.com"]),
+    ("GetADUsers.py", ["GetADUsers.py", "-dc-ip", "10.0.0.1", "target-corp.com"]),
+    ("findDelegation.py", ["findDelegation.py", "-dc-ip", "10.0.0.1",
+                           "target-corp.com"]),
+    ("bloodhound-python", ["bloodhound-python", "--collection", "All",
+                           "--domain", "target-corp.com", "--dc-ip", "10.0.0.1"]),
+    ("/opt/kryonsec/cloud_meta.py", ["/opt/kryonsec/cloud_meta.py",
+                                     "target-corp.com"]),
 ])
 def test_new_template_accepts_valid_argv(allow, tool, argv):
     allow.validate(tool, argv)
@@ -207,6 +222,24 @@ def test_openapi_probe_takes_only_a_url(allow):
     with pytest.raises(AllowlistViolation):
         allow.validate("/opt/kryonsec/openapi_probe.py",
                        ["/opt/kryonsec/openapi_probe.py", "target.com"])
+
+
+def test_impacket_secretsdump_is_not_allowlisted(allow):
+    """Phase 8 adds the READ-ONLY impacket recon tools only — anything
+    that extracts credentials or executes (secretsdump, atexec, wmiexec,
+    smbexec, psexec) must stay off the list entirely."""
+    for tool in ("secretsdump.py", "atexec.py", "wmiexec.py",
+                 "smbexec.py", "psexec.py", "GetST.py", "ticketer.py"):
+        with pytest.raises(AllowlistViolation):
+            allow.validate(tool, [tool, "-dc-ip", "10.0.0.1", "target-corp.com"])
+
+
+def test_impacket_template_pins_dc_ip_position(allow):
+    """The -dc-ip value is a {target} (host/ip) token and comes FIRST —
+    a free-form command line must never validate."""
+    with pytest.raises(AllowlistViolation):
+        allow.validate("GetNPUsers.py",
+                       ["GetNPUsers.py", "target-corp.com/", "-dc-ip", "10.0.0.1"])
 
 
 # ---- entrypoint ↔ host allowlist sync (defense-in-depth Layer 2b) ---------

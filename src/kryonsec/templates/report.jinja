@@ -102,6 +102,14 @@ information and guessed what might be wrong. Nothing below is confirmed
   - Public exploit code available: {{ "yes" if h.enrichment.exploit_available else "not found" }}
 {% if h.enrichment.cpes %}  - Affected software (CPE): {{ h.enrichment.cpes | join(", ") }}
 {% endif %}
+{% if h.enrichment.cwes %}  - Weakness types (CWE, from NVD): {{ h.enrichment.cwes | join(", ") }}
+{% endif %}
+{% if h.enrichment.osv_aliases or h.enrichment.affected_packages %}  - OSV database: {{ h.enrichment.osv_severity or "severity unknown" }}{% if h.enrichment.osv_aliases %}; also known as {{ h.enrichment.osv_aliases | join(", ") }}{% endif %}{% if h.enrichment.affected_packages %}; affects {{ h.enrichment.affected_packages | join(", ") }}{% endif %}
+{% endif %}
+{% if h.enrichment.ghsa_id %}  - GitHub Advisory {{ h.enrichment.ghsa_id }}: {{ h.enrichment.ghsa_severity or "severity unknown" }}{% if h.enrichment.patched_versions %}; fixed in {{ h.enrichment.patched_versions | join(", ") }}{% endif %}
+{% endif %}
+{% if h.enrichment.nuclei_templates %}  - Public scanning templates (nuclei): {{ h.enrichment.nuclei_templates | map(attribute='id') | join(", ") }}
+{% endif %}
 {% endif %}
 - Why it thinks this: {{ h.rationale }}
 - How to check it: {{ h.tools | join(", ") if h.tools else "(no tool suggested)" }}

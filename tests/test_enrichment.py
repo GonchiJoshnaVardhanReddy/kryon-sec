@@ -219,14 +219,19 @@ def _hypothesis_graph():
     return graph
 
 
-def _patch_apis(monkeypatch, *, nvd=None, kev=None, epss=None):
-    """Patch the three API layers; anything left as None stays 'failed'."""
+def _patch_apis(monkeypatch, *, nvd=None, kev=None, epss=None,
+                osv=None, ghsa=None):
+    """Patch the API layers; anything left as None stays 'failed'."""
     monkeypatch.setattr("kryonsec.copilot.cve.lookup_cve",
                         lambda cfg, cve: nvd)
     monkeypatch.setattr("kryonsec.purple.enrichment.kev_cves",
                         lambda cfg: kev)
     monkeypatch.setattr("kryonsec.purple.enrichment.epss_for",
                         lambda cfg, cve: epss)
+    monkeypatch.setattr("kryonsec.purple.enrichment.osv_record",
+                        lambda cfg, cve: osv)
+    monkeypatch.setattr("kryonsec.purple.enrichment.ghsa_record",
+                        lambda cfg, cve: ghsa)
 
 
 def test_enrich_writes_properties_and_skips_cveless(cfg, audit, monkeypatch):
@@ -298,7 +303,10 @@ def test_enrich_searchsploit_hits_mark_exploit_available(cfg, audit, monkeypatch
 
     enrich_hypotheses(cfg, graph, audit, sandbox=sandbox)
 
-    assert sandbox.argvs == [["searchsploit", "--colorless", "CVE-2021-44228"]]
+    assert sandbox.argvs == [
+        ["searchsploit", "--colorless", "CVE-2021-44228"],
+        ["/opt/kryonsec/nuclei_meta.py", "CVE-2021-44228"],
+    ]
     enrich = graph.by_type("hypothesis")[0]["properties"]["enrichment"]
     assert enrich["exploit_available"] is True
     assert "Apache Log4j RCE" in enrich["exploits"][0]
@@ -372,6 +380,197 @@ def test_nvd_record_extracts_cpes(monkeypatch):
         "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*:*",
         "cpe:2.3:a:apache:log4j:2.15.0:*:*:*:*:*:*:*:*",
     ]  # deduped, order kept
+
+
+# ---- Phase 8: OSV / GHSA / nuclei_meta / CWE ------------------------------
+
+def _osv_payload():
+    return json.dumps({
+        "id": "GHSA-7rjr-3q55-vv33",
+        "aliases": ["CVE-2021-44228"],
+        "database_specific": {"severity": "HIGH"},
+        "affected": [
+            {"package": {"name": "org.apache.logging.log4j:log4j-core"}},
+            {"package": {"name": "org.apache.logging.log4j:log4j-core"}},
+            {"package": {"name": "log4j-core"}},
+        ],
+    }).encode()
+
+
+def test_osv_fetches_and_parses(cfg):
+    from kryonsec.purple.enrichment import osv_record
+
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               return_value=_osv_payload()):
+        record = osv_record(cfg, "cve-2021-44228")
+    assert record["osv_aliases"] == ["CVE-2021-44228"]
+    assert record["osv_severity"] == "HIGH"
+    # deduped package names
+    assert record["affected_packages"] == [
+        "org.apache.logging.log4j:log4j-core", "log4j-core"]
+
+
+def test_osv_uses_cache(cfg):
+    from kryonsec.purple.enrichment import osv_record
+
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               return_value=_osv_payload()):
+        osv_record(cfg, "CVE-2021-44228")
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               side_effect=RuntimeError("network down")):
+        assert osv_record(cfg, "CVE-2021-44228") is not None
+
+
+def test_osv_failure_and_empty_are_none(cfg):
+    from kryonsec.purple.enrichment import osv_record
+
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               side_effect=RuntimeError("network down")):
+        assert osv_record(cfg, "CVE-2021-44228") is None
+    # a record with nothing worth surfacing -> None too
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               return_value=json.dumps({"id": "OSV-1", "aliases": []}).encode()):
+        assert osv_record(cfg, "CVE-2021-44228") is None
+
+
+def _ghsa_payload():
+    return json.dumps([{
+        "ghsa_id": "GHSA-7rjr-3q55-vv33",
+        "severity": "HIGH",
+        "vulnerabilities": [
+            {"patched_versions": ">=2.15.0"},
+            {"patched_versions": ""},
+        ],
+    }]).encode()
+
+
+def test_ghsa_fetches_and_parses(cfg):
+    from kryonsec.purple.enrichment import ghsa_record
+
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               return_value=_ghsa_payload()):
+        record = ghsa_record(cfg, "cve-2021-44228")
+    assert record["ghsa_id"] == "GHSA-7rjr-3q55-vv33"
+    assert record["ghsa_severity"] == "HIGH"
+    assert record["patched_versions"] == [">=2.15.0"]  # empty entries dropped
+
+
+def test_ghsa_empty_and_failure_are_none(cfg):
+    from kryonsec.purple.enrichment import ghsa_record
+
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               return_value=json.dumps([]).encode()):
+        assert ghsa_record(cfg, "CVE-2021-44228") is None
+    with patch("kryonsec.purple.enrichment._zone_a_fetch",
+               side_effect=RuntimeError("network down")):
+        assert ghsa_record(cfg, "CVE-2021-44228") is None
+
+
+def test_nuclei_template_matches_parses_and_bounds(audit):
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.enrichment import nuclei_template_matches
+
+    stdout = json.dumps({"matches": [
+        {"id": "log4shell-rce", "severity": "critical",
+         "tags": ["cve-2021-44228", "rce"], "path": "/opt/nuclei-templates/cves/2021/x.yaml"},
+    ]})
+    sandbox = _FakeSandbox(stdout=stdout)
+    matches = nuclei_template_matches(
+        sandbox, audit, "CVE-2021-44228", allowlist=ToolAllowlist())
+
+    assert sandbox.argvs == [["/opt/kryonsec/nuclei_meta.py", "CVE-2021-44228"]]
+    assert matches[0]["id"] == "log4shell-rce"
+    assert matches[0]["severity"] == "critical"
+
+
+def test_nuclei_template_matches_bad_json_is_none(audit):
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.enrichment import nuclei_template_matches
+
+    sandbox = _FakeSandbox(stdout="not json at all")
+    assert nuclei_template_matches(
+        sandbox, audit, "CVE-2021-44228", allowlist=ToolAllowlist()) is None
+
+
+def test_nuclei_template_matches_rejects_metacharacter_term(audit):
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.enrichment import nuclei_template_matches
+
+    sandbox = _FakeSandbox(stdout="{}")
+    assert nuclei_template_matches(
+        sandbox, audit, "x; rm -rf /", allowlist=ToolAllowlist()) is None
+    assert sandbox.argvs == []  # never spawned
+
+
+def test_enrich_phase8_lookups_land_in_properties(cfg, audit, monkeypatch):
+    _patch_apis(
+        monkeypatch,
+        nvd={"id": "CVE-2021-44228", "cvss_score": 10.0,
+             "severity": "CRITICAL", "cpes": [],
+             "cwes": ["CWE-502", "CWE-917"]},
+        kev=set(),
+        epss={"epss": 0.9, "percentile": "0.99"},
+        osv={"osv_aliases": ["GHSA-7rjr-3q55-vv33"],
+             "osv_severity": "HIGH",
+             "affected_packages": ["log4j-core"]},
+        ghsa={"ghsa_id": "GHSA-7rjr-3q55-vv33", "ghsa_severity": "HIGH",
+              "patched_versions": [">=2.15.0"]},
+    )
+    graph = _hypothesis_graph()
+    sandbox = _FakeSandbox(stdout=json.dumps({"matches": [
+        {"id": "log4shell-rce", "severity": "critical", "tags": ["rce"]},
+    ]}))
+    enrich_hypotheses(cfg, graph, audit, sandbox=sandbox)
+
+    enrich = graph.by_type("hypothesis")[0]["properties"]["enrichment"]
+    assert enrich["cwes"] == ["CWE-502", "CWE-917"]
+    assert enrich["osv_severity"] == "HIGH"
+    assert enrich["affected_packages"] == ["log4j-core"]
+    assert enrich["ghsa_id"] == "GHSA-7rjr-3q55-vv33"
+    assert enrich["patched_versions"] == [">=2.15.0"]
+    assert enrich["nuclei_templates"][0]["id"] == "log4shell-rce"
+    # a template match is exploit-availability signal too
+    assert enrich["exploit_available"] is True
+
+    events = [json.loads(l) for l in open(audit.path, encoding="utf-8") if l.strip()]
+    kinds = [e["kind"] for e in events if e["event"] == "enrichment_lookup"]
+    for kind in ("nvd", "kev", "epss", "osv", "ghsa", "searchsploit", "nuclei_meta"):
+        assert kind in kinds
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_nvd_record_extracts_cwes(monkeypatch):
+    from kryonsec.copilot.cve import _from_nvd
+
+    payload = json.dumps({"vulnerabilities": [{"cve": {
+        "id": "CVE-2021-44228",
+        "descriptions": [{"lang": "en", "value": "Log4Shell"}],
+        "metrics": {},
+        "references": [],
+        "configurations": [],
+        "weaknesses": [
+            {"description": [{"value": "CWE-502"}]},
+            {"description": [{"value": "CWE-917"}, {"value": "nvd-cwe-other"}]},
+            {"description": [{"value": "CWE-502"}]},  # dup — dropped
+        ],
+    }}]}).encode()
+
+    class _Resp:
+        def read(self):
+            return payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("kryonsec.copilot.cve.urllib.request.urlopen",
+               return_value=_Resp()):
+        record = _from_nvd("CVE-2021-44228")
+
+    assert record["cwes"] == ["CWE-502", "CWE-917"]  # deduped, non-CWE dropped
 
 
 # ---- HYPOTHESIZE integration ----------------------------------------------------

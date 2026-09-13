@@ -24,6 +24,8 @@ ALLOWED_TOOLS=(
     "nuclei" "sqlmap" "nikto" "curl" "wget" "ffuf" "gobuster" "wfuzz"
     "dalfox" "commix" "ssrfmap" "arjun" "tplmap" "jwt_tool" "kr"
     "graphql-cop" "searchsploit"
+    # nuclei template metadata search (Phase 8) — HYPOTHESIZE enrichment
+    "/opt/kryonsec/nuclei_meta.py"
     # verify
     "http" "openssl" "dig" "nc" "ncat"
     "/opt/kryonsec/probe.py"
@@ -31,6 +33,11 @@ ALLOWED_TOOLS=(
     "linpeas.sh" "pspy64" "linux-exploit-suggester.sh"
     "/opt/kryonsec/enum_processes.py" "/opt/kryonsec/enum_fs.py"
     "/opt/kryonsec/enum_network.py" "/opt/kryonsec/find_secrets.py"
+    # post-exploit (Phase 8, DORMANT — allowlisted + in image, not in the
+    # fixed plan; activates when a shell-producing tool exists)
+    "/opt/kryonsec/cloud_meta.py"
+    "GetNPUsers.py" "GetUserSPNs.py" "GetADUsers.py" "findDelegation.py"
+    "bloodhound-python"
     # blue-team static analyzers (Phase 5) — run against /code read-only
     "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint" "kube-bench"
     # image-side extras kept from the original image (not host-allowlisted
