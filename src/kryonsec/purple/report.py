@@ -11,6 +11,7 @@ enrichment/mapping sections in the rendered report.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -215,6 +216,35 @@ def redact_secrets(text: str) -> str:
     return redact(text)[0]
 
 
+def build_timeline(audit: AuditLog) -> list[dict]:
+    """Phase 8: engagement timeline from the audit chain — one row per
+    milestone event (engagement_created, state_enter, report_written),
+    (timestamp, event, detail). The chain's hash order (not the wall
+    clock) remains the ordering guarantee; ts is presentation only."""
+    milestones = []
+    try:
+        with open(audit.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue  # verify() reports corruption; render anyway
+                event = entry.get("event", "")
+                ts = str(entry.get("ts", ""))
+                if event in ("engagement_created", "state_enter",
+                             "report_written"):
+                    detail = (entry.get("state") or entry.get("target")
+                              or entry.get("engagement_id") or "")
+                    milestones.append(
+                        {"ts": ts, "event": event, "detail": detail})
+    except OSError:
+        return []
+    return milestones[:100]  # bounded
+
+
 def render_report(
     graph: EngagementGraph,
     audit: AuditLog,
@@ -287,6 +317,25 @@ def render_report(
             },
         })
 
+    # Phase 8: scanner evidence rows + an SBOM summary when syft ran
+    scanners = [
+        {
+            "label": n["label"],
+            "exit_code": n["properties"].get("exit_code", "?"),
+            "findings_count": n["properties"].get("findings_count"),
+            "excerpt": normalize_evidence(
+                n["properties"].get("excerpt", ""), max_chars=300),
+        }
+        for n in graph.by_type("scanner_result")
+    ]
+    sbom_summary = ""
+    syft_nodes = [n for n in graph.by_type("scanner_result")
+                  if n["label"] == "syft"]
+    if syft_nodes and syft_nodes[0]["properties"].get("findings_count"):
+        sbom_summary = (
+            f"SBOM: {syft_nodes[0]['properties']['findings_count']} "
+            "packages identified (syft)")
+
     return template.render(
         engagement_id=engagement_id,
         target=target_nodes[0]["label"] if target_nodes else "(none)",
@@ -294,14 +343,18 @@ def render_report(
         paths=sorted(n["label"] for n in graph.by_type("path"))[:50],
         hypotheses=hypotheses,
         attempts=norm_attempts,
+        scanners=scanners,
+        sbom_summary=sbom_summary,
+        timeline=build_timeline(audit),
         remediations=[
             # .get defaults: BLUE_TEAM nodes written before Phase 6 (and
-            # test fixtures) lack cwe/owasp/attack — StrictUndefined must
-            # never crash REPORT (the report is the only deliverable)
+            # test fixtures) lack cwe/owasp/attack/owasp_api — StrictUndefined
+            # must never crash REPORT (the report is the only deliverable)
             {"hypothesis_id": n["label"], **n["properties"],
              "cwe": n["properties"].get("cwe", ""),
              "owasp": n["properties"].get("owasp", ""),
-             "attack": n["properties"].get("attack", "")}
+             "attack": n["properties"].get("attack", ""),
+             "owasp_api": n["properties"].get("owasp_api", "")}
             for n in graph.by_type("remediation")
         ],
         # the report may only claim testing happened when tools really ran

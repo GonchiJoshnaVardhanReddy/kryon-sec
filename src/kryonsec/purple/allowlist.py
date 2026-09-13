@@ -230,6 +230,10 @@ BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
     "trivy": ["fs", "--scanners", "vuln", "/code"],
     "checkov": ["-d", "/code"],
     "hadolint": ["/code/Dockerfile"],
+    # Phase 8: SBOM + dependency-vulnerability scanners (JSON output)
+    "syft": ["scan", "/code", "-o", "json"],
+    "osv-scanner": ["-r", "/code", "--format", "json"],
+    "grype": ["dir:/code", "-o", "json"],
 }
 
 # Historical name kept (tests / callers import it): the union of everything
