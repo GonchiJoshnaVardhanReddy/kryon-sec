@@ -507,3 +507,36 @@ unknown-not-no semantics), dedup (merge + pointer remapping + audit
 event + noop), subagent merges before rendering, validate_report catches
 unmerged duplicates / dropped enrichment / ANSI in output, normalized
 attempt excerpts, mapping tags render with the "suggested" label.
+
+## Phase 7 — Record, tests, docs (final)
+
+**Status: COMPLETE — full suite green (496 passed, `py -3.13 -m pytest -q`,
+2026-09-13). Version bumped to 1.2.0.**
+
+- **CHANGELOG.md**: v1.2.0 entry summarizing all seven phases, with the
+  known limitations (default-bridge egress, dormant POST_EXPLOIT,
+  semgrep/trivy sandbox-egress needs, CLI-only --code).
+- **README.md**: version/test badges (1.2.0, 496 tests), the 10-state
+  table rewritten with the real per-state tool inventories, Zone A/B
+  descriptions updated (OTX/RIPEstat/Shodan/Censys + enrichment APIs,
+  read-only /code mount), a new "Enrichment and the report" section, a
+  sandbox smoke-test recipe (WSL2: `kryonsec doctor` then `purple --target
+  … --code …`), the roadmap table gains the expansion rows (POST_EXPLOIT
+  now "wired but dormant", egress proxy listed as pending), test counts
+  fixed, and the safety layer 6 claim corrected — the egress proxy is
+  NOT built yet, the sandbox uses the default docker bridge today.
+- **Version**: `__version__` + pyproject 1.1.0 → 1.2.0 (they had been
+  left at 1.1.0 through the whole expansion; no test asserts the value).
+- **Final verification**: full suite 496 passed; `kryonsec doctor`
+  behaves unchanged (expected Profile-2 failures on the Windows dev
+  machine, Purple Team is WSL2-only).
+
+### The full expansion in one line each
+
+1. Zone B tool inventory (~30 templates, per-state splits)
+2. Passive recon sources (OTX, RIPEstat, Shodan, Censys)
+3. Hypothesis enrichment (NVD/CPE, KEV, EPSS, searchsploit)
+4. POST_EXPLOIT (wired, dormant behind Gate 3)
+5. Blue-team code scanners (--code, read-only /code mount)
+6. Report enrichment (CVSS 3.1 calculator, dedup, normalizer)
+7. CHANGELOG, README tool tables, version 1.2.0

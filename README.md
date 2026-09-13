@@ -7,8 +7,8 @@
 **A single-user CLI cybersecurity platform with two modes: an AI copilot and a deterministic purple-team engine.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.1.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryon-sec)
-[![Tests](https://img.shields.io/badge/tests-276%20passing-brightgreen)](#development)
+[![Version](https://img.shields.io/badge/version-1.2.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryon-sec)
+[![Tests](https://img.shields.io/badge/tests-496%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
 [Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [Safety design](#safety-design) · [Configuration](#configuration-reference)
@@ -224,6 +224,8 @@ One command runs a full engagement:
 ```bash
 kryonsec purple --target your-authorized-target.com
 # or: kryonsec purple --target example.com --id my-engagement
+# with blue-team code scanning (folder mounted read-only into the sandbox):
+kryonsec purple --target example.com --code /path/to/source
 ```
 
 Or switch inside the chat with `/mode` (or **Shift+Tab**), then type a domain.
@@ -237,15 +239,15 @@ The engine walks a fixed state machine — **no LLM-driven transitions, ever**:
 | # | State | Agent | What it does | Zone |
 |---|---|---|---|---|
 | 1 | `INIT` | init | load config, validate scope | — |
-| 2 | `RECON_PASSIVE` | passive-recon | third-party lookups — **zero packets to target** (crt.sh, Wayback) | A (host) |
-| 3 | `RECON_ACTIVE` | active-recon | scan the target — nmap, httpx, wappalyzer, wafw00f, feroxbuster, nuclei | B (sandbox) |
-| 4 | `HYPOTHESIZE` | hypothesizer (LLM) | **propose** vulnerability hypotheses from recon data — proposes only | — |
+| 2 | `RECON_PASSIVE` | passive-recon | third-party lookups — **zero packets to target** (crt.sh, Wayback, OTX, RIPEstat, Shodan, Censys; subfinder/amass/assetfinder `-passive` in sandbox) | A + B (passive) |
+| 3 | `RECON_ACTIVE` | active-recon | scan the target — nmap, naabu, rustscan, dnsx, httpx, whatweb, katana, hakrawler, feroxbuster, sslscan, testssl.sh | B (sandbox) |
+| 4 | `HYPOTHESIZE` | hypothesizer (LLM) | **propose** hypotheses from recon data, then enrich with NVD/CPE, CISA KEV, EPSS + sandboxed searchsploit | A + B |
 | 5 | `HUMAN_REVIEW` | operator (you) | **approve or reject each hypothesis** — blocking gate | — |
-| 6 | `EXPLOIT` | exploit | execute **approved hypotheses only** — sqlmap, nuclei, ffuf, jwt_tool, dalfox, commix, ssrfmap | B (sandbox) |
-| 7 | `POST_EXPLOIT` | post-exploit | enumerate shells — needs **separate approval** (currently stubbed) | B (sandbox) |
-| 8 | `VERIFY` | verifier | **independently confirm** findings — curl, httpie, python, netcat, openssl | B (sandbox) |
-| 9 | `BLUE_TEAM` | blue-team (LLM) | generate fixes and detection rules | — |
-| 10 | `REPORT` | reporter | compile the engagement report (Jinja2) | — |
+| 6 | `EXPLOIT` | exploit | execute **approved hypotheses only** — sqlmap, nuclei, nikto, ffuf, gobuster, wfuzz, curl, wget, dalfox, commix, ssrfmap, arjun, tplmap, jwt_tool, kiterunner, graphql-cop | B (sandbox) |
+| 7 | `POST_EXPLOIT` | post-exploit | evidence collection in an obtained shell — needs **separate approval** (dormant: no current tool yields a shell) | B (sandbox) |
+| 8 | `VERIFY` | verifier | **independently confirm** findings — curl, http, dig, nc, ncat, openssl, baked probe script | B (sandbox) |
+| 9 | `BLUE_TEAM` | blue-team (LLM) | fixes + detection rules, grounded in scanner evidence with `--code` (semgrep, bandit, gitleaks, trivy, checkov, hadolint on a read-only `/code` mount) | B (scanners) + LLM |
+| 10 | `REPORT` | reporter | compile the engagement report (Jinja2) with enrichment, CVSS scores, dedup | — |
 | — | `HALT` | — | terminal absorbing state | — |
 
 Deterministic transition table (plain Python in `purple/orchestrator.py`):
@@ -276,13 +278,25 @@ by hand.
 
 ### Zones
 
-- **Zone A (host):** passive recon runs host-side using only third-party APIs
-  (crt.sh certificates, Wayback Machine archives). **Zero packets to the target.**
-  API keys are injected per-call and never logged.
+- **Zone A (host):** passive recon and enrichment run host-side using only
+  third-party APIs (crt.sh certificates, Wayback Machine archives, OTX passive
+  DNS, RIPEstat whois/ASN, NVD, CISA KEV, EPSS, Shodan and Censys with keys).
+  **Zero packets to the target.** API keys are injected per-call and never
+  logged.
 - **Zone B (sandbox):** all active tool execution happens inside a Kali-based
   Docker container under the **gVisor `runsc` runtime**, with a seccomp profile,
-  egress limited to target scope, and a **non-root** user. The sandbox image is
-  pinned by digest.
+  a **non-root** user, and a read-only root filesystem. The sandbox image is
+  pinned by digest. With `--code`, your source folder is mounted **read-only**
+  at a fixed `/code` path for the static analyzers.
+
+### Enrichment and the report
+
+Hypotheses that name a CVE get public-risk context automatically: NVD
+score/CPE, CISA KEV (actively-exploited list), EPSS (probability of
+exploitation), and whether public exploit code exists (searchsploit in the
+sandbox). The engagement report shows all of it, plus a CVSS 3.1 base score
+calculated locally from each hypothesis's vector, deduplicated findings, and
+normalized evidence — with a tamper-evident fingerprint of the audit chain.
 
 ### The audit chain
 
@@ -321,7 +335,9 @@ Ten safety layers from the v2.1.1 spec, all implemented and unit-tested:
    secrets present always routes to local Ollama, never a third-party API.
    Engagement data, credentials, and raw evidence are never sent to third-party LLMs.
 5. **RECON_PASSIVE sends zero packets to the target** — host-side Zone A only.
-6. **Zone B egress is target-scope only**, sandbox image pinned by digest.
+6. **Zone B egress is target-scope only** (via the egress proxy, pending —
+   containers use the default bridge today and the gap is audited), sandbox
+   image pinned by digest.
 7. **No docker.sock in the kryonsec container** — Docker access goes through a
    socket proxy with endpoint allowlisting.
 8. **Audit chain** — append-only JSONL, SHA256-linked, canonical-JSON hashed.
@@ -454,7 +470,7 @@ kryon-sec/
 │   ├── storage/                      # SQLAlchemy models + db session layer
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 26 files, 276 tests
+└── tests/                            # 30 files, 496 tests
 ```
 
 ---
@@ -470,9 +486,10 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 276 tests across 26 files
+- **Every safety layer has at least one unit test** — 496 tests across 30 files
   covering the audit chain, allowlist, secrets redaction, orchestrator
-  transitions, compaction, sandbox, TUI, wizard, and more
+  transitions, compaction, sandbox, enrichment, scanners, report validation,
+  CVSS calculator, TUI, wizard, and more
 
 Optional extras: `pip install -e ".[postgres]"` for the PostgreSQL driver
 (`psycopg[binary]`).
@@ -480,6 +497,18 @@ Optional extras: `pip install -e ".[postgres]"` for the PostgreSQL driver
 Dev note: since v1.1 config comes from `~/.kryonsec/config.toml` (the old `.env`
 loading is gone). Run `kryonsec setup` once, or export `OPENAI_API_KEY` for a
 quick start.
+
+### Sandbox smoke test (Linux / WSL2)
+
+```bash
+kryonsec doctor                    # must pass: docker, runsc, pinned image
+kryonsec purple --target example.com --code ~/src/my-app
+```
+
+Watch the BLUE_TEAM state in the run output — it should report the
+scanners that ran (semgrep/bandit/gitleaks/trivy/checkov, plus hadolint
+when the folder has a Dockerfile), and the report's fix list should be
+grounded in that scanner evidence.
 
 ---
 
@@ -499,8 +528,14 @@ quick start.
 | Purple Team state machine (all 10 states) | ✅ done — live-verified on WSL2 |
 | Audit chain | ✅ done |
 | Tool allowlist + Kali sandbox (Docker/gVisor) | ✅ done — live-verified |
+| Tool expansion (~40 tools, 7 phases) | ✅ done — see `docs/TOOL-EXPANSION-2026-09-13.md` |
+| Passive recon sources (crt.sh, Wayback, OTX, RIPEstat, Shodan, Censys) | ✅ done |
+| Hypothesis enrichment (NVD/CPE, KEV, EPSS, searchsploit) | ✅ done |
+| Blue-team code scanners (`--code`, read-only mount) | ✅ done |
+| Report enrichment (CVSS 3.1 calculator, dedup, evidence normalizer) | ✅ done |
 | Evidence ladder (tested → confirmed → verified) | ✅ done — live-verified |
-| POST_EXPLOIT | ⛔ intentionally stubbed — needs a separate approval flow |
+| POST_EXPLOIT | 🟡 wired but dormant — no current tool yields a shell |
+| Target-scope-only sandbox egress (proxy) | ⛔ pending — sandbox uses the default bridge today |
 
 ---
 
