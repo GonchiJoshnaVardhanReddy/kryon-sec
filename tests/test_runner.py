@@ -173,8 +173,11 @@ def test_full_loop_through_exploit(tmp_path):
     orig_hr_init = hr_mod.HumanReviewSubagent.__init__
     orig_sb_init = sb_mod.KaliSandbox.__init__
 
-    def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None):
-        orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm, budget=budget)
+    def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None,
+                  sandbox=None):
+        # sandbox=None keeps the fake subagent offline (no searchsploit)
+        orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm, budget=budget,
+                      sandbox=None)
 
     def _init_hr(self, graph, audit, reviewer=None):
         orig_hr_init(self, graph, audit, reviewer=approve_all)

@@ -96,6 +96,15 @@ def _from_nvd(cve_id: str) -> dict[str, Any] | None:
         for d in cve.get("descriptions", [])
         if d.get("lang") == "en"
     ]
+    # affected products (tool-expansion Phase 3: hypothesis enrichment reads
+    # these as CPE evidence) — bounded, deduped, criteria only
+    cpes: list[str] = []
+    for config in cve.get("configurations", []):
+        for node in config.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+                cpe = str(match.get("criteria", "")).strip()
+                if cpe.startswith("cpe:") and cpe not in cpes:
+                    cpes.append(cpe)
     return {
         "id": cve_id,
         "published": cve.get("published"),
@@ -104,6 +113,7 @@ def _from_nvd(cve_id: str) -> dict[str, Any] | None:
         "severity": severity,
         "description": descriptions[0] if descriptions else "",
         "references": [r.get("url") for r in cve.get("references", [])[:10]],
+        "cpes": cpes[:10],
     }
 
 
