@@ -47,6 +47,11 @@ class Hypothesis(BaseModel):
         default="",
         description="CVSS 3.1 vector string guess, e.g. AV:N/AC:L/...",
     )
+    cve: str = Field(
+        default="",
+        description="CVE id when the hypothesis names a specific known "
+        "vulnerability (e.g. CVE-2021-44228), else empty",
+    )
     tools: list[str] = Field(
         default_factory=list,
         description="Tools from the allowlist that could test this",
@@ -173,8 +178,8 @@ def propose_hypotheses(
         f"{prompt}\n\n"
         "Respond with ONLY a JSON object of this exact shape:\n"
         '{"hypotheses": [{"id": "H1", "title": "...", "target_asset": "...", '
-        '"rationale": "...", "cvss_vector": "...", "tools": ["..."], '
-        '"confidence": 0.0-1.0}]}\n'
+        '"rationale": "...", "cvss_vector": "...", "cve": "...", '
+        '"tools": ["..."], "confidence": 0.0-1.0}]}\n'
         "Maximum 10 hypotheses. No other text."
     )
     messages = [
@@ -209,6 +214,7 @@ class HypothesizeSubagent:
         audit: AuditLog,
         llm_fn: Callable[[str], HypothesisSet] | None = None,
         budget: BudgetTracker | None = None,
+        sandbox: object | None = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -218,6 +224,9 @@ class HypothesizeSubagent:
         # engagement budget (spec §4.3): LLM states accrue their usage so
         # the orchestrator's budget guard can actually trip on tokens
         self.budget = budget
+        # sandbox for ExploitDB (searchsploit) enrichment; None = skipped
+        # cleanly with an audited notice (HYPOTHESIZE runs on any OS)
+        self.sandbox = sandbox
 
     def _default_llm(self, prompt: str) -> HypothesisSet:
         return propose_hypotheses(self.cfg, prompt)
@@ -264,6 +273,7 @@ class HypothesizeSubagent:
                     "target_asset": h.target_asset,
                     "rationale": h.rationale,
                     "cvss_vector": h.cvss_vector,
+                    "cve": h.cve,
                     "tools": h.tools,
                     "confidence": h.confidence,
                 },
@@ -293,6 +303,23 @@ class HypothesizeSubagent:
                     seen.add(n["label"])
                     deduped.append(n)
             log.warning("hypothesize: duplicate ids deduped (%d kept)", len(deduped))
+
+        # ---- enrichment (tool expansion Phase 3) ---------------------------
+        # Public-risk context (NVD/CPE, KEV, EPSS, ExploitDB) for hypotheses
+        # that name a CVE. All third-party fetches, target never contacted.
+        # Enrichment can never fail the state — the worst case is an audited
+        # skip, exactly like a flaky passive source.
+        try:
+            from .enrichment import enrich_hypotheses
+
+            enrich_hypotheses(
+                self.cfg, self.graph, self.audit, sandbox=self.sandbox)
+        except Exception as e:
+            self.audit.write({
+                "event": "enrichment_failed",
+                "error": str(e)[:200],
+            })
+            log.warning("hypothesis enrichment failed: %s", e)
 
         self.audit.write({
             "event": "hypothesize_done",

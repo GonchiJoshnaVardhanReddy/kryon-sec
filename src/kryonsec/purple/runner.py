@@ -48,9 +48,11 @@ STATE_INFO: dict[str, dict[str, str]] = {
     },
     "HYPOTHESIZE": {
         "agent": "hypothesizer (LLM)",
-        "does": "propose vulnerability hypotheses from recon data",
-        "tools": "none — pure LLM, proposes only",
-        "zone": "—",
+        "does": "propose vulnerability hypotheses from recon data, then "
+                "enrich with public risk data",
+        "tools": "LLM proposes only; enrichment: NVD/CPE, CISA KEV, EPSS "
+                 "(free APIs) + searchsploit in sandbox",
+        "zone": "A (third-party APIs) + B for searchsploit",
     },
     "HUMAN_REVIEW": {
         "agent": "operator (you)",
@@ -218,8 +220,18 @@ def start_engagement(
         if state == "HYPOTHESIZE":
             from .hypothesize import HypothesizeSubagent
 
+            # the sandbox (when present) powers ExploitDB searchsploit
+            # enrichment; without it enrichment runs API-only and skips
+            # searchsploit with an audited notice
+            sandbox = None
+            if sandbox_ok:
+                from .sandbox import KaliSandbox
+
+                sandbox = KaliSandbox(cfg=cfg)
             sub = HypothesizeSubagent(
-                cfg=cfg, graph=graph, audit=audit, budget=orch.budget)
+                cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
+                sandbox=sandbox,
+            )
             return sub.run
 
         if state == "HUMAN_REVIEW":

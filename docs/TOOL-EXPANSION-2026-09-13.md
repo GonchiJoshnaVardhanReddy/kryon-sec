@@ -192,3 +192,79 @@ notes→osint_note nodes, prompt includes notes, sandbox passive fetcher
 (argv shapes, allowlist validation, scoping, failed tool continues).
 Config: `[api]` round-trip + env overrides (fixture extended with the
 three new env vars).
+
+---
+
+## Phase 3 — Hypothesis enrichment (free APIs, RAG deferred)
+
+**Status: COMPLETE — full suite green (419 passed, `py -3.13 -m pytest -q`,
+2026-09-13).**
+
+New `src/kryonsec/purple/enrichment.py`. After the LLM proposes
+hypotheses, each one that names a CVE gets public-risk context:
+
+- **NVD/CPE** — reuses `copilot/cve.py:lookup_cve` (cache-first, NVD
+  fallback; NVD is an approved search API per spec §3.2). `_from_nvd` now
+  also extracts the affected-product CPEs (bounded, deduped) into
+  `record["cpes"]`.
+- **KEV** — CISA known-exploited catalog JSON
+  (`www.cisa.gov/.../known_exploited_vulnerabilities.json`), cached in
+  `system_knowledge` (24h TTL, same pattern as the websearch cache).
+  Fetched at most once per run. Fetch failure returns None = "unknown" —
+  never treated as "not in KEV".
+- **EPSS** — `api.first.org/data/v1/epss?cve=…` (same cache pattern).
+- **ExploitDB** — `searchsploit --colorless {term}` in the sandbox (local
+  database, no egress). Term = the CVE id; the `{term}` allowlist pattern
+  (alnum/space/dash/dot) is enforced by the template and the term is
+  *stripped* to that charset, never escaped (argv is exec'd directly).
+  Without a sandbox (e.g. Windows) it is an audited skip.
+
+Enrichment lands in `hypothesis.properties["enrichment"]` =
+`{cve, cvss_score, severity, cpes, kev, epss, epss_percentile, exploits,
+exploit_available}` (fields present only when the lookup succeeded).
+
+### Wiring
+
+- `Hypothesis` model + JSON prompt gained an optional `cve` field (the
+  LLM may name the CVE directly; regex extraction from
+  title/rationale is the fallback — `extract_cve_ids`).
+- `HypothesizeSubagent` gained `sandbox=None`; enrichment runs after the
+  dedup pass, wrapped so any crash is an `enrichment_failed` audit event —
+  it can never fail the state (same policy as a flaky passive source).
+- `runner.py` passes a `KaliSandbox` to HYPOTHESIZE when the sandbox
+  exists; STATE_INFO updated.
+- `zonea._zone_a_fetch` gained a keyword-only `allowed_hosts` override so
+  enrichment reuses the same bounded, redirect-re-checked fetch with its
+  own host set (`www.cisa.gov`, `api.first.org`). The target is never in
+  any of these sets.
+
+### Decisions made during Phase 3
+
+- **Enrichment = third parties only.** NVD, CISA, FIRST, and the
+  sandbox-local ExploitDB copy — the target is never contacted, so
+  HYPOTHESIZE keeps its Zone A character even with enrichment on.
+- **Unknown ≠ absent.** A failed KEV/EPSS/NVD lookup leaves the field
+  out entirely; `kev: False` is reserved for "checked and definitively
+  not in the catalog". This distinction flows into the report (Phase 6).
+- **searchsploit searches by CVE id, not free text.** Hypothesis titles
+  are prose ("SQLi on login") — searching ExploitDB with them returns
+  noise; a CVE id is a precise query.
+- **`_zone_a_fetch` parameterized instead of duplicated.** One bounded
+  fetch + redirect re-check implementation, two allowlists (recon
+  sources, enrichment sources) — the safety-critical code stays single.
+- **Existing hypothesize tests stayed offline by construction**: their
+  fake hypotheses contain no CVE ids, so enrichment's no-CVE path does
+  zero lookups. The one test that wires the new `sandbox` kwarg
+  (`test_runner.py::test_full_loop_through_exploit`) forces `None`.
+
+### Tests (`tests/test_enrichment.py` — new)
+
+CVE extraction/dedup, term sanitization (metacharacters stripped, length
+cap), KEV fetch/parse/cache/stale-refetch/failure-is-None, EPSS
+fetch/cache/unknown/failure, searchsploit allowlist validation +
+audit events + spawn-failure and rejected-term paths, `enrich_hypotheses`
+(properties written, CVE-less hypothesis skipped, all-APIs-down = audited
+skips with `kev` absent not False, ExploitDB hits mark
+`exploit_available`, KEV catalog fetched once for many hypotheses, empty
+graph noop), NVD CPE extraction, and two HYPOTHESIZE integrations
+(enrichment after proposing; enrichment crash never fails the state).

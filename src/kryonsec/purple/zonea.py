@@ -85,16 +85,23 @@ def _zone_a_fetch(
     timeout: int = TIMEOUT_S,
     headers: dict[str, str] | None = None,
     data: bytes | None = None,
+    *,
+    allowed_hosts: "set[str] | None" = None,
 ) -> bytes:
     """Fetch a Zone A URL. Refuses hosts outside the allowlist — including
     the hosts of redirects (urlopen follows 3xx silently otherwise, which
     would send packets to arbitrary hosts, possibly the target).
-    data != None makes this a POST (Censys search)."""
+    data != None makes this a POST (Censys search).
+    allowed_hosts: override for non-recon callers that share the same
+    safety properties (hypothesis enrichment talks to CISA/first.org, not
+    the recon sources) — the redirect re-check uses the same set."""
+    hosts = allowed_hosts if allowed_hosts is not None else ZONE_A_ALLOWED_HOSTS
+
     # a redirect handler that re-checks every hop against the allowlist
     class _ZoneARedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             host = urllib.parse.urlparse(newurl).hostname or ""
-            if host not in ZONE_A_ALLOWED_HOSTS:
+            if host not in hosts:
                 raise ZoneAViolation(
                     f"Zone A egress denied: redirect to {host!r} not in allowlist"
                 )
@@ -102,7 +109,7 @@ def _zone_a_fetch(
 
     opener = urllib.request.build_opener(_ZoneARedirectHandler)
     host = urllib.parse.urlparse(url).hostname or ""
-    if host not in ZONE_A_ALLOWED_HOSTS:
+    if host not in hosts:
         raise ZoneAViolation(f"Zone A egress denied: {host!r} not in allowlist")
     all_headers = {"User-Agent": USER_AGENT}
     if headers:
