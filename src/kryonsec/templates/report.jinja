@@ -38,6 +38,17 @@ engagement, so every issue below is an unconfirmed suggestion.
 The engagement stopped early. Reason: {{ halt_reason }}.
 {% endif %}
 
+## Timeline
+
+{% if timeline %}
+| When (UTC) | What happened |
+|---|---|
+{% for t in timeline %}| {{ t.ts }} | {{ t.event }}{% if t.detail %} — {{ t.detail }}{% endif %} |
+{% endfor %}
+{% else %}
+No timeline events were recorded in the audit chain.
+{% endif %}
+
 ## How the testing was done (steps you can repeat)
 
 {% if attempts %}
@@ -118,6 +129,17 @@ information and guessed what might be wrong. Nothing below is confirmed
 No issues were suggested for this target.
 {% endfor %}
 
+## Code scanning results (blue team)
+
+{% if scanners %}
+{% if sbom_summary %}{{ sbom_summary }}
+{% endif %}{% for s in scanners %}
+- {{ s.label }}: {{ s.findings_count if s.findings_count is not none else "ran" }} (exit {{ s.exit_code }}) — {{ s.excerpt }}
+{% endfor %}
+{% else %}
+No code scanners ran (no --code folder was provided, or the sandbox was unavailable).
+{% endif %}
+
 ## How to fix them (blue team advice)
 
 {% for r in remediations %}
@@ -125,7 +147,7 @@ No issues were suggested for this target.
 - How serious: {{ r.severity }}
 - What to do: {{ r.fix }}
 {% if r.detection %}- How to spot attacks: {{ r.detection }}{% endif %}
-{% if r.cwe or r.owasp or r.attack %}- Weakness types (suggested, not verified): {{ r.cwe if r.cwe else "—" }}{{ "; " if r.cwe and r.owasp }}{{ r.owasp if r.owasp else "—" }}{{ "; " if (r.cwe or r.owasp) and r.attack }}{{ r.attack if r.attack else "—" }}{% endif %}
+{% if r.cwe or r.owasp or r.attack or r.owasp_api %}- Weakness types (suggested, not verified): {{ r.cwe if r.cwe else "—" }}{{ "; " if r.cwe and r.owasp }}{{ r.owasp if r.owasp else "—" }}{{ "; " if (r.cwe or r.owasp) and r.attack }}{{ r.attack if r.attack else "—" }}{{ "; " if (r.cwe or r.owasp or r.attack) and r.owasp_api }}{{ r.owasp_api if r.owasp_api else "—" }}{% endif %}
 
 {% else %}
 No fix advice was generated.

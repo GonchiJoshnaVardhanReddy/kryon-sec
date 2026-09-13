@@ -34,6 +34,13 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     ("gitleaks", ["gitleaks", "detect", "--source", "/code"]),
     ("trivy", ["trivy", "fs", "--scanners", "vuln", "/code"]),
     ("checkov", ["checkov", "-d", "/code"]),
+    # Phase 8: SBOM + dependency-vulnerability scanners (JSON output for
+    # the findings counters). osv-scanner/grype need egress to their
+    # vulnerability databases — same caveat as trivy (documented in the
+    # tool-expansion record): they fail as audited skips offline.
+    ("syft", ["syft", "scan", "/code", "-o", "json"]),
+    ("osv-scanner", ["osv-scanner", "-r", "/code", "--format", "json"]),
+    ("grype", ["grype", "dir:/code", "-o", "json"]),
 ]
 HADOLINT_PLAN_ENTRY = ("hadolint", ["hadolint", "/code/Dockerfile"])
 
@@ -66,6 +73,19 @@ def _count_findings(tool: str, stdout: str) -> int | None:
                            for r in data["Results"])
             if tool == "checkov" and isinstance(data.get("failed_checks"), list):
                 return len(data["failed_checks"])
+            # Phase 8 SBOM/dependency scanners (JSON by flag)
+            if tool == "syft" and isinstance(data.get("artifacts"), list):
+                return len(data["artifacts"])  # package count, not vulns
+            if tool == "osv-scanner" and isinstance(data.get("results"), list):
+                return sum(
+                    len(r.get("packages") or []) and sum(
+                        len(p.get("vulnerabilities") or [])
+                        for p in r.get("packages") or []
+                    )
+                    for r in data["results"]
+                )
+            if tool == "grype" and isinstance(data.get("matches"), list):
+                return len(data["matches"])
     except (ValueError, TypeError):
         pass
     for pattern in _FINDING_COUNT_RES.get(tool, []):
@@ -176,6 +196,12 @@ class Remediation(BaseModel):
     attack: str = Field(
         default="",
         description="MITRE ATT&CK technique id if applicable, e.g. T1190 (suggested)",
+    )
+    # Phase 8: OWASP API Security Top 10 mapping for API-shaped issues
+    # (displayed as a suggestion, never verified fact)
+    owasp_api: str = Field(
+        default="",
+        description="OWASP API category for API issues, e.g. API1:2023-BOLA (suggested)",
     )
 
 

@@ -94,7 +94,16 @@ RUN mkdir -p /opt/tools && cd /opt/tools && \
     (wget -q https://github.com/epinna/tplmap/archive/refs/heads/master.tar.gz -O tplmap.tar.gz \
       && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
       && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
-      || echo "WARN: tplmap not installed") ; \
+      || echo "WARN: tplmap not installed") && \
+    (wget -q https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
+      && tar xzf /tmp/syft.tar.gz -C /tmp syft && mv /tmp/syft /usr/local/bin/syft && rm -f /tmp/syft.tar.gz \
+      || echo "WARN: syft not installed (SBOM scan unavailable)") && \
+    (wget -q https://github.com/anchore/grype/releases/download/v0.95.0/grype_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
+      && tar xzf /tmp/grype.tar.gz -C /tmp grype && mv /tmp/grype /usr/local/bin/grype && rm -f /tmp/grype.tar.gz \
+      || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
+    (wget -q https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
+      && chmod 0755 /usr/local/bin/osv-scanner \
+      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") ; \
     chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
       /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
 

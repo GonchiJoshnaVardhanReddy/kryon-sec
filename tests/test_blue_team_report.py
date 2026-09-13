@@ -201,6 +201,12 @@ def _events(audit):
     ("trivy", '{"Results": [{"Vulnerabilities": [{"a": 1}, {"b": 2}]}, '
               '{"Vulnerabilities": []}, {"Vulnerabilities": [{"c": 3}]}]}', 3),
     ("checkov", '{"failed_checks": [{"x": 1}, {"x": 2}]}', 2),
+    # Phase 8 SBOM/dependency scanners (JSON by flag)
+    ("syft", '{"artifacts": [{"name": "flask"}, {"name": "django"}, '
+             '{"name": "requests"}]}', 3),
+    ("osv-scanner", '{"results": [{"packages": [{"vulnerabilities": ["a", "b"]}, '
+                    '{"vulnerabilities": ["c"]}]}, {"packages": []}]}', 3),
+    ("grype", '{"matches": [{"m": 1}, {"m": 2}]}', 2),
     # text shapes
     ("semgrep", "scanned 120 files\n42 findings", 42),
     ("bandit", "Issue: [B101]\nIssue: [B102]\nIssue: [B301]", 3),
@@ -244,26 +250,39 @@ def test_run_code_scanners_full_run(tmp_path):
         "trivy": _SpawnResult(stdout='{"Results": [{"Vulnerabilities": [{}]}]}'),
         "checkov": _SpawnResult(stdout="Passed checks: 2, Failed checks: 5"),
         "hadolint": _SpawnResult(stdout="/code/Dockerfile:3 DL3008"),
+        # Phase 8 SBOM/dependency scanners
+        "syft": _SpawnResult(
+            stdout='{"artifacts": [{"name": "flask"}, {"name": "requests"}]}'),
+        "osv-scanner": _SpawnResult(stdout='{"results": []}'),
+        "grype": _SpawnResult(stdout='{"matches": [{"v": {}}, {"v": {}}]}'),
     })
 
     ran = run_code_scanners(graph, sandbox, audit, has_dockerfile=True)
-    assert ran == 6
-    assert len(sandbox.argvs) == 6
+    assert ran == 9
+    assert len(sandbox.argvs) == 9
     # every scanner reads the fixed /code mount, never the host path
-    assert all(any(a == "/code" or a.startswith("/code/") for a in argv)
-               for argv in sandbox.argvs)
+    # (grype spells it dir:/code — same fixed literal, prefix notation)
+    assert all(
+        any(a == "/code" or a == "dir:/code"
+            or a.startswith("/code/") or a.startswith("dir:/code/")
+            for a in argv)
+        for argv in sandbox.argvs)
 
     nodes = {n["label"]: n["properties"] for n in graph.by_type("scanner_result")}
     assert set(nodes) == {"semgrep", "bandit", "gitleaks", "trivy",
-                          "checkov", "hadolint"}
+                          "checkov", "hadolint", "syft", "osv-scanner",
+                          "grype"}
     assert nodes["semgrep"]["findings_count"] == 12
     assert nodes["trivy"]["findings_count"] == 1
     assert nodes["checkov"]["findings_count"] == 5
     assert nodes["gitleaks"]["excerpt"] == "no leaks found"
+    # Phase 8 counters: syft counts packages, grype counts matches
+    assert nodes["syft"]["findings_count"] == 2
+    assert nodes["grype"]["findings_count"] == 2
 
     events = _events(audit)
-    assert events.count("tool_spawn") == 6
-    assert events.count("tool_result") == 6
+    assert events.count("tool_spawn") == 9
+    assert events.count("tool_result") == 9
     assert "scanners_done" in events
     ok, reason = audit.verify()
     assert ok, reason
@@ -277,7 +296,7 @@ def test_hadolint_only_with_dockerfile(tmp_path):
     run_code_scanners(_graph(), sandbox, audit, has_dockerfile=False)
     tools = [argv[0] for argv in sandbox.argvs]
     assert "hadolint" not in tools
-    assert len(tools) == 5
+    assert len(tools) == 8
 
 
 def test_failing_scanner_is_audited_skip(tmp_path):
@@ -335,7 +354,7 @@ def test_scanners_fail_closed_on_empty_allowlist(tmp_path):
     assert sandbox.argvs == []  # nothing ever spawned
     assert graph.by_type("scanner_result") == []
     events = _events(audit)
-    assert events.count("scanner_rejected_by_allowlist") == 5
+    assert events.count("scanner_rejected_by_allowlist") == 8
     ok, reason = audit.verify()
     assert ok, reason
 
@@ -843,3 +862,116 @@ def test_report_fixes_show_mapping_suggestions(tmp_path):
     assert "T1190" in report
     assert "suggested, not verified" in report
     assert validate_report(report, graph) == []
+
+
+# ---- Phase 8E: SBOM scanners in the report ---------------------------------
+
+def test_report_renders_scanner_section_and_sbom_summary(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("scanner_result", "syft", {
+        "tool": "syft", "exit_code": 0, "stdout_chars": 100,
+        "excerpt": '{"artifacts": [...]}', "findings_count": 42,
+    })
+    graph.add_node("scanner_result", "grype", {
+        "tool": "grype", "exit_code": 0, "stdout_chars": 100,
+        "excerpt": '{"matches": [...]}', "findings_count": 3,
+    })
+    report = render_report(graph, audit, "e-sbom")
+
+    assert "Code scanning results" in report
+    assert "SBOM: 42 packages identified (syft)" in report
+    assert "grype" in report
+    assert validate_report(report, graph) == []
+
+
+def test_report_scanner_section_absent_without_nodes(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    report = render_report(_graph(), audit, "e-nosc")
+    assert "Code scanning results" in report
+    assert "No code scanners ran" in report
+
+
+def test_report_osv_ghsa_cwe_nuclei_rows(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("hypothesis", "H1", {
+        "title": "Log4Shell on login", "target_asset": "/login",
+        "rationale": "log4j", "tools": ["nuclei"], "cvss_vector": "",
+        "confidence": 0.7, "approved": False,
+        "enrichment": {
+            "cve": "CVE-2021-44228",
+            "cwes": ["CWE-502"],
+            "osv_severity": "HIGH",
+            "osv_aliases": ["GHSA-7rjr-3q55-vv33"],
+            "affected_packages": ["log4j-core"],
+            "ghsa_id": "GHSA-7rjr-3q55-vv33",
+            "ghsa_severity": "HIGH",
+            "patched_versions": [">=2.15.0"],
+            "nuclei_templates": [{"id": "log4shell-rce", "severity": "critical"}],
+        },
+    })
+    report = render_report(graph, audit, "e-p8c")
+    assert "CWE-502" in report
+    assert "OSV database" in report and "HIGH" in report
+    assert "log4j-core" in report
+    assert "GitHub Advisory GHSA-7rjr-3q55-vv33" in report
+    assert "fixed in >=2.15.0" in report
+    assert "log4shell-rce" in report
+    assert validate_report(report, graph) == []
+
+
+# ---- Phase 8F: timeline + owasp_api + audit ts ------------------------------
+
+def test_audit_write_adds_iso_timestamp(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.write({"event": "state_enter", "state": "RECON_PASSIVE"})
+    entry = json.loads(open(audit.path, encoding="utf-8").read().splitlines()[0])
+    # ISO-8601 UTC, seconds precision — presentation only, the chain
+    # hashes whatever fields exist (old chains still verify)
+    assert entry["ts"].endswith("+00:00") or entry["ts"].endswith("Z")
+    assert "T" in entry["ts"]
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_report_renders_timeline_from_audit(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.write({"event": "engagement_created", "engagement_id": "e-tl",
+                 "target": "target-corp.com"})
+    audit.write({"event": "state_enter", "state": "RECON_PASSIVE",
+                 "target": "target-corp.com"})
+    audit.write({"event": "state_enter", "state": "HYPOTHESIZE"})
+    report = render_report(_graph(), audit, "e-tl")
+
+    assert "## Timeline" in report
+    assert "RECON_PASSIVE" in report
+    assert "HYPOTHESIZE" in report
+    assert audit.head_hash() in report
+
+
+def test_report_owasp_api_mapping_rendered(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("remediation", "H1", {
+        "title": "Add object-level authz", "fix": "check tenant ownership",
+        "detection": "log 403s per tenant", "severity": "high",
+        "cwe": "", "owasp": "", "attack": "",
+        "owasp_api": "API1:2023-BOLA",
+    })
+    report = render_report(graph, audit, "e-api")
+    assert "API1:2023-BOLA" in report
+    assert validate_report(report, graph) == []
+
+
+def test_build_timeline_bounded_and_tolerant(tmp_path):
+    from kryonsec.purple.report import build_timeline
+
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    for i in range(150):
+        audit.write({"event": "state_enter", "state": f"S{i % 10}"})
+    timeline = build_timeline(audit)
+    assert len(timeline) == 100  # bounded
+    # a nonexistent audit path is an empty timeline, not a crash
+    missing = AuditLog(tmp_path / "nope" / "missing.jsonl")
+    assert build_timeline(missing) == []

@@ -35,9 +35,18 @@ class AuditLog:
 
     def write(self, entry: dict) -> str:
         """Append an entry; returns its hash. Entry is mutated: gains
-        prev_hash and hash fields."""
+        ts, prev_hash and hash fields.
+
+        ts (Phase 8): ISO-8601 UTC wall-clock for the report timeline —
+        informational, NOT part of the ordering guarantee (the hash chain
+        is). Included in the hashed body like every other field."""
+        import datetime as _dt
+
         with self._lock:
             entry = dict(entry)
+            entry.setdefault(
+                "ts", _dt.datetime.now(_dt.timezone.utc).isoformat(
+                    timespec="seconds"))
             entry["prev_hash"] = self.last_hash
             body = canonical_json(entry)
             entry["hash"] = hashlib.sha256(body.encode()).hexdigest()

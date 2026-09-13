@@ -40,6 +40,8 @@ ALLOWED_TOOLS=(
     "bloodhound-python"
     # blue-team static analyzers (Phase 5) — run against /code read-only
     "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint" "kube-bench"
+    # blue-team SBOM/dependency scanners (Phase 8)
+    "syft" "osv-scanner" "grype"
     # image-side extras kept from the original image (not host-allowlisted
     # today, harmless here — the HOST allowlist is the authoritative gate)
     "python3" "bloodhound-python"
