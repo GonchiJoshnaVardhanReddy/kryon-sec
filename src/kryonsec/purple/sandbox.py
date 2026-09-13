@@ -54,9 +54,29 @@ class KaliSandbox:
         run_fn: Callable[..., subprocess.CompletedProcess] | None = None,
         seccomp_profile: Path | None = None,
         timeout_s: int = DEFAULT_TIMEOUT_S,
+        code_dir: str | None = None,
     ):
         self.cfg = cfg
         self.image = cfg.sandbox_image
+        # Blue-team code scanning (Phase 5): an ABSOLUTE host path, mounted
+        # READ-ONLY at the fixed /code inside the container. The path comes
+        # from the CLI (--code), never the LLM; a relative path is refused
+        # outright rather than silently resolved against an unknown cwd.
+        if code_dir is not None:
+            # absolute on EITHER platform: production is Linux (posixpath),
+            # but Windows dev machines hand us "C:\\..." paths — both are
+            # fine, only a relative path (which would silently resolve
+            # against an unknown cwd) is refused
+            import posixpath
+
+            if not (Path(code_dir).is_absolute() or posixpath.isabs(code_dir)):
+                raise ValueError(
+                    f"code_dir must be an absolute path (got {code_dir!r})")
+            # stored verbatim — str(Path(...)) would mangle forward slashes
+            # to backslashes on Windows dev machines
+            self.code_dir = code_dir
+        else:
+            self.code_dir = None
         if "@sha256:" not in self.image:
             # rule 7: the image should be digest-pinned — a tag is mutable.
             # Still runnable (install.sh builds a local :latest) but flagged.
@@ -86,6 +106,11 @@ class KaliSandbox:
         ]
         if self.seccomp_profile and Path(self.seccomp_profile).is_file():
             argv += ["--security-opt", f"seccomp={self.seccomp_profile}"]
+        # read-only code mount (blue-team scanners, Phase 5): :ro so no
+        # scanner can write to the user's folder; -w /code so tools with a
+        # default cwd still find the code
+        if getattr(self, "code_dir", None):
+            argv += ["-v", f"{self.code_dir}:/code:ro", "-w", "/code"]
         # NOTE: full spec adds network_mode=container:kryonsec-proxy for
         # target-scope-only egress (§8.2). The proxy does not exist yet —
         # containers use the default bridge. Recorded in the audit chain

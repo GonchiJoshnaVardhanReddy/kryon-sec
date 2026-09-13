@@ -222,3 +222,98 @@ def test_full_loop_through_exploit(tmp_path):
     assert "H1:sqlmap" in content
     ok, reason = audit.verify()
     assert ok, reason
+
+
+# ---- code folder wiring (tool expansion Phase 5) --------------------------
+
+def _audit_events(audit):
+    import json
+    with open(audit.path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def test_engagement_code_folder_wiring(tmp_path):
+    """--code folder: recorded in engagement_created, and only the
+    BLUE_TEAM sandbox is built with the /code mount."""
+    from kryonsec.purple.orchestrator import SubagentResult
+
+    import kryonsec.purple.blue_team as bt_mod
+    import kryonsec.purple.sandbox as sb_mod
+
+    cfg = KryonsecConfig(home=tmp_path)
+    code = tmp_path / "victim"
+    code.mkdir()
+
+    code_dirs: list = []
+    bt_kwargs: dict = {}
+
+    class FakeBlueTeam:
+        def __init__(self, **kwargs):
+            bt_kwargs.update(kwargs)
+
+        def run(self):
+            return SubagentResult(status="ok")
+
+    class FakeProc:
+        returncode = 0
+        stdout = '{"exit_code": 0, "stdout": ""}'
+        stderr = ""
+
+    orig_sb_init = sb_mod.KaliSandbox.__init__
+    orig_bt = bt_mod.BlueTeamSubagent
+
+    def _init_sb(self, cfg, code_dir=None, **kw):
+        orig_sb_init(self, cfg, code_dir=code_dir, **kw)
+        code_dirs.append(code_dir)
+        # every spawn "succeeds" with empty output — no docker needed
+        self._run = lambda argv, **kw2: FakeProc()
+
+    bt_mod.BlueTeamSubagent = FakeBlueTeam
+    sb_mod.KaliSandbox.__init__ = _init_sb
+    try:
+        with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
+            with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
+                orch, audit, graph = start_engagement(
+                    cfg, "e-code", target="target-corp.com",
+                    code_folder=str(code))
+                completed = orch.run()
+    finally:
+        bt_mod.BlueTeamSubagent = orig_bt
+        sb_mod.KaliSandbox.__init__ = orig_sb_init
+
+    assert "BLUE_TEAM" in completed
+    # the subagent got the folder, and its sandbox got the /code mount
+    assert bt_kwargs["code_folder"] == str(code)
+    assert code_dirs[-1] == str(code)
+    # every OTHER sandbox (recon/exploit/verify) is mount-free
+    assert code_dirs[:-1]
+    assert all(cd is None for cd in code_dirs[:-1])
+
+    created = next(e for e in _audit_events(audit)
+                   if e["event"] == "engagement_created")
+    assert created["code_scan"] is True
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_engagement_without_code_folder_records_false(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    with patch("kryonsec.purple.runner.sandbox_available", return_value=(False, "not Linux")):
+        with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
+            orch, audit, graph = start_engagement(cfg, "e-nc", target="target-corp.com")
+            orch.run()
+
+    created = next(e for e in _audit_events(audit)
+                   if e["event"] == "engagement_created")
+    assert created["code_scan"] is False
+
+
+def test_run_purple_rejects_missing_code_folder(tmp_path):
+    """A --code path that is not a folder is a hard error — never silently
+    scan (or mount) the wrong thing."""
+    from kryonsec.cli import _run_purple
+
+    cfg = KryonsecConfig(home=tmp_path)
+    rc = _run_purple(cfg, "target-corp.com",
+                     code_folder=str(tmp_path / "does-not-exist"))
+    assert rc == 2

@@ -168,6 +168,285 @@ def test_blue_team_records_budget_usage(tmp_path):
     assert budget.exhausted()
 
 
+# ---- BLUE_TEAM static scanners (tool expansion Phase 5) ------------------
+
+class _SpawnResult:
+    def __init__(self, ok=True, exit_code=0, stdout=""):
+        self.ok = ok
+        self.exit_code = exit_code
+        self.stdout = stdout
+
+
+class _FakeSandbox:
+    """Records argvs; answers from a {tool -> result} script."""
+
+    def __init__(self, script):
+        self.script = script
+        self.argvs = []
+
+    def spawn(self, argv):
+        self.argvs.append(list(argv))
+        # unscripted tools "fail" — keeps `ran` counts honest per test
+        return self.script.get(argv[0],
+                               _SpawnResult(ok=False, exit_code=-1))
+
+
+def _events(audit):
+    return [json.loads(l)["event"]
+            for l in open(audit.path, encoding="utf-8") if l.strip()]
+
+
+@pytest.mark.parametrize("tool,stdout,expected", [
+    # JSON shapes first (trivy/checkov print JSON when configured)
+    ("trivy", '{"Results": [{"Vulnerabilities": [{"a": 1}, {"b": 2}]}, '
+              '{"Vulnerabilities": []}, {"Vulnerabilities": [{"c": 3}]}]}', 3),
+    ("checkov", '{"failed_checks": [{"x": 1}, {"x": 2}]}', 2),
+    # text shapes
+    ("semgrep", "scanned 120 files\n42 findings", 42),
+    ("bandit", "Issue: [B101]\nIssue: [B102]\nIssue: [B301]", 3),
+    ("gitleaks", "Finding: aws-key\nFinding: github-pat", 2),
+    ("trivy", "Total: 7 (HIGH: 3)", 7),
+    ("checkov", "Passed checks: 12, Failed checks: 4", 4),
+    ("hadolint", "/code/Dockerfile:3 DL3008\n/code/Dockerfile:9 DL3045", 2),
+    # unknown shape -> None, never a guess
+    ("semgrep", "nothing recognizable here", None),
+    ("made-up-tool", "whatever", None),
+])
+def test_count_findings(tool, stdout, expected):
+    from kryonsec.purple.blue_team import _count_findings
+    assert _count_findings(tool, stdout) == expected
+
+
+def test_scan_plan_argv_shapes_validate():
+    """The fixed plan must validate against the SHIPPED allowlist — if the
+    templates and the plan drift apart, every spawn is rejected at runtime."""
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.blue_team import (
+        BLUE_TEAM_SCAN_PLAN,
+        HADOLINT_PLAN_ENTRY,
+    )
+
+    allow = ToolAllowlist()
+    for tool, argv in BLUE_TEAM_SCAN_PLAN + [HADOLINT_PLAN_ENTRY]:
+        allow.validate(argv[0], argv)
+        allow.check_blocklist(argv)
+
+
+def test_run_code_scanners_full_run(tmp_path):
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({
+        "semgrep": _SpawnResult(stdout="12 findings in /code/app.py"),
+        "bandit": _SpawnResult(exit_code=1, stdout="Issue: [B101] hardcoded"),
+        "gitleaks": _SpawnResult(stdout="no leaks found"),
+        "trivy": _SpawnResult(stdout='{"Results": [{"Vulnerabilities": [{}]}]}'),
+        "checkov": _SpawnResult(stdout="Passed checks: 2, Failed checks: 5"),
+        "hadolint": _SpawnResult(stdout="/code/Dockerfile:3 DL3008"),
+    })
+
+    ran = run_code_scanners(graph, sandbox, audit, has_dockerfile=True)
+    assert ran == 6
+    assert len(sandbox.argvs) == 6
+    # every scanner reads the fixed /code mount, never the host path
+    assert all(any(a == "/code" or a.startswith("/code/") for a in argv)
+               for argv in sandbox.argvs)
+
+    nodes = {n["label"]: n["properties"] for n in graph.by_type("scanner_result")}
+    assert set(nodes) == {"semgrep", "bandit", "gitleaks", "trivy",
+                          "checkov", "hadolint"}
+    assert nodes["semgrep"]["findings_count"] == 12
+    assert nodes["trivy"]["findings_count"] == 1
+    assert nodes["checkov"]["findings_count"] == 5
+    assert nodes["gitleaks"]["excerpt"] == "no leaks found"
+
+    events = _events(audit)
+    assert events.count("tool_spawn") == 6
+    assert events.count("tool_result") == 6
+    assert "scanners_done" in events
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_hadolint_only_with_dockerfile(tmp_path):
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({})
+    run_code_scanners(_graph(), sandbox, audit, has_dockerfile=False)
+    tools = [argv[0] for argv in sandbox.argvs]
+    assert "hadolint" not in tools
+    assert len(tools) == 5
+
+
+def test_failing_scanner_is_audited_skip(tmp_path):
+    """A spawn failure skips the evidence node but never kills the run."""
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({
+        "bandit": _SpawnResult(ok=False, exit_code=-1, stdout=""),
+        "semgrep": _SpawnResult(stdout="1 findings"),
+    })
+
+    ran = run_code_scanners(graph, sandbox, audit)
+    assert ran == 1
+    labels = [n["label"] for n in graph.by_type("scanner_result")]
+    assert labels == ["semgrep"]
+    # the failure is still on the audit trail
+    results = [json.loads(l) for l in open(audit.path, encoding="utf-8")
+               if l.strip()]
+    bandit = next(r for r in results
+                  if r["event"] == "tool_result" and r["tool"] == "bandit")
+    assert bandit["ok"] is False
+
+
+def test_exit_code_one_is_findings_not_failure(tmp_path):
+    """bandit/gitleaks exit 1 when they FIND something — the evidence node
+    is still written, with the findings count."""
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({
+        "bandit": _SpawnResult(exit_code=1, stdout="Issue: [B101]\nIssue: [B102]"),
+    })
+
+    ran = run_code_scanners(graph, sandbox, audit)
+    assert ran == 1
+    node = graph.by_type("scanner_result")[0]
+    assert node["properties"]["exit_code"] == 1
+    assert node["properties"]["findings_count"] == 2
+
+
+def test_scanners_fail_closed_on_empty_allowlist(tmp_path):
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({})
+
+    ran = run_code_scanners(graph, sandbox, audit,
+                            allowlist=ToolAllowlist(templates={}))
+    assert ran == 0
+    assert sandbox.argvs == []  # nothing ever spawned
+    assert graph.by_type("scanner_result") == []
+    events = _events(audit)
+    assert events.count("scanner_rejected_by_allowlist") == 5
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_prompt_renders_scanner_evidence():
+    graph = _graph()
+    graph.add_node("scanner_result", "bandit", {
+        "tool": "bandit", "exit_code": 1, "stdout_chars": 900,
+        "excerpt": "Issue: [B101] hard-coded password",
+        "findings_count": 2,
+    })
+    prompt = render_blue_team_prompt(graph)
+    assert "SCANNER EVIDENCE" in prompt
+    assert "bandit: exit code 1, ~2 findings" in prompt
+    assert "Issue: [B101] hard-coded password" in prompt
+    # findings_count missing -> no count claim, still evidence
+    graph.add_node("scanner_result", "semgrep", {
+        "tool": "semgrep", "exit_code": 0, "stdout_chars": 10, "excerpt": "x",
+    })
+    prompt2 = render_blue_team_prompt(graph)
+    assert "semgrep: exit code 0" in prompt2
+    assert "semgrep: exit code 0, ~" not in prompt2
+
+
+def test_remediation_mapping_fields_optional():
+    r = Remediation(hypothesis_id="H1", title="t", fix="f")
+    assert r.cwe == "" and r.owasp == "" and r.attack == ""
+    r2 = Remediation(hypothesis_id="H1", title="t", fix="f",
+                     cwe="CWE-89", owasp="A03:2021-Injection", attack="T1190")
+    assert r2.cwe == "CWE-89"
+
+
+def test_subagent_runs_scanners_before_llm(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    code = tmp_path / "victim"
+    code.mkdir()
+    (code / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    sandbox = _FakeSandbox({
+        "semgrep": _SpawnResult(stdout="3 findings"),
+        "bandit": _SpawnResult(stdout="Issue: [B101]"),
+        "gitleaks": _SpawnResult(stdout="no leaks"),
+        "trivy": _SpawnResult(stdout="Total: 0"),
+        "checkov": _SpawnResult(stdout="Failed checks: 1"),
+        "hadolint": _SpawnResult(stdout="/code/Dockerfile:3 DL3008"),
+    })
+
+    seen = {}
+
+    def llm(prompt):
+        seen["prompt"] = prompt
+        seen["scanner_nodes"] = len(graph.by_type("scanner_result"))
+        return RemediationSet(remediations=[
+            Remediation(hypothesis_id="semgrep", title="t", fix="f")])
+
+    sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit, llm_fn=llm,
+                           sandbox=sandbox, code_folder=str(code))
+    assert sub.run().status == "ok"
+
+    # the scanner evidence existed BEFORE the LLM saw the prompt, and the
+    # prompt contains it
+    assert seen["scanner_nodes"] == 6  # 5 + hadolint (Dockerfile present)
+    assert "bandit: exit code" in seen["prompt"]
+    events = _events(audit)
+    assert events.index("tool_spawn") < events.index("remediation_proposed")
+    enter = json.loads(
+        next(l for l in open(audit.path, encoding="utf-8")
+             if l.strip() and json.loads(l)["event"] == "state_enter"))
+    assert enter["code_scan"] is True
+    # the remediation node carries the suggested mappings
+    assert graph.by_type("remediation")[0]["properties"]["cwe"] == ""
+
+
+def test_subagent_scanner_crash_does_not_kill_llm(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+
+    class ExplodingSandbox:
+        def spawn(self, argv):
+            raise RuntimeError("docker exploded")
+
+    def llm(prompt):
+        assert "SCANNER EVIDENCE" in prompt
+        return RemediationSet(remediations=[
+            Remediation(hypothesis_id="H1", title="t", fix="f")])
+
+    sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit, llm_fn=llm,
+                           sandbox=ExplodingSandbox(), code_folder="/tmp/x")
+    assert sub.run().status == "ok"
+    assert "scanners_failed" in _events(audit)
+    assert graph.by_type("scanner_result") == []
+
+
+def test_subagent_without_sandbox_stays_pure_llm(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+
+    def llm(prompt):
+        assert "no code folder scanned" in prompt
+        return RemediationSet(remediations=[
+            Remediation(hypothesis_id="H1", title="t", fix="f")])
+
+    sub = BlueTeamSubagent(cfg=cfg, graph=graph, audit=audit, llm_fn=llm)
+    assert sub.run().status == "ok"
+    events = _events(audit)
+    assert "tool_spawn" not in events
+
+
 # ---- REPORT ----------------------------------------------------------
 
 def _remediated_graph():

@@ -2,6 +2,8 @@
 
 import subprocess
 
+import pytest
+
 from kryonsec.config import KryonsecConfig
 from kryonsec.purple.sandbox import KaliSandbox
 
@@ -61,6 +63,35 @@ def test_docker_argv_seccomp_when_profile_exists(tmp_path):
 def test_docker_argv_no_seccomp_when_missing(tmp_path):
     s = _sandbox(tmp_path)
     assert "--security-opt" not in s._docker_argv(["nmap", "x"])
+
+
+# ---- code folder mount (tool expansion Phase 5) --------------------------
+
+def test_docker_argv_mounts_code_dir_read_only(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    s = KaliSandbox(cfg=cfg, code_dir="/opt/victim-code",
+                    seccomp_profile=tmp_path / "n.json")
+    argv = s._docker_argv(["bandit", "-r", "/code"])
+    # the host folder is mounted read-only at the FIXED /code path
+    assert argv[argv.index("-v") + 1] == "/opt/victim-code:/code:ro"
+    assert argv[argv.index("-w") + 1] == "/code"
+    assert "--read-only" in argv  # rootfs still read-only too
+
+
+def test_docker_argv_without_code_dir_has_no_mount(tmp_path):
+    s = _sandbox(tmp_path)
+    argv = s._docker_argv(["nmap", "x"])
+    assert not any(a.endswith(":/code:ro") for a in argv)
+    assert "-w" not in argv
+
+
+def test_code_dir_must_be_absolute(tmp_path):
+    """A relative path would silently resolve against the CWD — refuse
+    it loudly instead (the CLI resolves to absolute before this)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    with pytest.raises(ValueError):
+        KaliSandbox(cfg=cfg, code_dir="victim-code",
+                    seccomp_profile=tmp_path / "n.json")
 
 
 # ---- spawn result parsing ----------------------------------------------

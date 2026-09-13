@@ -83,9 +83,11 @@ STATE_INFO: dict[str, dict[str, str]] = {
     },
     "BLUE_TEAM": {
         "agent": "blue-team (LLM)",
-        "does": "generate fixes and detection rules",
-        "tools": "none — pure LLM",
-        "zone": "—",
+        "does": "generate fixes and detection rules, grounded in scanner "
+                "evidence when a --code folder is provided",
+        "tools": "semgrep, bandit, gitleaks, trivy, checkov, hadolint "
+                 "(read-only /code mount) + LLM",
+        "zone": "B for scanners (sandbox), LLM is host-side",
     },
     "REPORT": {
         "agent": "reporter",
@@ -161,12 +163,18 @@ def start_engagement(
     target: str = "",
     progress: "Callable[[str], None] | None" = None,
     status_factory: "Callable[[str], object] | None" = None,
+    code_folder: str | None = None,
 ) -> tuple[PurpleOrchestrator, AuditLog, "object"]:
     """Wire up an engagement. Returns (orchestrator, audit, graph).
 
     The engagement starts on every OS. When the sandbox is unavailable,
     the orchestrator HALTs (with an audited reason) as soon as a state
     needs Zone B.
+
+    code_folder: absolute path to a user-provided code folder
+    (--code). Blue-team static analyzers scan it through a read-only
+    sandbox mount; without it (or without a sandbox) BLUE_TEAM stays
+    pure LLM.
 
     progress: optional callback invoked with each state name before it
     runs (CLI uses it to show which agent is working).
@@ -184,6 +192,7 @@ def start_engagement(
         "event": "engagement_created",
         "engagement_id": engagement_id,
         "target": target,
+        "code_scan": bool(code_folder),
     })
     graph = EngagementGraph(engagement_id=engagement_id)
 
@@ -244,8 +253,18 @@ def start_engagement(
         if state == "BLUE_TEAM":
             from .blue_team import BlueTeamSubagent
 
+            # sandbox with the read-only /code mount for the static
+            # analyzers; without a code folder (or sandbox) BLUE_TEAM
+            # stays pure LLM
+            sandbox = None
+            if sandbox_ok and code_folder:
+                from .sandbox import KaliSandbox
+
+                sandbox = KaliSandbox(cfg=cfg, code_dir=code_folder)
             sub = BlueTeamSubagent(
-                cfg=cfg, graph=graph, audit=audit, budget=orch.budget)
+                cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
+                sandbox=sandbox, code_folder=code_folder,
+            )
             return sub.run
 
         if state == "REPORT":

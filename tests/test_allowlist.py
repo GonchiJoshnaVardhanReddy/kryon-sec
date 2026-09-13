@@ -94,9 +94,27 @@ def test_blocklist_allows_normal_argv(allow):
     ("nc", ["nc", "-z", "-w", "30", "target.com", "443"]),
     ("ncat", ["ncat", "-z", "-w", "30", "target.com", "443"]),
     ("/opt/kryonsec/probe.py", ["/opt/kryonsec/probe.py", "http://target.com/"]),
+    # blue-team static analyzers (Phase 5) — fixed /code mount, read-only
+    ("semgrep", ["semgrep", "--config=auto", "/code"]),
+    ("bandit", ["bandit", "-r", "/code"]),
+    ("gitleaks", ["gitleaks", "detect", "--source", "/code"]),
+    ("trivy", ["trivy", "fs", "--scanners", "vuln", "/code"]),
+    ("checkov", ["checkov", "-d", "/code"]),
+    ("hadolint", ["hadolint", "/code/Dockerfile"]),
 ])
 def test_new_template_accepts_valid_argv(allow, tool, argv):
     allow.validate(tool, argv)
+
+
+def test_blue_team_templates_reject_other_paths(allow):
+    """The scanners read the fixed /code mount ONLY — a different path
+    (e.g. /etc) must never validate."""
+    with pytest.raises(AllowlistViolation):
+        allow.validate("bandit", ["bandit", "-r", "/etc"])
+    with pytest.raises(AllowlistViolation):
+        allow.validate("hadolint", ["hadolint", "/code/../etc/passwd"])
+    with pytest.raises(AllowlistViolation):
+        allow.validate("semgrep", ["semgrep", "--config=auto", "/code", "-o", "/tmp/x"])
 
 
 def test_passive_templates_require_passive_flag(allow):

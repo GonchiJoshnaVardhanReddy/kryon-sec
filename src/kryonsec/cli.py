@@ -532,10 +532,16 @@ def _remember_facts(cfg: KryonsecConfig, user_text: str, reply: str) -> None:
         pass  # memory is best-effort by design
 
 
-def _run_purple(cfg: KryonsecConfig, target_arg: str, engagement_id: str | None = None) -> int:
+def _run_purple(
+    cfg: KryonsecConfig,
+    target_arg: str,
+    engagement_id: str | None = None,
+    code_folder: str | None = None,
+) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
     subcommand and the /mode toggle inside the chat loop."""
     import uuid
+    from pathlib import Path
 
     from .purple.orchestrator import STATES
     from .purple.runner import STATE_INFO, sandbox_available, start_engagement
@@ -548,10 +554,22 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str, engagement_id: str | None 
         err_console.print(f"[red]Invalid target:[/red] {e}")
         return 2
 
+    # --code: blue-team scanners need a real folder; anything else is a
+    # hard error (never silently scans the wrong thing)
+    if code_folder:
+        code_path = Path(code_folder).expanduser()
+        if not code_path.is_dir():
+            err_console.print(
+                f"[red]--code path is not a folder:[/red] {code_folder}")
+            return 2
+        code_folder = str(code_path.resolve())
+
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     if not sandbox_ok:
         console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
         console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
+        if code_folder:
+            console.print("[yellow]--code ignored: static scanners need the sandbox.[/yellow]")
 
     # an explicit --id must survive the run: re-running a named engagement
     # keeps the same audit/report dirs instead of getting a random id
@@ -580,7 +598,7 @@ def _run_purple(cfg: KryonsecConfig, target_arg: str, engagement_id: str | None 
 
     orch, audit, graph = start_engagement(
         cfg, engagement_id, target=target, progress=_progress,
-        status_factory=_status_factory,
+        status_factory=_status_factory, code_folder=code_folder,
     )
     console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
     completed = orch.run()
@@ -691,6 +709,10 @@ def main(argv: list[str] | None = None) -> int:
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
     purple.add_argument("--id", default=None, help="engagement id (default: auto-generated)")
+    purple.add_argument(
+        "--code", default=None, metavar="FOLDER",
+        help="code folder for blue-team static scanning (mounted read-only "
+             "into the sandbox)")
 
     args = parser.parse_args(argv)
 
@@ -706,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(cfg)
 
     if args.command == "purple":
-        return _run_purple(cfg, args.target, engagement_id=args.id)
+        return _run_purple(
+            cfg, args.target, engagement_id=args.id, code_folder=args.code)
 
     if args.command == "setup":
         from .wizard import run_setup
