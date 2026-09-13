@@ -40,7 +40,8 @@ STATE_INFO: dict[str, dict[str, str]] = {
     "RECON_ACTIVE": {
         "agent": "active-recon",
         "does": "scan the target (packets to target)",
-        "tools": "nmap, httpx, wappalyzer, wafw00f, feroxbuster, nuclei",
+        "tools": "nmap, naabu, dnsx, httpx, whatweb, katana, feroxbuster, "
+                 "sslscan, testssl.sh",
         "zone": "B (sandbox)",
     },
     "HYPOTHESIZE": {
@@ -58,19 +59,21 @@ STATE_INFO: dict[str, dict[str, str]] = {
     "EXPLOIT": {
         "agent": "exploit",
         "does": "execute approved hypotheses only",
-        "tools": "sqlmap, nuclei, ffuf, jwt_tool, dalfox, commix, ssrfmap",
+        "tools": "sqlmap, nuclei, nikto, ffuf, gobuster, wfuzz, curl, wget, "
+                 "dalfox, commix, ssrfmap, arjun, tplmap, graphql-cop",
         "zone": "B (sandbox)",
     },
     "POST_EXPLOIT": {
         "agent": "post-exploit",
         "does": "enumerate shells (requires separate approval)",
-        "tools": "pwncat, linpeas, bloodhound-python",
+        "tools": "linpeas, pspy, linux-exploit-suggester, baked enum "
+                 "scripts (evidence collection only)",
         "zone": "B (sandbox)",
     },
     "VERIFY": {
         "agent": "verifier",
         "does": "independently confirm findings",
-        "tools": "curl, httpie, python, netcat, openssl",
+        "tools": "curl, httpie, nc, openssl, dig, baked probe script",
         "zone": "B (sandbox)",
     },
     "BLUE_TEAM": {

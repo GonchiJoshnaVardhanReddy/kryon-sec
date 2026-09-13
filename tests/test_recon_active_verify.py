@@ -96,9 +96,117 @@ def test_recon_active_failure_fails_state_not_engagement(tmp_path):
     assert "recon_active_failed" in _events(audit)
 
 
-# ---- VERIFY: probe URL building ------------------------------------------
+# ---- RECON_ACTIVE: multi-tool plan (tool expansion Phase 1) ---------------
 
-def test_boolean_probe_urls_builds_true_false_pair():
+class MultiToolSandbox:
+    """Returns a realistic output per tool so every parser gets exercised."""
+
+    OUTPUTS = {
+        "nmap": NMAP_SAMPLE,
+        "naabu": "t.com:80\nt.com:8080\n",
+        "dnsx": "t.com. 300 IN A 1.2.3.4\n",
+        "httpx": "http://t.com:80/ [200] [Home] [Nginx,PHP]\n",
+        "whatweb": "http://t.com:80/ [200 OK] Nginx[1.18], PHP[7.4]\n",
+        "katana": "http://t.com/admin/login\nhttp://t.com/api/v1\n",
+        "feroxbuster": "200      15l      345w     /admin\n"
+                       "301       0l        0w     /backup\n",
+        "sslscan": "TLSv1.0  enabled\n",
+        "testssl.sh": "subject: t.com\n",
+    }
+
+    def __init__(self):
+        self.tools = []
+
+    def spawn(self, argv):
+        self.tools.append(argv[0])
+        return SpawnResult(ok=True, exit_code=0,
+                           stdout=self.OUTPUTS.get(argv[0], ""))
+
+
+def test_recon_active_multi_tool_plan(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra3")
+    fake = MultiToolSandbox()
+
+    result = ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+    assert result.status == "ok"
+
+    # stage 1 always runs the discovery trio
+    for tool in ("nmap", "naabu", "dnsx"):
+        assert tool in fake.tools
+
+    # 80+443 found by nmap, 8080 by naabu → web probes on all three
+    for tool in ("httpx", "whatweb", "katana", "feroxbuster"):
+        assert tool in fake.tools
+    # 443 is a TLS port → TLS scanners run
+    assert "sslscan" in fake.tools
+    assert "testssl.sh" in fake.tools
+
+    # every spawn was allowlist-valid (no rejection events)
+    events = _events(audit)
+    assert "recon_active_rejected_by_allowlist" not in events
+    assert "recon_active_done" in events
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_recon_active_parses_into_graph_nodes(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra4")
+    fake = MultiToolSandbox()
+
+    ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+
+    # nmap services
+    services = graph.by_type("service")
+    assert {"t.com:80/tcp", "t.com:443/tcp"} <= {s["label"] for s in services}
+    # dnsx resolution
+    dns = graph.by_type("dns_resolution")
+    assert dns and dns[0]["properties"]["ips"] == ["1.2.3.4"]
+    # httpx endpoint with title/tech
+    endpoints = graph.by_type("web_endpoint")
+    assert any(e["label"] == "http://t.com:80/"
+               and e["properties"]["tech"] == "Nginx,PHP" for e in endpoints)
+    # katana crawled URLs + feroxbuster paths both land as path nodes
+    paths = graph.by_type("path")
+    path_labels = {p["label"] for p in paths}
+    assert "/admin/login" in path_labels
+    assert "/backup" in path_labels
+    # whatweb / TLS outputs stored as bounded observations
+    assert graph.by_type("tech_fingerprint")
+    assert graph.by_type("tls_observation")
+
+
+def test_recon_active_no_web_ports_still_runs_default_probe(tmp_path):
+    """Nothing web-ish discovered → the default port-80 probe still runs
+    (many hosts simply don't advertise; the probe is cheap)."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra5")
+
+    class WeirdPorts:
+        def __init__(self):
+            self.tools = []
+
+        def spawn(self, argv):
+            self.tools.append(argv[0])
+            if argv[0] == "nmap":
+                return SpawnResult(ok=True, exit_code=0,
+                                   stdout="5432/tcp open postgresql\n")
+            return SpawnResult(ok=True, exit_code=0, stdout="")
+
+    fake = WeirdPorts()
+    result = ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+    assert result.status == "ok"
+    assert "httpx" in fake.tools  # default web probe ran anyway
+    # 5432 is not a web port — no whatweb/katana/feroxbuster on it
+    assert fake.tools.count("whatweb") == 1  # only the port-80 default
+
+
+
+# ---- VERIFY: probe URL building ------------------------------------------def test_boolean_probe_urls_builds_true_false_pair():
     true_url, false_url = _boolean_probe_urls(
         "http://t.com/showthread.asp?id=1")
     assert "id=1+AND+1%3D1" in true_url or "id=1%20AND%201%3D1" in true_url
@@ -339,3 +447,89 @@ def test_verify_baseline_keeps_query_string(tmp_path):
     sub.run()
     assert len(sub.sandbox.urls) == 3  # true + false + baseline
     assert graph.by_type("finding")[0]["properties"]["verified"] is True
+
+
+# ---- VERIFY: secondary probes (tool expansion Phase 1) --------------------
+
+def test_verify_no_query_param_gathers_secondary_evidence(tmp_path):
+    """A finding with no numeric query parameter can't be boolean-probed.
+    VERIFY then gathers reachability evidence with OTHER tools (httpie,
+    nc, dig — openssl only for https) — recorded as supporting evidence,
+    never marking the finding verified on its own."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-v3")
+    graph.add_node("target", "target-corp.com", {})
+    graph.add_node("hypothesis", "H1", {
+        "title": "dir listing", "target_asset": "/uploads/",
+        "rationale": "evidence", "cvss_vector": "",
+        "tools": ["nikto"], "confidence": 0.6, "approved": True,
+    })
+    graph.add_node("exploit_attempt", "H1:nikto", {
+        "tool": "nikto", "ok": True, "exit_code": 0, "confirmed": True,
+        "argv": ["nikto"], "output_excerpt": "found",
+    })
+    graph.add_node("finding", "H1", {
+        "tool": "nikto", "confirmed_by": "sandbox nikto output",
+        "excerpt": "found",
+    })
+
+    class ProbeSandbox:
+        def __init__(self):
+            self.spawned = []
+
+        def spawn(self, argv):
+            self.spawned.append(argv)
+            return SpawnResult(ok=True, exit_code=0, stdout="x")
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", ProbeSandbox())
+    result = sub.run()
+    assert result.status == "ok"
+
+    tools = [argv[0] for argv in sub.sandbox.spawned]
+    assert "http" in tools      # httpie
+    assert "nc" in tools
+    assert "dig" in tools
+    assert "openssl" not in tools  # plain http URL — no TLS handshake probe
+    assert "curl" not in tools     # nothing to boolean-probe
+
+    verify_nodes = graph.by_type("verify_attempt")
+    assert len(verify_nodes) == 1
+    props = verify_nodes[0]["properties"]
+    assert props["verified"] is False  # reachability ≠ verification
+    assert set(props["secondary_evidence"]) == {"http", "nc", "dig"}
+    assert "verify_skipped" in _events(audit)
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_verify_secondary_probes_https_gets_openssl(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = EngagementGraph(engagement_id="e-v4")
+    graph.add_node("target", "target-corp.com", {})
+    graph.add_node("hypothesis", "H1", {
+        "title": "old ssl", "target_asset": "https://target-corp.com/old/",
+        "rationale": "evidence", "cvss_vector": "",
+        "tools": ["sslscan"], "confidence": 0.5, "approved": True,
+    })
+    graph.add_node("finding", "H1", {
+        "tool": "sslscan", "confirmed_by": "sandbox sslscan output",
+        "excerpt": "TLSv1.0 enabled",
+    })
+
+    class ProbeSandbox:
+        def __init__(self):
+            self.spawned = []
+
+        def spawn(self, argv):
+            self.spawned.append(argv)
+            return SpawnResult(ok=True, exit_code=0, stdout="x")
+
+    sub = VerifySubagent(cfg, graph, audit, "target-corp.com", ProbeSandbox())
+    sub.run()
+    tools = [argv[0] for argv in sub.sandbox.spawned]
+    assert "openssl" in tools
+    # the openssl probe connects to host:port, not a URL
+    openssl_argv = next(a for a in sub.sandbox.spawned if a[0] == "openssl")
+    assert openssl_argv[openssl_argv.index("-connect") + 1] == "target-corp.com:443"
