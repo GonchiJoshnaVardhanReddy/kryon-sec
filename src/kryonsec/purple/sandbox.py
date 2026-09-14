@@ -103,7 +103,41 @@ class KaliSandbox:
         # injectable for tests: signature matches subprocess.run
         self._run = run_fn or subprocess.run
         self.seccomp_profile = seccomp_profile or _seccomp_default()
+        if self.seccomp_profile and not Path(self.seccomp_profile).is_file():
+            # M4: a missing packaged profile used to silently drop the
+            # seccomp flag — sandbox hardening (CLAUDE.md rule 9) must be loud
+            log.warning(
+                "seccomp profile %s not found — sandbox spawns will run "
+                "WITHOUT a seccomp filter (broken install? reinstall the "
+                "package or set KRYONSEC_SECCOMP_PROFILE)",
+                self.seccomp_profile,
+            )
         self.timeout_s = timeout_s
+
+    def copy_with(
+        self, code_dir: str | None = None, evidence_dir: str | None = None
+    ) -> "KaliSandbox":
+        """Shallow copy with replaced mounts (same validation as __init__).
+
+        The runner constructs ONE sandbox per engagement and derives
+        per-state variants here — one construction also means one
+        image-pin warning, not one per state (M5).
+        """
+        import posixpath
+
+        clone = object.__new__(KaliSandbox)
+        clone.__dict__.update(self.__dict__)
+        if code_dir is not None:
+            if not (Path(code_dir).is_absolute() or posixpath.isabs(code_dir)):
+                raise ValueError(
+                    f"code_dir must be an absolute path (got {code_dir!r})")
+            clone.code_dir = code_dir  # verbatim, same rule as __init__
+        if evidence_dir is not None:
+            if not (Path(evidence_dir).is_absolute() or posixpath.isabs(evidence_dir)):
+                raise ValueError(
+                    f"evidence_dir must be an absolute path (got {evidence_dir!r})")
+            clone.evidence_dir = evidence_dir
+        return clone
 
     def _docker_argv(self, tool_argv: list[str]) -> list[str]:
         """Build the docker run argv. Tool argv as container args (spec §8.5)."""

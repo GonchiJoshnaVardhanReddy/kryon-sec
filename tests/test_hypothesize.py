@@ -57,6 +57,16 @@ def test_prompt_contains_findings():
     assert "sqlmap" in prompt
 
 
+def test_prompt_tool_list_cannot_drift_from_allowlist():
+    """L8: the prompt's tool list is generated from EXPLOIT_TEMPLATES —
+    a tool added to the allowlist must appear in the prompt automatically."""
+    from kryonsec.purple.allowlist import EXPLOIT_TEMPLATES
+
+    prompt = render_hypothesize_prompt(_graph_with_findings())
+    for tool in EXPLOIT_TEMPLATES:
+        assert tool in prompt, f"allowlisted tool {tool!r} missing from prompt"
+
+
 def test_prompt_empty_graph():
     graph = EngagementGraph(engagement_id="e-h2")
     prompt = render_hypothesize_prompt(graph)

@@ -14,6 +14,7 @@ import logging
 import platform
 
 from ..config import KryonsecConfig
+from . import runtime_checks
 from .audit import AuditLog
 from .orchestrator import HALT, PurpleOrchestrator, SubagentResult
 
@@ -105,45 +106,13 @@ STATE_INFO: dict[str, dict[str, str]] = {
 }
 
 
-def _docker_runtimes() -> str | None:
-    """Return Docker's registered runtime list, or None if unreachable."""
-    import shutil
-    import subprocess
-
-    if not shutil.which("docker"):
-        return None
-    try:
-        # .Runtimes is a Go map — `join` errors on it (moby#37584); range it
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:
-        return None
-    if out.returncode != 0:
-        return None
-    return out.stdout.strip()
-
-
-def _image_present(image: str) -> bool:
-    """True if the pinned sandbox image exists locally (tag or digest)."""
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return out.returncode == 0
-    except Exception:
-        return False
-
-
 def sandbox_available(image: str = "kryonsec/sandbox:latest") -> tuple[bool, str]:
     """Check Zone B prerequisites. Returns (ok, reason-if-not).
 
     Probes, in order: Linux platform, docker CLI + daemon, runsc runtime
     registered, and the pinned sandbox image present locally (spec §8.5/§8.6).
+    The probes themselves live in purple/runtime_checks.py (shared with
+    `kryonsec doctor`).
     """
     if platform.system() != "Linux":
         return False, (
@@ -151,14 +120,14 @@ def sandbox_available(image: str = "kryonsec/sandbox:latest") -> tuple[bool, str
             f"{platform.system()}. Use WSL2 or a Linux VM."
         )
 
-    runtimes = _docker_runtimes()
+    runtimes = runtime_checks.docker_runtimes()
     if runtimes is None:
         return False, "docker CLI not found or daemon unreachable"
 
     if "runsc" not in runtimes:
         return False, "gVisor (runsc) runtime not registered with Docker"
 
-    if not _image_present(image):
+    if not runtime_checks.image_present(image):
         return False, f"sandbox image not found locally: {image}"
 
     return True, "ok"
@@ -218,6 +187,15 @@ def start_engagement(
     if sandbox_ok:
         evidence_dir.mkdir(parents=True, exist_ok=True)
 
+    # ONE sandbox per engagement (M5): a config holder, so per-state mount
+    # variants come from copy_with() — one construction also means one
+    # image-pin warning, not one per state
+    sandbox = None
+    if sandbox_ok:
+        from .sandbox import KaliSandbox
+
+        sandbox = KaliSandbox(cfg=cfg)
+
     def resolve(state: str):
         """State name -> subagent run callable (or None for stubs)."""
         if state == "RECON_PASSIVE":
@@ -228,12 +206,9 @@ def start_engagement(
             )
 
             fetchers = zone_a_fetchers(cfg)
-            if sandbox_ok:
+            if sandbox is not None:
                 # passive subdomain tools in the sandbox (-passive flags;
                 # zero packets to the target) — skipped cleanly elsewhere
-                from .sandbox import KaliSandbox
-
-                sandbox = KaliSandbox(cfg=cfg)
                 fetchers.append(
                     sandbox_passive_fetcher(sandbox, audit))
             sub = ReconPassiveSubagent(
@@ -248,11 +223,6 @@ def start_engagement(
             # the sandbox (when present) powers ExploitDB searchsploit
             # enrichment; without it enrichment runs API-only and skips
             # searchsploit with an audited notice
-            sandbox = None
-            if sandbox_ok:
-                from .sandbox import KaliSandbox
-
-                sandbox = KaliSandbox(cfg=cfg)
             sub = HypothesizeSubagent(
                 cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
                 sandbox=sandbox,
@@ -271,14 +241,13 @@ def start_engagement(
             # sandbox with the read-only /code mount for the static
             # analyzers; without a code folder (or sandbox) BLUE_TEAM
             # stays pure LLM
-            sandbox = None
-            if sandbox_ok and code_folder:
-                from .sandbox import KaliSandbox
-
-                sandbox = KaliSandbox(cfg=cfg, code_dir=code_folder)
+            bt_sandbox = (
+                sandbox.copy_with(code_dir=code_folder)
+                if sandbox is not None and code_folder else None
+            )
             sub = BlueTeamSubagent(
                 cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
-                sandbox=sandbox, code_folder=code_folder,
+                sandbox=bt_sandbox, code_folder=code_folder,
             )
             return sub.run
 
@@ -297,47 +266,40 @@ def start_engagement(
 
             return run_report
 
-        if state == "RECON_ACTIVE" and sandbox_ok:
+        if state == "RECON_ACTIVE" and sandbox is not None:
             from .recon_active import ReconActiveSubagent
-            from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = ReconActiveSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
-                sandbox=sandbox,
+                sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
             )
             return sub.run
 
-        if state == "EXPLOIT" and sandbox_ok:
+        if state == "EXPLOIT" and sandbox is not None:
             from .exploit import ExploitSubagent
-            from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = ExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
-                sandbox=sandbox, progress=progress,
+                sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
+                progress=progress,
             )
             return sub.run
 
-        if state == "POST_EXPLOIT" and sandbox_ok:
+        if state == "POST_EXPLOIT" and sandbox is not None:
             from .post_exploit import PostExploitSubagent
-            from .sandbox import KaliSandbox
 
-            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = PostExploitSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
-                sandbox=sandbox,
+                sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
             )
             return sub.run
 
-        if state == "VERIFY" and sandbox_ok:
-            from .sandbox import KaliSandbox
+        if state == "VERIFY" and sandbox is not None:
             from .verify import VerifySubagent
 
-            sandbox = KaliSandbox(cfg=cfg, evidence_dir=str(evidence_dir))
             sub = VerifySubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
-                sandbox=sandbox,
+                sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
             )
             return sub.run
 

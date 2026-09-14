@@ -61,7 +61,7 @@ TOOL_SCHEMAS = {
     },
     "file_write": {
         "type": "function",
-            "function": {
+        "function": {
             "name": "file_write",
             "description": "Write text to a file (creates parent directories). "
                            "Outside the workspace the user must approve.",

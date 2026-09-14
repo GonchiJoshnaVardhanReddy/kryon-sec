@@ -62,24 +62,32 @@ def _scan_file(path: str, findings: list[dict]) -> None:
                 return
 
 
+def _iter_files(roots: list[str]):
+    """Yield files under the roots; the caller bounds how many it consumes."""
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirs, files_list in os.walk(root):
+            # SKIP_DIRS holds absolute paths — compare the joined path
+            dirs[:] = [d for d in dirs if os.path.join(dirpath, d) not in SKIP_DIRS]
+            for name in files_list:
+                yield os.path.join(dirpath, name)
+
+
 def main() -> int:
     target = sys.argv[1] if len(sys.argv) > 1 else ""
     roots = ["/home", "/tmp", "/evidence"] if HOME_ONLY else ["/"]
     findings: list[dict] = []
     files = 0
 
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, dirs, files_list in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            for name in files_list:
-                files += 1
-                if files > MAX_FILES or len(findings) >= 200:
-                    break
-                _scan_file(os.path.join(dirpath, name), findings)
-            if files > MAX_FILES:
-                break
+    # single bounded loop: MAX_FILES / 200-findings caps stop the WHOLE scan,
+    # not just the current root (H6 — nested breaks used to leak to the next
+    # root and exceed the caps up to len(roots)×)
+    for path in _iter_files(roots):
+        files += 1
+        if files > MAX_FILES or len(findings) >= 200:
+            break
+        _scan_file(path, findings)
 
     print(json.dumps({
         "probe": "find_secrets",

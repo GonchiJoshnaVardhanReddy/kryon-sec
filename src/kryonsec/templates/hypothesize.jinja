@@ -49,9 +49,9 @@ Your task:
 4. Prefer parameters that look like they reach a database (id, artist, cat,
    product, search) over redirect parameters (RetURL, next, url).
 5. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
-6. Suggest testing tools ONLY from this allowlist:
-   sqlmap, nmap, nikto, ffuf, gobuster, wfuzz, curl, wget, nuclei,
-   dalfox, commix, ssrfmap, arjun, tplmap, graphql-cop.
+6. Suggest testing tools ONLY from this allowlist (generated from the
+   engine's allowlist — never edited by hand):
+   {{ tools | join(", ") }}.
    These are the tools the execution engine can actually run. Any other
    tool will be skipped.
 7. Give each hypothesis a confidence between 0.0 and 1.0.

@@ -201,9 +201,8 @@ def _events(audit):
     ("trivy", '{"Results": [{"Vulnerabilities": [{"a": 1}, {"b": 2}]}, '
               '{"Vulnerabilities": []}, {"Vulnerabilities": [{"c": 3}]}]}', 3),
     ("checkov", '{"failed_checks": [{"x": 1}, {"x": 2}]}', 2),
-    # Phase 8 SBOM/dependency scanners (JSON by flag)
-    ("syft", '{"artifacts": [{"name": "flask"}, {"name": "django"}, '
-             '{"name": "requests"}]}', 3),
+    # Phase 8 dependency scanners (JSON by flag). syft is NOT here: an SBOM
+    # is a package inventory, not findings (M14) — see _count_packages.
     ("osv-scanner", '{"results": [{"packages": [{"vulnerabilities": ["a", "b"]}, '
                     '{"vulnerabilities": ["c"]}]}, {"packages": []}]}', 3),
     ("grype", '{"matches": [{"m": 1}, {"m": 2}]}', 2),
@@ -221,6 +220,17 @@ def _events(audit):
 def test_count_findings(tool, stdout, expected):
     from kryonsec.purple.blue_team import _count_findings
     assert _count_findings(tool, stdout) == expected
+
+
+def test_count_packages_syft_sbom():
+    """M14: the syft package count is an inventory, kept out of the
+    findings count (which must stay None for an SBOM)."""
+    from kryonsec.purple.blue_team import _count_findings, _count_packages
+
+    sbom = '{"artifacts": [{"name": "flask"}, {"name": "django"}, {"name": "requests"}]}'
+    assert _count_packages(sbom) == 3
+    assert _count_findings("syft", sbom) is None
+    assert _count_packages("not json") is None
 
 
 def test_scan_plan_argv_shapes_validate():
@@ -276,8 +286,10 @@ def test_run_code_scanners_full_run(tmp_path):
     assert nodes["trivy"]["findings_count"] == 1
     assert nodes["checkov"]["findings_count"] == 5
     assert nodes["gitleaks"]["excerpt"] == "no leaks found"
-    # Phase 8 counters: syft counts packages, grype counts matches
-    assert nodes["syft"]["findings_count"] == 2
+    # Phase 8 counters: grype counts matches; syft is an SBOM — its package
+    # count is an inventory (packages_count), never a findings_count (M14)
+    assert "findings_count" not in nodes["syft"]
+    assert nodes["syft"]["packages_count"] == 2
     assert nodes["grype"]["findings_count"] == 2
 
     events = _events(audit)
@@ -871,7 +883,7 @@ def test_report_renders_scanner_section_and_sbom_summary(tmp_path):
     graph = _graph()
     graph.add_node("scanner_result", "syft", {
         "tool": "syft", "exit_code": 0, "stdout_chars": 100,
-        "excerpt": '{"artifacts": [...]}', "findings_count": 42,
+        "excerpt": '{"artifacts": [...]}', "packages_count": 42,
     })
     graph.add_node("scanner_result", "grype", {
         "tool": "grype", "exit_code": 0, "stdout_chars": 100,

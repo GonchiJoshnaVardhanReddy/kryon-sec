@@ -166,4 +166,6 @@ def test_build_mcp_toolbox_import_error_is_empty(tmp_path, monkeypatch):
         "builtins.__import__",
         lambda name, *a, **k: (_ for _ in ()).throw(ImportError(name)) if name == "mcp"
         else __import__(name, *a, **k))
-    assert mod.build_mcp_toolbox(cfg) == {}
+    # context-manager shaped (M7): still usable, still empty, still closes
+    with mod.build_mcp_toolbox(cfg) as tools:
+        assert tools == {}

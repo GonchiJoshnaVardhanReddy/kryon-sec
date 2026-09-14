@@ -1,8 +1,9 @@
 """Database models (spec v2.1.1 §10.1).
 
-UUIDs are stored as 36-char strings and JSON as the portable JSON type so the
-same models work on PostgreSQL (system of record) and the Profile-1 embedded
-fallback. Purple-team tables are PostgreSQL-only in practice; on the fallback
+UUIDs are stored as 36-char strings and JSON as JSONB on PostgreSQL /
+plain JSON on the fallback (see _json) so the same models work on
+PostgreSQL (system of record) and the Profile-1 embedded fallback.
+Purple-team tables are PostgreSQL-only in practice; on the fallback
 backend only general/shared tables are created.
 """
 
@@ -20,6 +21,7 @@ from sqlalchemy import (
     DateTime,
     Float,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -29,6 +31,12 @@ def _uuid() -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _json() -> JSON:
+    """JSONB on PostgreSQL (indexable, no re-parse), plain JSON on the
+    SQLite fallback (L7)."""
+    return JSON().with_variant(JSONB(), "postgresql")
 
 
 class Base(DeclarativeBase):
@@ -46,7 +54,7 @@ class GeneralSession(Base):
     user_id: Mapped[str] = mapped_column(String(64), default="default")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    messages: Mapped[list] = mapped_column(JSON, default=list)
+    messages: Mapped[list] = mapped_column(_json(), default=list)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
 
@@ -59,7 +67,7 @@ class GeneralUserLtm(Base):
     user_id: Mapped[str] = mapped_column(String(64), default="default")
     category: Mapped[str] = mapped_column(String(64))
     key: Mapped[str] = mapped_column(String(255))
-    value: Mapped[str] = mapped_column(JSON)  # JSON column; writers store str/dict/list
+    value: Mapped[str] = mapped_column(_json())  # writers store str/dict/list
     last_accessed: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     access_count: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -75,7 +83,7 @@ class SystemKnowledge(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     category: Mapped[str] = mapped_column(String(64))
     key: Mapped[str] = mapped_column(String(255))
-    value: Mapped[str] = mapped_column(JSON)  # JSON column; writers store str/dict/list
+    value: Mapped[str] = mapped_column(_json())  # writers store str/dict/list
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
@@ -91,7 +99,7 @@ class StmNode(Base):
     subagent: Mapped[str] = mapped_column(String(64))
     node_type: Mapped[str] = mapped_column(String(32))
     label: Mapped[str] = mapped_column(Text)
-    properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    properties: Mapped[dict | None] = mapped_column(_json(), nullable=True)
     # App-layer computed (spec §4.5): pg_column_size() is not IMMUTABLE.
     size_bytes: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -101,7 +109,7 @@ class LtmTargetProfile(Base):
     __tablename__ = "ltm_target_profiles"
 
     target_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    stack_fingerprint: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    stack_fingerprint: Mapped[dict | None] = mapped_column(_json(), nullable=True)
     last_engagement: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     engagement_count: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -113,14 +121,16 @@ class LtmEngagementSummary(Base):
 
     engagement_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     target_label: Mapped[str] = mapped_column(Text)
-    findings_metadata: Mapped[list] = mapped_column(JSON, default=list)  # title/severity/cvss/status only
+    findings_metadata: Mapped[list] = mapped_column(_json(), default=list)  # title/severity/cvss/status only
     status: Mapped[str] = mapped_column(String(32), default="completed")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class EngagementSecretMap(Base):
     """Local-only placeholder->secret mapping for compaction (spec §6.4).
-    Never sent to any LLM. Values are application-layer encrypted."""
+    Never sent to any LLM. secret_encrypted holds a Fernet token produced by
+    storage.crypto (key at <home>/secret.key); use store_secret/lookup_secret
+    — never write this column directly."""
 
     __tablename__ = "engagement_secret_map"
     __table_args__ = (UniqueConstraint("engagement_id", "placeholder"),)
@@ -128,7 +138,7 @@ class EngagementSecretMap(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     engagement_id: Mapped[str] = mapped_column(String(36))
     placeholder: Mapped[str] = mapped_column(String(64))
-    secret_encrypted: Mapped[str] = mapped_column(String)  # base64 ciphertext (str, not bytes)
+    secret_encrypted: Mapped[str] = mapped_column(String)  # Fernet token (ASCII, not bytes)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -137,7 +147,7 @@ class Checkpoint(Base):
 
     engagement_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     current_state: Mapped[str] = mapped_column(String(32))
-    completed_states: Mapped[list] = mapped_column(JSON, default=list)
+    completed_states: Mapped[list] = mapped_column(_json(), default=list)
     graph_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     audit_log_path: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

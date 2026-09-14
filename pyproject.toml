@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kryonsec"
-version = "1.3.0"
+version = "1.3.1"
 description = "Single-user CLI cybersecurity platform: conversational copilot + deterministic purple-team engine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = [
     "litellm>=1.40",
     "pydantic>=2.6",
     "sqlalchemy>=2.0",
+    "cryptography>=42.0",
     "prompt_toolkit>=3.0",
     "jinja2>=3.1",
     "rich>=13.7",
@@ -32,6 +33,10 @@ where = ["src"]
 [tool.setuptools.package-data]
 # templates/ and containers/ are loaded at runtime relative to the package
 # (__file__), so they must ship inside the wheel — not just the repo.
+# NOTE: only the seccomp JSON ships here. The sandbox image sources
+# (containers/sandbox/*, incl. Dockerfile.kali and scripts/) are NOT in the
+# wheel — install.sh clones the repo to build the image, so nothing under
+# containers/sandbox should ever be added to package-data.
 kryonsec = ["templates/*.jinja", "containers/*.json"]
 
 [tool.pytest.ini_options]

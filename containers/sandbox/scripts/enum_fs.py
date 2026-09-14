@@ -36,8 +36,10 @@ def main() -> int:
         depth = root.rstrip("/").count("/")
         if depth >= MAX_DEPTH:
             dirs[:] = []
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in SKIP_DIRS
-                   and not d.startswith("proc")]
+        # SKIP_DIRS holds absolute paths; /proc, /sys, /dev, /run exist only
+        # at the root, where os.path.join("/", d) produces exactly these.
+        # (No prefix matching: a dir named e.g. "processor" is legitimate.)
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in SKIP_DIRS]
         for name in files:
             entries += 1
             if entries > MAX_ENTRIES:

@@ -86,11 +86,14 @@ def main() -> int:
         return 2
 
     results = [_probe(base_url, path) for path in DOC_PATHS]
-    found = [r for r in results if r.get("status") == 200 or r.get("error")]
+    # "found" is honest (M10): only HTTP 200 responses. Errors (timeouts,
+    # refused connections) go to "unreachable" — a dead host must not read
+    # as "found 4 API docs".
     print(json.dumps({
         "url": base_url,
         "probed": list(DOC_PATHS),
-        "found": found,
+        "found": [r for r in results if r.get("status") == 200],
+        "unreachable": [r for r in results if r.get("error")],
     }))
     return 0
 

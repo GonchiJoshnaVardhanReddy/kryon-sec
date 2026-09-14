@@ -27,7 +27,7 @@ from ..storage import SystemKnowledge, get_session as db_session
 log = logging.getLogger(__name__)
 
 DDG_URL = "https://html.duckduckgo.com/html/?q={query}"
-DDG_LITE_URL = "https://lite.duckduckgo.com/lite/?q={query}"
+DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"  # results come via POST to this
 DDG_API_URL = "https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
 MOJEEK_URL = "https://www.mojeek.com/search?q={query}"
 WIKI_SEARCH_URL = (
@@ -164,13 +164,14 @@ def _from_ddg_lite(query: str) -> list[dict[str, Any]] | None:
     empty search form); the html endpoint often serves a 202 bot-challenge
     instead of results."""
     body = urllib.parse.urlencode({"q": query}).encode("utf-8")
-    page = _fetch(DDG_LITE_URL.format(query=""), data=body)
+    page = _fetch(DDG_LITE_URL, data=body)
     if page is None:
         return None
     links = _LITE_LINK_RE.findall(page) or _LITE_BARE_LINK_RE.findall(page)
     snippets = _LITE_SNIPPET_RE.findall(page)
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
+    accepted = 0  # snippets pair with ACCEPTED results, not with skipped ones
     for href, title in links:
         href = html.unescape(href)
         url_out = _clean_url(href)
@@ -180,10 +181,8 @@ def _from_ddg_lite(query: str) -> list[dict[str, Any]] | None:
         if url_out in seen:
             continue
         seen.add(url_out)
-        snippet = (
-            _strip_tags(snippets[len(seen) - 1])
-            if len(seen) - 1 < len(snippets) else ""
-        )
+        snippet = _strip_tags(snippets[accepted]) if accepted < len(snippets) else ""
+        accepted += 1
         results.append({
             "title": _strip_tags(title) or url_out,
             "url": url_out,
