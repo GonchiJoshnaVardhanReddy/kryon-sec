@@ -77,32 +77,36 @@ RUN pip install --no-cache-dir --break-system-packages \
 # security hole. EVERY download is pinned (tag or commit SHA — never
 # `latest` or a branch head): a rebuild months later must get the exact
 # code that was smoke-tested (M11). Bump pins deliberately, like deps.
+# wget gets --tries/--timeout: a flaky network once left a truncated
+# kr tarball and a 0-byte grype that the || WARN path happily accepted.
 RUN mkdir -p /opt/tools && cd /opt/tools && \
-    (wget -q https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
+    (wget -q --tries=3 --timeout=30 https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
       || echo "WARN: linpeas.sh not installed") && \
-    (wget -q https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
+    (wget -q --tries=3 --timeout=30 https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
       || echo "WARN: pspy64 not installed") && \
-    (wget -q https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
+    (wget -q --tries=3 --timeout=30 https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
       || echo "WARN: linux-exploit-suggester not installed") && \
-    (wget -q https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kr_linux_amd64.tar.gz -O kr.tar.gz \
+    (wget -q --tries=3 --timeout=30 https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kiterunner_1.0.2_linux_amd64.tar.gz -O kr.tar.gz \
       && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
       || echo "WARN: kiterunner (kr) not installed") && \
-    (wget -q https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
+    (wget -q --tries=3 --timeout=30 https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
       && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
-      && cd /opt/tools/SSRFmap && pip install --no-cache-dir --break-system-packages -r requirements.txt \
+      && cd /opt/tools/SSRFmap \
+      && pip install --no-cache-dir --break-system-packages dnslib dnspython flask tldextract \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' ssrfmap.py \
       && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
       || echo "WARN: ssrfmap not installed") && \
-    (wget -q https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
+    (wget -q --tries=3 --timeout=30 https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
       && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
       && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
       || echo "WARN: tplmap not installed") && \
-    (wget -q https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
       && tar xzf /tmp/syft.tar.gz -C /tmp syft && mv /tmp/syft /usr/local/bin/syft && rm -f /tmp/syft.tar.gz \
       || echo "WARN: syft not installed (SBOM scan unavailable)") && \
-    (wget -q https://github.com/anchore/grype/releases/download/v0.95.0/grype_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/grype/releases/download/v0.95.0/grype_0.95.0_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
       && tar xzf /tmp/grype.tar.gz -C /tmp grype && mv /tmp/grype /usr/local/bin/grype && rm -f /tmp/grype.tar.gz \
       || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
-    (wget -q https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
+    (wget -q --tries=3 --timeout=30 https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
       && chmod 0755 /usr/local/bin/osv-scanner \
       || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") ; \
     chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
