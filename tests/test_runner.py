@@ -27,8 +27,8 @@ def _fake_recon(domain):
 )
 def test_sandbox_available_failure_paths(runtimes, image_present, expected_reason):
     with patch("kryonsec.purple.runner.platform.system", return_value="Linux"):
-        with patch("kryonsec.purple.runner._docker_runtimes", return_value=runtimes):
-            with patch("kryonsec.purple.runner._image_present", return_value=image_present):
+        with patch("kryonsec.purple.runtime_checks.docker_runtimes", return_value=runtimes):
+            with patch("kryonsec.purple.runtime_checks.image_present", return_value=image_present):
                 ok, reason = sandbox_available()
     assert not ok
     assert expected_reason in reason
@@ -37,10 +37,10 @@ def test_sandbox_available_failure_paths(runtimes, image_present, expected_reaso
 def test_sandbox_available_ok_when_image_present():
     with patch("kryonsec.purple.runner.platform.system", return_value="Linux"):
         with patch(
-            "kryonsec.purple.runner._docker_runtimes",
+            "kryonsec.purple.runtime_checks.docker_runtimes",
             return_value="io.containerd.runc.v2,runc,runsc",
         ):
-            with patch("kryonsec.purple.runner._image_present", return_value=True):
+            with patch("kryonsec.purple.runtime_checks.image_present", return_value=True):
                 ok, reason = sandbox_available()
     assert ok, reason
     assert reason == "ok"
@@ -244,7 +244,9 @@ def test_engagement_code_folder_wiring(tmp_path):
     code = tmp_path / "victim"
     code.mkdir()
 
-    code_dirs: list = []
+    # (code_dir, evidence_dir) of every sandbox handed to a subagent —
+    # the base construction AND every copy_with variant
+    mounts: list = []
     bt_kwargs: dict = {}
 
     class FakeBlueTeam:
@@ -260,16 +262,24 @@ def test_engagement_code_folder_wiring(tmp_path):
         stderr = ""
 
     orig_sb_init = sb_mod.KaliSandbox.__init__
+    orig_sb_copy = sb_mod.KaliSandbox.copy_with
     orig_bt = bt_mod.BlueTeamSubagent
 
-    def _init_sb(self, cfg, code_dir=None, **kw):
-        orig_sb_init(self, cfg, code_dir=code_dir, **kw)
-        code_dirs.append(code_dir)
+    def _init_sb(self, cfg, code_dir=None, evidence_dir=None, **kw):
+        orig_sb_init(self, cfg, code_dir=code_dir,
+                     evidence_dir=evidence_dir, **kw)
+        mounts.append((code_dir, evidence_dir))
         # every spawn "succeeds" with empty output — no docker needed
         self._run = lambda argv, **kw2: FakeProc()
 
+    def _copy_sb(self, code_dir=None, evidence_dir=None):
+        clone = orig_sb_copy(self, code_dir=code_dir, evidence_dir=evidence_dir)
+        mounts.append((clone.code_dir, clone.evidence_dir))
+        return clone
+
     bt_mod.BlueTeamSubagent = FakeBlueTeam
     sb_mod.KaliSandbox.__init__ = _init_sb
+    sb_mod.KaliSandbox.copy_with = _copy_sb
     try:
         with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
             with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
@@ -280,14 +290,15 @@ def test_engagement_code_folder_wiring(tmp_path):
     finally:
         bt_mod.BlueTeamSubagent = orig_bt
         sb_mod.KaliSandbox.__init__ = orig_sb_init
+        sb_mod.KaliSandbox.copy_with = orig_sb_copy
 
     assert "BLUE_TEAM" in completed
     # the subagent got the folder, and its sandbox got the /code mount
     assert bt_kwargs["code_folder"] == str(code)
-    assert code_dirs[-1] == str(code)
-    # every OTHER sandbox (recon/exploit/verify) is mount-free
-    assert code_dirs[:-1]
-    assert all(cd is None for cd in code_dirs[:-1])
+    code_mounts = [cd for cd, _ in mounts if cd is not None]
+    assert code_mounts == [str(code)]  # exactly one, and only blue team
+    # the base sandbox (passive/hypothesize) is mount-free
+    assert mounts[0] == (None, None)
 
     created = next(e for e in _audit_events(audit)
                    if e["event"] == "engagement_created")
@@ -332,7 +343,8 @@ def test_engagement_evidence_dir_wiring(tmp_path):
 
     cfg = KryonsecConfig(home=tmp_path)
 
-    evidence_dirs: list = []
+    # (code_dir, evidence_dir) of every sandbox handed to a subagent
+    mounts: list = []
 
     def fake_llm(prompt):
         return HypothesisSet(hypotheses=[
@@ -354,6 +366,7 @@ def test_engagement_evidence_dir_wiring(tmp_path):
     orig_hyp_init = hyp_mod.HypothesizeSubagent.__init__
     orig_hr_init = hr_mod.HumanReviewSubagent.__init__
     orig_sb_init = sb_mod.KaliSandbox.__init__
+    orig_sb_copy = sb_mod.KaliSandbox.copy_with
 
     def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None,
                   sandbox=None):
@@ -366,12 +379,18 @@ def test_engagement_evidence_dir_wiring(tmp_path):
     def _init_sb(self, cfg, code_dir=None, evidence_dir=None, **kw):
         orig_sb_init(self, cfg, code_dir=code_dir,
                      evidence_dir=evidence_dir, **kw)
-        evidence_dirs.append(evidence_dir)
+        mounts.append((code_dir, evidence_dir))
         self._run = lambda argv, **kw2: FakeProc()
+
+    def _copy_sb(self, code_dir=None, evidence_dir=None):
+        clone = orig_sb_copy(self, code_dir=code_dir, evidence_dir=evidence_dir)
+        mounts.append((clone.code_dir, clone.evidence_dir))
+        return clone
 
     hyp_mod.HypothesizeSubagent.__init__ = _init_hyp
     hr_mod.HumanReviewSubagent.__init__ = _init_hr
     sb_mod.KaliSandbox.__init__ = _init_sb
+    sb_mod.KaliSandbox.copy_with = _copy_sb
     try:
         with patch("kryonsec.purple.runner.sandbox_available", return_value=(True, "ok")):
             with patch("kryonsec.purple.recon_passive.zone_a_fetchers", return_value=[_fake_recon]):
@@ -382,15 +401,16 @@ def test_engagement_evidence_dir_wiring(tmp_path):
         hyp_mod.HypothesizeSubagent.__init__ = orig_hyp_init
         hr_mod.HumanReviewSubagent.__init__ = orig_hr_init
         sb_mod.KaliSandbox.__init__ = orig_sb_init
+        sb_mod.KaliSandbox.copy_with = orig_sb_copy
 
     assert "RECON_ACTIVE" in completed
     # POST_EXPLOIT is dormant (no tool yields a shell, so shell_obtained
     # never fires) — the three evidence-producing states that actually run
     # are active recon, exploit, verify. Passive/hypothesize get no mount.
     expected = str(cfg.home / "engagements" / "e-ev" / "evidence")
-    producers = [d for d in evidence_dirs if d is not None]
+    producers = [ed for _, ed in mounts if ed is not None]
     assert producers == [expected] * 3
-    assert evidence_dirs[0] is None  # passive recon needs no evidence mount
+    assert mounts[0] == (None, None)  # the base sandbox needs no evidence mount
     # the folder was actually created on disk
     assert (cfg.home / "engagements" / "e-ev" / "evidence").is_dir()
     ok, reason = audit.verify()

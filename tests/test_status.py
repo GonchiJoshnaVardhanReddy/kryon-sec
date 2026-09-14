@@ -87,11 +87,3 @@ def test_non_terminal_console_is_fully_silent():
         assert not line.active
     line.update("x")
     line.hide()
-
-
-def test_stop_if_active_is_hide():
-    con = FakeConsole()
-    line = StatusLine(con)
-    line.show("x")
-    line.stop_if_active()
-    assert not line.active

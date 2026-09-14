@@ -61,7 +61,12 @@ _FINDING_COUNT_RES: dict[str, list[re.Pattern[str]]] = {
 
 def _count_findings(tool: str, stdout: str) -> int | None:
     """Approximate the findings count from scanner text output. None when
-    the output shape is unknown — never a guess presented as a count."""
+    the output shape is unknown — never a guess presented as a count.
+
+    syft is NOT counted here: an SBOM is a package inventory, not a
+    findings list — "syft: 400 findings" on a clean project reads as 400
+    vulnerabilities. Its package count goes to packages_count / the SBOM
+    summary line instead (M14)."""
     import json as _json
 
     # trivy/checkov often print JSON when configured — try that first
@@ -73,9 +78,7 @@ def _count_findings(tool: str, stdout: str) -> int | None:
                            for r in data["Results"])
             if tool == "checkov" and isinstance(data.get("failed_checks"), list):
                 return len(data["failed_checks"])
-            # Phase 8 SBOM/dependency scanners (JSON by flag)
-            if tool == "syft" and isinstance(data.get("artifacts"), list):
-                return len(data["artifacts"])  # package count, not vulns
+            # Phase 8 dependency-vulnerability scanners (JSON by flag)
             if tool == "osv-scanner" and isinstance(data.get("results"), list):
                 return sum(
                     len(r.get("packages") or []) and sum(
@@ -93,6 +96,19 @@ def _count_findings(tool: str, stdout: str) -> int | None:
         if matches:
             # "N findings" styles report a number; occurrence styles count
             return int(matches[-1]) if matches[-1].isdigit() else len(matches)
+    return None
+
+
+def _count_packages(stdout: str) -> int | None:
+    """syft SBOM package count — an inventory size, never a findings count."""
+    import json as _json
+
+    try:
+        data = _json.loads(stdout)
+        if isinstance(data, dict) and isinstance(data.get("artifacts"), list):
+            return len(data["artifacts"])
+    except (ValueError, TypeError):
+        pass
     return None
 
 
@@ -157,6 +173,12 @@ def run_code_scanners(
         count = _count_findings(tool, result.stdout)
         if count is not None:
             properties["findings_count"] = count
+        if tool == "syft":
+            # M14: package inventory, rendered as the SBOM summary line —
+            # never as a "findings" count in the scanner table
+            packages = _count_packages(result.stdout)
+            if packages is not None:
+                properties["packages_count"] = packages
         graph.add_node(
             node_type="scanner_result", label=tool, properties=properties,
         )

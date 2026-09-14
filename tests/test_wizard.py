@@ -154,6 +154,9 @@ def test_wizard_openai_flow_writes_config(scripted_wizard, tmp_path):
     assert cfg.provider == "openai"
     assert cfg.openai_api_key == "sk-test-123"
     assert cfg.general_chat_model == "gpt-4o-mini"
+    # H2: search/compaction reuse the chosen chat model, not hardcoded gpt-4o-mini
+    assert cfg.general_search_model == "gpt-4o-mini"  # == the chosen model here
+    assert cfg.compaction_model == "gpt-4o-mini"
     assert cfg.enabled_tools == ["file_read", "cve_lookup"]
     assert [s["name"] for s in cfg.mcp_servers] == ["fetch"]
 
@@ -168,6 +171,8 @@ def test_wizard_openai_flow_writes_config(scripted_wizard, tmp_path):
 def test_wizard_ollama_flow(scripted_wizard, monkeypatch, tmp_path):
     monkeypatch.setattr("kryonsec.wizard.ollama_model_names",
                         lambda host: ["llama3.1:latest", "mistral:latest"])
+    # a stale OpenAI key from a previous setup must not survive Ollama setup
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stale-from-before")
     cfg = scripted_wizard([
         "2",       # Ollama
         "1",       # llama3.1:latest
@@ -178,6 +183,8 @@ def test_wizard_ollama_flow(scripted_wizard, monkeypatch, tmp_path):
     assert cfg.provider == "ollama"
     assert cfg.general_chat_model == "ollama/llama3.1"  # implicit :latest stripped
     assert cfg.local_model == "ollama/llama3.1"
+    # M1: picking Ollama clears any stale OpenAI key (strict isolation)
+    assert cfg.openai_api_key is None
     assert cfg.enabled_tools == ["file_write", "cve_lookup"]
     assert cfg.mcp_servers == []
 

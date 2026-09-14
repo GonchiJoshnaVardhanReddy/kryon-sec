@@ -5,8 +5,11 @@ server: kryonsec starts it, lists its tools, and exposes them to the
 LLM agent alongside the built-in tools. A server that fails to start is
 skipped with a console notice — it never blocks the chat.
 
-The `mcp` package is imported lazily: base installs without MCP servers
-pay no import cost.
+The `mcp` package is a REQUIRED dependency (the setup wizard offers MCP
+presets, so a default install must run them), but it is still imported
+lazily: sessions with no MCP servers configured pay no import cost. The
+ImportError guard only covers broken/partial installs — it is not a
+supported "base without mcp" configuration.
 
 Threading model: each server runs on its own daemon thread inside
 anyio.run (asyncio backend). Tool executors marshal the call onto that
@@ -17,10 +20,11 @@ loop", so a fresh anyio.run per call (the v1.1 bug) is never done.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ..config import KryonsecConfig
 
@@ -268,9 +272,11 @@ class McpToolbox:
             pass
 
         conn = _ServerConnection()
-        self._thread = threading.Thread(
+        # daemon thread, never joined — a local is enough (M6: a self._thread
+        # attribute here was clobbered per server and read by nobody)
+        thread = threading.Thread(
             target=self._run_bg, args=(conn, params, errlog), daemon=True)
-        self._thread.start()
+        thread.start()
         # wait briefly for the tool list (or failure) to arrive; a server
         # that overruns it is NOT dropped — see _wait_late
         slow = not conn.ready.wait(timeout=10)
@@ -326,15 +332,27 @@ def _schema(tool: Any) -> dict:
     }
 
 
-def build_mcp_toolbox(cfg: KryonsecConfig) -> dict[str, tuple[dict, Any]]:
-    """Convenience wrapper: connect all enabled servers, return the
-    toolbox entries (possibly empty). The caller cannot close the
-    servers afterwards — prefer McpToolbox directly for long sessions."""
+@contextlib.contextmanager
+def build_mcp_toolbox(cfg: KryonsecConfig) -> Iterator[dict[str, tuple[dict, Any]]]:
+    """Convenience wrapper: connect all enabled servers and yield the
+    toolbox entries (possibly empty). Context-manager shaped (M7): the
+    servers are CLOSED on exit — the old bare-call form leaked every
+    server process it started for the rest of the session.
+
+        with build_mcp_toolbox(cfg) as tools:
+            ...
+    """
+    toolbox: dict[str, tuple[dict, Any]] = {}
+    box: McpToolbox | None = None
     try:
-        return McpToolbox(cfg).connect_all()
+        box = McpToolbox(cfg)
+        toolbox = box.connect_all()
     except ImportError:
         log.info("mcp package not installed — MCP tools unavailable")
-        return {}
     except Exception as e:
         log.warning("MCP connect failed: %s", e)
-        return {}
+    try:
+        yield toolbox
+    finally:
+        if box is not None:
+            box.close()

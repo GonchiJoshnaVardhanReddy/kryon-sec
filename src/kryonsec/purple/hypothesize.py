@@ -95,11 +95,16 @@ def render_hypothesize_prompt(graph: EngagementGraph) -> str:
         for note in node.get("properties", {}).get("notes", []):
             notes.append(f"[{node['label']}] {note}")
 
+    # L8: the tool list is generated from the allowlist module — a
+    # hardcoded copy here silently drifted whenever a tool was added
+    from .allowlist import EXPLOIT_TEMPLATES
+
     return template.render(
         target=target,
         subdomains=subdomains[:50],
         paths=paths[:50],
         notes=notes[:20],
+        tools=list(EXPLOIT_TEMPLATES),  # order-stable dict keys
         services=[
             {"label": n["label"], **n["properties"]}
             for n in graph.by_type("service")

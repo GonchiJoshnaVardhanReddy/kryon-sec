@@ -58,6 +58,3 @@ class StatusLine:
         if self._status is not None:
             self._status.stop()
             self._status = None
-
-    # alias: safety net for an exception unwinding past the context manager
-    stop_if_active = hide

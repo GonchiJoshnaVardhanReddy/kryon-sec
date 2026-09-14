@@ -74,24 +74,25 @@ RUN pip install --no-cache-dir --break-system-packages \
 
 # GitHub-hosted tools (no apt package). All best-effort with the same
 # rule as pip above: absent tool = audited spawn failure, never a silent
-# security hole. Pinned release tags where they exist; branch tarballs
-# (SSRFmap/tplmap) may drift — rebuild after reviewing the diff.
+# security hole. EVERY download is pinned (tag or commit SHA — never
+# `latest` or a branch head): a rebuild months later must get the exact
+# code that was smoke-tested (M11). Bump pins deliberately, like deps.
 RUN mkdir -p /opt/tools && cd /opt/tools && \
-    (wget -q https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -O /usr/local/bin/linpeas.sh \
+    (wget -q https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
       || echo "WARN: linpeas.sh not installed") && \
-    (wget -q https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64 -O /usr/local/bin/pspy64 \
+    (wget -q https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
       || echo "WARN: pspy64 not installed") && \
-    (wget -q https://raw.githubusercontent.com/jondonas/linux-exploit-suggester/master/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
+    (wget -q https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
       || echo "WARN: linux-exploit-suggester not installed") && \
     (wget -q https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kr_linux_amd64.tar.gz -O kr.tar.gz \
       && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
       || echo "WARN: kiterunner (kr) not installed") && \
-    (wget -q https://github.com/swisskyrepo/SSRFmap/archive/refs/heads/master.tar.gz -O ssrfmap.tar.gz \
+    (wget -q https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
       && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
       && cd /opt/tools/SSRFmap && pip install --no-cache-dir --break-system-packages -r requirements.txt \
       && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
       || echo "WARN: ssrfmap not installed") && \
-    (wget -q https://github.com/epinna/tplmap/archive/refs/heads/master.tar.gz -O tplmap.tar.gz \
+    (wget -q https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
       && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
       && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
       || echo "WARN: tplmap not installed") && \

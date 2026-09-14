@@ -189,6 +189,30 @@ def test_from_ddg_lite_fallback_when_html_empty(monkeypatch):
     assert results[0]["snippet"] == "A page about security"
 
 
+def test_from_ddg_lite_snippets_pair_with_accepted_results(monkeypatch):
+    """H3 regression: DDG-nav links interleaved with results must not shift
+    the snippet pairing — snippet N belongs to the Nth ACCEPTED result, not
+    to the Nth link on the page."""
+    from kryonsec.copilot.websearch import _from_ddg_lite
+
+    page = """
+    <a rel="nofollow" href="https://duckduckgo.com/lite/?p=1" class="result-link">Next page</a>
+    <a rel="nofollow" href="https://first.example/a" class="result-link">First result</a>
+    <td class="result-snippet">snippet for first</td>
+    <a rel="nofollow" href="https://duckduckgo.com/lite/?p=2" class="result-link">More</a>
+    <a rel="nofollow" href="https://second.example/b" class="result-link">Second result</a>
+    <td class="result-snippet">snippet for second</td>
+    """
+    _patch_urlopen(monkeypatch, page)
+    results = _from_ddg_lite("q")
+    assert results is not None
+    assert len(results) == 2
+    assert results[0]["url"] == "https://first.example/a"
+    assert results[0]["snippet"] == "snippet for first"
+    assert results[1]["url"] == "https://second.example/b"
+    assert results[1]["snippet"] == "snippet for second"
+
+
 def test_from_ddg_falls_back_to_mojeek(monkeypatch):
     """DDG's web endpoints bot-challenge some IPs — Mojeek is the next
     source in the chain and has no bot wall."""

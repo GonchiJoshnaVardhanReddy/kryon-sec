@@ -39,12 +39,14 @@ ALLOWED_TOOLS=(
     "GetNPUsers.py" "GetUserSPNs.py" "GetADUsers.py" "findDelegation.py"
     "bloodhound-python"
     # blue-team static analyzers (Phase 5) — run against /code read-only
-    "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint" "kube-bench"
+    # (kube-bench deliberately NOT here: excluded from Phase 8's fixed plan
+    # and not host-allowlisted — see the extras line below)
+    "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint"
     # blue-team SBOM/dependency scanners (Phase 8)
     "syft" "osv-scanner" "grype"
     # image-side extras kept from the original image (not host-allowlisted
     # today, harmless here — the HOST allowlist is the authoritative gate)
-    "python3" "bloodhound-python"
+    "python3" "kube-bench"
 )
 
 if [[ -z "$TOOL" ]] || [[ ! " ${ALLOWED_TOOLS[*]} " =~ " ${TOOL} " ]]; then

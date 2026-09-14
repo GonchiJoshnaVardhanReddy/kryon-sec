@@ -6,7 +6,6 @@ Prints a pass/fail report. Purple Team refuses to start on failure.
 
 from __future__ import annotations
 
-import shutil
 import sys
 
 from rich.console import Console
@@ -36,7 +35,10 @@ def _check_ollama(cfg: KryonsecConfig) -> tuple[bool, str]:
     try:
         import urllib.request
 
-        with urllib.request.urlopen(f"{host}/api/tags", timeout=3) as r:
+        # 8 s: a cold `ollama serve` can take several seconds to answer the
+        # first /api/tags — 3 s reported "down" on machines where it was
+        # merely still starting
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=8) as r:
             if r.status == 200:
                 return True, f"OK ({host})"
             return False, f"HTTP {r.status}"
@@ -51,37 +53,17 @@ def _check_openai(cfg: KryonsecConfig) -> tuple[bool, str]:
 
 
 def _check_docker() -> tuple[bool, str]:
-    docker = shutil.which("docker")
-    if not docker:
-        return False, "docker CLI not found"
-    import subprocess
+    from .purple import runtime_checks
 
-    try:
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if out.returncode == 0:
-            return True, f"OK (server {out.stdout.strip()})"
-        return False, "daemon not reachable"
-    except Exception as e:
-        return False, str(e)
+    return runtime_checks.docker_server_ok()
 
 
 def _check_gvisor() -> tuple[bool, str]:
-    import subprocess
+    from .purple import runtime_checks
 
-    try:
-        # .Runtimes is a Go map — `join` errors on it (moby#37584); range it
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if out.returncode == 0 and "runsc" in out.stdout:
-            return True, "OK (runsc registered)"
-        return False, "runsc runtime not registered — gVisor missing"
-    except Exception as e:
-        return False, str(e)
+    if runtime_checks.runsc_registered():
+        return True, "OK (runsc registered)"
+    return False, "runsc runtime not registered — gVisor missing"
 
 
 def run_doctor(cfg: KryonsecConfig | None = None) -> int:
@@ -89,7 +71,9 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
     cfg = cfg or KryonsecConfig()
     is_linux = sys.platform.startswith("linux")
 
-    checks: list[tuple[str, str, bool, str]] = []
+    # ok is None for deliberate skips (non-Linux platform) — rendered as
+    # yellow SKIP, never as a red FAIL that looks like something broke
+    checks: list[tuple[str, str, bool | None, str]] = []
 
     ok, msg = _check_storage(cfg)
     checks.append(("Storage", "", ok, msg))
@@ -100,7 +84,8 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
 
     checks.append((
         "Purple Team: platform", "gVisor requires Linux",
-        is_linux, "OK (Linux)" if is_linux else "NOT Linux — this machine cannot run Purple Team",
+        True if is_linux else None,
+        "OK (Linux)" if is_linux else "NOT Linux — this machine cannot run Purple Team",
     ))
     if is_linux:
         ok, msg = _check_docker()
@@ -109,10 +94,10 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
             ok, msg = _check_gvisor()
             checks.append(("Purple Team: gVisor (runsc)", "sandbox runtime", ok, msg))
             if ok:
-                from .purple.runner import _image_present
+                from .purple import runtime_checks
 
                 image = cfg.sandbox_image
-                if _image_present(image):
+                if runtime_checks.image_present(image):
                     checks.append(("Purple Team: sandbox image", "Zone B tool container", True, f"OK ({image})"))
                 else:
                     checks.append((
@@ -122,7 +107,7 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
                     ))
     else:
         checks.append((
-            "Purple Team: Docker", "sandbox host", False,
+            "Purple Team: Docker", "sandbox host", None,
             "skipped (non-Linux; use WSL2 or a Linux VM for Purple Team)",
         ))
 
@@ -134,7 +119,10 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
         # ASCII markers, not ✔/✘: doctor must render in ANY console,
         # including legacy cp1252 ones (it's the tool you run when
         # things are already broken)
-        mark = "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
+        if ok is None:
+            mark = "[yellow]SKIP[/yellow]"
+        else:
+            mark = "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
         table.add_row(name, purpose, f"{mark} {msg}")
     console.print(table)
 
@@ -144,7 +132,8 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
     storage_ok = checks[0][2]
     any_llm = checks[1][2] or checks[2][2]
     copilot_ok = storage_ok and any_llm
-    purple_ok = all(ok for _, _, ok, _ in checks)
+    # skipped rows count as "not available here", not "failed"
+    purple_ok = all(ok is True for _, _, ok, _ in checks)
 
     from rich.panel import Panel
 

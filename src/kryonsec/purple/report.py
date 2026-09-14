@@ -331,9 +331,9 @@ def render_report(
     sbom_summary = ""
     syft_nodes = [n for n in graph.by_type("scanner_result")
                   if n["label"] == "syft"]
-    if syft_nodes and syft_nodes[0]["properties"].get("findings_count"):
+    if syft_nodes and syft_nodes[0]["properties"].get("packages_count"):
         sbom_summary = (
-            f"SBOM: {syft_nodes[0]['properties']['findings_count']} "
+            f"SBOM: {syft_nodes[0]['properties']['packages_count']} "
             "packages identified (syft)")
 
     return template.render(

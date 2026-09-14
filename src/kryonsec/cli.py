@@ -255,7 +255,15 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     preload_litellm()
 
+    _exited = [False]
+
     def _exit() -> None:
+        # one-shot: _print_goodbye runs it on the normal exit paths, the
+        # finally around the chat loop runs it on interrupts — both can
+        # fire for the same exit, and the session must persist exactly once
+        if _exited[0]:
+            return
+        _exited[0] = True
         _persist_session(cfg, session)
         if mcp_toolbox is not None:
             mcp_toolbox.close()
@@ -272,224 +280,230 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
     ps = make_prompt_session(_mode, _notice, cfg, on_change=_on_mode_change)
 
-    while True:
-        try:
-            if ps is not None:
-                user_input = await ps.prompt_async()
-            else:  # prompt_toolkit unavailable — plain input fallback
-                user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
-        except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
-            _print_goodbye(_exit)
-            return
-        finally:
-            _notice[0] = ""  # notices are one-shot
-
-        text = user_input.strip()
-        if not text:
-            continue
-
-        cmd = text.lower()
-        if cmd in ("/quit", "/exit", "exit", "quit", "q"):
-            _print_goodbye(_exit)
-            return
-        if cmd == "/help":
-            _print_help()
-            continue
-        if cmd == "/mode":
-            from .tui import set_mode
-
-            target = "purple" if _mode[0] == "copilot" else "copilot"
-            if set_mode(_mode, _notice, cfg, target):
-                console.clear()  # repaint the banner in the new mode color
-                _print_banner(_mode[0])
-            if _notice[0]:
-                console.print(f"[cyan]{_notice[0]}[/cyan]")
-                if _mode[0] != "purple":
-                    console.print("[yellow]staying in copilot[/yellow]")
-            continue
-
-        # ---- CVE lookup (spec §3.6) --------------------------------------
-        if cmd.startswith("/cve "):
-            from rich.console import Group
-            from rich.panel import Panel
-            from rich.table import Table
-            from rich.text import Text
-
-            from .copilot.cve import lookup_cve
-
+    try:
+        while True:
             try:
-                record = lookup_cve(cfg, text[len("/cve "):].strip())
-            except ValueError as e:
+                if ps is not None:
+                    user_input = await ps.prompt_async()
+                else:  # prompt_toolkit unavailable — plain input fallback
+                    user_input = console.input(f"[cyan]\\[{_mode[0].upper()}]>[/cyan] ")
+            except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
+                _print_goodbye(_exit)
+                return
+            finally:
+                _notice[0] = ""  # notices are one-shot
+
+            text = user_input.strip()
+            if not text:
+                continue
+
+            cmd = text.lower()
+            if cmd in ("/quit", "/exit", "exit", "quit", "q"):
+                _print_goodbye(_exit)
+                return
+            if cmd == "/help":
+                _print_help()
+                continue
+            if cmd == "/mode":
+                from .tui import set_mode
+
+                target = "purple" if _mode[0] == "copilot" else "copilot"
+                if set_mode(_mode, _notice, cfg, target):
+                    console.clear()  # repaint the banner in the new mode color
+                    _print_banner(_mode[0])
+                if _notice[0]:
+                    console.print(f"[cyan]{_notice[0]}[/cyan]")
+                    if _mode[0] != "purple":
+                        console.print("[yellow]staying in copilot[/yellow]")
+                continue
+
+            # ---- CVE lookup (spec §3.6) --------------------------------------
+            if cmd.startswith("/cve "):
+                from rich.console import Group
+                from rich.panel import Panel
+                from rich.table import Table
+                from rich.text import Text
+
+                from .copilot.cve import lookup_cve
+
+                try:
+                    record = lookup_cve(cfg, text[len("/cve "):].strip())
+                except ValueError as e:
+                    err_console.print(f"{e}")
+                    continue
+                if not record:
+                    console.print(
+                        "[yellow]not found (offline cache miss and NVD "
+                        "unreachable — try again online)[/yellow]")
+                    continue
+                sev = str(record.get("severity") or "?").lower()
+                sev_color = {"critical": "red", "high": "red",
+                             "medium": "yellow", "low": "green"}.get(sev, "cyan")
+                score = record.get("cvss_score")
+                t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+                t.add_column(style="bold")
+                t.add_column()
+                t.add_row("severity", f"[{sev_color}]{sev.upper()}[/]")
+                t.add_row("CVSS", f"{score if score is not None else '?'}")
+                refs = [r for r in (record.get("references") or []) if r]
+                if refs:
+                    t.add_row("refs", f"{len(refs)} reference(s)")
+                # a Rich renderable must be a Panel child, never f-string
+                # interpolated — str(Table) is an object repr, not the table
+                console.print(Panel(
+                    Group(t, Text(""), Text(record.get("description", "")[:500])),
+                    title=f"[bold]{record['id']}[/bold]",
+                    border_style=sev_color,
+                ))
+                continue
+
+            # ---- web search (spec §3.7) --------------------------------------
+            if cmd.startswith("/search "):
+                from .copilot.websearch import search_web
+
+                query = text[len("/search "):].strip()
+                results = search_web(cfg, query)
+                if results is None:
+                    console.print("[yellow]search failed (offline or blocked — try again online)[/yellow]")
+                    continue
+                if not results:
+                    console.print("[yellow]no results[/yellow]")
+                    continue
+                from rich.rule import Rule
+
+                console.print(Rule(f"[bold]web results[/bold] — {len(results)} found"))
+                for i, r in enumerate(results, 1):
+                    console.print(
+                        f"  [bold cyan]{i}.[/bold cyan] [bold]{r['title']}[/bold]")
+                    console.print(f"     [dim]{r['snippet']}[/dim]")
+                    console.print(f"     [blue]{r['url']}[/blue]\n")
+                session.add("user", f"[web search results for: {query}]\n" + "\n".join(
+                    f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results))
+                console.print("[green]results now in context — ask about them[/green]")
+                continue
+
+            # ---- file tools (spec §3.7) -------------------------------------
+            try:
+                if cmd == "/workspace":
+                    console.print(f"[dim]{cfg.workspace}[/dim]")
+                    continue
+                if cmd.startswith("/read "):
+                    from .copilot.tools import FileTools
+
+                    path = text[len("/read "):].strip()
+                    content = FileTools(cfg, approver=_console_approve).read_file(path)
+                    session.add("user", f"[file contents of {path}]\n{content}")
+                    console.print(f"[green]read {path} ({len(content)} chars) — now in context[/green]")
+                    continue
+                if cmd.startswith("/ls "):
+                    from .copilot.tools import FileTools
+
+                    path = text[len("/ls "):].strip()
+                    entries = FileTools(cfg, approver=_console_approve).list_directory(path)
+                    console.print("\n".join(entries))
+                    continue
+                if cmd.startswith("/write "):
+                    from .copilot.tools import FileTools
+
+                    # /write <path> then the next line is content
+                    path = text[len("/write "):].strip()
+                    content = console.input("[dim]content> [/dim]")
+                    FileTools(cfg, approver=_console_approve).write_file(path, content)
+                    console.print(f"[green]wrote {path}[/green]")
+                    continue
+            except Exception as e:
                 err_console.print(f"{e}")
                 continue
-            if not record:
-                console.print(
-                    "[yellow]not found (offline cache miss and NVD "
-                    "unreachable — try again online)[/yellow]")
+
+            # ---- purple mode: typed text is a target domain -------------------
+            if _mode[0] == "purple":
+                _run_purple(cfg, text)
                 continue
-            sev = str(record.get("severity") or "?").lower()
-            sev_color = {"critical": "red", "high": "red",
-                         "medium": "yellow", "low": "green"}.get(sev, "cyan")
-            score = record.get("cvss_score")
-            t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
-            t.add_column(style="bold")
-            t.add_column()
-            t.add_row("severity", f"[{sev_color}]{sev.upper()}[/]")
-            t.add_row("CVSS", f"{score if score is not None else '?'}")
-            refs = [r for r in (record.get("references") or []) if r]
-            if refs:
-                t.add_row("refs", f"{len(refs)} reference(s)")
-            # a Rich renderable must be a Panel child, never f-string
-            # interpolated — str(Table) is an object repr, not the table
-            console.print(Panel(
-                Group(t, Text(""), Text(record.get("description", "")[:500])),
-                title=f"[bold]{record['id']}[/bold]",
-                border_style=sev_color,
-            ))
-            continue
 
-        # ---- web search (spec §3.7) --------------------------------------
-        if cmd.startswith("/search "):
-            from .copilot.websearch import search_web
+            session.add("user", text)
+            try:
+                await session.maybe_compact()
+            except Exception as e:
+                # compaction is an optimization, not a chat dependency — a
+                # broken compaction model must not kill the CLI mid-turn
+                err_console.print(
+                    f"[yellow]compaction skipped ({type(e).__name__})[/yellow]")
+                log.warning("compaction failed: %s", e)
 
-            query = text[len("/search "):].strip()
-            results = search_web(cfg, query)
-            if results is None:
-                console.print("[yellow]search failed (offline or blocked — try again online)[/yellow]")
-                continue
-            if not results:
-                console.print("[yellow]no results[/yellow]")
-                continue
-            from rich.rule import Rule
+            # ---- the agent loop (v1.1): tools when the LLM asks --------------
+            from .copilot.agent import build_toolbox, run_agent
+            from .copilot.tools import FileTools
+            from .status import StatusLine
 
-            console.print(Rule(f"[bold]web results[/bold] — {len(results)} found"))
-            for i, r in enumerate(results, 1):
-                console.print(
-                    f"  [bold cyan]{i}.[/bold cyan] [bold]{r['title']}[/bold]")
-                console.print(f"     [dim]{r['snippet']}[/dim]")
-                console.print(f"     [blue]{r['url']}[/blue]\n")
-            session.add("user", f"[web search results for: {query}]\n" + "\n".join(
-                f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results))
-            console.print("[green]results now in context — ask about them[/green]")
-            continue
+            file_tools = FileTools(cfg, approver=_console_approve)
+            mcp_extra = mcp_toolbox.snapshot() if mcp_toolbox is not None else None
+            toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
 
-        # ---- file tools (spec §3.7) -------------------------------------
-        try:
-            if cmd == "/workspace":
-                console.print(f"[dim]{cfg.workspace}[/dim]")
-                continue
-            if cmd.startswith("/read "):
-                from .copilot.tools import FileTools
+            status = StatusLine(console)
 
-                path = text[len("/read "):].strip()
-                content = FileTools(cfg, approver=_console_approve).read_file(path)
-                session.add("user", f"[file contents of {path}]\n{content}")
-                console.print(f"[green]read {path} ({len(content)} chars) — now in context[/green]")
-                continue
-            if cmd.startswith("/ls "):
-                from .copilot.tools import FileTools
+            def _show_tool(name: str, args: dict) -> None:
+                # the spinner gives way: the tool may prompt for approval,
+                # which needs the terminal
+                status.hide()
+                arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in (args or {}).items())
+                console.print(f"  [dim]{TREE_BRANCH}[/dim] [cyan]{name}[/cyan][dim]({arg_preview})[/dim]")
 
-                path = text[len("/ls "):].strip()
-                entries = FileTools(cfg, approver=_console_approve).list_directory(path)
-                console.print("\n".join(entries))
-                continue
-            if cmd.startswith("/write "):
-                from .copilot.tools import FileTools
-
-                # /write <path> then the next line is content
-                path = text[len("/write "):].strip()
-                content = console.input("[dim]content> [/dim]")
-                FileTools(cfg, approver=_console_approve).write_file(path, content)
-                console.print(f"[green]wrote {path}[/green]")
-                continue
-        except Exception as e:
-            err_console.print(f"{e}")
-            continue
-
-        # ---- purple mode: typed text is a target domain -------------------
-        if _mode[0] == "purple":
-            _run_purple(cfg, text)
-            continue
-
-        session.add("user", text)
-        try:
-            await session.maybe_compact()
-        except Exception as e:
-            # compaction is an optimization, not a chat dependency — a
-            # broken compaction model must not kill the CLI mid-turn
-            err_console.print(
-                f"[yellow]compaction skipped ({type(e).__name__})[/yellow]")
-            log.warning("compaction failed: %s", e)
-
-        # ---- the agent loop (v1.1): tools when the LLM asks --------------
-        from .copilot.agent import build_toolbox, run_agent
-        from .copilot.tools import FileTools
-        from .status import StatusLine
-
-        file_tools = FileTools(cfg, approver=_console_approve)
-        mcp_extra = mcp_toolbox.snapshot() if mcp_toolbox is not None else None
-        toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
-
-        status = StatusLine(console)
-
-        def _show_tool(name: str, args: dict) -> None:
-            # the spinner gives way: the tool may prompt for approval,
-            # which needs the terminal
-            status.hide()
-            arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in (args or {}).items())
-            console.print(f"  [dim]{TREE_BRANCH}[/dim] [cyan]{name}[/cyan][dim]({arg_preview})[/dim]")
-
-        def _show_round() -> None:
-            status.show(f"[cyan]copilot[/cyan] thinking…")
-
-        try:
-            reply = run_agent(
-                cfg, session.as_llm_messages(system_prompt), toolbox,
-                cfg.general_chat_model,
-                on_tool=_show_tool, on_round=_show_round,
-            )
-        except Exception as e:
-            status.hide()
-            # tool-calling unsupported by the model or provider hiccup —
-            # fall back to the plain chat path (one short warning; the
-            # full error goes to the log)
-            err_console.print(
-                f"[yellow]tools unavailable ({type(e).__name__}) — plain chat[/yellow]")
-            from .llm import chat
+            def _show_round() -> None:
+                status.show(f"[cyan]copilot[/cyan] thinking…")
 
             try:
-                with status.running(f"[cyan]copilot[/cyan] thinking…"):
-                    reply = chat(cfg, session.as_llm_messages(system_prompt), cfg.general_chat_model)
-            except LlmUnavailable as e:
-                err_console.print(f"LLM unavailable: {e}")
-                hint = (
-                    "Start Ollama (`ollama serve`) and pull a model "
-                    "(`ollama pull llama3.1`), or run `kryonsec setup` to "
-                    "switch to OpenAI."
-                    if cfg.provider == "ollama"
-                    else "Check your OpenAI key or network — or run "
-                    "`kryonsec setup` to switch providers."
+                reply = run_agent(
+                    cfg, session.as_llm_messages(system_prompt), toolbox,
+                    cfg.general_chat_model,
+                    on_tool=_show_tool, on_round=_show_round,
                 )
-                console.print(f"[yellow]{hint}[/yellow]")
-                session.messages.pop()  # drop the unanswered user turn
-                continue
             except Exception as e:
-                # same contract as the primary path: no crash mid-turn —
-                # report, drop the unanswered turn, keep the session alive
                 status.hide()
+                # tool-calling unsupported by the model or provider hiccup —
+                # fall back to the plain chat path (one short warning; the
+                # full error goes to the log)
                 err_console.print(
-                    f"[red]chat failed ({type(e).__name__}): {e}[/red]")
-                log.exception("fallback chat failed")
-                session.messages.pop()
-                continue
-        finally:
-            status.hide()
+                    f"[yellow]tools unavailable ({type(e).__name__}) — plain chat[/yellow]")
+                from .llm import chat
 
-        session.add("assistant", reply)
-        _msg_count[0] += 1
-        console.print(Markdown(reply))
-        console.print("\n")  # a blank line separates the reply from the prompt
-        _remember_facts(cfg, text, reply)  # best-effort LTM (never blocks chat)
+                try:
+                    with status.running(f"[cyan]copilot[/cyan] thinking…"):
+                        reply = chat(cfg, session.as_llm_messages(system_prompt), cfg.general_chat_model)
+                except LlmUnavailable as e:
+                    err_console.print(f"LLM unavailable: {e}")
+                    hint = (
+                        "Start Ollama (`ollama serve`) and pull a model "
+                        "(`ollama pull llama3.1`), or run `kryonsec setup` to "
+                        "switch to OpenAI."
+                        if cfg.provider == "ollama"
+                        else "Check your OpenAI key or network — or run "
+                        "`kryonsec setup` to switch providers."
+                    )
+                    console.print(f"[yellow]{hint}[/yellow]")
+                    session.messages.pop()  # drop the unanswered user turn
+                    continue
+                except Exception as e:
+                    # same contract as the primary path: no crash mid-turn —
+                    # report, drop the unanswered turn, keep the session alive
+                    status.hide()
+                    err_console.print(
+                        f"[red]chat failed ({type(e).__name__}): {e}[/red]")
+                    log.exception("fallback chat failed")
+                    session.messages.pop()
+                    continue
+            finally:
+                status.hide()
+
+            session.add("assistant", reply)
+            _msg_count[0] += 1
+            console.print(Markdown(reply))
+            console.print("\n")  # a blank line separates the reply from the prompt
+            _remember_facts(cfg, text, reply)  # best-effort LTM (never blocks chat)
+    finally:
+        # M8: Ctrl+C during an LLM call bypasses the /quit and
+        # prompt-interrupt exits above — without this finally the
+        # MCP server processes were never closed (repro-verified).
+        _exit()
 
 
 def _remember_facts(cfg: KryonsecConfig, user_text: str, reply: str) -> None:

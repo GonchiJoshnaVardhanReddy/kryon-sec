@@ -280,8 +280,10 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
         if not model.startswith("gpt"):
             # a custom id may need the openai/ prefix for litellm routing
             cfg.general_chat_model = f"openai/{model}"
-        cfg.general_search_model = "gpt-4o-mini"
-        cfg.compaction_model = "gpt-4o-mini"
+        # reuse the chosen chat model for search/compaction: forcing
+        # gpt-4o-mini breaks restricted keys and Azure-proxy model ids
+        cfg.general_search_model = cfg.general_chat_model
+        cfg.compaction_model = cfg.general_chat_model
         cfg.local_model = "ollama/llama3.1"  # local fallback stays available
     else:
         names = ollama_model_names(cfg.ollama_host)
@@ -300,10 +302,11 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
         base = model[:-len(":latest")] if model.endswith(":latest") else model
         cfg.general_chat_model = f"ollama/{base}"
         cfg.local_model = f"ollama/{base}"
-        # strict provider isolation: ollama config never calls a hosted API
+        # strict provider isolation: ollama config never calls a hosted API —
+        # and that includes keys left in config by a previous OpenAI setup
         cfg.general_search_model = f"ollama/{base}"
         cfg.compaction_model = f"ollama/{base}"
-        cfg.openai_api_key = cfg.openai_api_key or None
+        cfg.openai_api_key = None
 
     # ---- 2. built-in tools ----------------------------------------------
     from .config import BUILTIN_TOOLS
@@ -324,6 +327,17 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     for preset in MCP_PRESETS:
         if preset["name"] not in picked_mcp:
             continue
+        # M13: warn BEFORE setup "succeeds" — a preset whose command is
+        # missing silently fails on the next chat session instead
+        import shutil as _shutil
+
+        first_token = preset["command"].split()[0]
+        if not _shutil.which(first_token):
+            console.print(
+                f"[yellow]warning:[/yellow] {preset['name']} needs "
+                f"[bold]{first_token}[/bold], which is not on PATH — install "
+                "it or this server won't start"
+            )
         args = list(preset["args"])
         if "{ask}" in args:
             # e.g. the filesystem server needs an allowed directory
@@ -408,6 +422,15 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
         title="[bold cyan]KRYONSEC IS READY[/bold cyan]",
         border_style="green",
     ))
+    import sys as _sys
+
+    if not _sys.platform.startswith("linux"):
+        # L6: half the product is invisible on this platform — say so at
+        # the end of setup, not only in the installer header
+        console.print(
+            "[yellow]note: Purple Team (penetration testing) needs "
+            "WSL2/Linux + Docker + gVisor — this machine runs the "
+            "Copilot only. `kryonsec doctor` shows the details.[/yellow]")
     console.print(
         f"[dim]config: {Path(cfg.home) / 'config.toml'}[/dim]\n"
         "[green]type `kryonsec` to start — `kryonsec doctor` checks "
