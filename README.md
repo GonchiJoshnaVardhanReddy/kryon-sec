@@ -76,6 +76,8 @@ Allowlists, not blocklists. Secrets never leave the machine by default.
 | PostgreSQL | optional (SQLite fallback) | optional (SQLite fallback in v1.1) |
 
 `kryonsec doctor` checks all of this and refuses to start Purple Team if anything is missing.
+On apt-based Linux (Ubuntu/Debian/Kali) with sudo, the one-line installer sets up
+Docker and gVisor for you — only the sandbox image build is a separate (long) step.
 
 ---
 
@@ -93,8 +95,21 @@ The installer:
 2. Creates a dedicated virtualenv at `~/.kryonsec/venv`
 3. Installs kryonsec into it from GitHub
 4. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
-5. **Builds the Zone B sandbox image** when Docker is available (Purple Team)
-6. Runs `kryonsec setup` — the first-run wizard
+5. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali
+6. **Builds the Zone B sandbox image** when Docker is available (Purple Team) — with live progress output, since it downloads 2+ GB and can take 30+ min on slow links
+7. Runs `kryonsec setup` — the first-run wizard
+
+To skip the (large) sandbox image build and do it later:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
+# later:
+git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
+cd kryon-sec
+docker build --progress=plain -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
+```
+
+If a build fails partway, already-downloaded layers are cached — re-running the same command resumes where it stopped.
 
 ### Windows (PowerShell)
 
