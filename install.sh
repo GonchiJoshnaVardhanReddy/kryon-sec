@@ -10,7 +10,10 @@
 #   4. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
 #   5. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
 #      then builds the Zone B sandbox image (Purple Team)
-#   6. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
+#   6. offers to install Ollama + llama3.1 when no LLM is configured
+#   7. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
+#   8. runs `kryonsec doctor` so the final state is visible, and prints
+#      the exact command to run when PATH isn't active in this shell yet
 set -euo pipefail
 
 REPO="https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
@@ -19,6 +22,11 @@ VENV="$KRYONSEC_HOME/venv"
 
 say() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+if [ "$(id -u)" -eq 0 ]; then
+    say "WARNING: running as root — kryonsec installs to /root/.kryonsec and"
+    say "         the command will only exist for the root user"
+fi
 
 # Clone the repo at a tag/branch/SHA ref (shallow) into $2.
 clone_ref() {
@@ -226,8 +234,68 @@ else
     say "docker not available — skipped the sandbox image (Copilot works fine; Purple Team needs it)"
 fi
 
-# ---- 6. first-run wizard ----------------------------------------------------
+# ---- 6. LLM preflight -------------------------------------------------------
+# The wizard used to be the first place a missing LLM showed up, and its
+# Ollama-down path aborted setup entirely. Make sure a usable LLM exists
+# BEFORE the wizard starts: existing Ollama, an OPENAI_API_KEY, or an
+# offered one-shot Ollama install.
+ollama_up() {
+    curl -fsS --max-time 4 "${OLLAMA_HOST:-http://localhost:11434}/api/tags" >/dev/null 2>&1
+}
+
+install_ollama() {
+    say "installing Ollama (local LLM — nothing leaves your machine)"
+    curl -fsSL https://ollama.com/install.sh | sh || return 1
+    # start it: systemd unit when present, detached background server otherwise
+    if ! (systemctl is-active --quiet ollama 2>/dev/null ||
+          maybe_sudo systemctl enable --now ollama 2>/dev/null); then
+        nohup ollama serve >/dev/null 2>&1 &
+    fi
+    # cold start can take a few seconds before /api/tags answers
+    for _ in $(seq 1 15); do
+        ollama_up && break
+        sleep 1
+    done
+    ollama_up || return 1
+    say "pulling llama3.1 (~5 GB download — the local model)"
+    ollama pull llama3.1 || return 1
+}
+
+if ollama_up; then
+    say "Ollama already running"
+elif [ -n "${OPENAI_API_KEY:-}" ]; then
+    say "OPENAI_API_KEY set — the wizard will use OpenAI"
+else
+    # curl|bash consumes stdin, so the answer must come from the terminal.
+    # No terminal (CI) → read fails → skip (the wizard still offers OpenAI).
+    printf '\033[36m==>\033[0m No LLM configured yet. Install Ollama + llama3.1 locally (~5 GB)? [Y/n] '
+    REPLY=""
+    read -r REPLY < /dev/tty 2>/dev/null || REPLY="n"
+    case "$REPLY" in
+        n*|N*)
+            say "skipped — pick OpenAI in the wizard (have your API key ready)"
+            ;;
+        *)
+            install_ollama ||
+                say "WARNING: Ollama install failed — pick OpenAI in the wizard (have your API key ready)"
+            ;;
+    esac
+fi
+
+# ---- 7. first-run wizard ----------------------------------------------------
 say "starting setup wizard"
 "$VENV/bin/kryonsec" setup
 
-say "done — open a new terminal (or 'source ~/.bashrc') and run: kryonsec"
+# ---- 8. verify + next steps --------------------------------------------------
+# show the final state — doctor's exit code never fails the installer
+# (it only says whether Copilot has storage + an LLM; the table above is
+# the actual information the user needs)
+"$VENV/bin/kryonsec" doctor || true
+
+if command -v kryonsec >/dev/null 2>&1; then
+    say "done — run: kryonsec"
+else
+    say "done — but the 'kryonsec' command is not active in THIS terminal yet."
+    say "  run this now:  source $SHELL_RC"
+    say "  (or open a new terminal — it works there automatically)"
+fi
