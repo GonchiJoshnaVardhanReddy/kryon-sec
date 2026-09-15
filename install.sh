@@ -8,7 +8,8 @@
 #   2. creates ~/.kryonsec/venv
 #   3. installs kryonsec into it (from GitHub)
 #   4. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
-#   5. builds the Zone B sandbox image when docker is available (Purple Team)
+#   5. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
+#      then builds the Zone B sandbox image (Purple Team)
 #   6. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
 set -euo pipefail
 
@@ -24,10 +25,12 @@ clone_ref() {
     if git clone --quiet --depth 1 --branch "$1" "$REPO.git" "$2"; then
         return 0
     fi
-    # commit SHAs can't be cloned via --branch; fetch the exact ref instead
+    # commit SHAs can't be cloned via --branch; fetch the exact ref instead.
+    # advice off + stderr swallowed: the detached-HEAD chatter a tag fetch
+    # produces looks like an error to users (it isn't — the checkout works)
     git init --quiet "$2" &&
-        git -C "$2" fetch --quiet --depth 1 origin "$1" &&
-        git -C "$2" checkout --quiet FETCH_HEAD
+        git -C "$2" fetch --quiet --depth 1 origin "$1" 2>/dev/null &&
+        git -C "$2" -c advice.detachedHead=false checkout --quiet FETCH_HEAD 2>/dev/null
 }
 
 # ---- 1. python 3.11+ ------------------------------------------------------
@@ -99,29 +102,113 @@ case "$SHELL" in
     *fish) say "fish detected: run this once ->  set -U fish_user_paths $VENV/bin \$fish_user_paths" ;;
 esac
 
-# ---- 5. docker sandbox image (Linux only, optional) ------------------------
-# Purple Team mode needs Docker + gVisor + the sandbox image. On the
-# copilot-only path (or macOS/Windows) this is skipped — `kryonsec doctor`
-# explains what's missing later.
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    if docker image inspect kryonsec/sandbox:latest >/dev/null 2>&1; then
+# ---- 5. docker + gvisor + sandbox image (Purple Team, Linux) ----------------
+# Purple Team mode needs Docker + gVisor + the sandbox image. Instead of
+# telling the user to install prerequisites by hand, do it here when we
+# have root/sudo on an apt system (Debian/Ubuntu/Kali). Copilot-only paths
+# and non-apt systems fall through — `kryonsec doctor` explains later.
+
+maybe_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+have_sudo() {
+    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1
+}
+is_apt() { command -v apt-get >/dev/null 2>&1; }
+
+# run docker as root when the current user can't talk to the daemon yet
+# (fresh install: the docker group only applies after the next login)
+dkr() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    else
+        maybe_sudo docker "$@"
+    fi
+}
+
+install_docker() {
+    say "installing Docker (apt)"
+    maybe_sudo apt-get update -qq || return 1
+    # distro package: works on every apt system (incl. Kali and Ubuntu
+    # releases the docker.com repo hasn't caught up with) and is plenty
+    # for a gVisor sandbox host
+    maybe_sudo apt-get install -y -qq docker.io || return 1
+    # start the daemon — systemd where available (WSL needs it on), the
+    # sysv script as a fallback
+    maybe_sudo systemctl enable --now docker 2>/dev/null ||
+        maybe_sudo service docker start 2>/dev/null || true
+    sleep 2
+}
+
+install_gvisor() {
+    say "installing gVisor (runsc)"
+    maybe_sudo apt-get install -y -qq gnupg
+    maybe_sudo mkdir -p /usr/share/keyrings
+    curl -fsSL https://gvisor.dev/archive.key |
+        maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg ||
+        return 1
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases/release main $(dpkg --print-architecture)" |
+        maybe_sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+    maybe_sudo apt-get update -qq || return 1
+    maybe_sudo apt-get install -y -qq runsc || return 1
+    # registers runsc in /etc/docker/daemon.json and restarts the daemon
+    maybe_sudo runsc install
+    maybe_sudo systemctl restart docker 2>/dev/null ||
+        maybe_sudo service docker restart 2>/dev/null || true
+    sleep 2
+}
+
+if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
+    if ! command -v docker >/dev/null 2>&1; then
+        install_docker ||
+            say "WARNING: Docker install failed — Copilot works fine; Purple Team needs it"
+    elif ! docker info >/dev/null 2>&1 && ! maybe_sudo docker info >/dev/null 2>&1; then
+        # docker is installed but the daemon is down — try to start it
+        maybe_sudo systemctl enable --now docker 2>/dev/null ||
+            maybe_sudo service docker start 2>/dev/null || true
+        sleep 2
+    fi
+    if dkr info >/dev/null 2>&1; then
+        RUNTIMES="$(dkr info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null)"
+        case " $RUNTIMES " in
+            *" runsc "*) : ;; # already registered
+            *)
+                install_gvisor ||
+                    say "WARNING: gVisor install failed — Purple Team needs the runsc runtime"
+                ;;
+        esac
+    fi
+fi
+
+if [ -n "${KRYONSEC_SKIP_SANDBOX:-}" ]; then
+    say "KRYONSEC_SKIP_SANDBOX set — skipping the sandbox image build"
+    say "build it later with: docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali ."
+elif dkr info >/dev/null 2>&1; then
+    if dkr image inspect kryonsec/sandbox:latest >/dev/null 2>&1; then
         say "sandbox image already present"
     else
-        say "building the Zone B sandbox image (kali + tools, ~4 min, ~2 GB)"
+        say "building the Zone B sandbox image (kali + ~50 tools, 2+ GB download)"
+        say "this is the slow part — on a slow link it can take 30+ min; progress is shown below"
         TMP=$(mktemp -d)
         # same ref the package was installed from — image and package must match
         if clone_ref "${KRYONSEC_VERSION#@}" "$TMP/kryonsec-src"; then
-            docker build -q -t kryonsec/sandbox \
+            # no -q: stream the build steps so it never looks frozen, and
+            # completed layers are cached, so a retry resumes where it stopped
+            if ! dkr build --progress=plain -t kryonsec/sandbox \
                 -f "$TMP/kryonsec-src/containers/sandbox/Dockerfile.kali" \
-                "$TMP/kryonsec-src" \
-                || say "WARNING: sandbox image build failed — Purple Team will need it (see README)"
+                "$TMP/kryonsec-src"; then
+                say "WARNING: sandbox image build failed — sources kept at $TMP/kryonsec-src"
+                say "retry later with: docker build --progress=plain -t kryonsec/sandbox -f $TMP/kryonsec-src/containers/sandbox/Dockerfile.kali $TMP/kryonsec-src"
+            else
+                rm -rf "$TMP"
+            fi
         else
             say "WARNING: could not fetch sandbox sources (git missing or network down) — skipping image build"
+            rm -rf "$TMP"
         fi
-        rm -rf "$TMP"
     fi
 else
-    say "docker not found/running — skipped the sandbox image (Copilot works fine; Purple Team needs it)"
+    say "docker not available — skipped the sandbox image (Copilot works fine; Purple Team needs it)"
 fi
 
 # ---- 6. first-run wizard ----------------------------------------------------
