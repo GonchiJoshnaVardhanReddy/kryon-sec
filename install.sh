@@ -144,13 +144,28 @@ install_gvisor() {
     say "installing gVisor (runsc)"
     maybe_sudo apt-get install -y -qq gnupg
     maybe_sudo mkdir -p /usr/share/keyrings
-    curl -fsSL https://gvisor.dev/archive.key |
-        maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg ||
-        return 1
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases/release main $(dpkg --print-architecture)" |
-        maybe_sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
-    maybe_sudo apt-get update -qq || return 1
-    maybe_sudo apt-get install -y -qq runsc || return 1
+    if curl -fsSL https://gvisor.dev/archive.key |
+        maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg &&
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases/release main $(dpkg --print-architecture)" |
+            maybe_sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null &&
+        maybe_sudo apt-get update -qq &&
+        maybe_sudo apt-get install -y -qq runsc; then
+        : # apt path worked
+    else
+        # The apt repo is distro-independent but some apt builds refuse it
+        # (seen on Ubuntu 26.04: "does not have a Release file"). Fall back
+        # to the official direct-binary install — same runsc, no repo.
+        say "apt repo unavailable — installing runsc binary directly"
+        local arch
+        arch="$(uname -m)"
+        if ! curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${arch}/runsc" -o /tmp/runsc-install; then
+            return 1
+        fi
+        maybe_sudo install -m 0755 /tmp/runsc-install /usr/local/bin/runsc || return 1
+        rm -f /tmp/runsc-install
+        # remove the broken repo line if we added one — apt update must stay clean
+        maybe_sudo rm -f /etc/apt/sources.list.d/gvisor.list
+    fi
     # registers runsc in /etc/docker/daemon.json and restarts the daemon
     maybe_sudo runsc install
     maybe_sudo systemctl restart docker 2>/dev/null ||
