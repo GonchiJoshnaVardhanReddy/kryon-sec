@@ -254,47 +254,52 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     console.print(Panel.fit("[bold cyan]KRYONSEC SETUP[/bold cyan] — first-time configuration"))
 
     # ---- 1. provider + key + model --------------------------------------
-    provider = _pick_provider(answers)
-    cfg.provider = provider
+    # loops back to the provider question when the chosen provider isn't
+    # usable (Ollama down). An unusable provider used to abort setup
+    # entirely — leaving no config and no obvious next step.
+    while True:
+        provider = _pick_provider(answers)
+        cfg.provider = provider
 
-    if provider == "openai":
-        while True:
-            key = _ask_key(answers)
-            ok, msg = check_openai_key(key)
-            if ok:
-                break
-            console.print(f"[red]key check failed:[/red] {msg}")
-            retry = (answers or []).pop(0) if answers else input("try again? [Y/n]: ")
-            if retry.strip().lower().startswith("n"):
-                console.print("[yellow]setup aborted — no provider configured[/yellow]")
-                return cfg
-        cfg.openai_api_key = key
-        models = list_openai_models(key)
-        model_ids = [m["id"] for m in (models or [])]
-        if not model_ids:
-            # key works but listing failed/empty — fall back to typing it
-            console.print("[yellow]could not list models — type the model id manually[/yellow]")
-            model_ids = [((answers or []).pop(0) if answers else input("model id: ")).strip()]
-        model = _pick_model(model_ids, answers)
-        cfg.general_chat_model = model
-        if not model.startswith("gpt"):
-            # a custom id may need the openai/ prefix for litellm routing
-            cfg.general_chat_model = f"openai/{model}"
-        # reuse the chosen chat model for search/compaction: forcing
-        # gpt-4o-mini breaks restricted keys and Azure-proxy model ids
-        cfg.general_search_model = cfg.general_chat_model
-        cfg.compaction_model = cfg.general_chat_model
-        cfg.local_model = "ollama/llama3.1"  # local fallback stays available
-    else:
+        if provider == "openai":
+            while True:
+                key = _ask_key(answers)
+                ok, msg = check_openai_key(key)
+                if ok:
+                    break
+                console.print(f"[red]key check failed:[/red] {msg}")
+                retry = (answers or []).pop(0) if answers else input("try again? [Y/n]: ")
+                if retry.strip().lower().startswith("n"):
+                    console.print("[yellow]setup aborted — no provider configured[/yellow]")
+                    return cfg
+            cfg.openai_api_key = key
+            models = list_openai_models(key)
+            model_ids = [m["id"] for m in (models or [])]
+            if not model_ids:
+                # key works but listing failed/empty — fall back to typing it
+                console.print("[yellow]could not list models — type the model id manually[/yellow]")
+                model_ids = [((answers or []).pop(0) if answers else input("model id: ")).strip()]
+            model = _pick_model(model_ids, answers)
+            cfg.general_chat_model = model
+            if not model.startswith("gpt"):
+                # a custom id may need the openai/ prefix for litellm routing
+                cfg.general_chat_model = f"openai/{model}"
+            # reuse the chosen chat model for search/compaction: forcing
+            # gpt-4o-mini breaks restricted keys and Azure-proxy model ids
+            cfg.general_search_model = cfg.general_chat_model
+            cfg.compaction_model = cfg.general_chat_model
+            cfg.local_model = "ollama/llama3.1"  # local fallback stays available
+            break
+
         names = ollama_model_names(cfg.ollama_host)
         if not names:
             console.print(
                 "[yellow]Ollama not answering at "
                 f"{cfg.ollama_host}[/yellow]\n"
                 "  start it (`ollama serve`) and pull a model "
-                "(`ollama pull llama3.1`), then re-run `kryonsec setup`."
+                "(`ollama pull llama3.1`) — or pick OpenAI instead."
             )
-            return cfg
+            continue
         model = _pick_model(names, answers)
         # only the implicit ':latest' tag can be dropped — 'llama3.1:8b'
         # stripped to 'llama3.1' resolves to :latest (a different model
@@ -307,6 +312,7 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
         cfg.general_search_model = f"ollama/{base}"
         cfg.compaction_model = f"ollama/{base}"
         cfg.openai_api_key = None
+        break
 
     # ---- 2. built-in tools ----------------------------------------------
     from .config import BUILTIN_TOOLS

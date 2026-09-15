@@ -168,6 +168,24 @@ def test_wizard_openai_flow_writes_config(scripted_wizard, tmp_path):
     assert data["mcp"]["servers"][0]["name"] == "fetch"
 
 
+def test_wizard_ollama_down_loops_back_to_openai(scripted_wizard, monkeypatch, tmp_path):
+    """Ollama picked but not running must NOT abort setup — the wizard
+    loops back to the provider question so OpenAI can be picked instead."""
+    monkeypatch.setattr("kryonsec.wizard.ollama_model_names", lambda host: None)
+    cfg = scripted_wizard([
+        "2",            # Ollama — server down
+        "1",            # loop back: pick OpenAI instead
+        "sk-test-456",  # api key
+        "1",            # first model
+        "",             # no tools
+        "",             # no MCP
+        "n",            # no passive-recon API keys
+    ])
+    assert cfg.provider == "openai"
+    assert cfg.openai_api_key == "sk-test-456"
+    assert config_path(tmp_path).is_file()
+
+
 def test_wizard_ollama_flow(scripted_wizard, monkeypatch, tmp_path):
     monkeypatch.setattr("kryonsec.wizard.ollama_model_names",
                         lambda host: ["llama3.1:latest", "mistral:latest"])
