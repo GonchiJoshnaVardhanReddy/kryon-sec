@@ -1,0 +1,52 @@
+# Build context for containers/sandbox/Dockerfile.kali.
+#
+# The Dockerfile only COPYs from containers/sandbox/ (the baked scripts and
+# entrypoint.sh). Everything listed here is dead weight: docker tars the whole
+# context and streams it to the daemon before the first instruction runs, and
+# the context is part of the cache key — so a file that changes here but is
+# never COPYed still invalidates the build cache and forces a re-send.
+#
+# .git is the big one: install.sh builds from a fresh clone, so the context
+# would otherwise carry the entire history on every build.
+#
+# Deliberately NOT ignored: containers/, src/, tests/, docs/ and the rest of
+# the source tree. They are small text and a future COPY may want them —
+# a too-clever allowlist here breaks the build in a way that is hard to read.
+
+.git
+.gitignore
+.gitattributes
+.github
+
+# virtualenvs (a manual `docker build .` from a dev checkout has these)
+.venv
+venv
+env
+
+# python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# local state and logs — never belong in an image
+*.log
+.kryonsec/

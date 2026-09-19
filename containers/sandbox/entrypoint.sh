@@ -50,8 +50,12 @@ ALLOWED_TOOLS=(
 )
 
 if [[ -z "$TOOL" ]] || [[ ! " ${ALLOWED_TOOLS[*]} " =~ " ${TOOL} " ]]; then
-    # stdout (not stderr): the host parses exactly one JSON payload there
-    printf '{"error": "tool_not_in_allowlist", "tool": "%s"}\n' "$TOOL"
+    # stdout (not stderr): the host parses exactly one JSON payload there.
+    # $TOOL is jq-encoded, never interpolated raw: a quote or backslash in the
+    # name would otherwise emit malformed JSON, and this is the violation
+    # report — the host must be able to read it to tell a rejection from a crash.
+    printf '{"error": "tool_not_in_allowlist", "tool": %s}\n' \
+        "$(printf '%s' "$TOOL" | jq -Rs '.')"
     exit 125
 fi
 

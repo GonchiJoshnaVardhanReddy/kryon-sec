@@ -25,10 +25,21 @@ MAX_MATCHES = 10
 MAX_VALUE_LEN = 120
 MAX_LIST_ITEMS = 3  # block-list items captured per key (bounded, no YAML dep)
 
+# Key lines are matched at ANY indent: real nuclei templates nest every
+# useful field (name / severity / tags / description / reference) inside the
+# top-level `info:` block, so the old anchored `^([a-z_]+):` captured only
+# `id` — severity always came back empty and product-name searches missed.
+# Indent scoping is deliberately not modelled: the header is tiny, and a
+# flat capture of the nested keys is exactly the search haystack we want.
+_KEY_RE = re.compile(r"^\s*([a-z_]+):\s*(.*)$")
+_ITEM_RE = re.compile(r"^\s+-\s*(\S.*)$")
+
 
 def _front_matter(text: str) -> dict:
     """Parse the leading YAML front-matter (--- delimited) as flat
-    key: value pairs. Inline lists appear as '[a, b]' strings; block
+    key: value pairs, including the keys nested inside the `info:` block
+    (name, severity, tags, description, reference). Inline lists appear
+    as '[a, b]' strings; block
     lists (key:\\n  - item) capture up to MAX_LIST_ITEMS item lines
     joined by spaces (M9: multi-line reference lists used to parse as
     empty and never matched). Still no YAML dependency."""
@@ -42,7 +53,7 @@ def _front_matter(text: str) -> dict:
     last_key: str | None = None  # key whose block list we are inside
     items_seen = 0
     for line in header.splitlines():
-        m = re.match(r"^([a-z_]+):\s*(.*)$", line)
+        m = _KEY_RE.match(line)
         if m:
             key, value = m.group(1), m.group(2)
             if value:
@@ -52,7 +63,7 @@ def _front_matter(text: str) -> dict:
                 last_key = key  # block list starts here
                 items_seen = 0
             continue
-        item = re.match(r"^\s+-\s*(\S.*)$", line)
+        item = _ITEM_RE.match(line)
         if item and last_key is not None and items_seen < MAX_LIST_ITEMS:
             existing = out.get(last_key)
             out[last_key] = (
