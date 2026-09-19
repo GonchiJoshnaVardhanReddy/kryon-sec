@@ -44,3 +44,31 @@ def test_preload_never_raises():
     finally:
         if original is not None:
             sys.modules["litellm"] = original
+
+
+def test_quiet_litellm_lets_litellm_drop_unsupported_params(monkeypatch):
+    """The fix for a hard 400 that arrives before any call is made.
+
+    kryonsec asks for temperature=0.0 (deterministic answers), but a growing
+    set of models are pinned at temperature=1 and reject anything else —
+    litellm raises UnsupportedParamsError itself, from its own model map.
+    `global.anthropic.claude-fable-5` on Bedrock did this, and the user saw
+    it as "no AWS Bedrock model answered".
+    """
+    import litellm
+
+    monkeypatch.setattr(litellm, "drop_params", False, raising=False)
+    llm._quiet_litellm()
+    assert litellm.drop_params is True
+
+
+def test_quiet_litellm_still_silences_the_banner(monkeypatch):
+    import litellm
+
+    monkeypatch.setattr(litellm, "suppress_debug_info", False, raising=False)
+    llm._quiet_litellm()
+    assert litellm.suppress_debug_info is True
+
+
+def test_quiet_litellm_never_raises():
+    assert llm._quiet_litellm() is None

@@ -105,12 +105,28 @@ _PRELOAD_DONE = threading.Thread()  # already-finished sentinel
 
 
 def _quiet_litellm() -> None:
-    """Stop litellm printing its 'Give Feedback / Get Help' banner on
-    every failed call — the warning log already has the real error."""
+    """Apply the two process-wide litellm flags, once per call.
+
+    suppress_debug_info: stop litellm printing its 'Give Feedback / Get
+    Help' banner on every failed call — the warning log has the real error.
+
+    drop_params: let litellm omit a parameter the model does not accept.
+    We ask for temperature=0.0 because deterministic answers are the point
+    for a security tool, but a growing number of models are fixed at
+    temperature=1 and reject anything else as a hard 400 *before* the call
+    is made — `global.anthropic.claude-fable-5` on Bedrock did exactly
+    that, and it reached the user as "no AWS Bedrock model answered", which
+    describes none of what happened. Which models carry the restriction is
+    a list we cannot keep current: it changes with every provider release,
+    and litellm already tracks it per model. Applying what litellm knows
+    beats us guessing, and the temperature still goes out unchanged
+    everywhere it is accepted.
+    """
     try:
         import litellm
 
         litellm.suppress_debug_info = True
+        litellm.drop_params = True
     except Exception:
         pass
 
