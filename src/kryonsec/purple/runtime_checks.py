@@ -111,7 +111,13 @@ def docker_desktop_in_use() -> bool:
 # this login and the same FAIL after the next reboot, with nothing in the
 # message to explain why. Turning Docker Desktop's WSL integration off for
 # this distro is the durable version of the same fix.
+# The by-hand equivalent, for anyone who would rather not re-run the
+# installer. The `rm` comes first because a malformed gVisor source left in
+# /etc/apt/sources.list.d makes apt refuse to install *anything* — so the
+# docker.io step fails with an error about a repository the user never
+# knowingly configured, and the real cause is one line away.
 DISTRO_DOCKER_FIX = (
+    "sudo rm -f /etc/apt/sources.list.d/gvisor.list && sudo apt-get update && "
     "sudo apt-get install -y docker.io && docker context use default && "
     "sudo service docker start"
 )
@@ -130,15 +136,20 @@ def gvisor_fix_hint() -> str:
     with "runsc: command not found" is how a user ends up stuck. install.sh
     already installs runsc (apt repo, with a direct-binary fallback) and
     registers it, so sending them back through it is the reliable path.
+
+    The installer is named first, not last. It does the whole sequence in
+    the order that works — clear the bad apt source, install a distro
+    daemon, move the CLI onto it, then install and register runsc — where
+    the by-hand version is four commands that each depend on the previous.
     """
     if docker_desktop_in_use():
         return (
             "runsc runtime not registered — your docker CLI is talking to "
             "Docker Desktop, whose daemon runs outside WSL and can never load "
-            "a runtime from inside the distro. Give the distro its own daemon "
-            f"and point the CLI at it: {DISTRO_DOCKER_FIX} — then re-run the "
-            f"kryonsec installer, which installs runsc and registers it. "
-            f"{DOCKER_CONTEXT_CAVEAT}"
+            "a runtime from inside the distro. Re-run the kryonsec installer: "
+            "it gives the distro its own daemon, points the CLI at it, then "
+            "installs runsc and registers it. By hand that is: "
+            f"{DISTRO_DOCKER_FIX}. {DOCKER_CONTEXT_CAVEAT}"
         )
     return (
         "runsc runtime not registered — gVisor is missing. Re-run the "

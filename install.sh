@@ -49,6 +49,33 @@ apt_install() {
     maybe_sudo apt-get install -y -qq $* >/dev/null 2>&1
 }
 
+# A configured-but-unfetchable apt source does not only fail itself: apt
+# refuses to install ANYTHING while one is present, so the error surfaces as
+# "that package is unavailable" for an unrelated package, and the real cause
+# scrolls by once in an `apt-get update` nobody was watching.
+#
+# This is not hypothetical. An earlier version of this script wrote a
+# malformed gVisor deb line; the next run's `apt-get update` failed, so the
+# Docker install aborted before it tried, and the visible symptom was
+# "Docker install failed — Purple Team needs it" on a machine where gVisor
+# was the actual problem. Removing the bad line is the only way out, since
+# the user cannot install docker.io by hand either while it is there.
+#
+# Only a malformed one is removed: the documented line is recognized and
+# left alone, so a user who added it correctly keeps it.
+purge_broken_apt_sources() {
+    # $1 is a test seam: the default is the only path that matters in
+    # production, and the tests need to point it at a temp file.
+    local f="${1:-/etc/apt/sources.list.d/gvisor.list}"
+    [ -f "$f" ] || return 0
+    if grep -q 'gvisor/releases release' "$f" 2>/dev/null; then
+        return 0   # the documented line — leave it alone
+    fi
+    say "removing a malformed gVisor apt source left by an earlier run"
+    maybe_sudo rm -f "$f"
+}
+purge_broken_apt_sources
+
 MISSING=""
 for tool in git curl; do
     command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
@@ -225,7 +252,11 @@ dkr() {
 
 install_docker() {
     say "installing Docker (apt)"
-    maybe_sudo apt-get update -qq || return 1
+    # A failing `apt-get update` must not abort this. apt still installs from
+    # the package lists it already has, and bailing here is precisely how a
+    # gVisor repo problem became a "Docker could not be installed" problem.
+    maybe_sudo apt-get update -qq ||
+        say "WARNING: apt-get update reported errors — trying the install anyway"
     # distro package: works on every apt system (incl. Kali and Ubuntu
     # releases the docker.com repo hasn't caught up with) and is plenty
     # for a gVisor sandbox host
@@ -248,31 +279,66 @@ install_docker() {
     sleep 2
 }
 
+# Download runsc straight from the release bucket, trying the architecture
+# spellings it might be filed under.
+#
+# The bucket names architectures the way the kernel does (x86_64, aarch64)
+# while dpkg names them amd64/arm64, so a single guess is a coin flip whose
+# loss looks like a bare `curl: (22) ... 404` with nothing to act on. And
+# whatever comes back is checked before it is installed: a proxy or a
+# captive portal answers 200 with an HTML page, and that must never become
+# /usr/local/bin/runsc.
+fetch_runsc() {
+    local out="$1" arch candidates url magic
+    # `|| true` on both: this script runs under `set -e`, and a missing dpkg
+    # would otherwise abort the installer from inside an assignment.
+    candidates="$(uname -m 2>/dev/null || true) $(dpkg --print-architecture 2>/dev/null || true) x86_64 aarch64"
+    for arch in $candidates; do
+        case "$arch" in
+            amd64) arch=x86_64 ;;
+            arm64) arch=aarch64 ;;
+            "") continue ;;
+        esac
+        url="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}/runsc"
+        curl -fsSL "$url" -o "$out" 2>/dev/null || continue
+        magic="$(head -c 4 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+        if [ "$magic" = "7f454c46" ]; then   # \x7f E L F
+            return 0
+        fi
+        say "         that is not a binary (${arch}) — trying the next name"
+    done
+    return 1
+}
+
 install_gvisor() {
     say "installing gVisor (runsc)"
-    maybe_sudo apt-get install -y -qq gnupg
+    maybe_sudo apt-get install -y -qq gnupg >/dev/null 2>&1
     maybe_sudo mkdir -p /usr/share/keyrings
+
+    local gvisor_list=/etc/apt/sources.list.d/gvisor.list
+    # The deb line is `deb [opts] URI SUITE COMPONENT`. It used to be written
+    # with `/release` glued onto the URI and the architecture appended as a
+    # second component, so apt went looking for
+    # `.../gvisor/releases/release/dists/main/Release`, got a 404 from the
+    # bucket, and reported "does not have a Release file" — which is the
+    # gVisor error that then took Docker down with it.
     if curl -fsSL https://gvisor.dev/archive.key |
         maybe_sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg &&
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases/release main $(dpkg --print-architecture)" |
-            maybe_sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null &&
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" |
+            maybe_sudo tee "$gvisor_list" >/dev/null &&
         maybe_sudo apt-get update -qq &&
         maybe_sudo apt-get install -y -qq runsc; then
         : # apt path worked
     else
-        # The apt repo is distro-independent but some apt builds refuse it
-        # (seen on Ubuntu 26.04: "does not have a Release file"). Fall back
-        # to the official direct-binary install — same runsc, no repo.
+        # Drop the repo line BEFORE falling back, on every path out of here.
+        # It used to be removed only after a successful binary install, so a
+        # failed download left a broken source behind — poisoning the next
+        # run's `apt-get update`, and therefore its Docker install, forever.
+        maybe_sudo rm -f "$gvisor_list"
         say "apt repo unavailable — installing runsc binary directly"
-        local arch
-        arch="$(uname -m)"
-        if ! curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${arch}/runsc" -o /tmp/runsc-install; then
-            return 1
-        fi
+        fetch_runsc /tmp/runsc-install || return 1
         maybe_sudo install -m 0755 /tmp/runsc-install /usr/local/bin/runsc || return 1
         rm -f /tmp/runsc-install
-        # remove the broken repo line if we added one — apt update must stay clean
-        maybe_sudo rm -f /etc/apt/sources.list.d/gvisor.list
     fi
     # registers runsc in /etc/docker/daemon.json and restarts the daemon
     maybe_sudo runsc install

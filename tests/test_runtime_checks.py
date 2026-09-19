@@ -103,6 +103,30 @@ def test_docker_desktop_hint_warns_that_the_switch_does_not_stick(monkeypatch):
     assert "DOCKER_HOST" in hint
 
 
+def test_docker_desktop_hint_leads_with_the_installer(monkeypatch):
+    """The by-hand sequence fails on the state this hint is reached from.
+
+    A user in this branch very likely has a malformed gvisor.list on disk —
+    our own installer used to write one — and while it is there apt refuses
+    every install, docker.io included. "Re-run the installer" does the whole
+    thing in the working order, so it goes first rather than last.
+    """
+    _fake_docker_info(monkeypatch, "Docker Desktop")
+    hint = runtime_checks.gvisor_fix_hint()
+    assert hint.index("installer") < hint.index("docker.io")
+
+
+def test_the_by_hand_fix_clears_the_bad_source_first(monkeypatch):
+    """Without the rm, `apt-get install docker.io` is the command that
+    fails — and it fails with a message about a gVisor repository, which is
+    not a thing the user set up on purpose."""
+    _fake_docker_info(monkeypatch, "Docker Desktop")
+    hint = runtime_checks.gvisor_fix_hint()
+    assert "rm -f /etc/apt/sources.list.d/gvisor.list" in hint
+    assert hint.index("rm -f /etc/apt/sources.list.d/gvisor.list") < \
+        hint.index("apt-get install -y docker.io")
+
+
 def test_gvisor_hint_is_a_plain_install_otherwise(monkeypatch):
     _fake_docker_info(monkeypatch, "Ubuntu 24.04.3 LTS")
     hint = runtime_checks.gvisor_fix_hint()
