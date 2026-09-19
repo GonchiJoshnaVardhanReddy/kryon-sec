@@ -78,7 +78,10 @@ def _compile_template_arg(arg: str) -> re.Pattern[str]:
         body.append(_alternation_or_pattern(m.group(1)))
         i = m.end()
     body.append(re.escape(arg[i:]))
-    return re.compile("^" + "".join(body) + "$")
+    # \Z, not $: Python's $ also matches just BEFORE a trailing newline, so
+    # "^…$" accepted an argument ending in "\n" (e.g. "http://t/\n" passed the
+    # {url} template). \Z anchors to the true end of the string.
+    return re.compile("^" + "".join(body) + r"\Z")
 
 
 def compile_tool_templates(templates: dict[str, list[str]]) -> dict[str, list[re.Pattern[str]]]:
@@ -163,7 +166,10 @@ EXPLOIT_TEMPLATES: dict[str, list[str]] = {
     "jwt_tool": ["{token}"],
     # kiterunner scans API routes from a .kx wordlist file ({template} token)
     "kr": ["scan", "{template}", "--host", "{url}"],
-    "graphql-cop": ["-u", "{url}", "-o", "json"],
+    # graphql-cop takes the target with -t (its README: `graphql-cop.py -t
+    # <url>`); -u is not one of its flags, so the old template produced an
+    # argv the tool rejects outright.
+    "graphql-cop": ["-t", "{url}", "-o", "json"],
     # ExploitDB search (local database inside the image — no egress)
     "searchsploit": ["--colorless", "{term}"],
     # Nuclei template metadata search (Phase 8): local template files in

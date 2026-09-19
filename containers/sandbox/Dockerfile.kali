@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     seclists \
     wget \
     ca-certificates \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Tool-expansion block (2026-09-13). Kali package names drift; if the
@@ -37,11 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # absent (spawning them then fails inside the sandbox — audited, safe).
 # ncat ships with the nmap package; nc comes from netcat-traditional.
 # searchsploit ships with exploitdb.
+# checkov is deliberately NOT in this list: Kali has no checkov package
+# (pkg.kali.org/pkg/checkov is a 404), so naming it here only produced a
+# per-build "WARN: checkov unavailable" while the tool stayed missing. It
+# is a Python tool and is installed from PyPI below instead.
 RUN EXTENDED_TOOLS=" \
-    amass subfinder assetfinder naabu httpx-toolkit rustscan whatweb \
+    amass subfinder assetfinder naabu dnsx httpx-toolkit rustscan whatweb \
     katana hakrawler feroxbuster sslscan testssl.sh dalfox commix \
     wfuzz arjun exploitdb httpie \
-    semgrep bandit gitleaks trivy checkov hadolint kube-bench \
+    semgrep bandit gitleaks trivy hadolint kube-bench \
     gowitness massdns impacket-scripts \
     " && apt-get update && \
     (apt-get install -y --no-install-recommends $EXTENDED_TOOLS || \
@@ -59,18 +64,23 @@ RUN nuclei -update-templates || true; \
     cp -r /root/nuclei-templates/* /opt/nuclei-templates/ 2>/dev/null || true; \
     chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
 
-# bloodhound.py is a pip package, not apt; executable is bloodhound-python.
-# Explicit index URL + best-effort: on flaky networks a failed PyPI fetch
-# must not kill the whole image build. If it fails, bloodhound-python is
-# simply absent (calling it then errors inside the sandbox — acceptable,
-# AD/ldap recon is optional in the tool table).
-# jwt_tool (ticarpi) and graphql-cop are pip-only too. checkov/semgrep are
-# pip-installable as a fallback when the apt name is missing above.
-RUN pip install --no-cache-dir --break-system-packages \
-    --index-url https://pypi.org/simple/ \
-    --timeout 60 --retries 3 \
-    bloodhound.py jwt-tool graphql-cop \
-    || echo "WARN: some pip tools not installed (PyPI unreachable?)"
+# PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
+# all-or-nothing: one unresolvable name aborts the whole command and
+# installs NOTHING — and the trailing `|| WARN` hides it. That is exactly
+# how bloodhound-python, jwt_tool AND graphql-cop all went missing in the
+# same build: the old line asked for `bloodhound.py`, `jwt-tool` and
+# `graphql-cop`, and NONE of those three names exists on PyPI (checked
+# with `pip index versions`). Per-package installs make one bad name cost
+# only that one tool — the same rule as the apt block above.
+#   bloodhound-python -> the real PyPI name; provides `bloodhound-python`
+#   checkov           -> no Kali package (see the apt note above), on PyPI
+# semgrep is NOT here: Kali ships it and the apt install above works.
+RUN for pkg in bloodhound-python checkov; do \
+      pip install --no-cache-dir --break-system-packages \
+        --index-url https://pypi.org/simple/ \
+        --timeout 60 --retries 3 "$pkg" \
+        || echo "WARN: $pkg not installed (PyPI unreachable?)"; \
+    done
 
 # GitHub-hosted tools (no apt package). All best-effort with the same
 # rule as pip above: absent tool = audited spawn failure, never a silent
@@ -108,7 +118,25 @@ RUN mkdir -p /opt/tools && cd /opt/tools && \
       || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
     (wget -q --tries=3 --timeout=30 https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
       && chmod 0755 /usr/local/bin/osv-scanner \
-      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") ; \
+      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/ticarpi/jwt_tool/archive/refs/tags/v2.3.0.tar.gz -O /tmp/jwt.tar.gz \
+      && mkdir -p /opt/tools/jwt_tool \
+      && tar xzf /tmp/jwt.tar.gz -C /opt/tools/jwt_tool --strip-components=1 \
+      && pip install --no-cache-dir --break-system-packages -r /opt/tools/jwt_tool/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/jwt_tool/jwt_tool.py \
+      && chmod 0755 /opt/tools/jwt_tool/jwt_tool.py \
+      && ln -sf /opt/tools/jwt_tool/jwt_tool.py /usr/local/bin/jwt_tool \
+      && rm -f /tmp/jwt.tar.gz \
+      || echo "WARN: jwt_tool not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/dolevf/graphql-cop/archive/refs/tags/1.15.tar.gz -O /tmp/gqlcop.tar.gz \
+      && mkdir -p /opt/tools/graphql-cop \
+      && tar xzf /tmp/gqlcop.tar.gz -C /opt/tools/graphql-cop --strip-components=1 \
+      && pip install --no-cache-dir --break-system-packages -r /opt/tools/graphql-cop/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/graphql-cop/graphql-cop.py \
+      && chmod 0755 /opt/tools/graphql-cop/graphql-cop.py \
+      && ln -sf /opt/tools/graphql-cop/graphql-cop.py /usr/local/bin/graphql-cop \
+      && rm -f /tmp/gqlcop.tar.gz \
+      || echo "WARN: graphql-cop not installed") ; \
     chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
       /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
 

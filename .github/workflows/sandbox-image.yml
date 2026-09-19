@@ -16,9 +16,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Extra tag for this manual build"
+        description: >-
+          Extra tag for this manual build (e.g. v1.3.1). Leave empty to
+          refresh latest only.
         required: false
-        default: "latest"
+        default: ""
 
 permissions:
   contents: read
@@ -28,7 +30,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # GHCR rejects uppercase repository names, and the account name here
       # is mixed-case — derive a lowercased image ref once and reuse it.
@@ -48,7 +50,7 @@ jobs:
           df -h /
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -56,20 +58,28 @@ jobs:
 
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.img.outputs.name }}
           tags: |
+            # A vX.Y.Z tag push publishes that version tag...
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            # ...and moves latest. Prereleases (a "-" in the name) do not.
+            # workflow_dispatch is included so a manual run always maintains
+            # latest: the old rule keyed only off ref_type == 'tag', so a
+            # dispatch refreshed latest only as a side effect of the input
+            # defaulting to the literal string "latest".
+            type=raw,value=latest,enable=${{ (github.ref_type == 'tag' && !contains(github.ref_name, '-')) || github.event_name == 'workflow_dispatch' }}
+            # the dispatch input adds one extra tag, for back-filling a
+            # release that was cut before this workflow existed
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: containers/sandbox/Dockerfile.kali

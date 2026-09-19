@@ -85,7 +85,7 @@ def test_blocklist_allows_normal_argv(allow):
     ("wfuzz", ["wfuzz", "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
                "--hc", "404", "http://target.com/FUZZ", "-t", "5"]),
     ("kr", ["kr", "scan", "/opt/wordlists/routes.kx", "--host", "http://target.com/"]),
-    ("graphql-cop", ["graphql-cop", "-u", "http://target.com/graphql", "-o", "json"]),
+    ("graphql-cop", ["graphql-cop", "-t", "http://target.com/graphql", "-o", "json"]),
     ("searchsploit", ["searchsploit", "--colorless", "apache struts"]),
     # verify
     ("http", ["http", "--ignore-stdin", "--check-status", "http://target.com/"]),
@@ -262,6 +262,140 @@ def _entrypoint_tools() -> set[str]:
     return set(re.findall(r'"([^"]+)"', m.group(1)))
 
 
+# ---- allowlisted tools must actually be INSTALLED in the image ------------
+# The sync test above proves the entrypoint lists the tool. It says nothing
+# about whether the tool exists on disk — a gap that shipped five silent
+# spawn failures at once:
+#   dnsx              allowlisted, stage-1 tool of the DEFAULT RECON_ACTIVE
+#                     plan, never installed (Kali has a dnsx package; the
+#                     apt list just never named it)
+#   bloodhound-python \
+#   jwt_tool          | one `pip install bloodhound.py jwt-tool graphql-cop`
+#   graphql-cop       / line. pip is all-or-nothing, so ONE bad name aborted
+#                     the whole command and a `|| WARN` hid it — and all
+#                     three names were wrong (none exists on PyPI).
+#   checkov           no Kali package (pkg.kali.org/pkg/checkov is a 404);
+#                     the "pip fallback" the comment promised was never wired.
+#
+# apt's file lists can't be introspected from a unit test (that `httpx-toolkit`
+# provides `httpx`, or that `exploitdb` provides `searchsploit`, is a Kali
+# database fact), so this does not guess. Every tool instead DECLARES the token
+# that proves its install below, and the test asserts that token really appears
+# in Dockerfile.kali. Adding a tool to the allowlist without saying where the
+# image gets it now fails here — which is the point.
+
+_DOCKERFILE = (
+    Path(__file__).resolve().parents[1] / "containers" / "sandbox" / "Dockerfile.kali"
+)
+
+# baked into the image by `COPY containers/sandbox/scripts/ /opt/kryonsec/`
+_BAKED = "/opt/kryonsec"
+
+_TOOL_SOURCE: dict[str, str] = {
+    # passive subdomain tools — apt
+    "subfinder": "subfinder",
+    "amass": "amass",
+    "assetfinder": "assetfinder",
+    # active recon — apt (the package name is not always the binary name)
+    "nmap": "nmap",
+    "naabu": "naabu",
+    "httpx": "httpx-toolkit",
+    "rustscan": "rustscan",
+    "whatweb": "whatweb",
+    "katana": "katana",
+    "hakrawler": "hakrawler",
+    "feroxbuster": "feroxbuster",
+    "sslscan": "sslscan",
+    "testssl.sh": "testssl.sh",
+    "dnsx": "dnsx",
+    "gowitness": "gowitness",
+    "massdns": "massdns",
+    f"{_BAKED}/openapi_probe.py": _BAKED,
+    # exploit
+    "nuclei": "nuclei",
+    "sqlmap": "sqlmap",
+    "nikto": "nikto",
+    "curl": "curl",
+    "wget": "wget",
+    "ffuf": "ffuf",
+    "gobuster": "gobuster",
+    "wfuzz": "wfuzz",
+    "dalfox": "dalfox",
+    "commix": "commix",
+    "ssrfmap": "ssrfmap",
+    "arjun": "arjun",
+    "tplmap": "tplmap",
+    "jwt_tool": "jwt_tool",
+    "kr": "kiterunner",
+    "graphql-cop": "graphql-cop",
+    "searchsploit": "exploitdb",
+    f"{_BAKED}/nuclei_meta.py": _BAKED,
+    # verify
+    "http": "httpie",
+    "openssl": "openssl",
+    "dig": "dnsutils",
+    "nc": "netcat-traditional",
+    "ncat": "nmap",
+    f"{_BAKED}/probe.py": _BAKED,
+    # post-exploit
+    "linpeas.sh": "linpeas",
+    "pspy64": "pspy",
+    "linux-exploit-suggester.sh": "linux-exploit-suggester",
+    f"{_BAKED}/enum_processes.py": _BAKED,
+    f"{_BAKED}/enum_fs.py": _BAKED,
+    f"{_BAKED}/enum_network.py": _BAKED,
+    f"{_BAKED}/find_secrets.py": _BAKED,
+    f"{_BAKED}/cloud_meta.py": _BAKED,
+    "GetNPUsers.py": "impacket-scripts",
+    "GetUserSPNs.py": "impacket-scripts",
+    "GetADUsers.py": "impacket-scripts",
+    "findDelegation.py": "impacket-scripts",
+    "bloodhound-python": "bloodhound-python",
+    # blue team
+    "semgrep": "semgrep",
+    "bandit": "bandit",
+    "gitleaks": "gitleaks",
+    "trivy": "trivy",
+    "checkov": "checkov",
+    "hadolint": "hadolint",
+    "syft": "syft",
+    "osv-scanner": "osv-scanner",
+    "grype": "grype",
+}
+
+
+def test_every_allowlisted_tool_declares_an_image_source():
+    from kryonsec.purple.allowlist import EXPLOIT_ALLOWLIST_TEMPLATES
+
+    undeclared = set(EXPLOIT_ALLOWLIST_TEMPLATES) - set(_TOOL_SOURCE)
+    assert not undeclared, (
+        f"allowlisted tools with no declared image source: {sorted(undeclared)}. "
+        f"Add each to _TOOL_SOURCE naming the Dockerfile.kali token that proves "
+        f"the image installs it — then make sure that install really happens."
+    )
+
+
+def test_declared_image_sources_are_all_in_the_dockerfile():
+    """The other half: a declaration that names something the Dockerfile does
+    not actually contain is the same silent failure, one step later."""
+    text = _DOCKERFILE.read_text(encoding="utf-8")
+    missing = {
+        tool: token for tool, token in _TOOL_SOURCE.items() if token not in text
+    }
+    assert not missing, (
+        f"these tools declare an image source the Dockerfile never installs: "
+        f"{sorted(missing.items())} — the spawn would fail inside the sandbox"
+    )
+
+
+def test_nothing_is_declared_that_is_not_allowlisted():
+    """Keep the table from rotting: a stale entry hides a real removal."""
+    from kryonsec.purple.allowlist import EXPLOIT_ALLOWLIST_TEMPLATES
+
+    stale = set(_TOOL_SOURCE) - set(EXPLOIT_ALLOWLIST_TEMPLATES)
+    assert not stale, f"_TOOL_SOURCE entries for tools no longer allowlisted: {sorted(stale)}"
+
+
 def test_entrypoint_allowlist_in_sync():
     from kryonsec.purple.allowlist import EXPLOIT_ALLOWLIST_TEMPLATES
 
@@ -270,3 +404,33 @@ def test_entrypoint_allowlist_in_sync():
         f"host-allowlisted tools missing from sandbox entrypoint "
         f"ALLOWED_TOOLS (would be rejected inside the image): {sorted(missing)}"
     )
+
+
+# ---- trailing-newline anchor (2026-09-18) ----------------------------------
+# Templates were compiled as "^…$". Python's $ also matches just BEFORE a
+# trailing newline, so an argv element ending in "\n" passed validation even
+# though the character is outside every argument character class.
+
+def test_trailing_newline_in_url_rejected(allow):
+    with pytest.raises(AllowlistViolation):
+        allow.validate("curl", ["curl", "-sS", "--max-time", "30", "http://t/\n"])
+
+
+def test_trailing_newline_in_term_rejected(allow):
+    with pytest.raises(AllowlistViolation):
+        allow.validate("searchsploit", ["searchsploit", "--colorless", "-h\n"])
+
+
+def test_trailing_newline_in_target_rejected(allow):
+    with pytest.raises(AllowlistViolation):
+        allow.validate("dig", ["dig", "../../etc\n", "+short"])
+
+
+def test_plain_url_still_accepted(allow):
+    r"""The \Z anchor must not tighten anything else."""
+    allow.validate("curl", ["curl", "-sS", "--max-time", "30", "http://t/"])
+
+
+def test_embedded_newline_rejected(allow):
+    with pytest.raises(AllowlistViolation):
+        allow.validate("curl", ["curl", "-sS", "--max-time", "30", "http://t/\nX"])
