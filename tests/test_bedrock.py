@@ -36,11 +36,29 @@ _LEGACY_MODEL = {
     "providerName": "Someone",
     "modelLifecycle": {"status": "LEGACY"},
 }
+# A profile wraps a real foundation model, and says which one in its modelArn.
+# The fixture carries that because the listing reads it: a profile whose base
+# model is not a text model is not offered as a chat model.
 _PROFILE = {
-    "inferenceProfileId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    "inferenceProfileName": "Claude Sonnet 4.5",
+    "inferenceProfileId": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "inferenceProfileName": "Claude 3.5 Sonnet v2",
     "type": "SYSTEM_DEFINED",
     "status": "ACTIVE",
+    "models": [{
+        "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/"
+                    "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    }],
+}
+# The one that was actually offered to a user as a chat model, and could only
+# ever fail: Cohere Embed produces embeddings, not replies.
+_EMBED_PROFILE = {
+    "inferenceProfileId": "global.cohere.embed-v4:0",
+    "inferenceProfileName": "Cohere Embed v4",
+    "type": "SYSTEM_DEFINED",
+    "status": "ACTIVE",
+    "models": [{
+        "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",
+    }],
 }
 _APP_PROFILE = {
     "inferenceProfileId": "my-own-profile",
@@ -78,11 +96,16 @@ class FakeBedrock:
         accept: dict[str, dict] | None = None,
         reject_status: int = 403,
         deny_paths: set[str] | None = None,
+        deny_query_exact: set[str] | None = None,
         network_error: bool = False,
     ):
         self.accept = accept or {}
         self.reject_status = reject_status
         self.deny_paths = deny_paths or set()
+        # matched as `path.endswith("?" + q)`, so `?byOutputModality=TEXT`
+        # fails ONLY the models-for-chat call and not the main listing, whose
+        # query has more after it
+        self.deny_query_exact = deny_query_exact or set()
         self.network_error = network_error
         self.calls: list[tuple[str, str, str | None]] = []  # region, path, auth
         self.urls: list[str] = []
@@ -98,7 +121,10 @@ class FakeBedrock:
 
         if self.network_error:
             raise OSError("no network")
-        if region not in self.accept or any(path.startswith(p) for p in self.deny_paths):
+        denied = any(path.startswith(p) for p in self.deny_paths) or any(
+            path.endswith("?" + q) for q in self.deny_query_exact
+        )
+        if region not in self.accept or denied:
             raise urllib.error.HTTPError(
                 req.full_url, self.reject_status, "Forbidden", {}, None  # type: ignore[arg-type]
             )
@@ -241,6 +267,88 @@ def test_list_bedrock_models_none_when_the_catalog_is_unreadable(fake):
 def test_list_bedrock_models_empty_when_nothing_matches(fake):
     fake(accept={"us-east-1": {"models": [_LEGACY_MODEL]}})
     assert list_bedrock_models("ABSKx", "us-east-1") == []
+
+
+# ---- profiles must not offer a model that cannot chat ----------------------
+#
+# The model listing asks for TEXT output, so an embedding model never appears
+# in it. The profile listing has no such parameter, so `global.cohere.embed-v4:0`
+# arrived looking exactly like a chat model — and was offered as one. Picking
+# it could only ever fail, and it is what sent a user through several models
+# hunting for one that worked when the problem was the model *kind*.
+
+def test_an_embedding_profile_is_not_offered_as_a_chat_model(fake):
+    fake(accept={"us-east-1": {
+        "models": [_MODEL], "profiles": [_EMBED_PROFILE, _PROFILE],
+    }})
+    ids = [m["id"] for m in list_bedrock_models("ABSKx", "us-east-1")]
+    assert ids == [_PROFILE["inferenceProfileId"], _MODEL["modelId"]]
+    assert _EMBED_PROFILE["inferenceProfileId"] not in ids
+
+
+def test_the_profile_filter_reads_the_model_arn_not_the_id(fake):
+    """The ARN is what the profile actually routes to, so it decides.
+
+    A profile whose id looks like a chat model but wraps an embedding one is
+    still an embedding profile.
+    """
+    liar = {
+        "inferenceProfileId": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "inferenceProfileName": "Mislabelled",
+        "type": "SYSTEM_DEFINED",
+        "status": "ACTIVE",
+        "models": [{
+            "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",
+        }],
+    }
+    fake(accept={"us-east-1": {"models": [_MODEL], "profiles": [liar]}})
+    assert [m["id"] for m in list_bedrock_models("ABSKx", "us-east-1")] == [
+        _MODEL["modelId"]
+    ]
+
+
+def test_a_profile_without_arns_falls_back_to_its_id_prefix(fake):
+    """`global.` / `us.` / `apac.` then the base model id — the same fact
+    the ARN carries, recoverable when the response omits the ARN list."""
+    no_arn = {
+        "inferenceProfileId": "global.cohere.embed-v4:0",
+        "inferenceProfileName": "Cohere Embed v4",
+        "type": "SYSTEM_DEFINED",
+        "status": "ACTIVE",
+    }
+    fake(accept={"us-east-1": {"models": [_MODEL], "profiles": [no_arn]}})
+    ids = [m["id"] for m in list_bedrock_models("ABSKx", "us-east-1")]
+    assert ids == [_MODEL["modelId"]]
+    assert no_arn["inferenceProfileId"] not in ids
+
+
+def test_profiles_survive_when_the_modality_call_fails(fake):
+    """Only ever drop a profile on positive evidence.
+
+    If the text-model list cannot be read, we do not know that anything is
+    an embedding model — and dropping every profile then would take out the
+    ones the docs say must lead the list.
+    """
+    fake(
+        accept={"us-east-1": {"models": [_MODEL], "profiles": [_PROFILE]}},
+        deny_query_exact={"byOutputModality=TEXT"},
+    )
+    ids = [m["id"] for m in list_bedrock_models("ABSKx", "us-east-1")]
+    assert ids == [_PROFILE["inferenceProfileId"], _MODEL["modelId"]]
+
+
+def test_the_profile_filter_asks_for_text_without_the_on_demand_limit(fake):
+    """The filter's own call must not reuse the main listing's query.
+
+    The main listing asks for ON_DEMAND, which leaves out models reachable
+    only through a cross-region profile — exactly the ones the profiles
+    wrap. Filtering against that list would drop every good profile.
+    """
+    server = fake(accept={"us-east-1": {"models": [_MODEL], "profiles": [_PROFILE]}})
+    list_bedrock_models("ABSKx", "us-east-1")
+    queries = [p.split("?", 1)[1] for _, p, _ in server.calls if "?" in p]
+    assert "byOutputModality=TEXT" in queries
+    assert "byOutputModality=TEXT&byInferenceType=ON_DEMAND" in queries
 
 
 # ---- model id formatting + help text --------------------------------------

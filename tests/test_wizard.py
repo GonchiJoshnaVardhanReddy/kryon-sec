@@ -398,16 +398,24 @@ def test_wizard_bedrock_model_selection_picks_the_right_id(
 # their first prompt, from a setup that had just reported success.
 
 
-def test_wizard_bedrock_rejects_a_model_that_does_not_answer(
+def test_wizard_bedrock_scans_for_a_model_that_actually_answers(
         scripted_wizard, tmp_path, monkeypatch):
-    """The wizard must call the model and, when AWS refuses, say so and let
-    the user pick again instead of saving a config that cannot work."""
+    """A refused pick costs one call, not an evening of retyping.
+
+    The list is the region's catalog, not a menu of working models, and it
+    gives the user no way to tell them apart. Handing back "pick another?"
+    makes them do the search one model at a time — which is exactly the loop
+    a user with a whole region of refused models gets stuck in, and it reads
+    as "kryonsec is broken" rather than "these will not work". So the wizard
+    tests the rest itself and stops at the first that answers.
+    """
     calls = []
 
-    def fake_verify(cfg, *a, **kw):
-        calls.append(cfg.general_chat_model)
+    def fake_verify(cfg, model_id=None, **kw):
+        target = model_id or cfg.general_chat_model
+        calls.append(target)
         # the global cross-region profile is refused; the plain one works
-        if "global." in cfg.general_chat_model:
+        if "global." in target:
             return "rejected", 'BedrockException - {"message":"Operation not allowed"}'
         return "ok", "ok"
 
@@ -423,18 +431,146 @@ def test_wizard_bedrock_rejects_a_model_that_does_not_answer(
     cfg = scripted_wizard([
         "3", "ABSKtest",
         "1",   # global.openai.gpt-5.6-sol — refused
-        "y",   # yes, pick another
-        "2",   # the Claude profile — accepted
+        # NOTE: no "pick another" answer — the scan supplies the next model
         "", "", "n",
     ])
-    # it tried both, in order, and saved the one that actually answers
+    # it tried the refusal, then the alternative, and stopped there
     assert calls == [
         "bedrock/global.openai.gpt-5.6-sol",
         "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     ]
+    # and never re-tested the one it had just been refused
+    assert calls.count("bedrock/global.openai.gpt-5.6-sol") == 1
     assert cfg.general_chat_model == (
         "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
     assert cfg.general_search_model == cfg.general_chat_model
+
+
+def test_every_model_refused_is_reported_as_the_account_not_the_pick(
+        scripted_wizard, tmp_path, monkeypatch, capsys):
+    """The one message a screen full of identical errors cannot give.
+
+    "Every model in this region was refused" is a fact about the account,
+    and it is the fact that says stop picking and go to Model access. Both
+    of the other answers — silence, or "pick another" — send the user round
+    the loop again with no new information.
+    """
+    _patch_bedrock(monkeypatch, verify=("rejected", "Operation not allowed"))
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "1",   # refused; the scan then refuses the other one too
+        "n",   # keep it anyway
+        "", "", "n",
+    ])
+    out = capsys.readouterr().out
+    assert "none of the 1 other models answered either" in out
+    assert "refused every one of them" in out
+    assert "us-east-1" in out          # which region was searched
+    assert "Model access" in out       # and where to go about it
+    # the user was never asked to pick again before being told why
+    assert cfg.provider == "bedrock"
+
+
+def test_a_scan_that_reaches_nothing_stops_instead_of_grinding(
+        scripted_wizard, tmp_path, monkeypatch, capsys):
+    """Three calls with no verdict means the endpoint is not answering.
+
+    Without this the scan would spend its full allowance of 30-second
+    timeouts — twenty minutes — to learn what the first three already said.
+    """
+    calls = []
+
+    def fake_verify(cfg, model_id=None, **kw):
+        target = model_id or cfg.general_chat_model
+        calls.append(target)
+        if len(calls) == 1:
+            return "rejected", "Operation not allowed"
+        return "unknown", "APIConnectionError: connection refused"
+
+    models = [{"id": f"vendor.model-{i}", "label": f"Model {i}",
+               "kind": "foundation-model"} for i in range(40)]
+    _patch_bedrock(monkeypatch, models=models)
+    monkeypatch.setattr("kryonsec.bedrock.verify_model", fake_verify)
+
+    scripted_wizard([
+        "3", "ABSKtest",
+        "1",       # refused, so the scan starts
+        # then three no-verdict calls abort it
+        "n", "", "", "n",
+    ])
+    # 1 pick + 3 no-answer probes, not 1 + 39
+    assert len(calls) == 4
+    out = capsys.readouterr().out
+    assert "None of the calls reached AWS" in out
+
+
+def test_a_lone_model_that_is_refused_still_offers_the_manual_path(
+        scripted_wizard, tmp_path, monkeypatch):
+    """Nothing to scan is not the same as nothing to try.
+
+    With one model in the list there is no alternative to test, so the
+    wizard must go straight to letting the user type an id — for a model
+    they know about that the listing did not return.
+    """
+    calls = []
+
+    def fake_verify(cfg, model_id=None, **kw):
+        target = model_id or cfg.general_chat_model
+        calls.append(target)
+        if target == "bedrock/my.known-good-v1:0":
+            return "ok", "ok"
+        return "rejected", "Operation not allowed"
+
+    _patch_bedrock(monkeypatch, models=[
+        {"id": "amazon.nova-pro-v1:0", "label": "Amazon Nova Pro",
+         "kind": "foundation-model"},
+    ])
+    monkeypatch.setattr("kryonsec.bedrock.verify_model", fake_verify)
+
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "1",                  # the only listed model — refused
+        "y",                  # pick another
+        "my.known-good-v1:0",  # typed by hand
+        "", "", "n",
+    ])
+    assert calls == [
+        "bedrock/amazon.nova-pro-v1:0",
+        "bedrock/my.known-good-v1:0",
+    ]
+    assert cfg.general_chat_model == "bedrock/my.known-good-v1:0"
+
+
+def test_the_scan_runs_once_not_on_every_pass(
+        scripted_wizard, tmp_path, monkeypatch):
+    """After a full scan the list has been answered for.
+
+    Re-scanning on the next pass would repeat the whole set of calls to
+    reach a conclusion it already has.
+    """
+    calls = []
+
+    def fake_verify(cfg, model_id=None, **kw):
+        target = model_id or cfg.general_chat_model
+        calls.append(target)
+        return "rejected", "Operation not allowed"
+
+    _patch_bedrock(monkeypatch)
+    monkeypatch.setattr("kryonsec.bedrock.verify_model", fake_verify)
+
+    scripted_wizard([
+        "3", "ABSKtest",
+        "1",   # refused -> scan tests the other one -> refused too
+        "y",   # pick another by hand
+        "2",   # refused, and no second scan
+        "n",   # keep it
+        "", "", "n",
+    ])
+    assert calls == [
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",  # the pick
+        "bedrock/amazon.nova-pro-v1:0",                          # the scan
+        "bedrock/amazon.nova-pro-v1:0",                          # picked by hand
+    ]
 
 
 def test_wizard_bedrock_can_keep_a_model_that_failed_verification(

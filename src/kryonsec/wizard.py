@@ -286,6 +286,109 @@ def _ask_yes_no(question: str, answers: list[str] | None = None) -> bool:
     return raw.strip().lower() in ("y", "yes", "1")
 
 
+# What to do about a model AWS refused. Kept next to the loop that prints it
+# so the wording and the behaviour cannot drift apart.
+_BEDROCK_REFUSAL_HELP = (
+    "[dim]Three things cause this, in order of likelihood: the model is not "
+    "enabled for your account (Bedrock > Model access); it is a `global.` "
+    "profile and your account may not use global cross-region inference "
+    "(try the region-prefixed one — `us.`, `eu.`, …); or Bedrock does not "
+    "serve it on the OpenAI-compatible endpoint kryonsec calls, in which "
+    "case pick a different model.[/dim]"
+)
+
+# How many models the wizard tests on its own before handing back.
+#
+# A working model is nearly always near the top — cross-region profiles come
+# first, then the catalog — so a run this long that finds nothing means the
+# account cannot invoke anything, and grinding through the remaining hundred
+# would only spend more of the user's time reaching the same answer.
+BEDROCK_SCAN_LIMIT = 40
+
+# Three calls in a row that produced no verdict at all — no network, a
+# timeout, litellm dying in our own stack — mean the endpoint is not
+# answering, not that 40 models were each individually unlucky.
+BEDROCK_SCAN_NO_ANSWER_LIMIT = 3
+
+
+def _scan_bedrock_models(cfg, candidates: list[dict], verify_model):
+    """Test candidates until one answers. Returns (model_id or None, tally).
+
+    The tally is the point of the exercise. "40 were refused" and "40 could
+    not be checked" look identical in a console full of red, and they have
+    opposite fixes — model access on the AWS side, or the network on this
+    one. Counting them separately is what lets the summary say which.
+
+    The candidates are passed in rather than re-listed, so a model the user
+    already picked is never re-tested, and `cfg` is only read: verify_model
+    takes the id as an argument, so nothing here has to be undone.
+    """
+    from .bedrock import VERIFY_OK, VERIFY_REJECTED, format_model_id
+
+    tally = {"tested": 0, "refused": 0, "unchecked": 0, "capped": False}
+    streak = 0
+    for entry in candidates[:BEDROCK_SCAN_LIMIT]:
+        # Formatted here so the call is byte-identical to the one the wizard
+        # makes for a pick — verify_model would do this itself, but then the
+        # scan and the pick would be probing differently-spelled ids, and the
+        # scan's job is to answer the question the pick asks.
+        verdict, _ = verify_model(cfg, format_model_id(entry["id"]))
+        tally["tested"] += 1
+        if verdict == VERIFY_OK:
+            return entry["id"], tally
+        if verdict == VERIFY_REJECTED:
+            tally["refused"] += 1
+            streak = 0
+        else:
+            tally["unchecked"] += 1
+            streak += 1
+            if streak >= BEDROCK_SCAN_NO_ANSWER_LIMIT:
+                return None, tally
+    tally["capped"] = len(candidates) > BEDROCK_SCAN_LIMIT
+    return None, tally
+
+
+def _report_no_working_model(console, region: str, tally: dict) -> None:
+    """Say what the scan found, in the terms that decide the next action.
+
+    This is the branch the user with a whole region of models and no working
+    one actually needs: it has to distinguish "you picked badly" from "your
+    account cannot invoke anything", because only the second one means
+    stop picking and go to the console.
+    """
+    console.print(
+        f"[red]none of the {tally['tested']} other models answered either[/red]"
+    )
+    if tally["refused"] and not tally["unchecked"]:
+        console.print(
+            f"[yellow]AWS refused every one of them, in {region}. That is not "
+            "a bad pick — it is the account. Model access is granted per "
+            "region, and the AWS console opens on us-east-1, so access "
+            f"enabled there does nothing for {region}. Open Bedrock with "
+            f"{region} selected, enable a model under Model access, then run "
+            "`kryonsec setup` again.[/yellow]"
+        )
+    elif tally["unchecked"] and not tally["refused"]:
+        console.print(
+            "[yellow]None of the calls reached AWS — no verdict either way, "
+            "so nothing here says the models are wrong. Check the network and "
+            "run `kryonsec setup` again.[/yellow]"
+        )
+    else:
+        console.print(
+            f"[yellow]{tally['refused']} were refused and "
+            f"{tally['unchecked']} could not be checked. Both, rather than "
+            "one, usually means model access is the problem and the network "
+            "is muddying it.[/yellow]"
+        )
+    if tally["capped"]:
+        console.print(
+            f"[dim]Only the first {BEDROCK_SCAN_LIMIT} were tested and the "
+            "list is longer, so a model further down may still work — type "
+            "its id if you know one.[/dim]"
+        )
+
+
 def _setup_bedrock(
     cfg: KryonsecConfig, console, answers: list[str] | None = None
 ) -> bool:
@@ -350,6 +453,7 @@ def _setup_bedrock(
     # Stopping at the list is how the first Bedrock user reached their first
     # prompt with a config that could never work — from a wizard that had
     # just reported success.
+    scanned = False
     while True:
         models = list_bedrock_models(key, region)
         if models:
@@ -383,15 +487,32 @@ def _setup_bedrock(
             break
 
         console.print(f"[red]that model did not answer:[/red] {why}")
-        console.print(
-            "[dim]Three things cause this, in order of likelihood: the model "
-            "is not enabled for your account (Bedrock > Model access); it is "
-            "a `global.` profile and your account may not use global "
-            "cross-region inference (try the region-prefixed one — `us.`, "
-            "`eu.`, …); or Bedrock does not serve it on the OpenAI-compatible "
-            "endpoint kryonsec calls, in which case pick a different "
-            "model.[/dim]"
-        )
+
+        # Test the rest here rather than handing back a one-at-a-time guessing
+        # game. That game is what a user with a whole region of models and no
+        # way to tell them apart actually gets, and it reads as "kryonsec is
+        # broken" when the real answer is "none of these will work, and here
+        # is why" — which is a thing only a scan can say.
+        #
+        # Once, not per pass: after a full scan the remaining list has been
+        # answered for, so a second one would only repeat it.
+        if models and not scanned:
+            scanned = True
+            others = [m for m in models if m["id"] != model_id]
+            if others:
+                console.print(
+                    f"[dim]that one was refused — testing the other "
+                    f"{len(others)} to find one that answers…[/dim]"
+                )
+                found, tally = _scan_bedrock_models(cfg, others, verify_model)
+                if found:
+                    console.print(f"[green]this one answers:[/green] {found}")
+                    cfg.general_chat_model = format_model_id(found)
+                    model_id = found
+                    break
+                _report_no_working_model(console, region, tally)
+
+        console.print(_BEDROCK_REFUSAL_HELP)
         again = (answers or []).pop(0) if answers else input("pick another model? [Y/n]: ")
         if again.strip().lower().startswith("n"):
             # never trap the user: they were told the reason, so keep what
