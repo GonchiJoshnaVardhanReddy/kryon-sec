@@ -99,6 +99,24 @@ def test_missing_uvx_says_where_uvx_comes_from():
     assert "log out and back in" in message  # the installed-but-not-on-PATH case
 
 
+def test_every_mcp_preset_has_an_install_hint():
+    """The wizard warns when a preset's command is missing, and the hint is
+    the only actionable part of that warning — a preset added without one
+    leaves the user with "not on PATH" and nothing to do about it. The
+    installers also pre-install uv so the fetch preset works on a fresh
+    machine; this is what keeps that promise honest as presets change."""
+    from kryonsec.copilot.mcp_tools import command_install_hint
+    from kryonsec.wizard import MCP_PRESETS
+
+    assert MCP_PRESETS, "no presets to check — did they move?"
+    for preset in MCP_PRESETS:
+        first_token = preset["command"].split()[0]
+        assert command_install_hint(first_token), (
+            f"MCP preset {preset['name']!r} starts {first_token!r}, which has no "
+            "entry in INSTALL_HINTS — the wizard cannot say how to install it"
+        )
+
+
 def test_missing_command_hint_survives_a_windows_path():
     from kryonsec.copilot.mcp_tools import (
         _missing_command_message,

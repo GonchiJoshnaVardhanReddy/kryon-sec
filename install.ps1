@@ -121,6 +121,22 @@ Say "installing kryonsec (a few minutes - pip is quiet while it resolves)"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Kryo)) { Die "installation failed" }
 & $Kryo --version
 
+# uvx runs a Python CLI tool without installing it - npx for Python. It is
+# what the wizard's `fetch` MCP preset starts, it ships with uv, and most
+# machines do not have uv, so that preset failed on the very first run for
+# everyone. Installed INTO the venv deliberately: it lands on the PATH this
+# script already manages and goes away with the venv. Skipped when uv is
+# already available; never fatal, because nothing in either mode depends on it.
+if (-not (Get-Command uvx -ErrorAction SilentlyContinue)) {
+    & $Pip install --quiet uv
+    if ($LASTEXITCODE -eq 0) {
+        Say "installed uv (provides uvx, for the 'fetch' MCP server)"
+    } else {
+        Say "WARNING: could not install uv - the 'fetch' MCP server needs it"
+        Say "         install it later with: $Pip install uv"
+    }
+}
+
 # ---- 4. PATH (user scope, idempotent) ----------------------------------------
 $Bin = Join-Path $Venv "Scripts"
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -133,6 +149,10 @@ if ($userPath -notlike "*$Bin*") {
 } else {
     Say "PATH already set up"
 }
+# Make it live in THIS process too, not just new terminals: the wizard runs
+# below as a subprocess and resolves commands against the PATH it inherits, so
+# without this it would warn that uvx is missing moments after we installed it.
+$env:Path = "$Bin;$env:Path"
 
 # ---- 5. first-run wizard -----------------------------------------------------
 Say "starting setup wizard"

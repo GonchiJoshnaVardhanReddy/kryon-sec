@@ -160,6 +160,22 @@ say "installing kryonsec (this pulls litellm, mcp, rich, … — takes a few min
 "$VENV/bin/pip" install "git+$REPO.git$KRYONSEC_VERSION"
 "$VENV/bin/kryonsec" --version || die "installation failed"
 
+# uvx runs a Python CLI tool without installing it — npx for Python. It is
+# what the wizard's `fetch` MCP preset starts, it ships with uv, and most
+# machines do not have uv, so that preset failed on the very first run for
+# everyone. Installed INTO the venv deliberately: it lands on the PATH this
+# script already manages, needs no extra `curl | sh` from a third party, and
+# goes away with the venv. Skipped when uv is already available; never fatal,
+# because nothing in either mode depends on it.
+if ! command -v uvx >/dev/null 2>&1; then
+    if "$VENV/bin/pip" install --quiet uv; then
+        say "installed uv (provides uvx, for the 'fetch' MCP server)"
+    else
+        say "WARNING: could not install uv — the 'fetch' MCP server needs it"
+        say "         install it later with: $VENV/bin/pip install uv"
+    fi
+fi
+
 # ---- 4. PATH (idempotent) ---------------------------------------------------
 SHELL_RC="$HOME/.bashrc"
 # ${SHELL:-}: not exported in many non-interactive environments (docker RUN,
@@ -179,6 +195,12 @@ fi
 case "${SHELL:-}" in
     *fish) say "fish detected: run this once ->  set -U fish_user_paths $VENV/bin \$fish_user_paths" ;;
 esac
+
+# Make it live in THIS process too, not just the next shell. The wizard and
+# doctor run below as subprocesses and resolve commands against the PATH they
+# inherit — without this the wizard would warn that uvx is missing moments
+# after we installed it, and the closing "run: kryonsec" hint would be a lie.
+export PATH="$VENV/bin:$PATH"
 
 # ---- 5. docker + gvisor + sandbox image (Purple Team, Linux) ----------------
 # Purple Team mode needs Docker + gVisor + the sandbox image. Instead of

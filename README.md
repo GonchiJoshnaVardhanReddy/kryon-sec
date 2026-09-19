@@ -259,6 +259,11 @@ one subprocess per server, connected once per session — not per message):
 | `fetch` | `uvx mcp-server-fetch` | fetch web pages as clean text, no API key |
 | `filesystem` | `npx -y @modelcontextprotocol/server-filesystem` | needs Node; wizard asks for the allowed directory |
 
+`uvx` comes with [uv](https://docs.astral.sh/uv/) and `npx` with
+[Node.js](https://nodejs.org/). The installers put uv into kryonsec's own venv
+so the `fetch` preset works on a fresh machine; Node is not installed for you —
+setup warns if it is missing, and names what to install.
+
 You can also add any custom stdio MCP server (name + command + env). Every MCP
 tool the server exposes becomes a tool the agent can call.
 
