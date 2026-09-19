@@ -11,9 +11,13 @@ the Bedrock console. It carries no region — AWS selects the region from the
 endpoint host — so the region is *discovered by probing* rather than read
 out of the key. The standard env var is ``AWS_BEARER_TOKEN_BEDROCK``.
 
-Everything here is stdlib-only (urllib), matching the wizard's OpenAI
-helpers. litellm forwards ``api_key`` as the bearer token and
-``aws_region_name`` as the region (see litellm/llms/bedrock/base_aws_llm.py).
+The control-plane calls here are stdlib-only (urllib), matching the wizard's
+OpenAI helpers. The one exception is verify_model(), which must ask whether
+a call succeeds and therefore goes through llm._complete; its litellm import
+is lazy so this module stays cheap to import.
+
+litellm forwards ``api_key`` as the bearer token and ``aws_region_name`` as
+the region (see litellm/llms/bedrock/base_aws_llm.py).
 """
 
 from __future__ import annotations
@@ -220,3 +224,140 @@ def list_bedrock_models(
         })
 
     return _list_inference_profiles(api_key, region, timeout) + models
+
+
+# A permission probe, not a conversation: the smallest call that proves the
+# model is invocable. 16 tokens because a few models refuse a 1-token
+# response outright, which would read as "not allowed" and be wrong.
+VERIFY_MAX_TOKENS = 16
+VERIFY_TIMEOUT_S = 30
+
+# "ok" / "rejected" / "unknown" — see verify_model.
+VERIFY_OK = "ok"
+VERIFY_REJECTED = "rejected"
+VERIFY_UNKNOWN = "unknown"
+
+# Exception classes that mean AWS answered and said no. Anything else means
+# the call never got a verdict out of AWS — litellm's Converse path, for
+# one, reads `credentials.access_key` before it checks for a bearer token,
+# so on a machine with no SigV4 credentials it dies locally with
+# "'NoneType' object has no attribute 'access_key'". That is our tooling
+# failing, not the model, and telling a user their model is broken because
+# our probe crashed would be worse than not checking at all.
+#
+# Only classes that mean one thing are listed. litellm's BadRequestError,
+# ValidationException and UnprocessableEntityError are deliberately absent:
+# a 400 covers "you may not invoke this model", "you are over quota" and
+# "your request was malformed" alike, and blaming the user's model choice
+# for a quota or for our own bug is exactly the false negative this
+# distinction exists to prevent. Messages that do mean it are matched by
+# prose below.
+_AWS_VERDICT_ERRORS = frozenset({
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "AccessDeniedError",
+    "AccessDeniedException",
+    "UnrecognizedClientException",
+    "NotFoundError",
+    "ResourceNotFoundException",
+})
+
+# AWS answers in prose too, and litellm does not always map a Bedrock error
+# onto one of its own types: the first user's rejection arrived as a bare
+# `BedrockException - {"message":"Operation not allowed"}`. Without these,
+# that case reads as "unknown" and the wizard says nothing about a model the
+# key genuinely cannot invoke — which is the whole thing this check exists
+# to catch. Deliberately narrow: "throttled", "quota", "timed out" and the
+# like are NOT here, because those mean the model is fine.
+_AWS_REJECTION_PHRASES = (
+    "operation not allowed",
+    "access denied",
+    "accessdenied",
+    "not authorized to perform",
+    "is not authorized",
+    "no access to this model",
+    "you don't have access",
+    # the other way a valid pick still cannot be called, and the reason the
+    # model list shows inference profiles at all
+    "on-demand throughput isn't supported",
+    "on-demand throughput is not supported",
+    # Bedrock's Model access form was never filled in for this account
+    "model use case details",
+)
+
+
+def _says_no(exc: BaseException) -> bool:
+    try:
+        text = str(exc).lower()
+    except Exception:  # a broken __str__ must not break the verdict
+        return False
+    return any(phrase in text for phrase in _AWS_REJECTION_PHRASES)
+
+
+def _walk_exceptions(exc: BaseException):
+    """exc, then everything it wraps: __cause__, and ExceptionGroup members.
+
+    litellm re-raises provider errors inside its own types, and anyio wraps
+    them again in an ExceptionGroup, so the class that identifies an AWS
+    verdict can sit two or three levels down. Seen-guarded: a malformed
+    chain that points back at itself must not hang the wizard.
+    """
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        cause = getattr(current, "__cause__", None)
+        if cause is not None:
+            queue.append(cause)
+        queue.extend(getattr(current, "exceptions", None) or [])
+
+
+def classify_verify_error(exc: BaseException) -> str:
+    """VERIFY_REJECTED when AWS gave a verdict, else VERIFY_UNKNOWN."""
+    for nested in _walk_exceptions(exc):
+        if type(nested).__name__ in _AWS_VERDICT_ERRORS or _says_no(nested):
+            return VERIFY_REJECTED
+    return VERIFY_UNKNOWN
+
+
+def verify_model(cfg: Any, model_id: str | None = None) -> tuple[str, str]:
+    """Ask AWS whether this key may actually invoke this model.
+
+    Returns (verdict, reason) where verdict is VERIFY_OK, VERIFY_REJECTED
+    (AWS answered and said no) or VERIFY_UNKNOWN (no verdict — network,
+    missing credentials, a litellm bug). Callers must treat UNKNOWN as
+    "no information", never as a failure: the model may be perfectly fine.
+
+    Listing a model proves only that the catalog knows about it. Whether
+    *this* key may invoke it is a separate question — model access, the
+    region an inference profile routes through, the key's own scope — and
+    AWS answers it only when you call. A wizard that stops at the catalog
+    hands the user a config that cannot work, which is exactly what
+    happened to the first person to pick a ``global.`` cross-region OpenAI
+    model: "Operation not allowed", on their first prompt, from a setup
+    that had just reported success.
+
+    Deliberately routed through llm._complete rather than calling litellm
+    directly, so this asks the real question — "will the call kryonsec makes
+    actually work?" — parameters included. Never raises.
+    """
+    from .llm import _complete, provider_reason
+
+    model = model_id or getattr(cfg, "general_chat_model", "") or ""
+    if not model:
+        return VERIFY_UNKNOWN, "no model chosen"
+    try:
+        _complete(
+            cfg,
+            format_model_id(model),
+            [{"role": "user", "content": "hi"}],
+            max_tokens=VERIFY_MAX_TOKENS,
+            timeout=VERIFY_TIMEOUT_S,
+        )
+    except Exception as e:
+        return classify_verify_error(e), provider_reason(e)
+    return VERIFY_OK, "ok"

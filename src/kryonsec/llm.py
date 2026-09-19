@@ -233,6 +233,31 @@ class SecretsMustStayLocal(RuntimeError):
     CLAUDE.md rule 4)."""
 
 
+def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
+    """The provider's own words for a failed call, shortened.
+
+    A hosted failure is usually the provider *telling* you what is wrong —
+    "Operation not allowed", "on-demand throughput isn't supported", a
+    quota message. Replacing that with our own guess ("check the API key or
+    the network") hides the one useful sentence, and the guess is often
+    wrong: the first Bedrock user to hit "Operation not allowed" had a
+    working key and a working network, and was told to check both.
+    """
+    if exc is None:
+        return "no response"
+    text = " ".join(str(exc).split())
+    if not text:
+        return type(exc).__name__
+    # litellm prefixes its own module path; the class name is already shown
+    # by the caller, so drop the duplicate
+    prefix = f"litellm.{type(exc).__name__}: "
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
 class CompactionMustStayLocal(SecretsMustStayLocal):
     """Secrets present and no local model available — refuse rather than
     send redacted-material upstream (spec §6.4)."""
@@ -388,21 +413,21 @@ def chat(
             f"{hosted.label} is the configured provider but no API key is "
             "set — run `kryonsec setup`"
         )
+    last_error: BaseException | None = None
     try:
         return _complete(cfg, model, messages, **kwargs)
-    except Exception:
-        pass
+    except Exception as e:
+        last_error = e
     # same-provider fallback: the cheap search model, when it differs
     if cfg.general_search_model != model:
         log.warning("LLM %s failed; falling back to %s", model, cfg.general_search_model)
         try:
             return _complete(cfg, cfg.general_search_model, messages, **kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = e
 
     raise LlmUnavailable(
-        f"no {hosted.label} model answered — check the API key "
-        "(`kryonsec setup`) or the network"
+        f"no {hosted.label} model answered — {provider_reason(last_error)}"
     )
 
 

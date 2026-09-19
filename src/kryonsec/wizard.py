@@ -293,12 +293,18 @@ def _setup_bedrock(
 
     Returns True when cfg is configured, False to send the caller back to
     the provider question (bad/missing key, or no model chosen).
+
+    The chosen model is proved with a real call before it is saved — see
+    the loop below for why that is not optional.
     """
     from .bedrock import (
         BEDROCK_KEY_HELP,
+        VERIFY_OK,
+        VERIFY_REJECTED,
         format_model_id,
         list_bedrock_models,
         probe_regions,
+        verify_model,
     )
 
     console.print(f"[dim]{BEDROCK_KEY_HELP}[/dim]")
@@ -337,32 +343,67 @@ def _setup_bedrock(
         console.print(f"[green]your key works in {len(regions)} regions[/green]")
         region = _pick_model(regions, answers, noun="region", sort_note="most common first")
 
-    models = list_bedrock_models(key, region)
-    if models:
-        model_id = _pick_bedrock_model(models, answers)
-    else:
-        console.print(
-            "[yellow]could not list models for that region — type the model "
-            "id manually[/yellow]\n"
-            "  e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
-        )
-        model_id = ((answers or []).pop(0) if answers else input("model id: ")).strip()
-    if not model_id:
-        return False
+    # Choose a model and PROVE it answers before saving it. Listing a model
+    # only proves the catalog knows about it; whether this key may invoke it
+    # is a different question ("Operation not allowed" is a permissions
+    # answer, not a key or network one), and AWS gives it only when you call.
+    # Stopping at the list is how the first Bedrock user reached their first
+    # prompt with a config that could never work — from a wizard that had
+    # just reported success.
+    while True:
+        models = list_bedrock_models(key, region)
+        if models:
+            model_id = _pick_bedrock_model(models, answers)
+        else:
+            console.print(
+                "[yellow]could not list models for that region — type the model "
+                "id manually[/yellow]\n"
+                "  e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
+            )
+            model_id = ((answers or []).pop(0) if answers else input("model id: ")).strip()
+        if not model_id:
+            return False
 
-    cfg.bedrock_api_key = key
-    cfg.bedrock_region = region
-    cfg.general_chat_model = format_model_id(model_id)
+        cfg.bedrock_api_key = key
+        cfg.bedrock_region = region
+        cfg.general_chat_model = format_model_id(model_id)
+
+        console.print(f"[dim]checking {model_id} answers…[/dim]")
+        verdict, why = verify_model(cfg)
+        if verdict == VERIFY_OK:
+            break
+        if verdict != VERIFY_REJECTED:
+            # The call never reached a verdict — no network, or litellm died
+            # before it sent anything. That says nothing about the model, so
+            # do not make the user pick again over it.
+            console.print(
+                f"[yellow]could not check {model_id} — keeping it.[/yellow] "
+                f"[dim]({why})[/dim]"
+            )
+            break
+
+        console.print(f"[red]that model did not answer:[/red] {why}")
+        console.print(
+            "[dim]Enable it for your account under Bedrock > Model access. "
+            "If it is a `global.` profile, try the region-prefixed one "
+            "(`us.`, `eu.`, …) instead — not every account may use global "
+            "cross-region inference.[/dim]"
+        )
+        again = (answers or []).pop(0) if answers else input("pick another model? [Y/n]: ")
+        if again.strip().lower().startswith("n"):
+            # never trap the user: they were told the reason, so keep what
+            # they chose and let them fix it on the AWS side
+            console.print(
+                "[yellow]keeping it anyway — the first chat will fail until "
+                "this is fixed.[/yellow]"
+            )
+            break
+
     # search/compaction reuse the chosen model: a Bedrock account may not
     # have every model enabled, so a hardcoded default would fail
     cfg.general_search_model = cfg.general_chat_model
     cfg.compaction_model = cfg.general_chat_model
     cfg.local_model = "ollama/llama3.1"  # local fallback stays available
-    console.print(
-        "[yellow]note:[/yellow] this model must also be enabled for your "
-        "account under Bedrock > Model access, or calls fail with "
-        "AccessDenied."
-    )
     return True
 
 

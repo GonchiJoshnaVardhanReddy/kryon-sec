@@ -55,14 +55,59 @@ def test_gvisor_hint_names_docker_desktop_and_points_at_a_distro_daemon(monkeypa
     assert "Docker Desktop" in hint
     # the fix is installing docker inside the distro — not re-running runsc
     assert "docker.io" in hint
-    assert "runsc install" in hint
+
+
+def test_docker_desktop_hint_includes_the_context_switch(monkeypatch):
+    """The step that looks unnecessary and is not.
+
+    Docker Desktop leaves currentContext set to "desktop-linux" in
+    ~/.docker/config.json, so a newly installed docker.io daemon is
+    invisible to the CLI until the context is switched. Without this the
+    user installs Docker in the distro, re-runs doctor, and gets the same
+    FAIL — because every probe is still reading Docker Desktop.
+    """
+    _fake_docker_info(monkeypatch, "Docker Desktop")
+    hint = runtime_checks.gvisor_fix_hint()
+    assert "docker context use default" in hint
+    # client-side config only: under sudo this would edit root's config and
+    # change nothing for the user who is actually running kryonsec
+    assert "sudo docker context use default" not in hint
+
+
+def test_gvisor_hint_is_self_contained(monkeypatch):
+    """Neither branch may name `runsc install` on its own.
+
+    runsc may not be installed at all yet, so `sudo runsc install` fails
+    with "runsc: command not found" — the user is told to run a command
+    that cannot work. Sending them back through the installer is the path
+    that actually installs runsc first.
+    """
+    for os_string in ("Docker Desktop", "Ubuntu 24.04.3 LTS"):
+        _fake_docker_info(monkeypatch, os_string)
+        hint = runtime_checks.gvisor_fix_hint()
+        assert "installer" in hint, os_string
+        assert "sudo runsc install" not in hint, os_string
+
+
+def test_docker_desktop_hint_warns_that_the_switch_does_not_stick(monkeypatch):
+    """The switch is reversible, and Docker Desktop is what reverses it.
+
+    A hint that stops at `docker context use default` gives the user a
+    working daemon until the next launch and then the same FAIL, with
+    nothing explaining why they are back where they started. DOCKER_HOST
+    overrides the context too, so both need naming.
+    """
+    _fake_docker_info(monkeypatch, "Docker Desktop")
+    hint = runtime_checks.gvisor_fix_hint()
+    assert "WSL Integration" in hint
+    assert "DOCKER_HOST" in hint
 
 
 def test_gvisor_hint_is_a_plain_install_otherwise(monkeypatch):
     _fake_docker_info(monkeypatch, "Ubuntu 24.04.3 LTS")
     hint = runtime_checks.gvisor_fix_hint()
     assert "Docker Desktop" not in hint
-    assert "runsc install" in hint
+    assert "gVisor is missing" in hint
 
 
 def test_runsc_registered_reads_the_runtime_list(monkeypatch):
@@ -96,3 +141,42 @@ def test_sandbox_available_points_at_doctor(monkeypatch):
     assert not ok
     assert "runsc" in reason
     assert "kryonsec doctor" in reason
+
+
+def test_permission_denied_socket_is_not_reported_as_a_dead_daemon(monkeypatch):
+    """Right after installing Docker in a distro the socket is root-owned.
+
+    "daemon not reachable" would send the user to restart a daemon that is
+    running perfectly — the actual fix is group membership and a re-login.
+    Docker Desktop's per-user socket is why this never came up before.
+    """
+    import subprocess
+
+    def fake_run(*a, **kw):
+        return subprocess.CompletedProcess(
+            a, 1, "", "permission denied while trying to connect to the "
+                      "Docker daemon socket at unix:///var/run/docker.sock")
+
+    monkeypatch.setattr(runtime_checks.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runtime_checks.subprocess, "run", fake_run)
+
+    ok, detail = runtime_checks.docker_server_ok()
+    assert ok is False
+    assert "docker group" in detail
+    assert "daemon not reachable" not in detail
+
+
+def test_a_genuinely_dead_daemon_still_says_so(monkeypatch):
+    import subprocess
+
+    def fake_run(*a, **kw):
+        return subprocess.CompletedProcess(
+            a, 1, "", "Cannot connect to the Docker daemon at "
+                      "unix:///var/run/docker.sock. Is the docker daemon running?")
+
+    monkeypatch.setattr(runtime_checks.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runtime_checks.subprocess, "run", fake_run)
+
+    ok, detail = runtime_checks.docker_server_ok()
+    assert ok is False
+    assert detail == "daemon not reachable"

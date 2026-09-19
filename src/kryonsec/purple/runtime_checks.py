@@ -24,6 +24,19 @@ def docker_server_ok() -> tuple[bool, str]:
         )
         if out.returncode == 0:
             return True, f"OK (server {out.stdout.strip()})"
+        # A daemon that is up but unreachable to this user is a different
+        # problem with a different fix, and it is the one that appears right
+        # after installing Docker in a distro: the socket is root-owned, so
+        # "daemon not reachable" would send the user to restart a daemon
+        # that is running fine. (Docker Desktop's socket is per-user, which
+        # is why this does not come up until you leave it.)
+        stderr = (out.stderr or "") + (out.stdout or "")
+        if "permission denied" in stderr.lower():
+            return False, (
+                "daemon is running, but this user cannot open its socket — add "
+                "yourself to the docker group: sudo usermod -aG docker $USER "
+                "(then log out and back in)"
+            )
         return False, "daemon not reachable"
     except Exception as e:
         return False, str(e)
@@ -81,25 +94,55 @@ def docker_desktop_in_use() -> bool:
 # missing, and no amount of re-running fixes it, because the thing being
 # configured is not the thing being asked. So this needs saying out loud,
 # and the fix is a different daemon — not a retry.
-GVISOR_INSTALL_CMDS = (
-    "sudo apt-get install -y docker.io && sudo runsc install && "
-    "sudo systemctl restart docker"
+#
+# `docker context use default` is the step that is easy to miss and looks
+# like it should not be needed. Docker Desktop writes a currentContext of
+# "desktop-linux" into ~/.docker/config.json, so a freshly installed
+# docker.io daemon on the default socket is invisible to the CLI until the
+# context is switched — every probe still reads Docker Desktop. It is
+# client-side only (it edits that config file, no daemon involved), and it
+# must NOT be run under sudo, which would write root's config instead of
+# the user's and change nothing.
+#
+# The switch is not permanent, and saying so is the difference between a
+# fix and a loop: Docker Desktop re-creates and re-selects its own context
+# on every launch, and a DOCKER_HOST env var overrides the context
+# entirely. A user who only runs the commands above gets a working daemon
+# this login and the same FAIL after the next reboot, with nothing in the
+# message to explain why. Turning Docker Desktop's WSL integration off for
+# this distro is the durable version of the same fix.
+DISTRO_DOCKER_FIX = (
+    "sudo apt-get install -y docker.io && docker context use default && "
+    "sudo service docker start"
+)
+DOCKER_CONTEXT_CAVEAT = (
+    "Docker Desktop re-selects its own context every launch, so this can "
+    "come back — turn off WSL integration for this distro (Docker Desktop "
+    "> Settings > Resources > WSL Integration), and check `echo $DOCKER_HOST`"
 )
 
 
 def gvisor_fix_hint() -> str:
-    """The most accurate fix for a missing runsc runtime, in one line."""
+    """The most accurate fix for a missing runsc runtime, in one line.
+
+    Both branches end at the installer rather than at `sudo runsc install`:
+    runsc may not be present at all yet, and naming a command that fails
+    with "runsc: command not found" is how a user ends up stuck. install.sh
+    already installs runsc (apt repo, with a direct-binary fallback) and
+    registers it, so sending them back through it is the reliable path.
+    """
     if docker_desktop_in_use():
         return (
-            "runsc runtime not registered — Docker Desktop's daemon is in use "
-            "and it cannot load a runtime from inside WSL. Install Docker in "
-            f"the distro and use that instead: {GVISOR_INSTALL_CMDS} "
-            "(enable systemd in /etc/wsl.conf, or start it with "
-            "`sudo service docker start`)"
+            "runsc runtime not registered — your docker CLI is talking to "
+            "Docker Desktop, whose daemon runs outside WSL and can never load "
+            "a runtime from inside the distro. Give the distro its own daemon "
+            f"and point the CLI at it: {DISTRO_DOCKER_FIX} — then re-run the "
+            f"kryonsec installer, which installs runsc and registers it. "
+            f"{DOCKER_CONTEXT_CAVEAT}"
         )
     return (
-        "runsc runtime not registered — gVisor missing. Install it with: "
-        f"{GVISOR_INSTALL_CMDS}"
+        "runsc runtime not registered — gVisor is missing. Re-run the "
+        "kryonsec installer: it installs runsc and registers it with Docker"
     )
 
 

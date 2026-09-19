@@ -335,7 +335,8 @@ _BEDROCK_MODELS = [
 ]
 
 
-def _patch_bedrock(monkeypatch, regions=("us-east-1",), models=None):
+def _patch_bedrock(monkeypatch, regions=("us-east-1",), models=None,
+                   verify=("ok", "ok")):
     # a developer machine may export AWS_BEARER_TOKEN_BEDROCK for real AWS
     # work; the wizard tests must not inherit it
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
@@ -344,6 +345,11 @@ def _patch_bedrock(monkeypatch, regions=("us-east-1",), models=None):
         "kryonsec.bedrock.list_bedrock_models",
         lambda key, region, **kw: (
             _BEDROCK_MODELS if models is None else models))
+    # the wizard proves the chosen model with a REAL call. Unpatched, every
+    # one of these tests would reach AWS — and worse, would reach it on
+    # machines where litellm's Converse path dies before sending anything.
+    # The default is "it answers", the path all the pre-existing tests take.
+    monkeypatch.setattr("kryonsec.bedrock.verify_model", lambda cfg, *a, **kw: verify)
 
 
 def test_wizard_bedrock_flow_writes_config(scripted_wizard, tmp_path, monkeypatch):
@@ -385,6 +391,93 @@ def test_wizard_bedrock_model_selection_picks_the_right_id(
     assert cfg.general_chat_model == "bedrock/amazon.nova-pro-v1:0"
 
 
+# ---- proving the model before saving it -------------------------------------
+#
+# A model being listed proves only that the catalog knows it. The first user
+# picked a `global.` cross-region profile and got "Operation not allowed" on
+# their first prompt, from a setup that had just reported success.
+
+
+def test_wizard_bedrock_rejects_a_model_that_does_not_answer(
+        scripted_wizard, tmp_path, monkeypatch):
+    """The wizard must call the model and, when AWS refuses, say so and let
+    the user pick again instead of saving a config that cannot work."""
+    calls = []
+
+    def fake_verify(cfg, *a, **kw):
+        calls.append(cfg.general_chat_model)
+        # the global cross-region profile is refused; the plain one works
+        if "global." in cfg.general_chat_model:
+            return "rejected", 'BedrockException - {"message":"Operation not allowed"}'
+        return "ok", "ok"
+
+    _patch_bedrock(monkeypatch, models=[
+        {"id": "global.openai.gpt-5.6-sol", "label": "OpenAI GPT-5.6 (global)",
+         "kind": "inference-profile"},
+        {"id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+         "label": "Claude Sonnet 4.5 (cross-region profile)",
+         "kind": "inference-profile"},
+    ])
+    monkeypatch.setattr("kryonsec.bedrock.verify_model", fake_verify)
+
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "1",   # global.openai.gpt-5.6-sol — refused
+        "y",   # yes, pick another
+        "2",   # the Claude profile — accepted
+        "", "", "n",
+    ])
+    # it tried both, in order, and saved the one that actually answers
+    assert calls == [
+        "bedrock/global.openai.gpt-5.6-sol",
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ]
+    assert cfg.general_chat_model == (
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    assert cfg.general_search_model == cfg.general_chat_model
+
+
+def test_wizard_bedrock_can_keep_a_model_that_failed_verification(
+        scripted_wizard, tmp_path, monkeypatch):
+    """Never trap the user: someone who knows the model is fine (a quota that
+    resets, a permission being granted) must be able to keep their choice."""
+    _patch_bedrock(monkeypatch, verify=("rejected", "ThrottlingException"))
+    # NOTE: the wizard reads answers before falling back to input(); the
+    # order is key -> model -> "pick another? [Y/n]" -> the rest of setup
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "1",   # model
+        "n",   # no, keep it anyway
+        "", "", "n",
+    ])
+    assert cfg.general_chat_model == (
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+
+
+def test_wizard_bedrock_unknown_verdict_does_not_nag(
+        scripted_wizard, tmp_path, monkeypatch):
+    """No verdict from AWS is not a bad model.
+
+    litellm's Converse path reads `credentials.access_key` before it checks
+    for a bearer token, so on a machine with no SigV4 credentials the probe
+    dies in our own call stack with "'NoneType' object has no attribute
+    'access_key'". Blaming the user's model choice for that would push them
+    off a model that works, so an inconclusive check keeps the choice and
+    asks nothing — note there is no "pick another?" answer in the script."""
+    _patch_bedrock(
+        monkeypatch,
+        verify=("unknown", "APIConnectionError: 'NoneType' object has no "
+                           "attribute 'access_key'"))
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "1",   # model — the check is inconclusive, so setup carries on
+        "", "", "n",
+    ])
+    assert cfg.general_chat_model == (
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    assert cfg.provider == "bedrock"
+
+
 def test_wizard_bedrock_prompts_when_several_regions_work(
         scripted_wizard, tmp_path, monkeypatch):
     """A key valid in more than one region must not be guessed at — it
@@ -411,6 +504,11 @@ def test_wizard_bedrock_rejected_key_retries(scripted_wizard, tmp_path, monkeypa
     monkeypatch.setattr("kryonsec.bedrock.probe_regions", fake_probe)
     monkeypatch.setattr(
         "kryonsec.bedrock.list_bedrock_models", lambda key, region, **kw: _BEDROCK_MODELS)
+    # this test builds its own patches rather than calling _patch_bedrock,
+    # so it must patch the verifier too — unpatched it makes a real call
+    # and the retry prompt then reads from captured stdin
+    monkeypatch.setattr("kryonsec.bedrock.verify_model",
+                        lambda cfg, *a, **kw: ("ok", "ok"))
     cfg = scripted_wizard([
         "3",
         "ABSKbad",   # rejected everywhere

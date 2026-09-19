@@ -107,7 +107,7 @@ The installer:
    tags, otherwise `main` (this repo is a single-commit snapshot with no tags, so
    `main` is the normal path). `KRYONSEC_VERSION=@main` or `@<sha>` overrides both.
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
-6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali
+6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali. On WSL2 with **Docker Desktop** it also installs a Docker daemon *inside* the distro and moves the CLI onto it, because Docker Desktop's daemon runs outside the distro and can never be given a gVisor runtime.
 7. **Fetches the Zone B sandbox image** when Docker is available (Purple Team) — a `docker pull` from `ghcr.io` in the normal case, which is minutes instead of tens of minutes. If the registry is unreachable, the image for this version isn't published yet, or you're offline, it falls back to building locally with live progress output (2+ GB, 30+ min on slow links). Either way it's tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look for.
 8. Runs `kryonsec setup` — the first-run wizard
 9. Runs `kryonsec doctor` so the final state is visible

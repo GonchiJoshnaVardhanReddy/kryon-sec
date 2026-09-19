@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, Iterator
@@ -121,6 +122,35 @@ def command_install_hint(name: str) -> str | None:
     # and both mean uv.
     leaf = name.replace("\\", "/").rsplit("/", 1)[-1]
     return INSTALL_HINTS.get(os.path.splitext(leaf)[0].lower())
+
+
+def _foreign_binary_reason(command: str, resolved: str) -> str | None:
+    """Why a resolved command cannot work here, or None if it looks fine.
+
+    WSL puts the Windows PATH on the Linux PATH, so on a machine with Node
+    for Windows and none inside the distro, `npx` resolves to
+    /mnt/c/Program Files/nodejs/npx.cmd. That is a real program and it
+    starts — then it is handed Linux paths (`/home/you`) and a Linux working
+    directory, and it fails several layers down with "CMD.EXE was started
+    with the above path as the current directory ... UNC paths are not
+    supported", which points at nothing. It cannot work: a Windows process
+    cannot open a WSL path under the name the WSL-side config uses.
+
+    Windows *drives* are the test, not the .exe suffix alone — the WSL
+    interop shims (`cmd.exe`, `wsl.exe`) live in /usr/bin and are legitimate
+    commands a user may configure on purpose.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    if not resolved.startswith("/mnt/") or os.name == "nt":
+        return None
+    if os.path.splitext(resolved)[1].lower() not in (".exe", ".cmd", ".bat", ".ps1"):
+        return None
+    return (
+        f"{command!r} resolves to the Windows program {resolved}, which cannot "
+        "open Linux paths — install it inside this distro instead "
+        "(e.g. sudo apt-get install -y nodejs npm)"
+    )
 
 
 def _missing_command_message(name: str) -> str:
@@ -366,6 +396,9 @@ class McpToolbox:
 
         resolved = shutil.which(parts[0])
         if resolved:
+            foreign = _foreign_binary_reason(parts[0], resolved)
+            if foreign:
+                raise RuntimeError(foreign)
             parts[0] = resolved
         else:
             # shutil.which checks OUR PATH; a missing binary surfaces later

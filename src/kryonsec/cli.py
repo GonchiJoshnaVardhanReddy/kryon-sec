@@ -492,8 +492,9 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                             "switch to OpenAI."
                         ),
                         "bedrock": (
-                            "Check your AWS Bedrock key and region — or run "
-                            "`kryonsec setup` to switch providers."
+                            "If it says the model is not allowed, enable it "
+                            "under Bedrock > Model access, or run `kryonsec "
+                            "setup` and pick another model."
                         ),
                     }.get(
                         cfg.provider,

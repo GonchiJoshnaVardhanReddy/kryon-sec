@@ -11,7 +11,10 @@
 #   5. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
 #   6. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
 #      then fetches the Zone B sandbox image — pulled from ghcr.io (fast),
-#      falling back to a local build (slow) when the pull isn't available
+#      falling back to a local build (slow) when the pull isn't available.
+#      On WSL2 talking to Docker Desktop it installs a daemon inside the
+#      distro and moves the CLI onto it, because Docker Desktop's daemon
+#      cannot host gVisor at all.
 #   7. offers to install Ollama + llama3.1 when no LLM is configured
 #   8. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
 #   9. runs `kryonsec doctor` so the final state is visible, and prints
@@ -227,6 +230,17 @@ install_docker() {
     # releases the docker.com repo hasn't caught up with) and is plenty
     # for a gVisor sandbox host
     maybe_sudo apt-get install -y -qq docker.io || return 1
+    # The socket is root-owned, so without this the daemon answers root and
+    # nobody else — the installer's own probes fall back to sudo and look
+    # fine, while `kryonsec` (which runs as the user) gets "permission
+    # denied" the first time it reaches for Docker. Membership only takes
+    # effect at the next login, so say so rather than pretending.
+    if [ "$(id -u)" -ne 0 ]; then
+        if ! id -nG 2>/dev/null | grep -qw docker; then
+            maybe_sudo usermod -aG docker "$(id -un)" >/dev/null 2>&1 &&
+                say "added $(id -un) to the docker group — log out and back in for it to apply"
+        fi
+    fi
     # start the daemon — systemd where available (WSL needs it on), the
     # sysv script as a fallback
     maybe_sudo systemctl enable --now docker 2>/dev/null ||
@@ -274,6 +288,51 @@ runsc_registered() {
 }
 
 if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
+    # Docker Desktop's daemon lives outside the distro, so no runtime
+    # installed in here can ever reach it. Detect that FIRST: the CLI exists
+    # and answers, so every "is Docker installed?" test below passes, the
+    # gVisor install then writes a daemon.json for a daemon nothing is
+    # talking to, and the whole thing reports success while Purple Team
+    # still cannot start.
+    DOCKER_OS=""
+    if command -v docker >/dev/null 2>&1; then
+        DOCKER_OS="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+        [ -n "$DOCKER_OS" ] || DOCKER_OS="$(maybe_sudo docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+    fi
+    case "$DOCKER_OS" in
+        *"Docker Desktop"*)
+            say "docker is currently Docker Desktop's, which cannot host gVisor"
+            say "         its daemon runs outside this distro. Installing a"
+            say "         Docker daemon in here and pointing the CLI at it."
+            install_docker ||
+                say "WARNING: Docker install failed — Purple Team needs it"
+            # Docker Desktop leaves currentContext set to "desktop-linux" in
+            # ~/.docker/config.json, so the new daemon on the default socket
+            # is invisible to the CLI until this switch — every probe below
+            # would still be reading Docker Desktop. Client-side only (it
+            # edits that config file; no daemon involved), and deliberately
+            # NOT under sudo, which would write root's config instead of the
+            # user's and change nothing for them.
+            docker context use default >/dev/null 2>&1 ||
+                say "         run this yourself: docker context use default"
+            if ! dkr info >/dev/null 2>&1; then
+                say "WARNING: the distro's docker daemon is not up yet — start it with"
+                say "         sudo service docker start   (or enable systemd in /etc/wsl.conf)"
+            fi
+            # The switch is not permanent: Docker Desktop re-creates and
+            # re-selects its own context on every launch, and DOCKER_HOST
+            # overrides the context outright. Without saying so, this fix
+            # holds until the next reboot and then silently reverts.
+            if dkr info --format '{{.OperatingSystem}}' 2>/dev/null | grep -q "Docker Desktop"; then
+                say "WARNING: the CLI is still pointed at Docker Desktop. Two things put"
+                say "         it back — DOCKER_HOST in your shell, and Docker Desktop"
+                say "         itself, which re-selects its context on every launch. Turn"
+                say "         off WSL integration for this distro (Settings > Resources >"
+                say "         WSL Integration), or: unset DOCKER_HOST && docker context use default"
+            fi
+            ;;
+    esac
+
     if ! command -v docker >/dev/null 2>&1; then
         install_docker ||
             say "WARNING: Docker install failed — Copilot works fine; Purple Team needs it"
@@ -289,21 +348,19 @@ if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
         # which daemon depends on how this host runs Docker, and on WSL2 the
         # CLI may be talking to one this script cannot touch at all.
         if ! runsc_registered; then
-            # Docker Desktop runs the daemon outside the distro, so nothing
-            # run in here can add a runtime to it: `runsc install` writes the
-            # distro's /etc/docker/daemon.json and restarts a daemon the CLI
-            # is not using. The install looks fine, the runtime never appears,
-            # and re-running never helps. Name the real problem.
+            # Still Docker Desktop after the switch above means the CLI could
+            # not be moved off it (a Desktop restart can put it back). Nothing
+            # run in here can add a runtime to that daemon, so name the real
+            # problem rather than printing a retry that cannot help.
             DOCKER_OS="$(dkr info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
             case "$DOCKER_OS" in
                 *"Docker Desktop"*)
-                    say "WARNING: your docker CLI is talking to Docker Desktop's daemon,"
-                    say "         which cannot load a runtime from inside WSL. Purple Team"
-                    say "         needs a daemon in the distro — install it and use that:"
+                    say "WARNING: still talking to Docker Desktop's daemon, which cannot"
+                    say "         load a runtime from inside WSL. Give the distro its own:"
                     say "           sudo apt-get install -y docker.io"
-                    say "           sudo runsc install && sudo systemctl restart docker"
-                    say "         (enable systemd in /etc/wsl.conf, or start it with:"
-                    say "          sudo service docker start)"
+                    say "           docker context use default"
+                    say "           sudo service docker start"
+                    say "         then re-run this installer to add gVisor"
                     ;;
                 *)
                     say "WARNING: gVisor install did not register runsc — Purple Team needs it"
