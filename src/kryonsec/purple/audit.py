@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+log = logging.getLogger(__name__)
 
 _GENESIS_PREV = "0" * 64
 
@@ -39,6 +42,22 @@ class AuditLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.last_hash = self._load_last_hash()
+        self._observers: list[Callable[[dict], None]] = []
+
+    # ---- observers -------------------------------------------------------
+
+    def add_observer(self, callback: Callable[[dict], None]) -> None:
+        """Watch the stream as it is written. Returns nothing; removal is
+        not offered — a run is short and the observer list is rebuilt per
+        engagement.
+
+        This is how the Purple Team console learns what tools are running
+        without every subagent having to know a UI exists: the audit log
+        already records each tool_spawn/tool_result, so it *is* the event
+        stream. Observers are presentation only and can never affect the
+        chain — see write().
+        """
+        self._observers.append(callback)
 
     # ---- writing ---------------------------------------------------------
 
@@ -63,6 +82,24 @@ class AuditLog:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
             self.last_hash = entry["hash"]
+
+            # Notified while still holding the lock, and after the line is
+            # durable. Chains and console must agree on order: releasing the
+            # lock first would let a concurrent writer append and notify
+            # ahead of us, so the UI would show tool results before the
+            # spawns that produced them.
+            #
+            # On a copy, so an observer that mutates its argument cannot
+            # reach back into anything that was hashed. In try/except, so a
+            # broken observer costs a UI row and never an audit entry —
+            # silence is deliberate, since raising would turn a cosmetic
+            # bug into a failed engagement.
+            for callback in self._observers:
+                try:
+                    callback(dict(entry))
+                except Exception:
+                    log.debug("audit observer failed (ignored)", exc_info=True)
+
             return entry["hash"]
 
     def head_hash(self) -> str:

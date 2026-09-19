@@ -328,11 +328,14 @@ def start_engagement(
 
     def loader(state: str):
         if progress is not None:
-            info = STATE_INFO.get(state, {})
-            # parentheses, not square brackets: rich would eat [tools: ...]
-            # as a markup tag
-            progress(f"{info.get('agent', state)}: {info.get('does', '')} "
-                     f"(tools: {info.get('tools', '?')} | zone {info.get('zone', '?')})")
+            # The action, not the inventory. The tool list used to be
+            # pasted in here, which printed eight lines of tool names for
+            # every state — including states whose tools never ran. What
+            # is actually running is reported per-tool as it starts, so
+            # this line only has to say what the state is doing.
+            from .ui import state_action
+
+            progress(state_action(state))
 
         run_fn = resolve(state)
 

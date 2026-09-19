@@ -14,6 +14,7 @@ import logging
 import re
 import sys
 import threading
+import time
 
 log = logging.getLogger(__name__)
 
@@ -583,10 +584,11 @@ def _run_purple(
     import uuid
     from pathlib import Path
 
-    from .purple.orchestrator import STATES
-    from .purple.runner import STATE_INFO, sandbox_available, start_engagement
+    # STATE_INFO (the per-state tool inventory) is deliberately not imported:
+    # the console shows what is running as it runs, so the inventory is no
+    # longer printed anywhere. STATES is imported where it is used, below.
+    from .purple.runner import sandbox_available, start_engagement
     from .purple.zonea import validate_target
-    from .status import StatusLine
 
     try:
         target = validate_target(target_arg)
@@ -628,35 +630,63 @@ def _run_purple(
     # keeps the same audit/report dirs instead of getting a random id
     if not engagement_id:
         engagement_id = str(uuid.uuid4())[:8]
-    status_line = StatusLine(console)
+
+    from .purple.ui import (
+        STATE_ACTION,
+        PurpleUI,
+        attach_purple_logging,
+        detach_purple_logging,
+    )
+
+    ui = PurpleUI(console, target=target, engagement_id=engagement_id)
+    # Precomputed so _progress can tell a state announcement (which the
+    # panel already shows) from a subagent's event (which it does not).
+    _STATE_ACTION_TEXTS = frozenset(STATE_ACTION.values())
 
     def _progress(msg: str) -> None:
-        # while a state is running, the spinner carries the update;
-        # between states it prints (state-entry lines stay in scrollback)
-        if status_line.active:
-            status_line.update(f"[magenta]purple {pct_holder[0]}%[/magenta] {msg}")
-        else:
-            console.print(f"  [magenta]>[/magenta] [bold]{msg}[/bold]")
+        # loader() announces each state with its action phrase, which the
+        # live panel is already showing — repeating it would be the exact
+        # scrolling-noise this redesign removes. Everything else on this
+        # channel comes from a subagent (exploit.py's scheme switch, an
+        # allowlist rejection) and is a real event worth one line.
+        if msg not in _STATE_ACTION_TEXTS:
+            ui.on_notice(msg)
 
-    def _status_factory(state: str):
-        n = STATES.index(state) + 1
-        info = STATE_INFO.get(state, {})
-        pct_holder[0] = int(100 * n / len(STATES))
-        return status_line.running(
-            f"[magenta]purple {pct_holder[0]}%[/magenta] "
-            f"{info.get('agent', state)}: {info.get('does', '')[:60]}"
+    # Attached before start_engagement, not after: start_engagement builds
+    # the sandbox, and the sandbox warns at construction when the image is
+    # not digest-pinned. Attached later, that warning was the first thing on
+    # screen and arrived raw ("WARNING kryonsec.purple.sandbox: ...") ahead
+    # of the engagement line, which is exactly the unfiltered-log look this
+    # console replaces.
+    log_handler, debug_log = attach_purple_logging(cfg.home, engagement_id, ui)
+    try:
+        orch, audit, graph = start_engagement(
+            cfg, engagement_id, target=target, progress=_progress,
+            code_folder=code_folder,
         )
+        # Two existing hooks, no new plumbing: the orchestrator announces
+        # state transitions (before the subagent is built, so HUMAN_REVIEW's
+        # prompt owns the terminal first), and the audit chain announces
+        # tool activity.
+        ui.graph = graph
+        orch.on_state = ui.on_state
+        audit.add_observer(ui.on_audit)
 
-    pct_holder = [0]
+        console.print(
+            f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
+            f"target={target}")
+        console.print()
+        ui.started_at = time.monotonic()
+        ui.start()
+        completed = orch.run()
+    finally:
+        ui.stop()
+        detach_purple_logging(log_handler)
 
-    orch, audit, graph = start_engagement(
-        cfg, engagement_id, target=target, progress=_progress,
-        status_factory=_status_factory, code_folder=code_folder,
+    _print_purple_summary(
+        cfg, engagement_id, target, completed, orch, audit, graph,
+        debug_log=debug_log,
     )
-    console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
-    completed = orch.run()
-    status_line.hide()
-    _print_purple_summary(cfg, engagement_id, target, completed, orch, audit, graph)
     return 0
 
 
@@ -668,19 +698,70 @@ def _print_purple_summary(
     orch: "Any",
     audit: "Any",
     graph: "Any",
+    debug_log: "Any" = None,
 ) -> None:
-    """End-of-engagement summary: a verdict line first (was anything
-    found?), then the evidence sections. A user who reads one line should
-    still know the engagement's outcome."""
+    """End-of-engagement summary: a verdict panel first, then the evidence.
+
+    The panel answers "what happened?" in one glance — complete or halted,
+    for how long, and what came out of it. The sections below it are the
+    working detail; they are kept because a finding without its evidence is
+    not actionable, but they are no longer the first thing on screen.
+    """
     from rich.panel import Panel
-    from rich.rule import Rule
+    from rich.table import Table
+
+    from .purple.orchestrator import STATES
 
     findings = graph.by_type("finding")
     verified = [n for n in findings if n["properties"].get("verified")]
     attempts = graph.by_type("exploit_attempt")
+    hypotheses = graph.by_type("hypothesis")
+    subdomains = [n["label"] for n in graph.by_type("subdomain")]
 
-    # ---- the verdict, in one glance -------------------------------
-    if orch.halt_reason:
+    engaged = bool(attempts)
+    halted = bool(orch.halt_reason)
+
+    evidence_dir = cfg.home / "engagements" / engagement_id / "evidence"
+    evidence_count = 0
+    if evidence_dir.is_dir():
+        evidence_count = sum(1 for p in evidence_dir.rglob("*") if p.is_file())
+
+    rows = Table.grid(padding=(0, 3))
+    rows.add_column(style="dim", justify="right")
+    rows.add_column()
+    rows.add_row("Target", f"[bold]{target}[/bold]")
+    rows.add_row("Duration", _elapsed_text(orch))
+    rows.add_row("", "")
+    if halted:
+        rows.add_row("Completed", f"{len(completed)} / {len(STATES)} stages")
+    rows.add_row("Verified findings", f"[red]{len(verified)}[/red]"
+                 if verified else "0")
+    rows.add_row("Hypotheses", str(len(hypotheses)))
+    rows.add_row("Tool executions", str(len(attempts)))
+    rows.add_row("Evidence artifacts", str(evidence_count))
+
+    report_path = cfg.home / "engagements" / engagement_id / "report.md"
+    if report_path.exists():
+        rows.add_row("", "")
+        rows.add_row("Report", _short_path(report_path, cfg.home))
+    if debug_log is not None:
+        rows.add_row("Debug log", _short_path(debug_log, cfg.home))
+
+    if halted:
+        title = "[bold red]ENGAGEMENT HALTED[/bold red]"
+        border = "red"
+        detail = f"[red]{orch.halt_reason}[/red]"
+        rows.add_row("", "")
+        rows.add_row("Reason", detail)
+    else:
+        title = "[bold green]ENGAGEMENT COMPLETE[/bold green]"
+        border = "green"
+
+    console.print()
+    console.print(Panel(rows, title=title, border_style=border, expand=False))
+
+    # ---- the verdict, in one line ---------------------------------
+    if halted:
         verdict = f"[red]HALTED[/red] — {orch.halt_reason}"
     elif verified:
         verdict = f"[red]{len(verified)} verified finding(s)[/red] on {target}"
@@ -693,21 +774,15 @@ def _print_purple_summary(
     else:
         verdict = f"[green]no testing performed[/green] (engagement stopped before EXPLOIT)"
 
-    console.print(Panel(
-        f"{verdict}\n"
-        f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]",
-        title=f"[magenta]engagement {engagement_id}[/magenta] — {target}",
-        border_style="magenta",
-    ))
+    console.print(verdict)
+    console.print(f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]")
 
-    subdomains = [n["label"] for n in graph.by_type("subdomain")]
     if subdomains:
         console.print(f"\n[cyan]passive recon — {len(subdomains)} subdomains[/cyan]")
         for s in subdomains[:30]:
             console.print(f"  [dim]{s}[/dim]")
         if len(subdomains) > 30:
             console.print(f"  [dim]… and {len(subdomains) - 30} more[/dim]")
-    hypotheses = graph.by_type("hypothesis")
     if hypotheses:
         console.print(f"\n[cyan]hypotheses — {len(hypotheses)}[/cyan]")
         for n in hypotheses:
@@ -744,10 +819,36 @@ def _print_purple_summary(
         for n in findings:
             mark = "[bold]verified[/bold]" if n["properties"].get("verified") else ""
             console.print(f"  [magenta]{n['label']}[/magenta] {mark}")
+
+    # engaged is computed above for the panel; keep the audit head last so
+    # it stays the final, verifiable line of the run
     console.print(f"\n[dim]audit chain head: {audit.head_hash()[:16]}…[/dim]")
-    report_path = cfg.home / "engagements" / engagement_id / "report.md"
-    if report_path.exists():
-        console.print(f"[dim]report written: {report_path}[/dim]")
+
+
+def _short_path(path: "Any", home: "Any") -> str:
+    """A path under the kryonsec home, written as ~/… .
+
+    Both paths in the summary live under the engagement directory, so the
+    home prefix is the same on every line and carries no information. It is
+    also what pushed the row past the panel width, and rich truncates from
+    the right — which hid the one part worth reading, the filename.
+    """
+    text = str(path)
+    prefix = str(home)
+    if prefix and text.startswith(prefix):
+        return "~" + text[len(prefix):]
+    return text
+
+
+def _elapsed_text(orch: "Any") -> str:
+    """Wall-clock duration of the engagement, if the budget tracker ran."""
+    seconds = getattr(getattr(orch, "budget", None), "elapsed_s", 0.0) or 0.0
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def main(argv: list[str] | None = None) -> int:

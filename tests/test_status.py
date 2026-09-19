@@ -96,14 +96,24 @@ def test_cli_only_calls_methods_that_exist():
     callers, but cli.py still called it — every completed purple engagement
     died with AttributeError before printing its summary. Adding a method to
     StatusLine is free; removing one has to fail here first.
+
+    The guard is bound to the *variable*, not to one hard-coded name: cli.py
+    names its instance `status` in the copilot loop and used to name it
+    `status_line` in the purple path (purple now uses PurpleUI instead). A
+    fixed `status_line\\.` pattern would have quietly stopped guarding
+    anything the moment that rename happened, which is exactly the failure
+    this test exists to catch.
     """
     import re
     from pathlib import Path
 
     cli = (Path(__file__).resolve().parents[1]
            / "src" / "kryonsec" / "cli.py").read_text(encoding="utf-8")
-    called = set(re.findall(r"\bstatus_line\.([A-Za-z_][A-Za-z0-9_]*)", cli))
-    assert called, "expected cli.py to use status_line somewhere"
+    variables = set(re.findall(r"(\w+)\s*=\s*StatusLine\(", cli))
+    assert variables, "expected cli.py to construct a StatusLine somewhere"
+    called = set()
+    for name in variables:
+        called |= set(re.findall(rf"\b{name}\.([A-Za-z_][A-Za-z0-9_]*)", cli))
     missing = sorted(called - set(dir(StatusLine)))
     assert not missing, (
         f"cli.py calls StatusLine methods that do not exist: {missing} "

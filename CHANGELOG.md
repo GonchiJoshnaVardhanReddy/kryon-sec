@@ -1,5 +1,52 @@
 # Changelog
 
+## v1.3.2 — Purple Team operations console
+
+Presentation-only change. The security engine is untouched: no state
+transition, tool allowlist, sandbox behaviour, exploit or verify logic,
+authorization gate, or provider code was modified. Test suite: **861 tests
+green** (was 854).
+
+Purple Team output used to be raw developer logs — a spinner printing
+`purple 20%` over a one-line inventory of every tool in the state, full
+tracebacks from free public APIs answering 429/403/404, and a final summary
+in plain text. It is now a single live console.
+
+- **One live region** (`purple/ui.py`, new) replaces the scrolling log. The
+  console learns everything from two existing streams — the orchestrator's
+  state callback and the audit chain via a new read-only `AuditLog.add_observer`
+  — so no subagent knows a UI exists.
+- **Honest progress.** The old `20%` was the fraction of *states entered*,
+  which reads as work completed. The bar is now labelled `Stage 3 of 10`.
+- **Tool activity.** Every tool shows its operator-facing name (`crt.sh`,
+  not `crt_sh_subdomains`), what it does, how long it took, and its result.
+  Completed tools stay as history; only tools that actually ran appear.
+  Columns are dropped, not crushed, as the terminal narrows.
+- **Tracebacks are split, not shown.** `PurpleLogHandler` renders one line
+  per warning to the console; the untouched record, `exc_info` intact, goes
+  to `engagements/<id>/debug.log`. The stderr handler `basicConfig()`
+  installs is silenced while the console owns the screen (it sat at WARNING
+  already, so pinning it there left the raw line — and its traceback —
+  printing beside the notice) and restored on exit.
+- **Consistent dashboard.** `Panel(expand=False)` measures content and only
+  caps at `width`, so panels boxed themselves at wildly different widths.
+  All panels now share one width, capped at 100 columns.
+- **ASCII fallback completed.** The glyph set alone was not enough: rich
+  still drew Unicode borders unless it detected a legacy Windows console.
+  The box style now travels with the glyph set, and the hardcoded `●` in the
+  RUNNING/STOPPED indicator was added to it.
+- **Piped and CI runs stay observable.** With no TTY there is no live region
+  and the run was previously silent; it now prints one line per state.
+- **Human review** is an approval panel (`A`/`R`, with `y`/`n` still
+  accepted) instead of a bare `y/N` prompt; the live region pauses so the
+  prompt owns the terminal.
+- **Final summary** is a complete/halted panel carrying duration, verified
+  findings, hypotheses, tool executions and evidence count, with paths
+  written relative to the kryonsec home.
+
+Loading a state no longer prints its full tool inventory — the inventory is
+shown per tool, as each one actually runs.
+
 ## v1.3.0 — Purple Team tool expansion Phase 8 (user tool map)
 
 Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:

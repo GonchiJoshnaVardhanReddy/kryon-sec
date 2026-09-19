@@ -193,6 +193,14 @@ class ReconPassiveSubagent:
         total_new = 0
         for fetcher in self.fetchers:
             source = getattr(fetcher, "__name__", str(fetcher))
+            # Recorded before the fetch, not after: the ok/failed/skipped
+            # events below say how it ended, but only this says it began,
+            # so the console can show which source is running right now.
+            # Observability only — no source's behaviour depends on it.
+            self.audit.write({
+                "event": "passive_source_start",
+                "source": source,
+            })
             try:
                 result = fetcher(self.target)
             except Exception as e:

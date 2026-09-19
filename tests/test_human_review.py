@@ -143,6 +143,10 @@ def test_empty_hypotheses(tmp_path):
 
 
 @pytest.mark.parametrize("answer,expected", [
+    # the panel offers [A]pprove/[R]eject; y/n stay accepted so an operator
+    # with the old muscle memory is never silently rejected
+    ("a", True), ("A", True), ("approve", True),
+    ("r", False), ("R", False), ("reject", False),
     ("y", True), ("yes", True), ("Y", True),
     ("n", False), ("", False), ("no", False), ("maybe", False),
 ])
