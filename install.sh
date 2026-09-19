@@ -72,7 +72,12 @@ purge_broken_apt_sources() {
         return 0   # the documented line — leave it alone
     fi
     say "removing a malformed gVisor apt source left by an earlier run"
-    maybe_sudo rm -f "$f"
+    # Never fatal. This runs at startup under `set -e`: a Copilot-only user
+    # with no sudo must not have the installer die on a line about apt
+    # sources they never wanted in the first place.
+    maybe_sudo rm -f "$f" ||
+        say "         could not remove it — apt may keep reporting errors"
+    return 0
 }
 purge_broken_apt_sources
 

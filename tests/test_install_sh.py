@@ -161,6 +161,22 @@ echo "RC=$?"
     assert "RC=0" in result.stdout
 
 
+def test_a_purge_that_cannot_delete_does_not_kill_the_installer():
+    """Startup runs under `set -e`. A Copilot-only user with no sudo, and a
+    file they cannot remove, must not lose the whole install over a line
+    about apt sources they never asked for."""
+    result = _bash(f"""
+f=$(mktemp)
+printf 'deb [arch=amd64] https://storage.googleapis.com/gvisor/releases/release main amd64\\n' > "$f"
+maybe_sudo() {{ return 1; }}   # rm fails, as it would without sudo
+set -e
+{_function("purge_broken_apt_sources")}
+purge_broken_apt_sources "$f"
+echo "SURVIVED"
+""")
+    assert "SURVIVED" in result.stdout, result.stdout + result.stderr
+
+
 # ---- the runsc binary fallback --------------------------------------------
 
 def _fetch_runsc_body(mode: str, uname: str, dpkg: str) -> str:
