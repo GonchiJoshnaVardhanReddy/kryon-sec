@@ -284,35 +284,80 @@ install_docker() {
     sleep 2
 }
 
-# Download runsc straight from the release bucket, trying the architecture
-# spellings it might be filed under.
+# Download gVisor's runsc package from the release bucket, verified against
+# the checksum the bucket's own apt index states.
 #
-# The bucket names architectures the way the kernel does (x86_64, aarch64)
-# while dpkg names them amd64/arm64, so a single guess is a coin flip whose
-# loss looks like a bare `curl: (22) ... 404` with nothing to act on. And
-# whatever comes back is checked before it is installed: a proxy or a
-# captive portal answers 200 with an HTML page, and that must never become
-# /usr/local/bin/runsc.
+# This used to fetch `releases/release/latest/<arch>/runsc`, guessing at the
+# architecture spelling. That URL does not exist. The bucket's release/ tree
+# holds only dated directories (20260914.0/ and the like) containing tarballs
+# — there is no `latest` and no bare `runsc` anywhere under it — so the
+# fallback was a guaranteed 404 on every machine that reached it, which is how
+# a user ends up with "apt repo unavailable" followed by "curl: (22) 404" and
+# no runsc.
+#
+# What the bucket does publish, and what gVisor's apt repo serves, is the .deb
+# under pool/. Its path and its SHA256 are both spelled out in the apt index,
+# so both are read from there instead of guessed: the download is checked
+# against the checksum the index states. That replaces an earlier check for an
+# ELF header, which a .deb does not have — it is an ar archive — and which
+# could not have caught a wrong-but-well-formed file anyway.
 fetch_runsc() {
-    local out="$1" arch candidates url magic
-    # `|| true` on both: this script runs under `set -e`, and a missing dpkg
-    # would otherwise abort the installer from inside an assignment.
-    candidates="$(uname -m 2>/dev/null || true) $(dpkg --print-architecture 2>/dev/null || true) x86_64 aarch64"
-    for arch in $candidates; do
-        case "$arch" in
-            amd64) arch=x86_64 ;;
-            arm64) arch=aarch64 ;;
-            "") continue ;;
-        esac
-        url="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}/runsc"
-        curl -fsSL "$url" -o "$out" 2>/dev/null || continue
-        magic="$(head -c 4 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
-        if [ "$magic" = "7f454c46" ]; then   # \x7f E L F
-            return 0
-        fi
-        say "         that is not a binary (${arch}) — trying the next name"
-    done
-    return 1
+    local out="$1" arch index packages fields filename sha url sums
+    # `|| true`: this script runs under `set -e`, and a missing dpkg would
+    # otherwise abort the installer from inside an assignment.
+    arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    case "$arch" in
+        amd64 | arm64) ;;
+        *)
+            say "         architecture '${arch:-unknown}' — no gVisor package for it"
+            return 1
+            ;;
+    esac
+
+    # The index is filed under dpkg's architecture name (binary-amd64), not
+    # the kernel's (x86_64) — the opposite of the dead URL above, which is
+    # part of why that one never resolved.
+    index="https://storage.googleapis.com/gvisor/releases/dists/release/main/binary-${arch}/Packages"
+    packages="$(mktemp)"
+    if ! curl -fsSL "$index" -o "$packages" 2>/dev/null; then
+        say "         could not read the package index (${arch})"
+        rm -f "$packages"
+        return 1
+    fi
+    # One pass over the stanzas: track which package we are inside and take
+    # the fields only while it is runsc. Plain awk, no dialect assumptions.
+    fields="$(awk '
+        /^Package: / { pkg = substr($0, 10) }
+        pkg == "runsc" && /^Filename: / { fn = substr($0, 11) }
+        pkg == "runsc" && /^SHA256: / { sha = substr($0, 9) }
+        END { if (fn != "" && sha != "") print fn, sha }
+    ' "$packages")"
+    rm -f "$packages"
+    if [ -z "$fields" ]; then
+        say "         the index lists no runsc package for ${arch}"
+        return 1
+    fi
+    filename="${fields%% *}"
+    sha="${fields##* }"
+
+    url="https://storage.googleapis.com/gvisor/releases/${filename}"
+    say "         downloading $(basename "$filename") — this is a large file"
+    # Progress stays visible here: ~170 MB with no output reads as a hang.
+    if ! curl -fSL --progress-bar "$url" -o "$out"; then
+        say "         download failed"
+        rm -f "$out"
+        return 1
+    fi
+    # Both spellings, because neither is guaranteed. If neither exists the
+    # sum comes back empty, which fails the comparison — refusing is the
+    # right direction to fail in.
+    sums="$(sha256sum "$out" 2>/dev/null || shasum -a 256 "$out" 2>/dev/null || true)"
+    if [ "${sums%% *}" != "$sha" ]; then
+        say "         checksum does not match the index — not installing it"
+        rm -f "$out"
+        return 1
+    fi
+    return 0
 }
 
 install_gvisor() {
@@ -340,10 +385,14 @@ install_gvisor() {
         # failed download left a broken source behind — poisoning the next
         # run's `apt-get update`, and therefore its Docker install, forever.
         maybe_sudo rm -f "$gvisor_list"
-        say "apt repo unavailable — installing runsc binary directly"
-        fetch_runsc /tmp/runsc-install || return 1
-        maybe_sudo install -m 0755 /tmp/runsc-install /usr/local/bin/runsc || return 1
-        rm -f /tmp/runsc-install
+        say "apt repo unavailable — installing runsc from gVisor's own package"
+        fetch_runsc /tmp/runsc.deb || return 1
+        # dpkg rather than install(1): this is gVisor's own .deb, so it brings
+        # runsc AND the containerd shim and helper binaries under
+        # usr/bin/gvisor-bin/, which a bare binary copied to /usr/local/bin
+        # would leave missing. It declares no dependencies, so -i is enough.
+        maybe_sudo dpkg -i /tmp/runsc.deb >/dev/null || return 1
+        rm -f /tmp/runsc.deb
     fi
     # registers runsc in /etc/docker/daemon.json and restarts the daemon
     maybe_sudo runsc install

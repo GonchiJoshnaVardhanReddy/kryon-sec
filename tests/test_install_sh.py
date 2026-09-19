@@ -17,10 +17,20 @@ the visible symptom on a user's machine was:
 
     WARNING: Docker install failed — Purple Team needs it
 
-Docker, not gVisor. The tests below pin each of the three failures that
+Docker, not gVisor. The tests below pin each of the failures that
 composed it: the malformed line, the fatal `apt-get update`, and the
 fallback that only guessed one architecture name and did not clean up the
 repo line it left behind.
+
+That fallback turned out to be broken in a second way, found later by
+checking rather than by reasoning: the URL it fetched
+(`releases/release/latest/<arch>/runsc`) does not exist at any architecture
+spelling. The bucket's release/ tree holds only dated directories with
+tarballs in them. So the code that exists to rescue a machine whose apt repo
+is unreachable could not rescue anything, and its failure — a bare
+`curl: (22) ... 404` — said nothing about why. The tests at the bottom pin
+the replacement: read the path and the checksum out of the bucket's own apt
+index, fetch the .deb, and refuse to install it unless the checksum matches.
 """
 
 from __future__ import annotations
@@ -177,12 +187,66 @@ echo "SURVIVED"
     assert "SURVIVED" in result.stdout, result.stdout + result.stderr
 
 
-# ---- the runsc binary fallback --------------------------------------------
+# ---- the runsc package fallback --------------------------------------------
+#
+# The fallback fetched `releases/release/latest/<arch>/runsc`. Checked live,
+# that is a 404: the bucket's release/ tree holds only dated directories
+# (20260914.0/ and the like) with tarballs inside, and there is no `latest`
+# and no bare runsc under it at any spelling. So the path that exists to save
+# a machine whose apt repo is unreachable could never save anything.
+#
+# The artifact that does exist is the pool/ .deb, and the bucket's own apt
+# index states its path AND its SHA256. Both are read from there now, which
+# is the substantive change: the download is checked against a checksum the
+# publisher asserts, not against a guess about file magic.
 
-def _fetch_runsc_body(mode: str, uname: str, dpkg: str) -> str:
-    return f"""
+_INDEX = """\
+Package: runsc
+Architecture: {arch}
+Version: 20260914.0
+Filename: pool/20260914.0/binary-{arch}/runsc.deb
+Size: 170572404
+SHA256: {sha}
+SHA512: irrelevant-to-this-test
+
+Package: gvisor-tap-vsock
+Architecture: {arch}
+Version: 1.0.0
+Filename: pool/1.0.0/binary-{arch}/tap.deb
+SHA256: 0000000000000000
+"""
+
+
+def _run_fetch_runsc(
+    *,
+    arch: str = "amd64",
+    sha: str = "d2f167823d81",
+    index: bool = True,
+    download: bool = True,
+    summed: str | None = None,
+):
+    """Run fetch_runsc against a stub bucket.
+
+    `index`/`download` False make that particular fetch fail. `summed` is
+    what the local sha256sum reports; the default is "whatever the index
+    said", i.e. the honest case.
+    """
+    if index:
+        index_arm = (
+            "cat > \"$out\" <<'IDX'\n"
+            + _INDEX.format(arch=arch, sha=sha)
+            + "IDX\n            return 0"
+        )
+    else:
+        index_arm = "return 22"
+    deb_arm = (
+        "printf '!<arch>\\n' > \"$out\"; return 0" if download else "return 22"
+    )
+    summed = sha if summed is None else summed
+
+    body = f"""
 CURL_LOG=$(mktemp)
-export CURL_LOG CURL_MODE={mode}
+export CURL_LOG
 curl() {{
     local out="" prev="" url=""
     for a in "$@"; do
@@ -191,68 +255,120 @@ curl() {{
         prev="$a"
     done
     echo "$url" >> "$CURL_LOG"
-    case "$CURL_MODE" in
-        ok)   printf '\\177ELF\\002\\001\\001' > "$out"; return 0 ;;
-        html) printf '<html>captive portal</html>' > "$out"; return 0 ;;
-        *)    return 22 ;;
+    case "$url" in
+        */Packages)
+            {index_arm}
+            ;;
+        */pool/*)
+            {deb_arm}
+            ;;
     esac
+    return 22
 }}
-uname() {{ echo "{uname}"; }}
-dpkg() {{ echo "{dpkg}"; }}
+dpkg() {{ echo "{arch}"; }}
+sha256sum() {{ echo "{summed}  $1"; }}
 {_function("fetch_runsc")}
 """
-
-
-def _run_fetch_runsc(mode: str, uname: str = "x86_64", dpkg: str = "amd64"):
-    return _bash(_fetch_runsc_body(mode, uname, dpkg) + """
+    return _bash(body + """
 out=$(mktemp)
 if fetch_runsc "$out"; then echo "RC=0"; else echo "RC=1"; fi
 echo "--- tried ---"
 cat "$CURL_LOG"
+echo "--- artifact ---"
+[ -s "$out" ] && echo "PRESENT" || echo "ABSENT"
 """)
 
 
-def test_fetch_runsc_uses_the_kernels_architecture_name():
-    """The bucket files architectures as x86_64/aarch64, not amd64/arm64."""
-    result = _run_fetch_runsc("ok", uname="x86_64")
-    assert '"RC=0"' not in result.stdout  # sanity: RC is printed bare
-    assert "RC=0" in result.stdout
-    assert "release/latest/x86_64/runsc" in result.stdout
+def _tried(result: subprocess.CompletedProcess) -> str:
+    """The URLs the stub curl was asked for, in order."""
+    after = result.stdout.split("--- tried ---", 1)[1]
+    return after.split("--- artifact ---", 1)[0].strip()
+
+
+def test_fetch_runsc_reads_the_package_path_out_of_the_index():
+    """Path and checksum both come from the publisher's index.
+
+    Reconstructing either from a naming convention is exactly how the
+    `release/latest/...` URL got written in the first place.
+    """
+    result = _run_fetch_runsc()
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    assert "/dists/release/main/binary-amd64/Packages" in _tried(result)
+    assert (
+        "https://storage.googleapis.com/gvisor/releases/pool/20260914.0/"
+        "binary-amd64/runsc.deb" in _tried(result)
+    )
+
+
+def test_fetch_runsc_uses_dpkgs_architecture_name_not_the_kernels():
+    """The index is filed binary-amd64/binary-arm64.
+
+    uname says x86_64, which is what the old URL used and part of why it
+    never resolved.
+    """
+    tried = _tried(_run_fetch_runsc())
+    assert "binary-amd64" in tried
+    assert "x86_64" not in tried
 
 
 def test_fetch_runsc_handles_arm():
-    result = _run_fetch_runsc("ok", uname="aarch64", dpkg="arm64")
+    result = _run_fetch_runsc(arch="arm64")
     assert "RC=0" in result.stdout
-    assert "release/latest/aarch64/runsc" in result.stdout
+    assert "binary-arm64/Packages" in _tried(result)
+    assert "binary-arm64/runsc.deb" in _tried(result)
 
 
-def test_fetch_runsc_translates_dpkg_names_when_uname_is_unhelpful():
-    """A dpkg `amd64` must become the bucket's `x86_64`, not a 404."""
-    result = _run_fetch_runsc("ok", uname="", dpkg="amd64")
-    assert "RC=0" in result.stdout
-    assert "release/latest/x86_64/runsc" in result.stdout
-    assert "/amd64/runsc" not in result.stdout
+def test_fetch_runsc_never_installs_an_artifact_that_fails_its_checksum():
+    """The check the old ELF-magic test was reaching for, done properly.
 
-
-def test_fetch_runsc_tries_every_name_before_giving_up():
-    """One guess used to be the whole plan, and its failure was a bare
-    `curl: (22) 404` with nothing to act on."""
-    result = _run_fetch_runsc("fail", uname="x86_64", dpkg="amd64")
-    assert "RC=1" in result.stdout
-    tried = result.stdout.split("--- tried ---")[1]
-    assert "release/latest/x86_64/runsc" in tried
-    assert "release/latest/aarch64/runsc" in tried
-
-
-def test_fetch_runsc_refuses_something_that_is_not_a_binary():
-    """200 with an HTML body is what a proxy or captive portal returns.
-
-    Installing that as /usr/local/bin/runsc would leave a broken runtime
-    that looks installed — worse than the 404 it replaced.
+    A proxy, a captive portal, or a truncated transfer can all hand back a
+    well-formed file that is not the package. Only the publisher's own
+    checksum can tell that apart, and a wrong /usr/bin/runsc looks installed
+    while Purple Team cannot start — worse than the failure it replaced.
     """
-    result = _run_fetch_runsc("html", uname="x86_64")
+    result = _run_fetch_runsc(summed="ffffffffffff")
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+    assert "checksum does not match" in result.stdout
+    assert "ABSENT" in result.stdout  # not left on disk to be installed anyway
+
+
+def test_fetch_runsc_refuses_a_package_index_it_cannot_read():
+    result = _run_fetch_runsc(index=False)
     assert "RC=1" in result.stdout
-    assert "not a binary" in result.stdout
+    assert "could not read the package index" in result.stdout
+
+
+def test_fetch_runsc_refuses_an_index_with_no_runsc_stanza():
+    """The index parses, but says nothing about runsc — so there is no
+    checksum to verify against and nothing to install."""
+    result = _run_fetch_runsc(sha="")
+    assert "RC=1" in result.stdout
+    assert "lists no runsc package" in result.stdout
+
+
+def test_fetch_runsc_refuses_a_failed_download():
+    result = _run_fetch_runsc(download=False)
+    assert "RC=1" in result.stdout
+    assert "ABSENT" in result.stdout
+
+
+def test_fetch_runsc_does_not_try_architectures_it_cannot_name():
+    """No guessing: an architecture this script has no package for must
+    stop, not fire off a spread of hopeful URLs."""
+    for arch in ("riscv64", ""):
+        result = _run_fetch_runsc(arch=arch)
+        assert "RC=1" in result.stdout, arch
+        assert _tried(result) == "", arch
+
+
+def test_the_dead_release_latest_url_is_gone_from_the_script():
+    """Pinned so it cannot come back: no *code* in install.sh may point at
+    `releases/release/latest`, which has never existed. Comments are exempt —
+    the note in fetch_runsc explaining why it was wrong is the point."""
+    code = "\n".join(
+        line for line in SRC.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "release/latest" not in code
 
 
 # ---- the repo line must not survive a failed fallback ---------------------
@@ -272,6 +388,20 @@ def test_install_gvisor_drops_the_repo_file_before_falling_back():
 def test_install_gvisor_removes_it_on_the_success_path_too():
     """Rewritten on every run, so a stale malformed line cannot linger."""
     assert 'tee "$gvisor_list"' in _function("install_gvisor")
+
+
+def test_install_gvisor_installs_the_package_rather_than_copying_a_binary():
+    """gVisor's .deb carries more than usr/bin/runsc.
+
+    It also ships the containerd shim (usr/bin/containerd-shim-runsc-v1) and
+    the helper binaries under usr/bin/gvisor-bin/, which gVisor uses for
+    sentry prewarming and the metric server. `install -m 0755` of a single
+    fetched binary — what the old fallback did — silently leaves all of them
+    missing, so pin dpkg here.
+    """
+    body = _function("install_gvisor")
+    assert "dpkg -i" in body
+    assert "install -m 0755" not in body
 
 
 if __name__ == "__main__":  # pragma: no cover
