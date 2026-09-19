@@ -125,7 +125,12 @@ def sandbox_available(image: str = "kryonsec/sandbox:latest") -> tuple[bool, str
         return False, "docker CLI not found or daemon unreachable"
 
     if "runsc" not in runtimes:
-        return False, "gVisor (runsc) runtime not registered with Docker"
+        # the notice line is a single line in the prompt, so the how-to-fix
+        # detail belongs in doctor, not here — point at it
+        return False, (
+            "gVisor (runsc) runtime not registered with Docker — "
+            "run `kryonsec doctor` for the fix"
+        )
 
     if not runtime_checks.image_present(image):
         return False, f"sandbox image not found locally: {image}"

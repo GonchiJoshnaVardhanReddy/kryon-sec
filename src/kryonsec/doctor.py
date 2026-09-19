@@ -82,7 +82,10 @@ def _check_gvisor() -> tuple[bool, str]:
 
     if runtime_checks.runsc_registered():
         return True, "OK (runsc registered)"
-    return False, "runsc runtime not registered — gVisor missing"
+    # a bare "gVisor missing" sends the user to re-run an install that may have
+    # already "succeeded" — the hint carries the actual fix (and names Docker
+    # Desktop, where the standard install can never take effect)
+    return False, runtime_checks.gvisor_fix_hint()
 
 
 def run_doctor(cfg: KryonsecConfig | None = None) -> int:

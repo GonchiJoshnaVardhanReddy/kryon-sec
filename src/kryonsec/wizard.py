@@ -464,15 +464,21 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
         if preset["name"] not in picked_mcp:
             continue
         # M13: warn BEFORE setup "succeeds" — a preset whose command is
-        # missing silently fails on the next chat session instead
+        # missing silently fails on the next chat session instead. Say how to
+        # get it: "uvx" is not a thing most people have heard of, and the
+        # runtime notice alone leaves them with nothing to act on.
         import shutil as _shutil
+
+        from .copilot.mcp_tools import command_install_hint
 
         first_token = preset["command"].split()[0]
         if not _shutil.which(first_token):
+            hint = command_install_hint(first_token)
             console.print(
                 f"[yellow]warning:[/yellow] {preset['name']} needs "
-                f"[bold]{first_token}[/bold], which is not on PATH — install "
-                "it or this server won't start"
+                f"[bold]{first_token}[/bold], which is not on PATH"
+                + (f" — {hint}" if hint else "")
+                + " — this server won't start until it is installed"
             )
         args = list(preset["args"])
         if "{ask}" in args:

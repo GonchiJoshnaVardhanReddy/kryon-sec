@@ -245,6 +245,12 @@ install_gvisor() {
     sleep 2
 }
 
+# true when the daemon the CLI is actually talking to has runsc registered
+runsc_registered() {
+    dkr info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null |
+        grep -qw runsc
+}
+
 if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
     if ! command -v docker >/dev/null 2>&1; then
         install_docker ||
@@ -255,15 +261,36 @@ if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
             maybe_sudo service docker start 2>/dev/null || true
         sleep 2
     fi
-    if dkr info >/dev/null 2>&1; then
-        RUNTIMES="$(dkr info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null)"
-        case " $RUNTIMES " in
-            *" runsc "*) : ;; # already registered
-            *)
-                install_gvisor ||
-                    say "WARNING: gVisor install failed — Purple Team needs the runsc runtime"
-                ;;
-        esac
+    if dkr info >/dev/null 2>&1 && ! runsc_registered; then
+        install_gvisor || true
+        # Verify, do not assume. `runsc install` restarts "the daemon" — but
+        # which daemon depends on how this host runs Docker, and on WSL2 the
+        # CLI may be talking to one this script cannot touch at all.
+        if ! runsc_registered; then
+            # Docker Desktop runs the daemon outside the distro, so nothing
+            # run in here can add a runtime to it: `runsc install` writes the
+            # distro's /etc/docker/daemon.json and restarts a daemon the CLI
+            # is not using. The install looks fine, the runtime never appears,
+            # and re-running never helps. Name the real problem.
+            DOCKER_OS="$(dkr info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+            case "$DOCKER_OS" in
+                *"Docker Desktop"*)
+                    say "WARNING: your docker CLI is talking to Docker Desktop's daemon,"
+                    say "         which cannot load a runtime from inside WSL. Purple Team"
+                    say "         needs a daemon in the distro — install it and use that:"
+                    say "           sudo apt-get install -y docker.io"
+                    say "           sudo runsc install && sudo systemctl restart docker"
+                    say "         (enable systemd in /etc/wsl.conf, or start it with:"
+                    say "          sudo service docker start)"
+                    ;;
+                *)
+                    say "WARNING: gVisor install did not register runsc — Purple Team needs it"
+                    say "         retry with: sudo runsc install && sudo systemctl restart docker"
+                    ;;
+            esac
+        else
+            say "gVisor (runsc) registered with Docker"
+        fi
     fi
 fi
 

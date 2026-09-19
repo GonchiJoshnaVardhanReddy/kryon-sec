@@ -88,6 +88,30 @@ def test_missing_command_is_a_clear_error(tmp_path):
     assert any("not found on PATH" in n for n in notices)
 
 
+def test_missing_uvx_says_where_uvx_comes_from():
+    """'install it' is not actionable for uvx — the user has to be told it
+    ships with uv, and that uv has its own installer."""
+    from kryonsec.copilot.mcp_tools import _missing_command_message
+
+    message = _missing_command_message("uvx")
+    assert "uvx" in message
+    assert "astral.sh/uv" in message
+    assert "log out and back in" in message  # the installed-but-not-on-PATH case
+
+
+def test_missing_command_hint_survives_a_windows_path():
+    from kryonsec.copilot.mcp_tools import (
+        _missing_command_message,
+        command_install_hint,
+    )
+
+    # a full Windows path still resolves to the uvx hint (basename match)
+    assert command_install_hint(r"C:\Users\x\AppData\Local\uv\uvx.exe")
+    # unknown tools still get the generic message, just without a hint
+    assert command_install_hint("mystery-tool") is None
+    assert "not found on PATH" in _missing_command_message("mystery-tool")
+
+
 def test_connect_all_survives_close_mid_connect(tmp_path, monkeypatch):
     """connect_all() runs on a daemon thread while the user may quit:
     close() during the connect loop must not crash it, and any server
@@ -169,3 +193,100 @@ def test_build_mcp_toolbox_import_error_is_empty(tmp_path, monkeypatch):
     # context-manager shaped (M7): still usable, still empty, still closes
     with mod.build_mcp_toolbox(cfg) as tools:
         assert tools == {}
+
+
+# ---- startup failure reporting -------------------------------------------
+# A stdio server that dies at launch reported "unhandled errors in a TaskGroup
+# (1 sub-exception)" — anyio's wrapper says nothing, the cause is on a leaf
+# (or on the server's own stderr, which used to go to /dev/null). The user's
+# filesystem server failed on WSL with exactly that useless line.
+
+
+def test_describe_error_unwraps_exception_group():
+    from kryonsec.copilot.mcp_tools import _describe_error
+
+    inner = FileNotFoundError("npx: not found")
+    try:
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [inner])
+    except ExceptionGroup as group:
+        described = _describe_error(group)
+
+    assert "unhandled errors in a TaskGroup" not in described
+    assert "FileNotFoundError" in described
+    assert "npx: not found" in described
+
+
+def test_describe_error_keeps_plain_exception_readable():
+    from kryonsec.copilot.mcp_tools import _describe_error
+
+    assert _describe_error(RuntimeError("boom")) == "RuntimeError: boom"
+    assert _describe_error(RuntimeError("")) == "RuntimeError"
+
+
+def test_describe_error_dedupes_repeated_leaves():
+    from kryonsec.copilot.mcp_tools import _describe_error
+
+    same = OSError("connection reset")
+    try:
+        raise ExceptionGroup("group", [same, same])
+    except ExceptionGroup as group:
+        assert _describe_error(group) == "OSError: connection reset"
+
+
+def test_read_errlog_returns_last_lines():
+    import tempfile
+
+    from kryonsec.copilot.mcp_tools import _read_errlog
+
+    with tempfile.TemporaryFile() as errlog:
+        errlog.write(b"npm WARN deprecated x\n")
+        errlog.write(b"npm error 404 Not Found - GET registry/y\n")
+        # binary under the hood: the child writes bytes, not str
+        assert "404 Not Found" in _read_errlog(errlog)
+
+
+def test_read_errlog_never_raises():
+    from kryonsec.copilot.mcp_tools import _read_errlog
+
+    assert _read_errlog(None) == ""
+    assert _read_errlog(object()) == ""  # not a file at all
+
+
+def test_startup_failure_leads_with_the_servers_own_words():
+    from kryonsec.copilot.mcp_tools import _startup_failure
+
+    conn = _ServerConnection()
+    conn.stderr_tail = "npm error 404 Not Found"
+    conn.error = "ExceptionGroup: unhandled errors in a TaskGroup"
+    message = _startup_failure(conn)
+    assert message.startswith("npm error 404 Not Found")
+    assert "TaskGroup" in message  # the exception is kept as context
+
+    assert _startup_failure(_ServerConnection()) == "server exited during startup"
+
+
+def test_dead_server_is_reported_with_its_stderr(tmp_path):
+    """End to end through connect_all: a server whose command exists but
+    dies immediately is reported with what it said, not with the wrapper."""
+    import sys
+
+    cfg = KryonsecConfig(home=tmp_path)
+    # a real interpreter that exits non-zero and explains itself on stderr
+    cfg.mcp_servers = [{
+        "name": "dead",
+        "command": sys.executable,
+        "args": ["-c", "import sys; sys.stderr.write('boom: cannot start\\n'); sys.exit(3)"],
+    }]
+    notices: list[str] = []
+    tb = McpToolbox(cfg, on_notice=notices.append)
+    try:
+        tb.connect_all()
+    finally:
+        tb.close()
+
+    assert any("failed to start" in n for n in notices)
+    # the bare anyio wrapper is never an acceptable explanation on its own —
+    # that exact sentence was the whole of the old message
+    assert not any(
+        n.rstrip().endswith("unhandled errors in a TaskGroup (1 sub-exception)")
+        for n in notices)
