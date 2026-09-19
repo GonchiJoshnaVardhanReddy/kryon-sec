@@ -320,3 +320,146 @@ def test_wizard_abort_on_key_failure(scripted_wizard, tmp_path, monkeypatch):
     assert cfg.provider == "openai"
     assert not config_path(tmp_path).is_file()
 
+
+# ---- AWS Bedrock flow -------------------------------------------------------
+#
+# The bedrock helpers are imported inside _setup_bedrock, so patching them on
+# kryonsec.bedrock is what the wizard actually sees.
+
+_BEDROCK_MODELS = [
+    {"id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+     "label": "Claude Sonnet 4.5 (cross-region profile)",
+     "kind": "inference-profile"},
+    {"id": "amazon.nova-pro-v1:0", "label": "Amazon Nova Pro",
+     "kind": "foundation-model"},
+]
+
+
+def _patch_bedrock(monkeypatch, regions=("us-east-1",), models=None):
+    # a developer machine may export AWS_BEARER_TOKEN_BEDROCK for real AWS
+    # work; the wizard tests must not inherit it
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    monkeypatch.setattr("kryonsec.bedrock.probe_regions", lambda key, **kw: list(regions))
+    monkeypatch.setattr(
+        "kryonsec.bedrock.list_bedrock_models",
+        lambda key, region, **kw: (
+            _BEDROCK_MODELS if models is None else models))
+
+
+def test_wizard_bedrock_flow_writes_config(scripted_wizard, tmp_path, monkeypatch):
+    _patch_bedrock(monkeypatch)
+    cfg = scripted_wizard([
+        "3",          # AWS Bedrock
+        "ABSKtest",   # api key
+        "1",          # first model (the inference profile)
+        "1,4",        # file_read + cve_lookup
+        "1",          # mcp: fetch
+        "n",          # no passive-recon API keys
+    ])
+    assert cfg.provider == "bedrock"
+    assert cfg.bedrock_api_key == "ABSKtest"
+    assert cfg.bedrock_region == "us-east-1"  # auto-detected, never asked
+    # the bedrock/ prefix is what makes litellm apply the region + token
+    assert cfg.general_chat_model == (
+        "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    assert cfg.general_search_model == cfg.general_chat_model
+    assert cfg.compaction_model == cfg.general_chat_model
+    assert cfg.enabled_tools == ["file_read", "cve_lookup"]
+
+    data = read_config(config_path(tmp_path))
+    assert data["llm"]["provider"] == "bedrock"
+    assert data["llm"]["bedrock_api_key"] == "ABSKtest"
+    assert data["llm"]["bedrock_region"] == "us-east-1"
+
+
+def test_wizard_bedrock_model_selection_picks_the_right_id(
+        scripted_wizard, tmp_path, monkeypatch):
+    """The menu shows readable names; the stored value must be the model id,
+    with the litellm prefix."""
+    _patch_bedrock(monkeypatch)
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "2",       # second entry: the foundation model, not the profile
+        "", "", "n",
+    ])
+    assert cfg.general_chat_model == "bedrock/amazon.nova-pro-v1:0"
+
+
+def test_wizard_bedrock_prompts_when_several_regions_work(
+        scripted_wizard, tmp_path, monkeypatch):
+    """A key valid in more than one region must not be guessed at — it
+    decides where calls are billed."""
+    _patch_bedrock(monkeypatch, regions=("us-east-1", "ap-south-1"))
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "2",   # region: ap-south-1
+        "1",   # model
+        "", "", "n",
+    ])
+    assert cfg.bedrock_region == "ap-south-1"
+
+
+def test_wizard_bedrock_rejected_key_retries(scripted_wizard, tmp_path, monkeypatch):
+    """The region probe doubles as the key check: nothing answering 200
+    means the key is bad, and the user gets another go."""
+    seen = []
+
+    def fake_probe(key, **kw):
+        seen.append(key)
+        return ["us-east-1"] if len(seen) > 1 else []
+
+    monkeypatch.setattr("kryonsec.bedrock.probe_regions", fake_probe)
+    monkeypatch.setattr(
+        "kryonsec.bedrock.list_bedrock_models", lambda key, region, **kw: _BEDROCK_MODELS)
+    cfg = scripted_wizard([
+        "3",
+        "ABSKbad",   # rejected everywhere
+        "y",         # retry
+        "ABSKgood",
+        "1", "", "", "n",
+    ])
+    assert seen == ["ABSKbad", "ABSKgood"]
+    assert cfg.bedrock_api_key == "ABSKgood"
+
+
+def test_wizard_bedrock_giving_up_loops_back_to_provider(
+        scripted_wizard, tmp_path, monkeypatch):
+    """Declining to retry must not abort setup — it returns to the provider
+    question, so OpenAI or Ollama is still reachable."""
+    _patch_bedrock(monkeypatch, regions=())
+    cfg = scripted_wizard([
+        "3", "ABSKbad",  # rejected
+        "n",             # give up on Bedrock
+        "1", "sk-test-123", "1",  # fall through to OpenAI instead
+        "", "", "n",
+    ])
+    assert cfg.provider == "openai"
+    assert cfg.openai_api_key == "sk-test-123"
+    assert config_path(tmp_path).is_file()
+
+
+def test_wizard_bedrock_empty_key_loops_back(scripted_wizard, tmp_path, monkeypatch):
+    _patch_bedrock(monkeypatch)
+    monkeypatch.setattr("kryonsec.wizard.ollama_model_names",
+                        lambda host: ["llama3.1:latest"])
+    cfg = scripted_wizard([
+        "3", "",          # blank key
+        "2", "1", "", "", "n",   # pick Ollama instead
+    ])
+    assert cfg.provider == "ollama"
+    assert cfg.bedrock_api_key is None
+
+
+def test_wizard_bedrock_falls_back_to_typed_model_id(
+        scripted_wizard, tmp_path, monkeypatch):
+    """A key scoped to runtime-only cannot list models. That must degrade to
+    typing an id, not dead-end the setup."""
+    _patch_bedrock(monkeypatch, models=[])
+    cfg = scripted_wizard([
+        "3", "ABSKtest",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",  # typed by hand
+        "", "", "n",
+    ])
+    assert cfg.general_chat_model == (
+        "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+

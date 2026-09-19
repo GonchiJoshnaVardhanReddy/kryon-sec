@@ -19,11 +19,20 @@ console = Console()
 def _check_storage(cfg: KryonsecConfig) -> tuple[bool, str]:
     try:
         cfg.ensure_dirs()
-        from .storage import init_db
+        from .storage import get_engine, init_db
 
         init_db(cfg)
         kind = cfg.storage_kind
-        return True, f"OK ({kind})"
+        # surface the schema revision: "my database is from an older release"
+        # is otherwise invisible until a query fails on a missing column
+        try:
+            from .migrations import current_version
+
+            version = current_version(get_engine(cfg))
+        except Exception:  # pragma: no cover - never fail doctor over this
+            version = None
+        suffix = f", schema {version}" if version else ""
+        return True, f"OK ({kind}{suffix})"
     except Exception as e:  # pragma: no cover - environment-dependent
         return False, f"FAILED ({e})"
 
@@ -52,6 +61,16 @@ def _check_openai(cfg: KryonsecConfig) -> tuple[bool, str]:
     return False, "OPENAI_API_KEY not set (third-party models unavailable)"
 
 
+def _check_bedrock(cfg: KryonsecConfig) -> tuple[bool, str]:
+    # Deliberately offline: doctor must stay fast, and the setup wizard
+    # already proved the key by probing every region (bedrock.probe_regions).
+    # The region is echoed because a Bedrock call sent to the wrong region
+    # is the most common failure and is otherwise invisible here.
+    if cfg.bedrock_api_key:
+        return True, f"OK (Bedrock API key set, region {cfg.bedrock_region})"
+    return False, "no Bedrock API key (run `kryonsec setup`)"
+
+
 def _check_docker() -> tuple[bool, str]:
     from .purple import runtime_checks
 
@@ -77,10 +96,21 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
 
     ok, msg = _check_storage(cfg)
     checks.append(("Storage", "", ok, msg))
-    ok, msg = _check_ollama(cfg)
-    checks.append(("LLM: Ollama (local)", "compaction with secrets, local chat", ok, msg))
-    ok, msg = _check_openai(cfg)
-    checks.append(("LLM: OpenAI", "third-party chat/analysis", ok, msg))
+    storage_ok = ok
+
+    # LLM providers: any ONE of these being usable is enough for Copilot
+    # mode. The results are accumulated here rather than read back out of
+    # `checks` by index — the old checks[1]/checks[2] arithmetic silently
+    # changed meaning the moment a provider row was inserted.
+    any_llm = False
+    for name, purpose, check in (
+        ("LLM: Ollama (local)", "compaction with secrets, local chat", _check_ollama),
+        ("LLM: OpenAI", "third-party chat/analysis", _check_openai),
+        ("LLM: AWS Bedrock", "third-party chat/analysis (Claude, Nova, Llama)", _check_bedrock),
+    ):
+        ok, msg = check(cfg)
+        checks.append((name, purpose, ok, msg))
+        any_llm = any_llm or ok
 
     checks.append((
         "Purple Team: platform", "gVisor requires Linux",
@@ -129,8 +159,6 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
     # exit code reflects the profile this machine can actually run, not
     # "every optional check passed": an Ollama-only Copilot user (fully
     # supported, wizard-configured) must not get exit 1
-    storage_ok = checks[0][2]
-    any_llm = checks[1][2] or checks[2][2]
     copilot_ok = storage_ok and any_llm
     # skipped rows count as "not available here", not "failed"
     purple_ok = all(ok is True for _, _, ok, _ in checks)

@@ -41,6 +41,21 @@ def ollama_cfg():
     reset_provider_cache()
 
 
+@pytest.fixture()
+def bedrock_cfg():
+    reset_provider_cache()
+    c = KryonsecConfig()
+    c.provider = "bedrock"
+    c.bedrock_api_key = "ABSKtest"
+    c.bedrock_region = "us-east-1"
+    c.general_chat_model = "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+    c.general_search_model = c.general_chat_model
+    c.compaction_model = c.general_chat_model
+    c.openai_api_key = None
+    yield c
+    reset_provider_cache()
+
+
 def test_ollama_provider_dead_ollama_is_a_hard_error(ollama_cfg):
     """Ollama config + dead Ollama = clear error, NOT a hosted fallback."""
     with (
@@ -259,3 +274,119 @@ def test_secrets_safe_prompt_local_model_passes_through(ollama_cfg):
     model, prompt = secrets_safe_prompt(
         ollama_cfg, "ollama/llama3.1", "recon: password=hunter2secret")
     assert (model, prompt) == ("ollama/llama3.1", "recon: password=hunter2secret")
+
+
+# ---- AWS Bedrock: same provider isolation + secrets gate as any hosted API --
+
+def test_bedrock_completion_kwargs_carry_key_and_region(cfg):
+    """litellm reads api_key as the Bedrock bearer token and needs the
+    region spelled out — a Bedrock API key carries no region itself."""
+    cfg.bedrock_api_key = "ABSKtest"
+    cfg.bedrock_region = "ap-south-1"
+    kw = completion_kwargs(cfg, "bedrock/anthropic.claude-v2")
+    assert kw["api_key"] == "ABSKtest"
+    assert kw["aws_region_name"] == "ap-south-1"
+    assert "api_base" not in kw  # that is the Ollama branch
+
+
+def test_bedrock_completion_kwargs_without_key_leave_aws_env_a_chance(cfg):
+    """No key in config.toml must not clobber AWS_* env vars or an
+    instance profile — litellm falls back to those."""
+    cfg.bedrock_api_key = None
+    cfg.bedrock_region = "us-west-2"
+    kw = completion_kwargs(cfg, "bedrock/anthropic.claude-v2")
+    assert "api_key" not in kw
+    assert kw["aws_region_name"] == "us-west-2"
+
+
+def test_bedrock_config_reroutes_a_non_bedrock_model(bedrock_cfg):
+    """Provider isolation: a bedrock config must never quietly call OpenAI
+    just because the caller passed a gpt-style model name."""
+    with patch("kryonsec.llm._complete", return_value="bedrock answer") as fake:
+        assert chat(bedrock_cfg, [], "gpt-4o-mini") == "bedrock answer"
+    assert fake.call_args[0][1] == bedrock_cfg.general_chat_model
+
+
+def test_bedrock_config_keeps_its_own_model(bedrock_cfg):
+    with patch("kryonsec.llm._complete", return_value="ok") as fake:
+        chat(bedrock_cfg, [], bedrock_cfg.general_chat_model)
+    assert fake.call_args[0][1] == bedrock_cfg.general_chat_model
+
+
+def test_bedrock_config_falls_back_within_provider(bedrock_cfg):
+    """Chat model fails -> the search model (same provider) answers. Nothing
+    here may reach Ollama or OpenAI."""
+    bedrock_cfg.general_search_model = "bedrock/amazon.nova-pro-v1:0"
+    calls = []
+
+    def fake_complete(c, model, messages, **kw):
+        calls.append(model)
+        if model == bedrock_cfg.general_chat_model:
+            raise RuntimeError("bedrock down")
+        return "nova answer"
+
+    with patch("kryonsec.llm._complete", side_effect=fake_complete):
+        assert chat(bedrock_cfg, [], bedrock_cfg.general_chat_model) == "nova answer"
+    assert calls == [bedrock_cfg.general_chat_model, bedrock_cfg.general_search_model]
+
+
+def test_bedrock_no_key_is_a_clear_error(bedrock_cfg):
+    bedrock_cfg.bedrock_api_key = None
+    with pytest.raises(LlmUnavailable, match="setup"):
+        chat(bedrock_cfg, [], bedrock_cfg.general_chat_model)
+
+
+def test_bedrock_error_names_bedrock_not_openai(bedrock_cfg):
+    """The message has to point at the right key, or the user edits the
+    wrong one."""
+    bedrock_cfg.bedrock_api_key = None
+    with pytest.raises(LlmUnavailable, match="Bedrock"):
+        chat(bedrock_cfg, [], bedrock_cfg.general_chat_model)
+
+
+def test_bedrock_call_with_secrets_routes_to_local(bedrock_cfg):
+    """CLAUDE.md rule 4: AWS is a third party, so a secret-bearing message
+    is re-routed to the local model exactly as it would be for OpenAI."""
+    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=True),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        assert chat(bedrock_cfg, messages, bedrock_cfg.general_chat_model) == "ok"
+    assert complete.call_args[0][1].startswith("ollama/")
+
+
+def test_bedrock_call_with_secrets_and_no_local_refuses(bedrock_cfg):
+    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=False),
+        patch("kryonsec.llm._complete") as complete,
+    ):
+        with pytest.raises(SecretsMustStayLocal):
+            chat(bedrock_cfg, messages, bedrock_cfg.general_chat_model)
+        complete.assert_not_called()  # nothing left the machine
+
+
+def test_bedrock_secrets_safe_prompt_redacts_when_no_local(bedrock_cfg):
+    with patch("kryonsec.llm._ollama_model_ok", return_value=False):
+        model, prompt = secrets_safe_prompt(
+            bedrock_cfg, bedrock_cfg.general_chat_model,
+            "recon: password=hunter2secret")
+    assert model == bedrock_cfg.general_chat_model
+    assert "hunter2secret" not in prompt
+
+
+def test_openai_config_reroutes_a_bedrock_model(cfg):
+    """The mirror case: before Bedrock existed, only an ollama/ prefix was
+    treated as foreign, so a bedrock/ id would have escaped isolation."""
+    with patch("kryonsec.llm._complete", return_value="hosted answer") as fake:
+        assert chat(cfg, [], "bedrock/anthropic.claude-v2") == "hosted answer"
+    assert fake.call_args[0][1] == cfg.general_chat_model
+
+
+def test_unknown_provider_falls_back_to_openai_rules(cfg):
+    """A hand-edited provider value must not become an unguarded call."""
+    cfg.provider = "wat"
+    with patch("kryonsec.llm._complete", return_value="ok") as fake:
+        assert chat(cfg, [], "gpt-4o-mini") == "ok"
+    assert fake.call_args[0][1] == "gpt-4o-mini"

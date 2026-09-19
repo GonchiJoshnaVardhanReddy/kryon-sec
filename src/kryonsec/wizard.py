@@ -136,50 +136,67 @@ def _pick_provider(answers: list[str] | None = None) -> str:
             title="Kryonsec setup — LLM provider",
             text="Which LLM provider do you want to use?",
             values=[("openai", "OpenAI (needs an API key)"),
-                    ("ollama", "Ollama (local, free)")],
+                    ("ollama", "Ollama (local, free)"),
+                    ("bedrock", "AWS Bedrock (needs an AWS Bedrock API key)")],
         ).run()
         if result is None:
             raise KeyboardInterrupt
         return result
     answer = (answers or []).pop(0) if answers else input(
-        "LLM provider?\n  1. OpenAI (needs an API key)\n  2. Ollama (local, free)\n> ")
+        "LLM provider?\n"
+        "  1. OpenAI (needs an API key)\n"
+        "  2. Ollama (local, free)\n"
+        "  3. AWS Bedrock (needs an AWS Bedrock API key)\n> ")
     answer = answer.strip().lower()
     # "o" is NOT an OpenAI abbreviation — it reads as Ollama. Spell it out.
-    return "openai" if answer in ("1", "openai") else "ollama"
+    # Bedrock stays LAST in the list so the numbering above never shifts.
+    return {"1": "openai", "openai": "openai",
+            "3": "bedrock", "bedrock": "bedrock"}.get(answer, "ollama")
 
 
-def _ask_key(answers: list[str] | None = None) -> str:
+def _ask_key(answers: list[str] | None = None, title: str = "OpenAI API key",
+             prompt: str = "Paste your OpenAI API key (sk-…):") -> str:
     if _is_tty() and not answers:
         from prompt_toolkit.shortcuts import input_dialog
 
         result = input_dialog(
-            title="OpenAI API key",
-            text="Paste your OpenAI API key (sk-…):",
+            title=title,
+            text=prompt,
             password=True,
         ).run()
         if result is None:
             raise KeyboardInterrupt
         return result.strip()
-    return (answers or []).pop(0).strip() if answers else input("OpenAI API key: ").strip()
+    return (answers or []).pop(0).strip() if answers else input(f"{title}: ").strip()
 
 
-def _pick_model(models: list[str], answers: list[str] | None = None) -> str:
-    """Choose one model from a list, most-recent-first."""
+def _pick_model(
+    models: list[str],
+    answers: list[str] | None = None,
+    noun: str = "model",
+    sort_note: str = "most recent first",
+) -> str:
+    """Choose one entry from a list.
+
+    `noun`/`sort_note` name the list being shown: Bedrock reuses this to
+    pick a region, and "Available models (most recent first)" would be a
+    lie there.
+    """
     if _is_tty() and not answers:
         from prompt_toolkit.shortcuts import radiolist_dialog
 
         result = radiolist_dialog(
-            title="Choose your model",
-            text=f"{len(models)} models available (most recent first). Pick one:",
+            title=f"Choose your {noun}",
+            text=f"{len(models)} {noun}s available ({sort_note}). Pick one:",
             values=[(m, m) for m in models],
         ).run()
         if result is None:
             raise KeyboardInterrupt
         return result
-    print("Available models (most recent first):")
+    print(f"Available {noun}s ({sort_note}):")
     for i, m in enumerate(models, 1):
         print(f"  {i}. {m}")
-    raw = (answers or []).pop(0) if answers else input("model number: ")
+    raw = (answers or []).pop(0) if answers else input(f"{noun} number: ")
     raw = raw.strip()
     if raw.isdigit() and 1 <= int(raw) <= len(models):
         return models[int(raw) - 1]
@@ -219,6 +236,32 @@ def _pick_many(
     return picked
 
 
+def _pick_bedrock_model(
+    models: list[dict], answers: list[str] | None = None
+) -> str:
+    """Choose a Bedrock model: show the readable name AND the model id,
+    return the id (what litellm needs)."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        result = radiolist_dialog(
+            title="Choose your Bedrock model",
+            text=f"{len(models)} models available (cross-region profiles first).",
+            values=[(m["id"], f"{m['label']}  —  {m['id']}") for m in models],
+        ).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result
+    print(f"Available Bedrock models ({len(models)}, cross-region profiles first):")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}. {m['label']}\n     {m['id']}")
+    raw = (answers or []).pop(0) if answers else input("model number: ")
+    raw = raw.strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(models):
+        return models[int(raw) - 1]["id"]
+    return raw  # a typed-in model id — trust it, same as _pick_model
+
+
 def _ask_optional_key(title: str, answers: list[str] | None = None) -> str:
     """Ask for an optional API key. Blank = skip (the source is simply
     not configured — keyless passive sources always run either way)."""
@@ -241,6 +284,86 @@ def _ask_yes_no(question: str, answers: list[str] | None = None) -> bool:
         return bool(yes_no_dialog(title=question, text=question).run())
     raw = (answers or []).pop(0) if answers else input(f"{question} [y/N]: ")
     return raw.strip().lower() in ("y", "yes", "1")
+
+
+def _setup_bedrock(
+    cfg: KryonsecConfig, console, answers: list[str] | None = None
+) -> bool:
+    """The Bedrock branch of the wizard.
+
+    Returns True when cfg is configured, False to send the caller back to
+    the provider question (bad/missing key, or no model chosen).
+    """
+    from .bedrock import (
+        BEDROCK_KEY_HELP,
+        format_model_id,
+        list_bedrock_models,
+        probe_regions,
+    )
+
+    console.print(f"[dim]{BEDROCK_KEY_HELP}[/dim]")
+
+    # A Bedrock API key is opaque and carries no region, so the probe below
+    # is BOTH the key check and the region lookup: nothing answers 200 when
+    # the key is wrong, revoked or expired.
+    key = ""
+    while True:
+        key = _ask_key(
+            answers,
+            title="AWS Bedrock API key",
+            prompt="Paste your Bedrock API key (ABSK…):",
+        )
+        if not key:
+            console.print("[yellow]no key entered[/yellow]")
+            return False
+        console.print("[dim]checking which AWS region your key works in…[/dim]")
+        regions = probe_regions(key)
+        if regions:
+            break
+        console.print(
+            "[red]that key was rejected in every AWS region[/red] — check it "
+            "is a Bedrock API key (starts with ABSK) and has not expired."
+        )
+        retry = (answers or []).pop(0) if answers else input("try again? [Y/n]: ")
+        if retry.strip().lower().startswith("n"):
+            return False
+
+    if len(regions) == 1:
+        region = regions[0]
+        console.print(f"[green]region detected from your key:[/green] {region}")
+    else:
+        # Some keys are valid in more than one region — let the user choose
+        # rather than guessing, since it decides where calls are billed.
+        console.print(f"[green]your key works in {len(regions)} regions[/green]")
+        region = _pick_model(regions, answers, noun="region", sort_note="most common first")
+
+    models = list_bedrock_models(key, region)
+    if models:
+        model_id = _pick_bedrock_model(models, answers)
+    else:
+        console.print(
+            "[yellow]could not list models for that region — type the model "
+            "id manually[/yellow]\n"
+            "  e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )
+        model_id = ((answers or []).pop(0) if answers else input("model id: ")).strip()
+    if not model_id:
+        return False
+
+    cfg.bedrock_api_key = key
+    cfg.bedrock_region = region
+    cfg.general_chat_model = format_model_id(model_id)
+    # search/compaction reuse the chosen model: a Bedrock account may not
+    # have every model enabled, so a hardcoded default would fail
+    cfg.general_search_model = cfg.general_chat_model
+    cfg.compaction_model = cfg.general_chat_model
+    cfg.local_model = "ollama/llama3.1"  # local fallback stays available
+    console.print(
+        "[yellow]note:[/yellow] this model must also be enabled for your "
+        "account under Bedrock > Model access, or calls fail with "
+        "AccessDenied."
+    )
+    return True
 
 
 def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> KryonsecConfig:
@@ -290,6 +413,13 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
             cfg.compaction_model = cfg.general_chat_model
             cfg.local_model = "ollama/llama3.1"  # local fallback stays available
             break
+
+        if provider == "bedrock":
+            # False (bad key, no model) loops back to the provider question
+            # rather than leaving the user with a half-written config
+            if _setup_bedrock(cfg, console, answers):
+                break
+            continue
 
         names = ollama_model_names(cfg.ollama_host)
         if not names:
@@ -413,6 +543,8 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     table.add_column(style="bold")
     table.add_row("provider", cfg.provider)
     table.add_row("chat model", cfg.general_chat_model)
+    if cfg.provider == "bedrock":
+        table.add_row("aws region", cfg.bedrock_region)
     table.add_row("local model", cfg.local_model)
     table.add_row("tools", ", ".join(cfg.enabled_tools) or "none")
     table.add_row("mcp servers", ", ".join(s["name"] for s in cfg.mcp_servers) or "none")

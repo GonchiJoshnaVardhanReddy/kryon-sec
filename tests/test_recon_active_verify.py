@@ -42,6 +42,62 @@ def test_parse_nmap_ignores_closed_ports():
     assert [s["port"] for s in services] == [80]
 
 
+# ---- feroxbuster parsing -------------------------------------------------
+
+def test_parse_feroxbuster_reads_real_output():
+    """The pattern must match what feroxbuster actually prints.
+
+    Real lines are "status [METHOD] Nl Nw Nc <full-url>". The old pattern
+    wanted "<status> <digits> <digits> /path" and so matched nothing real —
+    every directory-busting result was dropped without a word.
+    """
+    from kryonsec.purple.recon_active import parse_feroxbuster
+
+    out = (
+        "200      GET       15l       34w      345c http://t.com/admin\n"
+        "301      GET        9l       28w      317c http://t.com/backup => http://t.com/backup/\n"
+        "403      GET        9l       28w      317c http://t.com/.git/HEAD\n"
+        # builds that omit the METHOD column still parse
+        "200        10l        212w       38437c http://t.com/index.html\n"
+    )
+    assert parse_feroxbuster(out) == [
+        {"path": "/admin", "status": 200},
+        {"path": "/backup", "status": 301},
+        {"path": "/.git/HEAD", "status": 403},
+        {"path": "/index.html", "status": 200},
+    ]
+
+
+def test_parse_feroxbuster_keeps_query_string():
+    from kryonsec.purple.recon_active import parse_feroxbuster
+
+    out = "200      GET        1l        2w        3c http://t.com/s.php?id=1\n"
+    assert parse_feroxbuster(out) == [{"path": "/s.php?id=1", "status": 200}]
+
+
+def test_parse_feroxbuster_skips_404_and_junk():
+    from kryonsec.purple.recon_active import parse_feroxbuster
+
+    out = (
+        "404      GET        3l        5w       62c http://t.com/nope\n"
+        "500      GET        1l        1w       10c http://t.com/boom\n"
+        "🦡  feroxbuster v2.10.4\n"          # the banner
+        "Scanning: http://t.com/FUZZ\n"      # progress noise
+        "\n"
+    )
+    assert parse_feroxbuster(out) == []
+
+
+def test_parse_feroxbuster_is_bounded():
+    from kryonsec.purple.recon_active import parse_feroxbuster
+
+    out = "".join(
+        f"200      GET        1l        1w        1c http://t.com/p{i}\n"
+        for i in range(200)
+    )
+    assert len(parse_feroxbuster(out)) == 50
+
+
 # ---- RECON_ACTIVE --------------------------------------------------------
 
 class FakeSandbox:
@@ -108,8 +164,14 @@ class MultiToolSandbox:
         "httpx": "http://t.com:80/ [200] [Home] [Nginx,PHP]\n",
         "whatweb": "http://t.com:80/ [200 OK] Nginx[1.18], PHP[7.4]\n",
         "katana": "http://t.com/admin/login\nhttp://t.com/api/v1\n",
-        "feroxbuster": "200      15l      345w     /admin\n"
-                       "301       0l        0w     /backup\n",
+        # real feroxbuster shapes: status, optional METHOD, Nl/Nw/Nc, full URL.
+        # The fixture used to be "200  15l  345w  /admin" — a format the tool
+        # never prints — which is exactly why the parser looked correct.
+        "feroxbuster": "200      GET       15l       34w      345c http://t.com/admin\n"
+                       "301      GET        9l       28w      317c http://t.com/backup => http://t.com/backup/\n"
+                       "403      GET        9l       28w      317c http://t.com/.git/HEAD\n"
+                       "200        10l        212w       38437c http://t.com/index.html\n"
+                       "404      GET        3l        5w       62c http://t.com/nope\n",
         "sslscan": "TLSv1.0  enabled\n",
         "testssl.sh": "subject: t.com\n",
     }

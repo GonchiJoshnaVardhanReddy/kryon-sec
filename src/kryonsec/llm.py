@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any
+from typing import Any, NamedTuple
 
 from .config import KryonsecConfig
 
@@ -123,10 +123,18 @@ def completion_kwargs(
 ) -> dict[str, Any]:
     """Provider/shape kwargs shared by every litellm.completion call:
     the config.toml api key (litellm only reads the env var), the Ollama
-    host, and the reasoning-model quirks above."""
+    host, the Bedrock region, and the reasoning-model quirks above."""
     kwargs: dict[str, Any] = {}
     if model.startswith("ollama/"):
         kwargs["api_base"] = _normalize_host(cfg.ollama_host)
+    elif model.startswith("bedrock/"):
+        # litellm sends api_key to Bedrock as the bearer token
+        # (AWS_BEARER_TOKEN_BEDROCK), and needs the region spelled out: a
+        # Bedrock API key carries no region of its own. Left unset when
+        # there is no key, so AWS_* env vars / an instance profile still work.
+        if cfg.bedrock_api_key:
+            kwargs["api_key"] = cfg.bedrock_api_key
+        kwargs["aws_region_name"] = cfg.bedrock_region
     elif cfg.openai_api_key:
         kwargs["api_key"] = cfg.openai_api_key
     if is_reasoning_model(model):
@@ -291,6 +299,35 @@ def secrets_safe_prompt(
     return model, redact(prompt)[0]
 
 
+class _HostedProvider(NamedTuple):
+    """What the hosted branch of chat() needs to know per provider."""
+
+    label: str  # shown in errors, so the user knows which key to fix
+    key_attr: str  # KryonsecConfig attribute holding the API key
+
+
+# Hosted (third-party) providers. `ollama` is deliberately absent: it is the
+# local branch, handled separately below.
+_HOSTED_PROVIDERS: dict[str, _HostedProvider] = {
+    "openai": _HostedProvider("OpenAI", "openai_api_key"),
+    "bedrock": _HostedProvider("AWS Bedrock", "bedrock_api_key"),
+}
+
+
+def _owns_model(provider: str, model: str) -> bool:
+    """True when `model` belongs to `provider` and may be called as-is.
+
+    Provider isolation (v1.1): the provider chosen in setup is THE provider,
+    so a model id carrying a different provider's prefix is rerouted to the
+    configured chat model instead of silently calling someone else.
+    """
+    if provider == "bedrock":
+        return model.startswith("bedrock/")
+    # OpenAI ids are bare ("gpt-4o") or "openai/…" — anything carrying
+    # another provider's prefix is not ours.
+    return not model.startswith(("ollama/", "bedrock/"))
+
+
 def chat(
     cfg: KryonsecConfig,
     messages: list[dict],
@@ -336,17 +373,20 @@ def chat(
             )
         return _complete(cfg, model, messages, **kwargs)
 
-    # ---- openai config: hosted API only ---------------------------------
-    if model.startswith("ollama/"):
-        model = cfg.general_chat_model  # never silently call a local model
+    # ---- hosted config (openai | bedrock): that API only -----------------
+    # An unrecognised provider value in config.toml falls back to the OpenAI
+    # rules rather than calling something the user never chose.
+    hosted = _HOSTED_PROVIDERS.get(cfg.provider, _HOSTED_PROVIDERS["openai"])
+    if not _owns_model(cfg.provider, model):
+        model = cfg.general_chat_model  # never silently call another provider
     if secrets_present:
         # never send the hosted call; local model or hard refusal
         model = secrets_safe_model(cfg, model, messages)
         return _complete(cfg, model, messages, **kwargs)
-    if not cfg.openai_api_key:
+    if not getattr(cfg, hosted.key_attr, None):
         raise LlmUnavailable(
-            "OpenAI is the configured provider but no API key is set — "
-            "run `kryonsec setup`"
+            f"{hosted.label} is the configured provider but no API key is "
+            "set — run `kryonsec setup`"
         )
     try:
         return _complete(cfg, model, messages, **kwargs)
@@ -361,8 +401,8 @@ def chat(
             pass
 
     raise LlmUnavailable(
-        "no OpenAI model answered — check the API key (`kryonsec setup`) "
-        "or the network"
+        f"no {hosted.label} model answered — check the API key "
+        "(`kryonsec setup`) or the network"
     )
 
 

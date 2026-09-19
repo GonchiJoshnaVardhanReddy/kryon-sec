@@ -216,6 +216,16 @@ class KaliSandbox:
             )
         except Exception as e:
             return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e))
+        except BaseException:
+            # Ctrl+C during a long scan, or a signal handler raising
+            # SystemExit. KeyboardInterrupt/SystemExit derive from
+            # BaseException, so `except Exception` above never saw them: the
+            # docker CLI died while the container kept running in the daemon,
+            # still sending packets at the target after the operator believed
+            # the engagement had stopped. Kill it, then let the interrupt
+            # propagate so Ctrl+C still stops the run.
+            self._kill_container(container_name)
+            raise
 
         # The entrypoint prints one JSON object on stdout (rejections too —
         # exit 125 with {"error": ...}); anything else (docker-level error)

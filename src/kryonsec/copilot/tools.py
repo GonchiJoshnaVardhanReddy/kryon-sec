@@ -29,6 +29,13 @@ class ApprovalRequest:
     path: Path
     reason: str
     action: str = "read"  # "read" | "list" | "write"
+    # The path the agent literally named, when it differs from `path` (which
+    # is always the resolved target). A symlink inside the workspace pointing
+    # at /etc/shadow resolves outside it, so the approval gate correctly
+    # fires — but the prompt used to show only the innocent-looking workspace
+    # name, asking the user to approve a read of a file that wasn't the one
+    # being read.
+    requested_path: Path | None = None
 
 
 class FileTools:
@@ -41,16 +48,39 @@ class FileTools:
 
     # ---- approval --------------------------------------------------------
 
+    def _request(self, target: Path, reason: str, action: str) -> ApprovalRequest:
+        """Build an ApprovalRequest describing the file the decision is
+        actually about, plus the name the agent used when they differ."""
+        import os
+
+        resolved = target.resolve()
+        requested = Path(os.path.abspath(target))
+        return ApprovalRequest(
+            path=resolved,
+            reason=reason,
+            action=action,
+            requested_path=requested if requested != resolved else None,
+        )
+
     def _prompt_approve(self, req: ApprovalRequest) -> bool:
-        verb = "read" if req.action == "read" else "write"
+        verb = {"read": "read", "list": "list", "write": "write"}.get(
+            req.action, req.action)
+        via = (
+            f"  (requested as {req.requested_path})\n"
+            if req.requested_path else ""
+        )
         answer = input(
             f"\n  Agent wants to {verb}: {req.path}\n"
+            f"{via}"
             f"  Reason: {req.reason}\n"
             f"  [A]pprove once / [Y] always for this path / [D]eny: "
         )
         a = answer.strip().lower()
         if a.startswith("y"):
-            self._always_approved.add(req.path.resolve())
+            # resolved path, matching what _needs_approval() checks — keying
+            # this on the unresolved name let a second symlink with the same
+            # workspace name ride on the first approval
+            self._always_approved.add(req.path)
         return a.startswith(("a", "y"))
 
     def _needs_approval(self, path: Path) -> bool:
@@ -70,7 +100,8 @@ class FileTools:
         if not target.exists() or not target.is_file():
             raise FileAccessDenied(f"not a readable file: {target}")
         if self._needs_approval(target):
-            if not self._approver(ApprovalRequest(path=target, reason="Agent file read")):
+            if not self._approver(self._request(
+                    target, "Agent file read", "read")):
                 raise FileAccessDenied(f"user denied read: {target}")
         try:
             text = target.read_text(encoding="utf-8", errors="replace")
@@ -83,7 +114,8 @@ class FileTools:
         if not target.exists() or not target.is_dir():
             raise FileAccessDenied(f"not a readable directory: {target}")
         if self._needs_approval(target):
-            if not self._approver(ApprovalRequest(path=target, reason="Agent directory listing", action="list")):
+            if not self._approver(self._request(
+                    target, "Agent directory listing", "list")):
                 raise FileAccessDenied(f"user denied listing: {target}")
         return sorted(p.name for p in target.iterdir())[:500]
 
@@ -97,8 +129,8 @@ class FileTools:
             # Writes outside the workspace need approval (v1.1) — same
             # gate as reads. Denial raises; approval proceeds.
             if self._needs_approval(target):
-                if not self._approver(ApprovalRequest(
-                        path=target, reason="Agent file write", action="write")):
+                if not self._approver(self._request(
+                        target, "Agent file write", "write")):
                     raise FileAccessDenied(f"user denied write: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")

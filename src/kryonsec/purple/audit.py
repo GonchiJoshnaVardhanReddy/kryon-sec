@@ -18,6 +18,15 @@ _GENESIS_PREV = "0" * 64
 _CANON: dict[str, Any] = {"sort_keys": True, "separators": (",", ":")}
 
 
+class AuditChainError(RuntimeError):
+    """The on-disk chain is damaged. Raised instead of appending to it.
+
+    Continuing past a bad line is worse than refusing: the new entry chains
+    onto a hash that verify() will reject, so the file becomes permanently
+    unverifiable while the run happily keeps going.
+    """
+
+
 def canonical_json(obj: Any) -> str:
     return json.dumps(obj, **_CANON)
 
@@ -88,16 +97,40 @@ class AuditLog:
     # ---- internals -------------------------------------------------------
 
     def _load_last_hash(self) -> str:
+        """The chain head, or refuse to continue on a damaged file.
+
+        This used to `continue` past an unparseable line. A torn final line
+        (a crash mid-write) was therefore skipped silently: appends resumed
+        from the previous hash and the incomplete line stayed in the file, so
+        verify() reported "unparseable JSON" on every subsequent run while
+        nothing warned at write time. Damage to an audit chain has to be
+        loud, and refusing is the only non-destructive option — re-writing
+        the file would itself destroy evidence.
+        """
         if not self.path.exists():
             return _GENESIS_PREV
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        # index of the last line with any content — only that one can be a
+        # half-written record; an earlier bad line is corruption or tampering
+        try:
+            tail = max(i for i, l in enumerate(lines) if l.strip())
+        except ValueError:
+            return _GENESIS_PREV  # empty file: nothing written yet
         last = _GENESIS_PREV
-        with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    last = json.loads(line)["hash"]
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                last = json.loads(line)["hash"]
+            except (json.JSONDecodeError, KeyError) as e:
+                where = ("the last line — the process was probably interrupted "
+                         "mid-write" if i == tail else "an entry that is not "
+                         "the last — the file was edited or corrupted")
+                raise AuditChainError(
+                    f"{self.path}: line {i + 1} is not a valid audit entry "
+                    f"({e}). It is {where}. Refusing to append — appending "
+                    f"would chain onto a hash verify() rejects, leaving the "
+                    f"whole log unverifiable. Inspect the file and remove the "
+                    f"damaged line yourself if you accept the loss."
+                ) from e
         return last

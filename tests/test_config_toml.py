@@ -20,6 +20,9 @@ def clean_env(monkeypatch):
     for var in (
         "OPENAI_API_KEY", "DATABASE_URL", "OLLAMA_HOST",
         "SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET",
+        # AWS_* are set for real AWS work on many dev machines and the
+        # bedrock fields read them on construction
+        "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION_NAME", "AWS_DEFAULT_REGION",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -103,9 +106,56 @@ def test_config_empty_tools_round_trips_as_empty(tmp_path, clean_env):
     cfg.enabled_tools = []
     path = write_config(config_path(tmp_path), cfg.to_toml_dict())
     assert read_config(path)["tools"]["enabled"] == []
-
     loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
     assert loaded.enabled_tools == []
+
+
+# ---- AWS Bedrock ------------------------------------------------------------
+
+def test_bedrock_fields_round_trip(tmp_path, clean_env):
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.provider = "bedrock"
+    cfg.bedrock_api_key = "ABSKtest-key"
+    cfg.bedrock_region = "ap-south-1"
+    cfg.general_chat_model = "bedrock/amazon.nova-pro-v1:0"
+
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.provider == "bedrock"
+    assert loaded.bedrock_api_key == "ABSKtest-key"
+    assert loaded.bedrock_region == "ap-south-1"
+    assert loaded.general_chat_model == "bedrock/amazon.nova-pro-v1:0"
+
+
+def test_bedrock_region_defaults_to_us_east_1(tmp_path, clean_env):
+    assert KryonsecConfig(home=tmp_path).bedrock_region == "us-east-1"
+
+
+def test_bedrock_env_overrides_toml(tmp_path, clean_env, monkeypatch):
+    """The AWS-standard env vars win, so an existing AWS shell keeps
+    working without editing config.toml."""
+    path = write_config(config_path(tmp_path), {
+        "llm": {"provider": "bedrock", "bedrock_api_key": "ABSK-from-toml",
+                "bedrock_region": "us-east-1"},
+    })
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "ABSK-from-env")
+    monkeypatch.setenv("AWS_REGION_NAME", "eu-west-1")
+    cfg = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert cfg.bedrock_api_key == "ABSK-from-env"
+    assert cfg.bedrock_region == "eu-west-1"
+
+
+def test_bedrock_region_falls_back_to_aws_default_region(tmp_path, clean_env, monkeypatch):
+    """AWS_DEFAULT_REGION is the other spelling boto3 honours; a user with
+    only that set must not be silently sent to us-east-1."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+    assert KryonsecConfig(home=tmp_path).bedrock_region == "eu-central-1"
+
+
+def test_bedrock_region_prefers_aws_region_name(tmp_path, clean_env, monkeypatch):
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+    monkeypatch.setenv("AWS_REGION_NAME", "us-west-2")
+    assert KryonsecConfig(home=tmp_path).bedrock_region == "us-west-2"
 
 
 def test_config_changed_tunables_round_trip(tmp_path, clean_env):

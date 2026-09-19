@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import sys
 import threading
 
@@ -84,7 +85,10 @@ def welcome(cfg: "KryonsecConfig") -> str:
     """Startup screen: banner plus the facts a user actually needs before
     the first message — provider, model, workspace — so a wrong config is
     visible immediately, not three turns in."""
-    provider = "OpenAI" if cfg.provider == "openai" else "Ollama (local)"
+    provider = {
+        "openai": "OpenAI",
+        "bedrock": "AWS Bedrock",
+    }.get(cfg.provider, "Ollama (local)")
     return (
         f"{banner_styled('copilot')}\n"
         f"[bold cyan]v{__version__}[/bold cyan] — dual-mode cybersecurity CLI\n"
@@ -171,9 +175,19 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
         verb = {"read": "Read", "list": "List", "write": "Write"}.get(
             req.action, req.action.capitalize())
+        # req.path is the RESOLVED target (what the decision is about). When
+        # the agent named something else — a workspace symlink pointing out of
+        # the workspace — show both, or the user approves the wrong file.
+        via = ""
+        if req.requested_path:
+            via = (
+                f"\n[yellow]requested as[/yellow] [dim]{req.requested_path}[/dim]"
+                f"\n[yellow]→ really[/yellow] [bold red]{req.path}[/bold red]"
+            )
         console.print(Panel(
             f"[bold]{verb} this file?[/bold]\n"
-            f"[cyan]{req.path}[/cyan]\n"
+            f"[cyan]{req.path}[/cyan]"
+            f"{via}\n"
             f"[dim]why: {req.reason}[/dim]",
             title="[bold yellow]Approval required[/bold yellow]",
             border_style="yellow",
@@ -471,13 +485,20 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                         reply = chat(cfg, session.as_llm_messages(system_prompt), cfg.general_chat_model)
                 except LlmUnavailable as e:
                     err_console.print(f"LLM unavailable: {e}")
-                    hint = (
-                        "Start Ollama (`ollama serve`) and pull a model "
-                        "(`ollama pull llama3.1`), or run `kryonsec setup` to "
-                        "switch to OpenAI."
-                        if cfg.provider == "ollama"
-                        else "Check your OpenAI key or network — or run "
-                        "`kryonsec setup` to switch providers."
+                    hint = {
+                        "ollama": (
+                            "Start Ollama (`ollama serve`) and pull a model "
+                            "(`ollama pull llama3.1`), or run `kryonsec setup` to "
+                            "switch to OpenAI."
+                        ),
+                        "bedrock": (
+                            "Check your AWS Bedrock key and region — or run "
+                            "`kryonsec setup` to switch providers."
+                        ),
+                    }.get(
+                        cfg.provider,
+                        "Check your OpenAI key or network — or run "
+                        "`kryonsec setup` to switch providers.",
                     )
                     console.print(f"[yellow]{hint}[/yellow]")
                     session.messages.pop()  # drop the unanswered user turn
@@ -568,6 +589,19 @@ def _run_purple(
         err_console.print(f"[red]Invalid target:[/red] {e}")
         return 2
 
+    # --id is a PATH COMPONENT: it names cfg.home/engagements/<id>/ and is
+    # passed to docker as a bind-mount source. Unvalidated, "--id ../../../tmp/x"
+    # walked out of the engagements tree and "--id /etc" pointed the mount at
+    # the host's /etc. Auto-generated ids are uuid4 hex, so a conservative
+    # charset costs nothing and closes the traversal.
+    if engagement_id is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", engagement_id):
+            err_console.print(
+                f"[red]Invalid engagement id:[/red] {engagement_id!r} — "
+                "use letters, digits, dot, dash or underscore (max 64 chars)"
+            )
+            return 2
+
     # --code: blue-team scanners need a real folder; anything else is a
     # hard error (never silently scans the wrong thing)
     if code_folder:
@@ -616,7 +650,7 @@ def _run_purple(
     )
     console.print(f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} target={target}\n")
     completed = orch.run()
-    status_line.stop_if_active()
+    status_line.hide()
     _print_purple_summary(cfg, engagement_id, target, completed, orch, audit, graph)
     return 0
 
@@ -752,6 +786,14 @@ def main(argv: list[str] | None = None) -> int:
             run_setup(cfg)
         except KeyboardInterrupt:
             console.print("\n[yellow]setup cancelled — run `kryonsec setup` anytime[/yellow]")
+        except EOFError:
+            # stdin isn't a terminal (piped, or a CI/detached shell) — input()
+            # raised instead of reading an answer. Was an uncaught traceback.
+            console.print(
+                "\n[yellow]setup needs an interactive terminal — "
+                "run `kryonsec setup` from a real shell[/yellow]"
+            )
+            return 1
         return 0
 
     # first run without a config -> wizard before the chat loop
@@ -766,6 +808,14 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             console.print("\n[yellow]setup cancelled[/yellow]")
             return 0
+        except EOFError:
+            # no terminal on stdin — the wizard can't ask anything. Fall
+            # through: config isn't written, so there's nothing to start into.
+            console.print(
+                "\n[yellow]no terminal for first-time setup — "
+                "run `kryonsec setup` in an interactive shell[/yellow]"
+            )
+            return 1
         if not config_path(cfg.home).is_file():
             return 0  # aborted before writing — nothing to start
 

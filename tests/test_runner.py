@@ -330,6 +330,56 @@ def test_run_purple_rejects_missing_code_folder(tmp_path):
     assert rc == 2
 
 
+@pytest.mark.parametrize("bad_id", [
+    "../../../tmp/x",     # escapes cfg.home/engagements/
+    "/etc",               # absolute — docker mount source
+    "..",
+    ".",
+    "a/b",
+    "a\\b",               # windows separator
+    "..%2f..",
+    "with space",
+    "",                   # empty is falsy → auto-generated, but must not be ""-named
+    "x" * 65,             # over the length bound
+    "-leading-dash",
+])
+def test_run_purple_rejects_path_traversal_ids(tmp_path, bad_id):
+    """--id is a path component and a docker bind-mount source.
+
+    It was passed through unvalidated, so `--id ../../../tmp/x` wrote the
+    audit chain, evidence and report outside the engagements tree, and
+    `--id /etc` aimed the sandbox mount at the host's /etc.
+    """
+    from kryonsec.cli import _run_purple
+
+    cfg = KryonsecConfig(home=tmp_path)
+    rc = _run_purple(cfg, "target-corp.com", engagement_id=bad_id)
+    assert rc == 2, f"{bad_id!r} should have been rejected"
+    # and nothing was created outside/inside the tree for it
+    assert not (tmp_path / "engagements").exists() or not any(
+        (tmp_path / "engagements").iterdir()
+    )
+
+
+@pytest.mark.parametrize("good_id", [
+    "e-1", "abc123", "Engagement_2026-09-18", "a.b", "x" * 64,
+])
+def test_run_purple_accepts_reasonable_ids(tmp_path, good_id):
+    """The validation must not reject ordinary ids — it stops traversal, not
+    naming choices. (These never reach the state machine: sandbox is absent,
+    so the run stops after passive recon.)"""
+    from kryonsec.cli import _run_purple
+
+    cfg = KryonsecConfig(home=tmp_path)
+    with patch("kryonsec.purple.runner.sandbox_available",
+               return_value=(False, "not Linux")):
+        with patch("kryonsec.purple.recon_passive.zone_a_fetchers",
+                   return_value=[_fake_recon]):
+            rc = _run_purple(cfg, "target-corp.com", engagement_id=good_id)
+    assert rc == 0, f"{good_id!r} should have been accepted"
+    assert (cfg.home / "engagements" / good_id).is_dir()
+
+
 def test_engagement_evidence_dir_wiring(tmp_path):
     """Phase 8: every evidence-PRODUCING state (active recon, exploit,
     post-exploit, verify) builds its sandbox with the rw /evidence mount

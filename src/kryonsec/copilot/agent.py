@@ -180,17 +180,40 @@ def execute_tool(toolbox: Toolbox, name: str, raw_args: str | None) -> str:
     return str(result)
 
 
+def _redact_tool_calls(tool_calls: list) -> list:
+    """Tool calls with secret-looking `function.arguments` redacted.
+
+    `arguments` is a JSON string the model produced, so a secret can be sitting
+    in it just as easily as in `content` — and this is precisely the fallback
+    path taken when secrets were detected. Copying the message with `**m`
+    carried the raw arguments straight past the redaction.
+    """
+    from ..secrets import redact
+
+    out: list = []
+    for tc in tool_calls:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+            tc = {**tc, "function": {**fn, "arguments": redact(fn["arguments"])[0]}}
+        out.append(tc)
+    return out
+
+
 def _redacted_contents(messages: list[dict]) -> list[dict]:
     """Message copies with secret-looking contents replaced by placeholders
     (secrets.redact). The placeholder mapping is discarded — it never
     leaves the machine."""
     from ..secrets import redact
 
-    return [
-        {**m, "content": redact(m["content"])[0]}
-        if isinstance(m.get("content"), str) else m
-        for m in messages
-    ]
+    out: list[dict] = []
+    for m in messages:
+        copy = dict(m)
+        if isinstance(copy.get("content"), str):
+            copy["content"] = redact(copy["content"])[0]
+        if isinstance(copy.get("tool_calls"), list):
+            copy["tool_calls"] = _redact_tool_calls(copy["tool_calls"])
+        out.append(copy)
+    return out
 
 
 def run_agent(

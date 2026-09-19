@@ -62,3 +62,37 @@ def test_profile_guard_blocks_execution():
     assert orch.state == HALT
     assert "profile2" in orch.halt_reason
     assert orch.completed == []  # never left INIT
+
+
+def test_factory_crash_does_not_escape_run():
+    """A raising subagent FACTORY must not kill the loop.
+
+    Only the returned callable used to be wrapped in try/except, but
+    runner.loader() does real work before returning (lazy imports,
+    sandbox.copy_with, evidence mkdir). A raise there escaped run() entirely:
+    no HALT, no halt_reason, no report — the CLI got a bare traceback.
+    """
+    def loader(state):
+        if state == "RECON_ACTIVE":
+            raise RuntimeError("factory blew up")
+        return lambda: SubagentResult(approved_count=1)
+
+    orch = PurpleOrchestrator(engagement_id="e-factory", subagent_loader=loader)
+    completed = orch.run()
+
+    assert orch.state == HALT          # reaches the terminal state
+    assert "RECON_ACTIVE" in completed  # the gap is recorded, not fatal
+    assert "REPORT" in completed
+
+
+def test_subagent_crash_does_not_escape_run():
+    """The callable path was already guarded — keep it that way."""
+    def loader(state):
+        def boom():
+            raise RuntimeError("subagent blew up")
+        return boom
+
+    orch = PurpleOrchestrator(engagement_id="e-crash", subagent_loader=loader)
+    completed = orch.run()
+    assert orch.state == HALT
+    assert "REPORT" in completed

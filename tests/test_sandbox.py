@@ -198,3 +198,69 @@ def test_spawn_bounds_output(tmp_path):
     assert res.ok
     assert len(res.stdout) == 100
     assert res.truncated
+
+
+# --- container cleanup on interrupt (spec §8.5) -----------------------------
+
+def _interrupt_sandbox(tmp_path, explode, monkeypatch):
+    """A sandbox whose tool run raises `explode`, recording docker-kill calls.
+
+    _kill_container() shells out through subprocess.run directly (not the
+    injectable run_fn), so the kill has to be observed at that seam.
+    """
+    from kryonsec.purple import sandbox as sb_mod
+
+    killed: list[str] = []
+
+    def fake_run(argv, **kw):
+        if list(argv[:2]) == ["docker", "kill"]:
+            killed.append(argv[2])
+            return Completed()          # the file's existing fake proc
+        raise explode
+
+    monkeypatch.setattr(sb_mod.subprocess, "run", fake_run)
+    return _sandbox(tmp_path, run_fn=fake_run), killed
+
+
+def test_interrupt_kills_the_running_container(tmp_path, monkeypatch):
+    """Ctrl+C must not leave a container still sending packets at the target.
+
+    Only TimeoutExpired triggered _kill_container. KeyboardInterrupt derives
+    from BaseException, so it skipped the `except Exception` handler entirely:
+    the docker CLI died and the container kept running in the daemon.
+    """
+    import pytest
+
+    sb, killed = _interrupt_sandbox(tmp_path, KeyboardInterrupt(), monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        sb.spawn(["nmap", "-Pn", "-sT", "10.0.0.1"])
+    assert len(killed) == 1, "the container must be killed before re-raising"
+
+
+def test_interrupt_still_propagates(tmp_path, monkeypatch):
+    """Cleanup must not swallow the interrupt — Ctrl+C has to stop the run."""
+    import pytest
+
+    sb, _ = _interrupt_sandbox(tmp_path, KeyboardInterrupt(), monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        sb.spawn(["nmap", "-Pn", "10.0.0.1"])
+
+
+def test_system_exit_also_kills(tmp_path, monkeypatch):
+    """A signal handler raising SystemExit is the same hazard."""
+    import pytest
+
+    sb, killed = _interrupt_sandbox(tmp_path, SystemExit(130), monkeypatch)
+    with pytest.raises(SystemExit):
+        sb.spawn(["nmap", "-Pn", "10.0.0.1"])
+    assert len(killed) == 1
+
+
+def test_normal_exception_does_not_kill(tmp_path, monkeypatch):
+    """A docker-level failure that already exited must not fire a stray kill."""
+    sb, killed = _interrupt_sandbox(
+        tmp_path, RuntimeError("docker not found"), monkeypatch)
+    result = sb.spawn(["nmap", "-Pn", "10.0.0.1"])
+    assert result.ok is False
+    assert "docker not found" in result.error
+    assert killed == []

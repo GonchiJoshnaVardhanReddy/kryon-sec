@@ -121,7 +121,19 @@ class PurpleOrchestrator:
                     self.on_state(self.state)
                 except Exception:
                     log.exception("progress callback error (ignored)")
-            loader = self.subagent_loader(self.state) if self.subagent_loader else None
+            try:
+                loader = (
+                    self.subagent_loader(self.state)
+                    if self.subagent_loader else None
+                )
+            except Exception:
+                # Building the subagent must not break determinism either:
+                # the factory does real work (lazy imports, sandbox.copy_with,
+                # evidence mkdir), and a raise here used to escape run()
+                # entirely — no HALT, no halt_reason, no report.
+                log.exception("subagent factory error in %s", self.state)
+                loader = None
+
             if loader is None:
                 # No subagent wired yet — record the gap and continue
                 # deterministically so the state machine itself stays testable.

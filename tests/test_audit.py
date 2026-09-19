@@ -53,3 +53,82 @@ def test_reopened_log_appends_after_last_hash(tmp_path):
     log2.write({"event": "more"})
     ok, reason = log2.verify()
     assert ok, reason
+
+
+# --- damaged chain tail (spec §10.2) ---------------------------------------
+
+def test_torn_last_line_refuses_to_append(tmp_path):
+    """A crash mid-write left half a line. Appending must not silently skip it.
+
+    _load_last_hash used to `continue` past an unparseable line, so appends
+    resumed from the previous hash and the torn line stayed in the file:
+    verify() then failed with "unparseable JSON" forever, and nothing warned
+    at write time.
+    """
+    import pytest
+
+    from kryonsec.purple.audit import AuditChainError
+
+    _make_log(tmp_path)
+    path = tmp_path / "audit.jsonl"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"event":"tool_call","has')   # torn write, no newline
+
+    with pytest.raises(AuditChainError) as exc:
+        AuditLog(path)
+    # the message has to be actionable, not just "invalid JSON"
+    assert "last line" in str(exc.value)
+    assert "interrupted" in str(exc.value)
+
+
+def test_corrupt_middle_line_refuses_to_append(tmp_path):
+    import pytest
+
+    from kryonsec.purple.audit import AuditChainError
+
+    _make_log(tmp_path)
+    path = tmp_path / "audit.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[1] = "not json at all"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(AuditChainError, match="not the last"):
+        AuditLog(path)
+
+
+def test_entry_without_a_hash_refuses_to_append(tmp_path):
+    """Valid JSON that isn't an audit entry is damage too."""
+    import pytest
+
+    from kryonsec.purple.audit import AuditChainError
+
+    _make_log(tmp_path, n=2)
+    path = tmp_path / "audit.jsonl"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"event":"mystery"}\n')       # parsed, but has no hash
+
+    with pytest.raises(AuditChainError):
+        AuditLog(path)
+
+
+def test_blank_lines_do_not_break_the_chain(tmp_path):
+    """Trailing/embedded blank lines are not damage."""
+    log = _make_log(tmp_path)
+    head = log.head_hash()
+    path = tmp_path / "audit.jsonl"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n\n")
+
+    reopened = AuditLog(path)
+    assert reopened.head_hash() == head
+    reopened.write({"event": "after_blank"})
+    ok, reason = reopened.verify()
+    assert ok, reason
+
+
+def test_empty_file_is_genesis(tmp_path):
+    from kryonsec.purple.audit import _GENESIS_PREV
+
+    path = tmp_path / "audit.jsonl"
+    path.write_text("", encoding="utf-8")
+    assert AuditLog(path).head_hash() == _GENESIS_PREV

@@ -8,6 +8,7 @@ import pytest
 from kryonsec.config import KryonsecConfig
 from kryonsec.copilot.agent import (
     MAX_TOOL_ROUNDS,
+    _redacted_contents,
     build_toolbox,
     execute_tool,
     run_agent,
@@ -290,3 +291,53 @@ def test_run_agent_redacts_tool_secrets_when_no_local_model(cfg, monkeypatch):
     out = _tool_message(calls[1])["content"]
     assert "hunter2secret" not in out
     assert "«SECRET_" in out  # placeholder, mapping never leaves the machine
+
+
+# --- the redaction pass itself (spec §6.4, CLAUDE.md rule 4) ---------------
+
+def test_redacted_contents_covers_tool_call_arguments():
+    """`tool_calls[].function.arguments` is a JSON string the model produced.
+
+    Redacting only `content` (and copying the rest of the message with `**m`)
+    shipped those arguments to the hosted provider unredacted — on the exact
+    code path taken because secrets had been detected.
+    """
+    msgs = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({"path": ".env", "text": "password=hunter2secret"}),
+            },
+        }],
+    }]
+    out = _redacted_contents(msgs)
+    args = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert "hunter2secret" not in args
+    assert "«SECRET_" in args
+    # ...and the input is not mutated in place
+    assert "hunter2secret" in msgs[0]["tool_calls"][0]["function"]["arguments"]
+
+
+def test_redacted_contents_still_handles_plain_and_odd_messages():
+    """Shapes the loop actually emits, plus ones it might: a tool result, a
+    message with a null content, a tool_call with no arguments, and a
+    malformed non-dict entry must all pass through without raising."""
+    msgs = [
+        {"role": "tool", "tool_call_id": "call_1", "content": "key=AKIAIOSFODNN7EXAMPLE"},
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function"}]},
+        {"role": "assistant", "content": "", "tool_calls": ["not-a-dict"]},
+    ]
+    out = _redacted_contents(msgs)
+    assert "AKIAIOSFODNN7EXAMPLE" not in out[0]["content"]
+    assert out[1]["content"] is None
+    assert out[2]["tool_calls"] == []
+    assert out[3]["tool_calls"][0]["id"] == "x"   # no "function" key: untouched
+    assert out[4]["tool_calls"] == ["not-a-dict"]
+    # content is preserved verbatim where there is no secret to hide
+    assert _redacted_contents([{"role": "user", "content": "hello"}])[0]["content"] == "hello"

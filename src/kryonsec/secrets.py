@@ -32,11 +32,25 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         # sk-…, sk-proj-…, sk-svcacct-… (2024+ key formats include hyphens)
         r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b"
     )),
+    ("slack_token", re.compile(
+        r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"
+    )),
+    ("google_api_key", re.compile(
+        r"\bAIza[0-9A-Za-z_-]{35}\b"
+    )),
     ("password_assignment", re.compile(
         r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?"
     )),
     ("api_key_assignment", re.compile(
-        r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token)\b\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?"
+        # Left guard is (?<![A-Za-z0-9]) rather than \b: in the canonical
+        # cloud names the character before the label is "_", itself a word
+        # char, so \b never matched — AWS_SECRET_ACCESS_KEY=… sailed through
+        # unredacted (and detect_secrets() returned False, so the text was
+        # not even routed to the local model).
+        r"(?i)(?<![A-Za-z0-9])"
+        r"(api[_-]?key|secret[_-]?key|access[_-]?token"
+        r"|secret[_-]?access[_-]?key|aws[_-]?secret[_-]?key)\b"
+        r"\s*[:=]\s*[\"']?([^\s\"']{6,})[\"']?"
     )),
     ("conn_string", re.compile(
         r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s:@/]+:[^\s@]+@[^\s]+"

@@ -87,3 +87,25 @@ def test_non_terminal_console_is_fully_silent():
         assert not line.active
     line.update("x")
     line.hide()
+
+
+def test_cli_only_calls_methods_that_exist():
+    """Guard against a deleted alias with a live caller.
+
+    v1.3.1 removed the `stop_if_active = hide` alias believing it had no
+    callers, but cli.py still called it — every completed purple engagement
+    died with AttributeError before printing its summary. Adding a method to
+    StatusLine is free; removing one has to fail here first.
+    """
+    import re
+    from pathlib import Path
+
+    cli = (Path(__file__).resolve().parents[1]
+           / "src" / "kryonsec" / "cli.py").read_text(encoding="utf-8")
+    called = set(re.findall(r"\bstatus_line\.([A-Za-z_][A-Za-z0-9_]*)", cli))
+    assert called, "expected cli.py to use status_line somewhere"
+    missing = sorted(called - set(dir(StatusLine)))
+    assert not missing, (
+        f"cli.py calls StatusLine methods that do not exist: {missing} "
+        f"(StatusLine has: {sorted(m for m in dir(StatusLine) if not m.startswith('_'))})"
+    )

@@ -53,9 +53,27 @@ _HTTPX_RE = re.compile(
     r"(?:\s*\[(?P<title>[^\]]*)\])?(?:\s*\[(?P<tech>[^\]]*)\])?",
 )
 
-# feroxbuster: "200      15l      345w     /admin"
+# feroxbuster result lines. The shape is:
+#     status  [METHOD]  Nl  Nw  Nc  url
+# e.g. "200      GET       15l       34w      345c http://host/admin"
+# and on redirects "301      GET        9l       28w      317c http://host/a =>
+# http://host/a/". Two variations exist in the wild: the METHOD column is
+# printed by current releases but omitted by some builds, and the url is a
+# full URL (never a bare path). The old pattern required
+# "<status> <digits> <digits> /path" — neither shape — so every
+# directory-busting result was dropped, silently losing the evidence.
 _FEROX_RE = re.compile(
-    r"^(?P<status>[23]\d\d)\s+\d+[a-z]*\s+\d+[a-z]*\s+(?P<path>/\S*)\s*$"
+    r"^(?P<status>\d{3})\s+"
+    r"(?:(?P<method>[A-Z]{3,7})\s+)?"      # optional METHOD column
+    r"(?:\d+[lwc]\s+)+"                    # Nl Nw Nc (count may vary by build)
+    r"(?P<url>\S+)"                        # full URL (or a path in older builds)
+)
+
+# Statuses that mean "something is really there". 404s are filtered by
+# feroxbuster itself; everything else (2xx/3xx plus the protected-path codes)
+# is worth a node in the graph.
+_FEROX_STATUS = frozenset(
+    list(range(200, 400)) + [401, 403, 405]
 )
 
 # Ports the discovery stage looks at (web + common service ports — a
@@ -116,15 +134,30 @@ def parse_httpx(stdout: str) -> list[dict]:
 
 
 def parse_feroxbuster(stdout: str) -> list[dict]:
-    """Extract discovered paths from feroxbuster output."""
+    """Extract discovered paths from feroxbuster output.
+
+    feroxbuster prints the full URL; the graph wants the path, so the URL is
+    split here (query string kept — it's often the interesting part).
+    """
+    from urllib.parse import urlsplit
+
     paths = []
     for line in stdout.splitlines():
         m = _FEROX_RE.match(line.strip())
-        if m:
-            paths.append({
-                "path": m.group("path"),
-                "status": int(m.group("status")),
-            })
+        if not m:
+            continue
+        status = int(m.group("status"))
+        if status not in _FEROX_STATUS:
+            continue
+        raw = m.group("url")
+        if raw.startswith(("http://", "https://")):
+            parts = urlsplit(raw)
+            path = parts.path or "/"
+            if parts.query:
+                path = f"{path}?{parts.query}"
+        else:
+            path = raw  # bare-path build
+        paths.append({"path": path, "status": status})
     return paths[:50]  # bounded — the graph doesn't need 10k directories
 
 

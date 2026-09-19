@@ -168,14 +168,37 @@ class KryonsecConfig:
         default_factory=lambda: os.environ.get("GITHUB_TOKEN")
     )
 
+    # --- Membership (2026-09 plan) ---
+    # Purple Team is the paid feature: the key gates engagements only.
+    # Copilot mode is free and never requires one. Never logged.
+    license_key: str | None = field(
+        default_factory=lambda: os.environ.get("KRYONSEC_LICENSE_KEY")
+    )
+
     # --- LLM routing (spec §7.1) ---
-    provider: str = "openai"  # "openai" | "ollama"
+    provider: str = "openai"  # "openai" | "ollama" | "bedrock"
     general_chat_model: str = "ollama/llama3.1"
     general_search_model: str = "gpt-4o-mini"
     compaction_model: str = "gpt-4o-mini"
     # Local fallback: used whenever secrets are detected (spec §6.4)
     # or when the preferred provider is unavailable.
     local_model: str = "ollama/llama3.1"
+
+    # --- AWS Bedrock (hosted, spec §7.1) ---
+    # A Bedrock API key is an opaque bearer token (ABSK…) that carries no
+    # region — AWS picks the region from the endpoint host. The wizard
+    # discovers it by probing and stores it here; litellm receives it as
+    # aws_region_name. Never logged, never audited.
+    bedrock_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+    )
+    bedrock_region: str = field(
+        default_factory=lambda: (
+            os.environ.get("AWS_REGION_NAME")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+    )
 
     # --- Agent tools (v1.1) ---
     enabled_tools: list[str] = field(default_factory=lambda: list(BUILTIN_TOOLS))
@@ -193,8 +216,18 @@ class KryonsecConfig:
     max_tool_output_chars: int = 20000
 
     # --- Zone B sandbox (spec §8.5/§8.6) ---
-    # Tag until a digest is pinned (docker inspect after the smoke test);
-    # KRYONSEC_SANDBOX_IMAGE may hold "kryonsec/sandbox@sha256:<digest>".
+    # Defaults to the local tag install.sh produces: it pulls the published
+    # image from GHCR (see .github/workflows/sandbox-image.yml) and retags it
+    # as kryonsec/sandbox:latest, falling back to a local build. KRYONSEC_SANDBOX_IMAGE
+    # may hold "kryonsec/sandbox@sha256:<digest>".
+    #
+    # Spec §8.6 wants the image pinned by digest. We don't ship one by default
+    # because the digest is only known after the release workflow runs, and a
+    # stale or wrong digest makes doctor refuse to start Mode B for everyone.
+    # The workflow prints the digest in its job summary; to pin a release,
+    # replace the default below with "ghcr.io/gonchijoshnavardhanreddy/
+    # kryonsec-sandbox@sha256:<digest>" — doctor and the runner then verify the
+    # exact bytes that release was tested against.
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get(
             "KRYONSEC_SANDBOX_IMAGE", "kryonsec/sandbox:latest"
@@ -224,6 +257,8 @@ class KryonsecConfig:
                 "local_model": self.local_model,
                 "openai_api_key": self.openai_api_key or "",
                 "ollama_host": self.ollama_host,
+                "bedrock_api_key": self.bedrock_api_key or "",
+                "bedrock_region": self.bedrock_region,
             },
             "session": {
                 # round-trip the tunables — previously env-only, silently
@@ -245,6 +280,9 @@ class KryonsecConfig:
                 "censys_api_secret": self.censys_api_secret or "",
                 "github_token": self.github_token or "",
             },
+            "license": {
+                "key": self.license_key or "",
+            },
             "tools": {
                 "enabled": list(self.enabled_tools),
             },
@@ -265,6 +303,7 @@ class KryonsecConfig:
         limits = data.get("limits", {})
         sandbox = data.get("sandbox", {})
         api = data.get("api", {})
+        license_ = data.get("license", {})
 
         cfg = cls(**overrides)
         cfg.provider = llm.get("provider", cfg.provider)
@@ -280,6 +319,10 @@ class KryonsecConfig:
             cfg.openai_api_key = llm["openai_api_key"]
         if llm.get("ollama_host"):
             cfg.ollama_host = llm["ollama_host"]
+        if llm.get("bedrock_api_key"):
+            cfg.bedrock_api_key = llm["bedrock_api_key"]
+        if llm.get("bedrock_region"):
+            cfg.bedrock_region = llm["bedrock_region"]
         if "enabled" in tools:
             # an explicitly empty list must round-trip as "no tools" —
             # a falsy check would resurrect the dataclass default
@@ -306,18 +349,31 @@ class KryonsecConfig:
             cfg.censys_api_secret = api["censys_api_secret"]
         if api.get("github_token"):
             cfg.github_token = api["github_token"]
+        if license_.get("key"):
+            cfg.license_key = license_["key"]
         cfg.mcp_servers = [_server_from_row(r) for r in mcp.get("servers", [])]
 
         # environment beats TOML (documented behavior for power users / CI)
         cfg.openai_api_key = os.environ.get("OPENAI_API_KEY") or cfg.openai_api_key
         cfg.database_url = os.environ.get("DATABASE_URL") or cfg.database_url
         cfg.ollama_host = os.environ.get("OLLAMA_HOST") or cfg.ollama_host
+        cfg.bedrock_api_key = (
+            os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or cfg.bedrock_api_key
+        )
+        cfg.bedrock_region = (
+            os.environ.get("AWS_REGION_NAME")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or cfg.bedrock_region
+        )
         cfg.shodan_api_key = os.environ.get("SHODAN_API_KEY") or cfg.shodan_api_key
         cfg.censys_api_id = os.environ.get("CENSYS_API_ID") or cfg.censys_api_id
         cfg.censys_api_secret = (
             os.environ.get("CENSYS_API_SECRET") or cfg.censys_api_secret
         )
         cfg.github_token = os.environ.get("GITHUB_TOKEN") or cfg.github_token
+        cfg.license_key = (
+            os.environ.get("KRYONSEC_LICENSE_KEY") or cfg.license_key
+        )
         return cfg
 
     # ---- lifecycle --------------------------------------------------------
