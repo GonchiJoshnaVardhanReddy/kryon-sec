@@ -187,8 +187,9 @@ class KryonsecConfig:
     # --- AWS Bedrock (hosted, spec §7.1) ---
     # A Bedrock API key is an opaque bearer token (ABSK…) that carries no
     # region — AWS picks the region from the endpoint host. The wizard
-    # discovers it by probing and stores it here; litellm receives it as
-    # aws_region_name. Never logged, never audited.
+    # discovers it by probing and stores it here; the region goes into the
+    # runtime URL kryonsec calls (llm.bedrock_openai_base). Never logged,
+    # never audited.
     bedrock_api_key: str | None = field(
         default_factory=lambda: os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
     )

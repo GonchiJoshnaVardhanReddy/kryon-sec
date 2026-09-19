@@ -239,7 +239,7 @@ def run_agent(
     from ..llm import (
         SecretsMustStayLocal,
         _quiet_litellm,
-        completion_kwargs,
+        build_call,
         secrets_safe_model,
     )
 
@@ -267,7 +267,11 @@ def run_agent(
                 f"Ollama unavailable or {model} not pulled — start it "
                 "(`ollama serve`) and pull the model (`ollama pull llama3.1`)"
             )
-    provider_kwargs = completion_kwargs(cfg, model, tools=True)
+    # `model` stays kryonsec's id throughout the loop — the ollama precheck
+    # above and secrets_safe_model both read its prefix — and build_call
+    # translates it at the moment of the call, returning `model` already in
+    # the kwargs so the id and its credentials cannot be mismatched.
+    provider_kwargs = build_call(cfg, model, tools=True)
 
     for _ in range(MAX_TOOL_ROUNDS):
         if on_round:
@@ -278,9 +282,8 @@ def run_agent(
         round_model, outbound = _gate(model)
         if round_model != model:
             model = round_model
-            provider_kwargs = completion_kwargs(cfg, model, tools=True)
+            provider_kwargs = build_call(cfg, model, tools=True)
         resp = litellm.completion(
-            model=model,
             messages=outbound,
             tools=[toolbox[n][0] for n in toolbox],
             tool_choice="auto",

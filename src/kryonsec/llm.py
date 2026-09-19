@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from typing import Any, NamedTuple
 
@@ -131,6 +132,46 @@ def _quiet_litellm() -> None:
         pass
 
 
+# ---- Bedrock: kryonsec's model id vs the call litellm actually makes ------
+#
+# kryonsec's own model format is `bedrock/<model-id>`, and it stays that way
+# everywhere a human sees it: config.toml, the wizard, the banner, the logs.
+# It is unambiguous and it is what the provider-isolation checks key off.
+#
+# At the invocation boundary it has to become something else. litellm's
+# native `bedrock/` route authenticates with SigV4 or with credentials it
+# looks up itself, and a Bedrock API key is neither — it is an opaque bearer
+# token. Handing that route a bearer token ends in an AttributeError from
+# inside litellm's Converse handler before any request is sent. Bedrock
+# answers this with an OpenAI-compatible Chat Completions endpoint, which
+# takes the token as an ordinary `Authorization: Bearer`, so that is the
+# call kryonsec makes.
+BEDROCK_PREFIX = "bedrock/"
+_BEDROCK_ROUTE = "openai/"
+_BEDROCK_OPENAI_PATH = "/openai/v1"
+
+
+def bedrock_openai_base(region: str) -> str:
+    """Bedrock's OpenAI-compatible base URL for a region.
+
+    The region lives in the host, which is why nothing here needs
+    aws_region_name: the endpoint IS the region.
+    """
+    return f"https://bedrock-runtime.{region}.amazonaws.com{_BEDROCK_OPENAI_PATH}"
+
+
+def litellm_model(cfg: KryonsecConfig, model: str) -> str:
+    """kryonsec's model id -> the string litellm routes on.
+
+    The one place the two formats meet, and the only translation in the
+    system. `cfg` is unused for now and taken anyway so the signature does
+    not have to change if a provider ever needs more than the id to route.
+    """
+    if model.startswith(BEDROCK_PREFIX):
+        return _BEDROCK_ROUTE + model[len(BEDROCK_PREFIX):]
+    return model
+
+
 def completion_kwargs(
     cfg: KryonsecConfig,
     model: str,
@@ -139,18 +180,33 @@ def completion_kwargs(
 ) -> dict[str, Any]:
     """Provider/shape kwargs shared by every litellm.completion call:
     the config.toml api key (litellm only reads the env var), the Ollama
-    host, the Bedrock region, and the reasoning-model quirks above."""
+    host, the Bedrock endpoint, and the reasoning-model quirks above.
+
+    `model` is kryonsec's id — `bedrock/<id>`, not the routed `openai/<id>`
+    litellm will actually be given. That distinction is load-bearing: the
+    branches below key off the prefix, so handing this the routed string
+    would match the OpenAI branch and send cfg.openai_api_key. Use
+    build_call(), which produces the model string and these kwargs together.
+    """
     kwargs: dict[str, Any] = {}
     if model.startswith("ollama/"):
         kwargs["api_base"] = _normalize_host(cfg.ollama_host)
-    elif model.startswith("bedrock/"):
-        # litellm sends api_key to Bedrock as the bearer token
-        # (AWS_BEARER_TOKEN_BEDROCK), and needs the region spelled out: a
-        # Bedrock API key carries no region of its own. Left unset when
-        # there is no key, so AWS_* env vars / an instance profile still work.
+    elif model.startswith(BEDROCK_PREFIX):
+        # A Bedrock API key (ABSK…) is a bearer token and nothing else: there
+        # is no access key, no secret key, no instance profile, and no SigV4
+        # anywhere on this path. litellm's native bedrock/ route reaches for
+        # static credentials and dies before it sends anything, so kryonsec
+        # calls Bedrock's OpenAI-compatible Chat Completions endpoint instead.
+        # The region travels in the URL, which is why aws_region_name is not
+        # set here — it would be meaningless to an OpenAI-shaped request.
+        #
+        # api_base and api_key are set together, in this one branch, and
+        # build_call() asserts they arrived. A routed `openai/<id>` that lost
+        # its api_base would be sent to api.openai.com carrying the Bedrock
+        # key, so the pair must never be able to drift apart.
+        kwargs["api_base"] = bedrock_openai_base(cfg.bedrock_region)
         if cfg.bedrock_api_key:
             kwargs["api_key"] = cfg.bedrock_api_key
-        kwargs["aws_region_name"] = cfg.bedrock_region
     elif cfg.openai_api_key:
         kwargs["api_key"] = cfg.openai_api_key
     if is_reasoning_model(model):
@@ -208,10 +264,11 @@ class LlmUnavailable(RuntimeError):
 def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: Any) -> str:
     """Call litellm.completion; return the assistant text.
 
-    kwargs may include `tools` (list of JSON-schema tool definitions) —
-    passed straight through for the agent loop. The agent loop reads
-    tool_calls itself from the raw response, so this helper stays the
-    plain-text entry point.
+    `model` is kryonsec's id (`bedrock/<id>`); build_call turns it into the
+    call litellm actually makes. kwargs may include `tools` (list of
+    JSON-schema tool definitions) — passed straight through for the agent
+    loop. The agent loop reads tool_calls itself from the raw response, so
+    this helper stays the plain-text entry point.
     """
     import litellm
 
@@ -220,7 +277,6 @@ def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: A
     tool_schemas = kwargs.pop("tools", None)
     temperature = kwargs.pop("temperature", 0.0)
     call_kwargs: dict[str, Any] = {
-        "model": model,
         "messages": messages,
         "timeout": kwargs.pop("timeout", 30),
         "num_retries": kwargs.pop("num_retries", 0),  # we own the fallback chain
@@ -230,12 +286,16 @@ def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: A
         call_kwargs["tools"] = tool_schemas
         call_kwargs["tool_choice"] = kwargs.pop("tool_choice", "auto")
     call_kwargs.update(
-        completion_kwargs(cfg, model, temperature, tools=bool(tool_schemas)))
+        build_call(cfg, model, temperature, tools=bool(tool_schemas)))
 
     try:
         resp = litellm.completion(**call_kwargs)
     except Exception as e:
-        log.warning("LLM call failed for %s: %s", model, e)
+        # kryonsec's id, not the routed one: the log should say
+        # `bedrock/…`, which is what the user configured and can search for.
+        # The exception text is scrubbed — it is the provider's words, and
+        # may quote the Authorization header back at us.
+        log.warning("LLM call failed for %s: %s", model, scrub_secrets(str(e)))
         raise
     try:
         return resp.choices[0].message.content or ""
@@ -249,8 +309,71 @@ class SecretsMustStayLocal(RuntimeError):
     CLAUDE.md rule 4)."""
 
 
+# Credential shapes that must never reach a log line or an error shown to
+# the user. Shape-based, not just literal: the text being scrubbed is
+# usually a provider's own error, which may quote the request back —
+# headers and all — and we did not compose it. The Bedrock API key is the
+# one that matters most here, because the OpenAI-compatible route puts it
+# in an Authorization header litellm can echo.
+_SECRET_SHAPES = (
+    re.compile(r"\bABSK[A-Za-z0-9+/=_\-]{4,}"),          # Bedrock API key
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),              # OpenAI API key
+    re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._\-+/=]{8,}"),
+)
+
+
+def scrub_secrets(text: str) -> str:
+    """Replace anything credential-shaped with «redacted»."""
+    for pattern in _SECRET_SHAPES:
+        # group(1) exists only on the bearer pattern, where the scheme word
+        # is worth keeping: "Bearer «redacted»" still says what was wrong
+        text = pattern.sub(
+            lambda m: (m.group(1) if m.groups() else "") + "«redacted»", text)
+    return text
+
+
+def build_call(
+    cfg: KryonsecConfig,
+    model: str,
+    temperature: float = 0.0,
+    tools: bool = False,
+) -> dict[str, Any]:
+    """Everything one litellm.completion needs for a kryonsec model id.
+
+    The model string and its provider kwargs are produced together, here,
+    so they cannot disagree: the kwargs are derived from kryonsec's id
+    (which branch decides the credentials) while litellm is handed the
+    routed one. Passing a routed `openai/<id>` to completion_kwargs instead
+    would take the OpenAI branch and send cfg.openai_api_key to Bedrock.
+
+    Callers must pass kryonsec's id, and must not pass `model=` themselves —
+    it is in the returned dict.
+    """
+    call = completion_kwargs(cfg, model, temperature, tools=tools)
+    call["model"] = litellm_model(cfg, model)
+
+    if model.startswith(BEDROCK_PREFIX):
+        if not cfg.bedrock_api_key:
+            # Refuse before building the call rather than sending a keyless
+            # request. litellm falls back to OPENAI_API_KEY from the
+            # environment when no api_key is given, which would put an
+            # OpenAI credential in an Authorization header aimed at AWS.
+            raise LlmUnavailable(
+                "AWS Bedrock is the configured provider but no API key is "
+                "set — run `kryonsec setup`"
+            )
+        if not call.get("api_base"):
+            # belt and braces: this is the shape that would leak the Bedrock
+            # key to api.openai.com, so it must be impossible to construct
+            raise LlmUnavailable(
+                f"{model} would be sent to OpenAI without its Bedrock "
+                "endpoint — refusing"
+            )
+    return call
+
+
 def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
-    """The provider's own words for a failed call, shortened.
+    """The provider's own words for a failed call, shortened and scrubbed.
 
     A hosted failure is usually the provider *telling* you what is wrong —
     "Operation not allowed", "on-demand throughput isn't supported", a
@@ -258,6 +381,10 @@ def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
     the network") hides the one useful sentence, and the guess is often
     wrong: the first Bedrock user to hit "Operation not allowed" had a
     working key and a working network, and was told to check both.
+
+    Everything returned here is scrubbed: this text is shown to the user and
+    written to the log, and a provider error can quote the request back —
+    headers included.
     """
     if exc is None:
         return "no response"
@@ -271,7 +398,7 @@ def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
         text = text[len(prefix):]
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
-    return text
+    return scrub_secrets(text)
 
 
 class CompactionMustStayLocal(SecretsMustStayLocal):

@@ -492,9 +492,13 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                             "switch to OpenAI."
                         ),
                         "bedrock": (
-                            "If it says the model is not allowed, enable it "
-                            "under Bedrock > Model access, or run `kryonsec "
-                            "setup` and pick another model."
+                            "If the model is not allowed for your account, "
+                            "enable it under Bedrock > Model access; if it is "
+                            "a `global.` profile, try the region-prefixed one "
+                            "(`us.`, `eu.`, …). Bedrock also does not serve "
+                            "every model on the OpenAI-compatible endpoint "
+                            "kryonsec calls — `kryonsec setup` lists the ones "
+                            "that work."
                         ),
                     }.get(
                         cfg.provider,

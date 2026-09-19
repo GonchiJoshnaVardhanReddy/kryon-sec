@@ -334,12 +334,26 @@ def test_aws_verdict_errors_are_rejections():
         assert classify_verify_error(_err(name)) == VERIFY_REJECTED, name
 
 
-def test_broad_error_classes_are_not_verdicts_on_their_own():
-    """litellm collapses a lot of Bedrock 400s onto BadRequestError, so the
-    class alone says nothing — it has to be the message."""
+def test_broad_error_classes_are_verdicts_when_the_less_specific_way_fails():
+    """Bedrock's OpenAI-compatible endpoint serves a subset of the catalog
+    and refuses the rest with a plain 400, so a broad 4xx class has to count
+    as a verdict — otherwise the one case this check exists for is the one
+    case it never catches."""
     for name in ("BadRequestError", "ValidationException",
                  "UnprocessableEntityError"):
-        assert classify_verify_error(_err(name, "something went wrong")) == VERIFY_UNKNOWN, name
+        assert classify_verify_error(
+            _err(name, "This model is not supported for this endpoint")
+        ) == VERIFY_REJECTED, name
+
+
+def test_a_model_the_openai_endpoint_will_not_serve_is_a_rejection():
+    """The specific failure this route introduces: a model that lists fine
+    and cannot be called through /openai/v1."""
+    assert classify_verify_error(_err(
+        "BadRequestError",
+        "The model anthropic.claude-v2 isn't supported by the OpenAI "
+        "compatible endpoint.",
+    )) == VERIFY_REJECTED
 
 
 def test_local_failures_are_unknown_not_rejections():
@@ -362,6 +376,19 @@ def test_throttling_is_not_a_rejection():
     assert classify_verify_error(
         _err("BadRequestError", "You have exceeded your quota for this model")
     ) == VERIFY_UNKNOWN
+    # a bare 429 must not slip through on its class name either
+    assert classify_verify_error(_err("RateLimitError")) == VERIFY_UNKNOWN
+
+
+def test_a_transient_400_is_not_read_as_a_verdict():
+    """The narrow cost of counting broad 4xx classes: a 400 that means "not
+    now" would otherwise end the wizard with a wrong reason. The prose
+    check has to run before the class check."""
+    for msg in ("Service is temporarily unavailable, please retry",
+                "Too many requests — slow down",
+                "The model is at capacity"):
+        assert classify_verify_error(
+            _err("BadRequestError", msg)) == VERIFY_UNKNOWN, msg
 
 
 def test_on_demand_throughput_refusal_is_a_rejection():

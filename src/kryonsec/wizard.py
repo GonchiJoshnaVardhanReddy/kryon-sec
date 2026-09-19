@@ -384,10 +384,13 @@ def _setup_bedrock(
 
         console.print(f"[red]that model did not answer:[/red] {why}")
         console.print(
-            "[dim]Enable it for your account under Bedrock > Model access. "
-            "If it is a `global.` profile, try the region-prefixed one "
-            "(`us.`, `eu.`, …) instead — not every account may use global "
-            "cross-region inference.[/dim]"
+            "[dim]Three things cause this, in order of likelihood: the model "
+            "is not enabled for your account (Bedrock > Model access); it is "
+            "a `global.` profile and your account may not use global "
+            "cross-region inference (try the region-prefixed one — `us.`, "
+            "`eu.`, …); or Bedrock does not serve it on the OpenAI-compatible "
+            "endpoint kryonsec calls, in which case pick a different "
+            "model.[/dim]"
         )
         again = (answers or []).pop(0) if answers else input("pick another model? [Y/n]: ")
         if again.strip().lower().startswith("n"):

@@ -465,7 +465,19 @@ All LLM calls route through **LiteLLM** with a fallback chain:
 3. **AWS Bedrock:** a Bedrock API key (wizard, or `AWS_BEARER_TOKEN_BEDROCK`).
    Same rule as OpenAI — Bedrock is a third party, so secrets are never sent
    to it. Model ids carry a `bedrock/` prefix, e.g.
-   `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+   `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0` — and stay in that
+   form everywhere you see them (config, wizard, logs). At the moment of the
+   call kryonsec translates that to an OpenAI-compatible request against
+   `https://bedrock-runtime.<region>.amazonaws.com/openai/v1`, authenticated
+   with the key as a bearer token. The key is never logged and never put in
+   an error message.
+
+   A Bedrock API key is a bearer token, not a SigV4 credential pair, so the
+   AWS access key / secret key / instance-profile route is not used at all.
+   One consequence worth knowing: Bedrock's OpenAI-compatible endpoint serves
+   a subset of the model catalog, so a model that lists in `kryonsec setup`
+   may still refuse a call — the wizard checks that the model answers before
+   it saves the config.
 
 The wizard's provider choice is exclusive: an Ollama config never calls a hosted
 API, and an OpenAI or Bedrock config never silently falls back to a different

@@ -12,10 +12,13 @@ from kryonsec.llm import (
     LlmUnavailable,
     SecretsMustStayLocal,
     _ollama_model_ok,
+    build_call,
     chat,
     completion_kwargs,
     is_reasoning_model,
+    litellm_model,
     reset_provider_cache,
+    scrub_secrets,
     secrets_safe_prompt,
 )
 
@@ -278,25 +281,108 @@ def test_secrets_safe_prompt_local_model_passes_through(ollama_cfg):
 
 # ---- AWS Bedrock: same provider isolation + secrets gate as any hosted API --
 
-def test_bedrock_completion_kwargs_carry_key_and_region(cfg):
-    """litellm reads api_key as the Bedrock bearer token and needs the
-    region spelled out — a Bedrock API key carries no region itself."""
+def test_bedrock_routes_to_bedrocks_openai_endpoint(cfg):
+    """bedrock/<id> becomes a litellm OpenAI-compatible call against the
+    Bedrock runtime host for the configured region, carrying the Bedrock
+    key — and nothing that would make litellm reach for SigV4."""
     cfg.bedrock_api_key = "ABSKtest"
     cfg.bedrock_region = "ap-south-1"
-    kw = completion_kwargs(cfg, "bedrock/anthropic.claude-v2")
-    assert kw["api_key"] == "ABSKtest"
-    assert kw["aws_region_name"] == "ap-south-1"
-    assert "api_base" not in kw  # that is the Ollama branch
+    call = build_call(cfg, "bedrock/anthropic.claude-v2")
+    assert call["model"] == "openai/anthropic.claude-v2"
+    assert call["api_base"] == (
+        "https://bedrock-runtime.ap-south-1.amazonaws.com/openai/v1")
+    assert call["api_key"] == "ABSKtest"
+    # the SigV4 route's kwargs: any of these present and litellm picks the
+    # Converse handler, which needs static credentials a bearer token is not
+    for absent in ("aws_region_name", "aws_access_key_id",
+                   "aws_secret_access_key", "aws_session_token"):
+        assert absent not in call, absent
 
 
-def test_bedrock_completion_kwargs_without_key_leave_aws_env_a_chance(cfg):
-    """No key in config.toml must not clobber AWS_* env vars or an
-    instance profile — litellm falls back to those."""
+def test_bedrock_region_travels_in_the_url(cfg):
+    """There is no aws_region_name to get wrong — the endpoint IS the region."""
+    cfg.bedrock_api_key = "ABSKtest"
+    cfg.bedrock_region = "eu-west-1"
+    call = build_call(cfg, "bedrock/amazon.nova-pro-v1:0")
+    assert "eu-west-1" in call["api_base"]
+    assert call["model"] == "openai/amazon.nova-pro-v1:0"
+
+
+def test_bedrock_prefix_is_the_only_thing_translated(cfg):
+    """kryonsec's id format is unchanged — one prefix swap, nothing else.
+
+    Inference-profile ids (`us.`, `global.`) and version suffixes like `:0`
+    must survive verbatim; they are part of the model id AWS expects.
+    """
+    cfg.bedrock_api_key = "ABSKtest"
+    assert litellm_model(cfg, "bedrock/global.anthropic.claude-fable-5") == \
+        "openai/global.anthropic.claude-fable-5"
+    assert litellm_model(cfg, "bedrock/us.anthropic.claude-sonnet-4-5-v1:0") == \
+        "openai/us.anthropic.claude-sonnet-4-5-v1:0"
+    # non-bedrock ids pass through untouched
+    assert litellm_model(cfg, "gpt-4o") == "gpt-4o"
+    assert litellm_model(cfg, "ollama/llama3.1") == "ollama/llama3.1"
+
+
+def test_bedrock_without_a_key_refuses_before_building_the_call(cfg):
+    """The dangerous shape: no api_key in the dict makes litellm fall back
+    to OPENAI_API_KEY from the environment, which would put an OpenAI
+    credential in a header aimed at AWS."""
     cfg.bedrock_api_key = None
-    cfg.bedrock_region = "us-west-2"
+    with pytest.raises(LlmUnavailable, match="Bedrock"):
+        build_call(cfg, "bedrock/anthropic.claude-v2")
+
+
+def test_bedrock_call_never_loses_its_bedrock_endpoint(cfg):
+    """Whatever else changes, an `openai/` model with the Bedrock key must
+    always carry the Bedrock api_base. Without it litellm sends the request
+    to api.openai.com — the key leak this whole route exists to prevent."""
+    cfg.bedrock_api_key = "ABSKtest"
+    cfg.bedrock_region = "us-east-1"
+    for model in ("bedrock/anthropic.claude-v2", "bedrock/amazon.nova-lite-v1:0"):
+        call = build_call(cfg, model)
+        assert call["model"].startswith("openai/")
+        assert call["api_base"] == (
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1")
+        assert "api.openai.com" not in call["api_base"]
+
+
+def test_completion_kwargs_takes_kryonsecs_id_not_the_routed_one(cfg):
+    """The trap build_call exists to close.
+
+    completion_kwargs keys its branches off the prefix, so handing it the
+    already-routed `openai/<id>` matches the OpenAI branch and attaches
+    cfg.openai_api_key. build_call's contract is that callers pass
+    kryonsec's id; this test pins the reason.
+    """
+    cfg.bedrock_api_key = "ABSKtest"
+    cfg.openai_api_key = "sk-test"
     kw = completion_kwargs(cfg, "bedrock/anthropic.claude-v2")
-    assert "api_key" not in kw
-    assert kw["aws_region_name"] == "us-west-2"
+    assert kw["api_key"] == "ABSKtest"  # bedrock's key, not OpenAI's
+    assert "api.openai.com" not in kw["api_base"]
+    # and the misuse it warns about, for the record:
+    wrong = completion_kwargs(cfg, "openai/anthropic.claude-v2")
+    assert wrong["api_key"] == "sk-test"
+    assert "api_base" not in wrong
+
+
+def test_complete_sends_the_translated_call_to_litellm(bedrock_cfg):
+    """End to end through the real invocation layer: what litellm is
+    actually handed for a `bedrock/<id>` model."""
+    with patch("litellm.completion") as fake:
+        fake.return_value.choices = [
+            type("C", (), {"message": type("M", (), {"content": "hi",
+                                                     "tool_calls": None})()})()]
+        from kryonsec.llm import _complete
+
+        _complete(bedrock_cfg, "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+                  [{"role": "user", "content": "hi"}])
+    kwargs = fake.call_args.kwargs
+    assert kwargs["model"] == "openai/anthropic.claude-3-5-sonnet-20241022-v2:0"
+    assert kwargs["api_base"] == (
+        "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1")
+    assert kwargs["api_key"] == "ABSKtest"
+    assert "aws_region_name" not in kwargs
 
 
 def test_bedrock_config_reroutes_a_non_bedrock_model(bedrock_cfg):
@@ -390,3 +476,92 @@ def test_unknown_provider_falls_back_to_openai_rules(cfg):
     with patch("kryonsec.llm._complete", return_value="ok") as fake:
         assert chat(cfg, [], "gpt-4o-mini") == "ok"
     assert fake.call_args[0][1] == "gpt-4o-mini"
+
+
+# ---- the regression bar: OpenAI and Ollama must be untouched by the above ---
+
+def test_openai_call_is_still_a_plain_openai_call(cfg):
+    """Bedrock's translation must not have reached the OpenAI path: bare
+    model id, OpenAI's key, and no api_base override — so litellm goes to
+    api.openai.com exactly as it did before Bedrock existed."""
+    cfg.openai_api_key = "sk-test"
+    call = build_call(cfg, "gpt-4o-mini")
+    assert call["model"] == "gpt-4o-mini"
+    assert call["api_key"] == "sk-test"
+    assert "api_base" not in call  # nothing redirects it off api.openai.com
+    assert "aws_region_name" not in call
+
+
+def test_openai_complete_sends_the_same_call_as_before(cfg):
+    with patch("litellm.completion") as fake:
+        fake.return_value.choices = [
+            type("C", (), {"message": type("M", (), {"content": "hi",
+                                                     "tool_calls": None})()})()]
+        from kryonsec.llm import _complete
+
+        _complete(cfg, "gpt-4o-mini", [{"role": "user", "content": "hi"}])
+    kwargs = fake.call_args.kwargs
+    assert kwargs["model"] == "gpt-4o-mini"
+    assert kwargs["api_key"] == "sk-test"
+    assert "api_base" not in kwargs
+
+
+def test_openai_never_gets_the_bedrock_key(cfg):
+    """Provider isolation, credential half: a Bedrock key sitting in
+    config.toml must not ride along on an OpenAI call."""
+    cfg.bedrock_api_key = "ABSKtest"
+    cfg.openai_api_key = "sk-test"
+    assert build_call(cfg, "gpt-4o-mini")["api_key"] == "sk-test"
+
+
+def test_ollama_call_is_unchanged(cfg):
+    """Ollama's branch is chosen first and untouched: the host, no key, no
+    Bedrock endpoint, and the id is passed through as-is."""
+    cfg.ollama_host = "localhost:11434"
+    cfg.bedrock_api_key = "ABSKtest"
+    call = build_call(cfg, "ollama/llama3.1")
+    assert call["model"] == "ollama/llama3.1"
+    assert call["api_base"].endswith(":11434")
+    assert "api_key" not in call
+    assert "amazonaws.com" not in call["api_base"]
+
+
+def test_bedrock_key_never_reaches_a_log_line(cfg, caplog):
+    """A failed call logs the provider's own error, and a provider error
+    can quote the request back — Authorization header included."""
+    cfg.bedrock_api_key = "ABSKtest"
+
+    leak = RuntimeError(
+        "litellm.APIError: Error code: 400 - "
+        "{'error': {'message': 'bad request', 'headers': "
+        "{'Authorization': 'Bearer ABSKtest'}}}")
+    with patch("litellm.completion", side_effect=leak):
+        from kryonsec.llm import _complete
+
+        with caplog.at_level("WARNING"):
+            with pytest.raises(RuntimeError):
+                _complete(cfg, "bedrock/anthropic.claude-v2",
+                          [{"role": "user", "content": "hi"}])
+    assert "ABSKtest" not in caplog.text
+    assert "«redacted»" in caplog.text
+
+
+def test_bedrock_key_never_reaches_the_users_error_message(cfg):
+    """provider_reason feeds the message the user reads — same scrub."""
+    from kryonsec.llm import provider_reason
+
+    exc = RuntimeError(
+        "Error code: 403 - {'message': 'Operation not allowed', "
+        "'x-amz-security-token': 'ABSKtest'}")
+    reason = provider_reason(exc)
+    assert "ABSKtest" not in reason
+    assert "Operation not allowed" in reason  # the useful part survives
+
+
+def test_scrub_secrets_covers_both_providers_keys():
+    assert "ABSKtest" not in scrub_secrets("key=ABSKtest")
+    assert "sk-test" not in scrub_secrets("key=sk-abcdefghijklmnop")
+    # the scheme word is worth keeping — it says what was wrong
+    assert scrub_secrets("Authorization: Bearer ABSKtest") == \
+        "Authorization: Bearer «redacted»"
+    assert scrub_secrets("no credentials here") == "no credentials here"

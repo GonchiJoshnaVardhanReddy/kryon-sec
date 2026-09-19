@@ -16,8 +16,15 @@ OpenAI helpers. The one exception is verify_model(), which must ask whether
 a call succeeds and therefore goes through llm._complete; its litellm import
 is lazy so this module stays cheap to import.
 
-litellm forwards ``api_key`` as the bearer token and ``aws_region_name`` as
-the region (see litellm/llms/bedrock/base_aws_llm.py).
+litellm is not asked to authenticate to Bedrock itself. A Bedrock API key
+is a bearer token and nothing else — there are no SigV4 credentials behind
+it — and litellm's native ``bedrock/`` route reaches for static credentials
+before it checks for a token, dying inside its Converse handler with
+`'NoneType' object has no attribute 'access_key'` before any request is
+sent. So the call kryonsec actually makes is an OpenAI-shaped one against
+Bedrock's OpenAI-compatible Chat Completions endpoint, with the token as an
+ordinary ``Authorization: Bearer``. See llm.build_call() — it is the only
+place that translation happens.
 """
 
 from __future__ import annotations
@@ -237,38 +244,75 @@ VERIFY_OK = "ok"
 VERIFY_REJECTED = "rejected"
 VERIFY_UNKNOWN = "unknown"
 
-# Exception classes that mean AWS answered and said no. Anything else means
-# the call never got a verdict out of AWS — litellm's Converse path, for
-# one, reads `credentials.access_key` before it checks for a bearer token,
-# so on a machine with no SigV4 credentials it dies locally with
-# "'NoneType' object has no attribute 'access_key'". That is our tooling
-# failing, not the model, and telling a user their model is broken because
-# our probe crashed would be worse than not checking at all.
+# Telling "AWS said no" from "we never got an answer".
 #
-# Only classes that mean one thing are listed. litellm's BadRequestError,
-# ValidationException and UnprocessableEntityError are deliberately absent:
-# a 400 covers "you may not invoke this model", "you are over quota" and
-# "your request was malformed" alike, and blaming the user's model choice
-# for a quota or for our own bug is exactly the false negative this
-# distinction exists to prevent. Messages that do mean it are matched by
-# prose below.
+# verify_model makes a real call, so its failures come from two very
+# different places, and conflating them is harmful in both directions:
+# treating a local failure as a verdict pushes users off models that work,
+# and treating a verdict as a local failure leaves them on a model that
+# cannot possibly answer.
+#
+# The rule is the one the HTTP status already draws. A 4xx (except 429) is
+# the endpoint understanding the request and refusing it — a permission,
+# model access not enabled, or a model this endpoint does not serve. "Not
+# now" is not a refusal: throttling and 5xx mean the model is fine. And
+# anything that never produced a response — a connection error, a timeout,
+# or litellm dying in our own stack — says nothing at all.
+_NO_VERDICT_ERRORS = frozenset({
+    "RateLimitError",
+    "APIConnectionError",
+    "APITimeoutError",
+    "Timeout",
+    "TimeoutError",
+    "InternalServerError",
+    "ServiceUnavailableError",
+    "APIError",
+    "AttributeError",
+    "TypeError",
+})
+
+# 4xx: the endpoint answered, and the answer was no. Broad classes included
+# on purpose — Bedrock's OpenAI-compatible endpoint serves a subset of the
+# catalog and refuses the rest with a plain 400, so "the class alone says
+# nothing" would mean never catching the case this check exists for. The
+# genuinely ambiguous 400s are handled by the prose right below.
 _AWS_VERDICT_ERRORS = frozenset({
     "AuthenticationError",
     "PermissionDeniedError",
+    "NotFoundError",
+    "BadRequestError",
+    "UnprocessableEntityError",
     "AccessDeniedError",
     "AccessDeniedException",
     "UnrecognizedClientException",
-    "NotFoundError",
+    "ValidationException",
     "ResourceNotFoundException",
 })
 
+# "Not now" is not a refusal. These arrive as 4xx as often as not — a quota
+# cap is a 400 with a quota message — and a throttled model is a working
+# model. Reading one as a verdict sends the user hunting for a permission
+# they already hold.
+_NO_VERDICT_PHRASES = (
+    "quota",
+    "throttl",
+    "rate exceeded",
+    "too many requests",
+    "slow down",
+    "try again",
+    "please retry",
+    "temporarily unavailable",
+    "capacity",
+    "overloaded",
+    "timed out",
+    "timeout",
+)
+
 # AWS answers in prose too, and litellm does not always map a Bedrock error
 # onto one of its own types: the first user's rejection arrived as a bare
-# `BedrockException - {"message":"Operation not allowed"}`. Without these,
-# that case reads as "unknown" and the wizard says nothing about a model the
-# key genuinely cannot invoke — which is the whole thing this check exists
-# to catch. Deliberately narrow: "throttled", "quota", "timed out" and the
-# like are NOT here, because those mean the model is fine.
+# `BedrockException - {"message":"Operation not allowed"}`. These phrases
+# catch that, and the model-not-on-this-endpoint case, when the class name
+# carries nothing.
 _AWS_REJECTION_PHRASES = (
     "operation not allowed",
     "access denied",
@@ -277,21 +321,24 @@ _AWS_REJECTION_PHRASES = (
     "is not authorized",
     "no access to this model",
     "you don't have access",
-    # the other way a valid pick still cannot be called, and the reason the
-    # model list shows inference profiles at all
     "on-demand throughput isn't supported",
     "on-demand throughput is not supported",
-    # Bedrock's Model access form was never filled in for this account
     "model use case details",
+    # Bedrock's OpenAI-compatible endpoint serves a subset of the catalog,
+    # and this is what it says about the rest
+    "isn't supported by the openai",
+    "is not supported by the openai",
+    "not supported for this model",
+    "does not support chat completions",
 )
 
 
-def _says_no(exc: BaseException) -> bool:
+def _says(text: str, phrases: tuple[str, ...]) -> bool:
     try:
-        text = str(exc).lower()
+        lowered = str(text).lower()
     except Exception:  # a broken __str__ must not break the verdict
         return False
-    return any(phrase in text for phrase in _AWS_REJECTION_PHRASES)
+    return any(phrase in lowered for phrase in phrases)
 
 
 def _walk_exceptions(exc: BaseException):
@@ -317,9 +364,20 @@ def _walk_exceptions(exc: BaseException):
 
 
 def classify_verify_error(exc: BaseException) -> str:
-    """VERIFY_REJECTED when AWS gave a verdict, else VERIFY_UNKNOWN."""
-    for nested in _walk_exceptions(exc):
-        if type(nested).__name__ in _AWS_VERDICT_ERRORS or _says_no(nested):
+    """VERIFY_REJECTED when the endpoint gave a verdict, else VERIFY_UNKNOWN."""
+    chain = list(_walk_exceptions(exc))
+    # "no verdict" wins, and it is checked first: litellm wraps a connection
+    # failure inside something that can look like a status error, and a
+    # throttled model must never be reported as one the key cannot use.
+    for nested in chain:
+        if type(nested).__name__ in _NO_VERDICT_ERRORS:
+            return VERIFY_UNKNOWN
+    for nested in chain:
+        if _says(nested, _NO_VERDICT_PHRASES):
+            return VERIFY_UNKNOWN
+    for nested in chain:
+        if (type(nested).__name__ in _AWS_VERDICT_ERRORS
+                or _says(nested, _AWS_REJECTION_PHRASES)):
             return VERIFY_REJECTED
     return VERIFY_UNKNOWN
 
