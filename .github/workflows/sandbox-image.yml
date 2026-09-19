@@ -29,6 +29,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Publish ONLY from the canonical repo. This file travels with the source
+    # (into forks, mirrors, and the hackathon submission repo); without this
+    # guard each copy would try to publish its own kryonsec-sandbox package
+    # under its own owner. Pulling is unaffected — install.sh hardcodes the
+    # canonical GHCR ref, so the image always comes from one place no matter
+    # where the code is cloned from.
+    if: github.repository == 'GonchiJoshnaVardhanReddy/kryon-sec'
     steps:
       - uses: actions/checkout@v7
 

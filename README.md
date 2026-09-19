@@ -13,6 +13,13 @@
 
 [Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [Safety design](#safety-design) · [Configuration](#configuration-reference)
 
+<a href="https://youtu.be/zNEJTBBoiYM">
+  <img src="https://img.youtube.com/vi/zNEJTBBoiYM/maxresdefault.jpg"
+       alt="Kryonsec demo — click to play" width="760"/>
+</a>
+
+### ▶️ [Watch the demo](https://youtu.be/zNEJTBBoiYM)
+
 </div>
 
 ---
@@ -70,14 +77,16 @@ Allowlists, not blocklists. Secrets never leave the machine by default.
 | Linux / WSL2 | optional | ✅ required (gVisor) |
 | Docker | — | ✅ required |
 | [gVisor](https://github.com/google/gvisor) `runsc` runtime | — | ✅ required |
-| Pinned `kryonsec/sandbox` image | — | ✅ required (built by installer) |
+| Pinned `kryonsec/sandbox` image | — | ✅ required (pulled by installer) |
 | Ollama (local LLM) | optional (recommended) | optional (recommended) |
 | OpenAI API key | optional | optional |
+| AWS Bedrock API key | optional | optional |
 | PostgreSQL | optional (SQLite fallback) | optional (SQLite fallback in v1.1) |
 
 `kryonsec doctor` checks all of this and refuses to start Purple Team if anything is missing.
 On apt-based Linux (Ubuntu/Debian/Kali) with sudo, the one-line installer sets up
-Docker and gVisor for you — only the sandbox image build is a separate (long) step.
+Docker and gVisor for you, and fetches the sandbox image from a registry (a fast
+`docker pull`) rather than building it.
 
 ---
 
@@ -91,23 +100,38 @@ curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/
 
 The installer:
 
-1. Checks for Python 3.11+ (tries `python3.12`, `python3.11`, `python3`)
-2. Creates a dedicated virtualenv at `~/.kryonsec/venv`
-3. Installs kryonsec into it from GitHub
-4. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
-5. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali
-6. **Builds the Zone B sandbox image** when Docker is available (Purple Team) — with live progress output, since it downloads 2+ GB and can take 30+ min on slow links
-7. Runs `kryonsec setup` — the first-run wizard
+1. Installs missing prerequisites (`git`, `curl`) on apt systems
+2. Checks for Python 3.11+ (tries `python3.12`, `python3.11`, `python3`)
+3. Creates a dedicated virtualenv at `~/.kryonsec/venv`
+4. Installs the **latest released version** into it from GitHub
+   (`KRYONSEC_VERSION=@main` or `@<sha>` overrides the tag)
+5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
+6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali
+7. **Fetches the Zone B sandbox image** when Docker is available (Purple Team) — a `docker pull` from `ghcr.io` in the normal case, which is minutes instead of tens of minutes. If the registry is unreachable, the image for this version isn't published yet, or you're offline, it falls back to building locally with live progress output (2+ GB, 30+ min on slow links). Either way it's tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look for.
+8. Runs `kryonsec setup` — the first-run wizard
+9. Runs `kryonsec doctor` so the final state is visible
 
-To skip the (large) sandbox image build and do it later:
+To skip the sandbox image entirely and do it later:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
-# later:
+# later — pull (fast):
+docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
+docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
+# or build (slow):
 git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
 cd kryon-sec
 docker build --progress=plain -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 ```
+
+Sandbox-image environment variables:
+
+| Variable | Effect |
+|---|---|
+| `KRYONSEC_SANDBOX_IMAGE` | Override the image ref the installer pulls; may carry a `@sha256:<digest>` |
+| `KRYONSEC_REGISTRY_TOKEN` | GHCR token — only needed if the repo/image is private (`read:packages`) |
+| `KRYONSEC_REGISTRY_USER` | Username for that token (default `kryonsec`) |
+| `KRYONSEC_SKIP_SANDBOX=1` | Skip the image fetch/build entirely |
 
 If a build fails partway, already-downloaded layers are cached — re-running the same command resumes where it stopped.
 
@@ -136,16 +160,23 @@ kryonsec setup
 The first launch without a config starts the wizard automatically (re-run anytime
 with `kryonsec setup`). It walks you through:
 
-1. **Pick your LLM provider** — OpenAI or Ollama (local)
+1. **Pick your LLM provider** — OpenAI, Ollama (local), or AWS Bedrock
 2. **Provider setup**
    - *OpenAI:* paste your API key → it is tested live → pick a model from the list (most recent first)
    - *Ollama:* pick from your already-pulled local models
+   - *AWS Bedrock:* paste a Bedrock API key (starts with `ABSK`) → the wizard
+     prints how to create one. Your **region is detected automatically** — a
+     Bedrock API key carries no region, so the wizard probes the AWS regions
+     with your key and remembers the one that accepts it (this is also the key
+     check). Then pick a model from the list, cross-region inference profiles
+     first — newer Claude models only work through those.
 3. **Pick the built-in agent tools** (space to select, enter to continue)
 4. **Pick MCP servers** — presets or add your own (see [MCP integration](#mcp-integration))
 5. **A summary screen** of everything you chose
 
 The wizard writes `~/.kryonsec/config.toml` with **owner-only permissions** — that
-file holds your API key. Environment variables (`OPENAI_API_KEY`, `DATABASE_URL`,
+file holds your API key. Environment variables (`OPENAI_API_KEY`,
+`AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION_NAME`, `DATABASE_URL`,
 `OLLAMA_HOST`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`) still override the file for
 power users and CI.
 
@@ -382,13 +413,15 @@ Config lives at `~/.kryonsec/config.toml` (override the directory with
 
 ```toml
 [llm]
-provider = "openai"                  # "openai" | "ollama"
+provider = "openai"                  # "openai" | "ollama" | "bedrock"
 chat_model = "ollama/llama3.1"       # main copilot model
 search_model = "gpt-4o-mini"         # fact-extraction / light calls
 compaction_model = "gpt-4o-mini"     # chat compaction (local when secrets)
 local_model = "ollama/llama3.1"      # fallback + secrets-present routing
 openai_api_key = "sk-..."
 ollama_host = "http://localhost:11434"
+bedrock_api_key = "ABSK..."          # AWS Bedrock key (also AWS_BEARER_TOKEN_BEDROCK)
+bedrock_region = "us-east-1"         # detected by the wizard (also AWS_REGION_NAME)
 
 [session]
 max_session_tokens = 16000
@@ -412,7 +445,8 @@ env = "{}"
 ```
 
 Environment variables (they win over TOML): `OPENAI_API_KEY`, `DATABASE_URL`,
-`OLLAMA_HOST`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`, `KRYONSEC_SANDBOX_IMAGE`.
+`OLLAMA_HOST`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`, `KRYONSEC_SANDBOX_IMAGE`,
+`KRYONSEC_VERSION` (installer).
 
 ### LLM backends
 
@@ -422,6 +456,14 @@ All LLM calls route through **LiteLLM** with a fallback chain:
 2. **OpenAI:** API key from the wizard or `OPENAI_API_KEY` — used for chat and
    light analysis, but **never** for compaction when secrets are present (those
    calls always route locally)
+3. **AWS Bedrock:** a Bedrock API key (wizard, or `AWS_BEARER_TOKEN_BEDROCK`).
+   Same rule as OpenAI — Bedrock is a third party, so secrets are never sent
+   to it. Model ids carry a `bedrock/` prefix, e.g.
+   `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+
+The wizard's provider choice is exclusive: an Ollama config never calls a hosted
+API, and an OpenAI or Bedrock config never silently falls back to a different
+provider — only the local model, and only for the secrets gate.
 
 ---
 
@@ -493,7 +535,7 @@ kryon-sec/
 │   ├── storage/                      # SQLAlchemy models + db session layer
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 30 files, 559 tests
+└── tests/                            # 31 files, 594 tests
 ```
 
 ---
@@ -509,13 +551,15 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 559 tests across 30 files
+- **Every safety layer has at least one unit test** — 594 tests across 31 files
   covering the audit chain, allowlist, secrets redaction, orchestrator
   transitions, compaction, sandbox, enrichment, scanners, report validation,
   CVSS calculator, TUI, wizard, and more
 
 Optional extras: `pip install -e ".[postgres]"` for the PostgreSQL driver
-(`psycopg[binary]`).
+(`psycopg[binary]`, v3). A plain `postgresql://…` `DATABASE_URL` is pointed at
+whichever psycopg is installed; write `postgresql+psycopg2://` yourself if you
+specifically want psycopg2.
 
 Dev note: since v1.1 config comes from `~/.kryonsec/config.toml` (the old `.env`
 loading is gone). Run `kryonsec setup` once, or export `OPENAI_API_KEY` for a
@@ -533,8 +577,39 @@ scanners that ran (semgrep/bandit/gitleaks/trivy/checkov/syft/osv-scanner/
 grype, plus hadolint when the folder has a Dockerfile), and the report's
 fix list should be grounded in that scanner evidence. The report also gets
 an SBOM summary line and a timeline table. After the first run on a new
-version, rebuild the sandbox image (new tools are baked in):
-`docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .`
+version, fetch the new sandbox image (new tools are baked in):
+
+```bash
+docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
+docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
+# or, from a source checkout:
+docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
+```
+
+### Publishing a release (maintainer)
+
+The sandbox image is published to GHCR by
+`.github/workflows/sandbox-image.yml`, so users pull instead of building.
+
+1. **One-time repo setup:** Settings → Actions → General → Workflow permissions →
+   *Read and write permissions*. The default `GITHUB_TOKEN` cannot push packages
+   without this. (For a private repo, also make the package private under
+   Packages → `kryonsec-sandbox` → Settings.)
+2. **First image:** the workflow can't retro-publish for tags that predate it.
+   Run it once by hand: Actions → *sandbox-image* → *Run workflow* on `main`.
+3. **Every release:** tag and push (`git tag v1.3.2 && git push --tags`). The
+   workflow builds and pushes `:v1.3.2` plus `:latest` (non-prerelease tags only).
+4. **Read the digest** off the run's job summary — it prints
+   `ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox@sha256:<digest>`.
+5. **Optionally pin it** in `src/kryonsec/config.py` (`sandbox_image`) so
+   `doctor`/runner verify the exact bytes this release was tested against, per
+   spec §8.6. Pinning is a deliberate per-release choice: the installer retags
+   the pulled image as `kryonsec/sandbox:latest`, so a digest-pinned default
+   only works for users who pull that digest. Leaving the tag default keeps
+   offline rebuilds working; users who want strict pinning set
+   `KRYONSEC_SANDBOX_IMAGE` to the digest ref.
+6. **Verify** on a clean machine: `docker pull` the new tag, then
+   `kryonsec doctor` must pass.
 
 ---
 
