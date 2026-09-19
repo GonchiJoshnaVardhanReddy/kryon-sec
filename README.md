@@ -7,7 +7,7 @@
 **A single-user CLI cybersecurity platform with two modes: an AI copilot and a deterministic purple-team engine.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryon-sec)
+[![Version](https://img.shields.io/badge/version-1.3.0-8e44ad)](https://github.com/GonchiJoshnaVardhanReddy/kryonsec)
 [![Tests](https://img.shields.io/badge/tests-559%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
@@ -95,16 +95,17 @@ Docker and gVisor for you, and fetches the sandbox image from a registry (a fast
 ### One command (WSL / Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | bash
 ```
 
 The installer:
 
 1. Installs missing prerequisites (`git`, `curl`) on apt systems
-2. Checks for Python 3.11+ (tries `python3.12`, `python3.11`, `python3`)
+2. Checks for Python 3.11+ (tries `python3.13`, `python3.12`, `python3.11`, then a bare `python3` — and warns if the only one present is a very new 3.14, where pip may have to compile dependencies from source and the install looks stalled)
 3. Creates a dedicated virtualenv at `~/.kryonsec/venv`
-4. Installs the **latest released version** into it from GitHub
-   (`KRYONSEC_VERSION=@main` or `@<sha>` overrides the tag)
+4. Installs kryonsec into it from GitHub: the newest release tag if the repo has
+   tags, otherwise `main` (this repo is a single-commit snapshot with no tags, so
+   `main` is the normal path). `KRYONSEC_VERSION=@main` or `@<sha>` overrides both.
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
 6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing** — no manual prerequisite steps on Ubuntu/Debian/Kali
 7. **Fetches the Zone B sandbox image** when Docker is available (Purple Team) — a `docker pull` from `ghcr.io` in the normal case, which is minutes instead of tens of minutes. If the registry is unreachable, the image for this version isn't published yet, or you're offline, it falls back to building locally with live progress output (2+ GB, 30+ min on slow links). Either way it's tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look for.
@@ -114,13 +115,13 @@ The installer:
 To skip the sandbox image entirely and do it later:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
 # later — pull (fast):
 docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
 docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
 # or build (slow):
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
-cd kryon-sec
+git clone https://github.com/GonchiJoshnaVardhanReddy/kryonsec.git
+cd kryonsec
 docker build --progress=plain -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 ```
 
@@ -138,7 +139,7 @@ If a build fails partway, already-downloaded layers are cached — re-running th
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 | iex
 ```
 
 Windows gets Copilot mode only — Purple Team is gated behind a runtime check and
@@ -147,8 +148,8 @@ must never run on the Windows host. Use WSL2 for Mode B.
 ### From source (development)
 
 ```bash
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
-cd kryon-sec
+git clone https://github.com/GonchiJoshnaVardhanReddy/kryonsec.git
+cd kryonsec
 pip install -e ".[dev]"
 kryonsec setup
 ```
@@ -489,7 +490,7 @@ is the system of record; without it, kryonsec falls back to an embedded SQLite D
 ## Project structure
 
 ```
-kryon-sec/
+kryonsec/
 ├── install.sh / install.ps1          # one-line installers (bash + PowerShell)
 ├── pyproject.toml                    # deps: litellm, pydantic, sqlalchemy,
 │                                     #       prompt_toolkit, jinja2, rich, mcp

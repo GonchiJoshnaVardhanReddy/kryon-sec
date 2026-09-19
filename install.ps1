@@ -1,6 +1,6 @@
 # Kryonsec one-line installer (Windows PowerShell).
 #
-#   powershell -c "irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 | iex"
+#   powershell -c "irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 | iex"
 #
 # What it does:
 #   1. checks for Python 3.11+ and git (installs git via winget if missing)
@@ -13,7 +13,7 @@
 # For Purple Team use WSL2: see install.sh / the README.
 
 $ErrorActionPreference = "Stop"
-$Repo = "https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
+$Repo = "https://github.com/GonchiJoshnaVardhanReddy/kryonsec"
 $Home1 = if ($env:KRYONSEC_HOME) { $env:KRYONSEC_HOME } else { Join-Path $env:USERPROFILE ".kryonsec" }
 $Venv = Join-Path $Home1 "venv"
 
@@ -76,10 +76,15 @@ Say "installing kryonsec (this pulls litellm, mcp, rich, ...)"
 & $Pip install --quiet --upgrade pip
 
 # Install a released version, not whatever is on main at this moment (matches
-# install.sh). The latest tag comes from the GitHub tags API; FALLBACK_TAG
+# install.sh). The latest tag comes from the GitHub tags API; the fallback
 # covers offline installs and repos without tags. KRYONSEC_VERSION overrides
-# both ("@v1.3.1", "@main", "@<commit-sha>"). Bump FALLBACK_TAG on every release.
-$FallbackTag = "v1.3.1"
+# both ("@v1.3.1", "@main", "@<commit-sha>").
+#
+# THIS repo is a single-commit snapshot whose history was deliberately reset,
+# so it has no tags and the fallback is the normal path here — it points at
+# main, not at a version tag that cannot resolve. (v1.3.1 lives in the other
+# repo; asking for it here fails the install outright.)
+$FallbackRef = "main"
 $Version = $env:KRYONSEC_VERSION
 if (-not $Version) {
     $tagNames = @()
@@ -88,7 +93,7 @@ if (-not $Version) {
         # newest release past the first page (we sort by semver, so ordering
         # doesn't matter, but the cutoff would)
         $resp = Invoke-RestMethod -TimeoutSec 20 `
-            -Uri "https://api.github.com/repos/GonchiJoshnaVardhanReddy/kryon-sec/tags?per_page=100"
+            -Uri "https://api.github.com/repos/GonchiJoshnaVardhanReddy/kryonsec/tags?per_page=100"
         $tagNames = @($resp | ForEach-Object { $_.name })
     } catch {
         Say "could not query tags ($($_.Exception.Message))"
@@ -105,11 +110,14 @@ if (-not $Version) {
         $Version = "@$latest"
         Say "installing latest release $latest"
     } else {
-        $Version = "@$FallbackTag"
-        Say "no tags found - using pinned $FallbackTag"
+        $Version = "@$FallbackRef"
+        Say "no tags found - installing $FallbackRef"
     }
 }
-& $Pip install --quiet "git+$Repo.git$Version"
+# Not --quiet: the dependency tree takes minutes and pip prints nothing while
+# it resolves, so a silent install reads as a hung one.
+Say "installing kryonsec (a few minutes - pip is quiet while it resolves)"
+& $Pip install "git+$Repo.git$Version"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Kryo)) { Die "installation failed" }
 & $Kryo --version
 

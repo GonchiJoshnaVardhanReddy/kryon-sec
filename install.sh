@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kryonsec one-line installer (WSL / Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | bash
 #
 # What it does:
 #   1. installs missing prerequisites (git, curl) on apt systems
@@ -18,7 +18,7 @@
 #      the exact command to run when PATH isn't active in this shell yet
 set -euo pipefail
 
-REPO="https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
+REPO="https://github.com/GonchiJoshnaVardhanReddy/kryonsec"
 KRYONSEC_HOME="${KRYONSEC_HOME:-$HOME/.kryonsec}"
 VENV="$KRYONSEC_HOME/venv"
 
@@ -77,8 +77,14 @@ clone_ref() {
 }
 
 # ---- 1. python 3.11+ ------------------------------------------------------
+# Newest-supported first, but 3.14 is deliberately absent from the list: it is
+# new enough that parts of the dependency tree can still have no prebuilt
+# wheel, so pip quietly falls back to compiling from source and the install
+# looks hung for a very long time. A bare `python3` stays last, so a machine
+# whose only interpreter is 3.14 still installs — it just gets told why it is
+# slow.
 PY=""
-for candidate in python3.12 python3.11 python3; do
+for candidate in python3.13 python3.12 python3.11 python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
         if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
             PY="$candidate"
@@ -88,6 +94,12 @@ for candidate in python3.12 python3.11 python3; do
 done
 [ -n "$PY" ] || die "Python 3.11+ not found. Install it first: https://www.python.org/downloads/"
 say "using $($PY --version)"
+if "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/dev/null; then
+    say "WARNING: Python 3.14 is very new. If the install below sits still for"
+    say "         many minutes, pip is compiling a dependency from source."
+    say "         Install 3.12 and re-run for a much faster install:"
+    say "           sudo apt-get install -y python3.12 python3.12-venv"
+fi
 
 # ---- 2. venv ---------------------------------------------------------------
 say "creating virtualenv at $VENV"
@@ -105,17 +117,24 @@ fi
 # ---- 3. install -------------------------------------------------------------
 # Install a released version, not whatever is on main at this moment. The
 # latest tag comes from git ls-remote (plain tags count — no GitHub Release
-# needed, no API rate limits); a hardcoded fallback covers offline installs
-# and repos without tags. KRYONSEC_VERSION overrides both ("@v1.3.0",
-# "@main", "@<commit-sha>"). Bump FALLBACK_TAG on every release.
-FALLBACK_TAG="v1.3.1"
+# needed, no API rate limits); a fallback covers offline installs and repos
+# without tags. KRYONSEC_VERSION overrides both ("@v1.3.0", "@main",
+# "@<commit-sha>").
+#
+# THIS repo is a single-commit snapshot whose history was deliberately reset,
+# so it has no release tags — the fallback is the normal path here, and it
+# points at main rather than a version tag that cannot resolve. (v1.3.1 lives
+# in the other repo; asking for it here fails the install outright.) The tag
+# lookup still runs first, so cutting a tag here switches installs to it with
+# no edit to this script.
+FALLBACK_REF="main"
 if [ -n "${KRYONSEC_VERSION:-}" ]; then
     say "installing kryonsec${KRYONSEC_VERSION} (KRYONSEC_VERSION override)"
 else
     # `|| true` is load-bearing: under `set -o pipefail` the assignment takes
     # the pipeline's status, so a failing git (not installed → 127, or GitHub
     # unreachable → 128) used to kill the script right here — the exact
-    # offline case FALLBACK_TAG exists for. Without it the "no tags on the
+    # offline case the fallback exists for. Without it the "no tags on the
     # remote" branch below was unreachable dead code.
     LATEST_TAG="$(git ls-remote --tags --refs "$REPO.git" 2>/dev/null \
         | sed 's|.*refs/tags/||' | "$PY" -c '
@@ -128,13 +147,17 @@ print(max(tags, key=key) if tags else "")' || true)"
         KRYONSEC_VERSION="@$LATEST_TAG"
         say "installing latest release $LATEST_TAG"
     else
-        KRYONSEC_VERSION="@$FALLBACK_TAG"
-        say "no tags on the remote — using pinned $FALLBACK_TAG"
+        KRYONSEC_VERSION="@$FALLBACK_REF"
+        say "no release tags in this repo — installing $FALLBACK_REF"
     fi
 fi
-say "installing kryonsec (this pulls litellm, mcp, rich, …)"
+# Deliberately NOT --quiet: a tree this size takes minutes and pip prints
+# nothing while it resolves and downloads, so a silent install reads as a
+# hung one — which is exactly how it gets reported. The output is the
+# reassurance that it is still working.
+say "installing kryonsec (this pulls litellm, mcp, rich, … — takes a few minutes)"
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet "git+$REPO.git$KRYONSEC_VERSION"
+"$VENV/bin/pip" install "git+$REPO.git$KRYONSEC_VERSION"
 "$VENV/bin/kryonsec" --version || die "installation failed"
 
 # ---- 4. PATH (idempotent) ---------------------------------------------------
