@@ -414,10 +414,10 @@ def otx_passive_dns(domain: str) -> PassiveResult:
 def ripestat_whois(domain: str) -> PassiveResult:
     """RIPEstat whois — registrar, registration dates, nameservers.
 
-    Notes-only source (no subdomains). Deviation from the plan recorded
-    in docs/TOOL-EXPANSION-2026-09-13.md: rdap.org redirects to arbitrary
-    per-TLD registry hosts, which cannot be safely allowlisted; RIPEstat
-    serves the same data from one fixed host."""
+    Notes-only source (no subdomains). Deviation from the original plan:
+    rdap.org redirects to arbitrary per-TLD registry hosts, which cannot
+    be safely allowlisted; RIPEstat serves the same data from one fixed
+    host."""
     domain = normalize_target(domain)
     url = (
         "https://stat.ripe.net/data/whois/data.json"

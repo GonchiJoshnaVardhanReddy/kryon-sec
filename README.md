@@ -933,7 +933,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Purple Team state machine (all 10 states) | ✅ done — live-verified on WSL2 |
 | Audit chain | ✅ done |
 | Tool allowlist + Kali sandbox (Docker/gVisor) | ✅ done — live-verified |
-| Tool expansion (~50 tools, 8 phases) | ✅ done — see [`docs/TOOL-EXPANSION-2026-09-13.md`](docs/TOOL-EXPANSION-2026-09-13.md) |
+| Tool expansion (~50 tools, 8 phases) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei) | ✅ done |
 | Blue-team code scanners (`--code`, read-only mount) | ✅ done |
@@ -1001,12 +1001,9 @@ kryonsec/
 ├── install.sh / install.ps1          # installers (bash + PowerShell)
 ├── pyproject.toml                    # deps, entry point, Python >=3.11
 ├── CHANGELOG.md                      # the real version history
-├── PLAN.md                           # sandbox image publishing (done)
 ├── kryonsec-v2.1.1-dual-mode-architecture.md   # design-of-record spec
-├── AUDIT-2026-09-08.md               # security audit notes
 ├── docs/
-│   ├── logo.png
-│   └── TOOL-EXPANSION-2026-09-13.md  # the ~50-tool expansion, phase by phase
+│   └── logo.png
 ├── containers/sandbox/
 │   ├── Dockerfile.kali               # pinned Kali base, SHA256-verified tool
 │   │                                 #   install, non-root user

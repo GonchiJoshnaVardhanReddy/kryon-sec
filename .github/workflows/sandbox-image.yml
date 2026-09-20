@@ -1,7 +1,7 @@
 name: sandbox-image
 
 # Publishes the Zone B sandbox image to GHCR so installs can `docker pull`
-# instead of building ~2 GB of tooling from source (PLAN.md, Option B).
+# instead of building ~2 GB of tooling from source.
 #
 # The installer falls back to a local build whenever the pull isn't available,
 # so a failed run here never breaks installs — it only makes them slow again.

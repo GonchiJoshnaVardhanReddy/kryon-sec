@@ -49,8 +49,7 @@ shown per tool, as each one actually runs.
 
 ## v1.3.0 — Purple Team tool expansion Phase 8 (user tool map)
 
-Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:
-**559 tests green** (was 496).
+Test suite: **559 tests green** (was 496).
 
 The user supplied a complete tool map for every state; Phase 8 closes the
 gaps against the ~40 tools already present. Every addition keeps the hard
@@ -99,8 +98,7 @@ still uses the default docker bridge (proxy pending); POST_EXPLOIT dormant.
 
 ## v1.2.0 — Purple Team tool expansion (7 phases)
 
-Full record per phase: `docs/TOOL-EXPANSION-2026-09-13.md`. Test suite:
-**496 tests green** (was 321).
+Test suite: **496 tests green** (was 321).
 
 The Purple Team tool inventory grew from ~10 to **~40 sandboxed tools**,
 every spawn allowlisted (argv templates, never shell strings), audited

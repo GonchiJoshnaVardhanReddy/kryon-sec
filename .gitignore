@@ -31,3 +31,14 @@ Thumbs.db
 
 # commit-message scratch files (never track)
 COMMIT_MSG*
+
+# Local working notes — kept on disk, never published.
+# These were untracked from the repo on 2026-09-20 but left in the working
+# tree; the patterns keep them, and any future notes of the same kind, out
+# of the repo without deleting anything locally.
+AUDIT-*.md
+PLAN.md
+SESSION-NOTES*.md
+CODEFIX.md
+docs/TOOL-EXPANSION-*.md
+_smoke.txt

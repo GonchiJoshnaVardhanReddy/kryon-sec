@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # user-provided folder (--code). hadolint is conditional on a Dockerfile.
 # kube-bench is deliberately NOT here: it audits a live node's kubelet
 # config, not a code folder — inside this sandbox it would test the
-# sandbox itself (recorded in docs/TOOL-EXPANSION-2026-09-13.md).
+# sandbox itself.
 BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     ("semgrep", ["semgrep", "--config=auto", "/code"]),
     ("bandit", ["bandit", "-r", "/code"]),
