@@ -1,6 +1,13 @@
-# Kryonsec one-line installer (Windows PowerShell).
+# Kryonsec installer (Windows PowerShell).
 #
-#   powershell -c "irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 | iex"
+#   irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 -OutFile install.ps1
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1
+#
+# Download-then-run rather than piping the response straight into PowerShell's
+# expression evaluator: fetching to a file means you can read the script before
+# it runs, where the pipe form executes whatever the URL returns, uninspected.
+# Bypass is scoped to that one process — a freshly downloaded script is blocked
+# outright under the Windows client default policy.
 #
 # What it does:
 #   1. checks for Python 3.11+ and git (installs git via winget if missing)

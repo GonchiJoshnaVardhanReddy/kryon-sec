@@ -1,6 +1,7 @@
 """Tests for secret detection/redaction (spec §6.4)."""
 
 from kryonsec.secrets import detect_secrets, redact, restore
+from secret_fixtures import google_api_key, private_key_block, slack_token
 
 
 def test_detect_jwt():
@@ -9,7 +10,7 @@ def test_detect_jwt():
 
 
 def test_detect_private_key():
-    text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----"
+    text = private_key_block()
     assert detect_secrets(text)
 
 
@@ -61,24 +62,15 @@ def test_redact_aws_secret_access_key_keeps_label():
     assert list(mapping.values()) == [_AWS_SECRET]
 
 
-# Assembled at runtime rather than written as one literal: GitHub's push
-# protection cannot tell a test fixture from a live credential, so the
-# contiguous xoxb-… shape is refused outright ("Push cannot contain secrets")
-# and the commit never reaches the remote. Splitting it means no single string
-# in this file matches the scanner's pattern, while detect_secrets() still
-# sees the joined value and redacts it as the test intends.
-_SLACK_TOKEN = "-".join(("xoxb", "123456789012", "abcdefghijklmnop"))
-
-
 def test_detect_slack_token():
-    token = _SLACK_TOKEN
+    token = slack_token()
     assert detect_secrets(f"slack_token={token}")
     redacted, _ = redact(f"slack_token={token}")
     assert token not in redacted
 
 
 def test_detect_google_api_key():
-    key = "AIzaSyD-1234567890abcdefghijklmnopqrstu"
+    key = google_api_key()
     assert detect_secrets(f"GOOGLE_API_KEY={key}")
     redacted, _ = redact(f"GOOGLE_API_KEY={key}")
     assert key not in redacted

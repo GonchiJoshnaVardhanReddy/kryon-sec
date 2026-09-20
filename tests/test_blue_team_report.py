@@ -22,6 +22,7 @@ from kryonsec.purple.report import (
     render_report,
     validate_report,
 )
+from secret_fixtures import aws_access_key, github_token
 
 
 def _graph(target="target-corp.com"):
@@ -566,8 +567,8 @@ def test_report_subagent_writes_file(tmp_path):
     ("BEGIN PRIVATE KEY", False),  # partial text — must not redact innocuous text
     # patterns only the SHARED detector (secrets.py) has — the report's
     # old private list missed all three
-    ("AKIAABCDEFGHIJKLMNOP", True),          # AWS access key
-    ("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij", True),  # GitHub token
+    (aws_access_key(), True),          # AWS access key
+    (github_token(), True),            # GitHub token
     ("postgres://user:hunter2secret@db.example/x", True),  # conn string
 ])
 def test_redact_secrets(secret, expected):

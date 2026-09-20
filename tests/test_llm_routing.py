@@ -21,6 +21,7 @@ from kryonsec.llm import (
     scrub_secrets,
     secrets_safe_prompt,
 )
+from secret_fixtures import aws_access_key
 
 
 @pytest.fixture()
@@ -202,7 +203,7 @@ def test_completion_kwargs_ollama_gets_api_base(cfg):
 def test_hosted_call_with_secrets_routes_to_local(cfg):
     """A message containing a secret never reaches the hosted provider —
     the call is re-routed to the local model (chat path, general form)."""
-    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    messages = [{"role": "user", "content": f"my key is {aws_access_key()}"}]
     with (
         patch("kryonsec.llm._ollama_model_ok", return_value=True),
         patch("kryonsec.llm._complete", return_value="ok") as complete,
@@ -214,7 +215,7 @@ def test_hosted_call_with_secrets_routes_to_local(cfg):
 
 def test_hosted_call_with_secrets_no_local_refuses(cfg):
     """Secrets + no local model = hard refusal, never a hosted call."""
-    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    messages = [{"role": "user", "content": f"my key is {aws_access_key()}"}]
     with (
         patch("kryonsec.llm._ollama_model_ok", return_value=False),
         patch("kryonsec.llm._complete") as complete,
@@ -236,7 +237,7 @@ def test_hosted_call_without_secrets_unchanged(cfg):
 
 def test_local_call_with_secrets_unchanged(ollama_cfg):
     """Ollama never leaves the machine — secrets pass through fine."""
-    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    messages = [{"role": "user", "content": f"my key is {aws_access_key()}"}]
     with (
         patch("kryonsec.llm._ollama_model_ok", return_value=True),
         patch("kryonsec.llm._complete", return_value="ok") as complete,
@@ -433,7 +434,7 @@ def test_bedrock_error_names_bedrock_not_openai(bedrock_cfg):
 def test_bedrock_call_with_secrets_routes_to_local(bedrock_cfg):
     """CLAUDE.md rule 4: AWS is a third party, so a secret-bearing message
     is re-routed to the local model exactly as it would be for OpenAI."""
-    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    messages = [{"role": "user", "content": f"my key is {aws_access_key()}"}]
     with (
         patch("kryonsec.llm._ollama_model_ok", return_value=True),
         patch("kryonsec.llm._complete", return_value="ok") as complete,
@@ -443,7 +444,7 @@ def test_bedrock_call_with_secrets_routes_to_local(bedrock_cfg):
 
 
 def test_bedrock_call_with_secrets_and_no_local_refuses(bedrock_cfg):
-    messages = [{"role": "user", "content": "my key is AKIAABCDEFGHIJKLMNOP"}]
+    messages = [{"role": "user", "content": f"my key is {aws_access_key()}"}]
     with (
         patch("kryonsec.llm._ollama_model_ok", return_value=False),
         patch("kryonsec.llm._complete") as complete,

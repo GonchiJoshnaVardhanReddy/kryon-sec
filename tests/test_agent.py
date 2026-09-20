@@ -14,6 +14,7 @@ from kryonsec.copilot.agent import (
     run_agent,
 )
 from kryonsec.copilot.tools import FileTools
+from secret_fixtures import AWS_EXAMPLE_KEY
 
 
 @pytest.fixture()
@@ -327,14 +328,14 @@ def test_redacted_contents_still_handles_plain_and_odd_messages():
     message with a null content, a tool_call with no arguments, and a
     malformed non-dict entry must all pass through without raising."""
     msgs = [
-        {"role": "tool", "tool_call_id": "call_1", "content": "key=AKIAIOSFODNN7EXAMPLE"},
+        {"role": "tool", "tool_call_id": "call_1", "content": f"key={AWS_EXAMPLE_KEY}"},
         {"role": "assistant", "content": None},
         {"role": "assistant", "content": "", "tool_calls": []},
         {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function"}]},
         {"role": "assistant", "content": "", "tool_calls": ["not-a-dict"]},
     ]
     out = _redacted_contents(msgs)
-    assert "AKIAIOSFODNN7EXAMPLE" not in out[0]["content"]
+    assert AWS_EXAMPLE_KEY not in out[0]["content"]
     assert out[1]["content"] is None
     assert out[2]["tool_calls"] == []
     assert out[3]["tool_calls"][0]["id"] == "x"   # no "function" key: untouched
