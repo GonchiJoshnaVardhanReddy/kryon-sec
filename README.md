@@ -16,12 +16,12 @@ and a deterministic purple-team engine that finds, tests and proves.
 
 [Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [AWS Bedrock](#aws-bedrock) · [Safety design](#safety-design) · [Repository structure](#repository-structure)
 
-<a href="https://youtu.be/zNEJTBBoiYM">
-  <img src="https://img.youtube.com/vi/zNEJTBBoiYM/maxresdefault.jpg"
+<a href="https://youtu.be/ZnH-U8DG3Y0">
+  <img src="https://img.youtube.com/vi/ZnH-U8DG3Y0/maxresdefault.jpg"
        alt="Kryonsec demo — click to play" width="760"/>
 </a>
 
-### ▶️ [Watch the demo](https://youtu.be/zNEJTBBoiYM)
+### ▶️ [Watch the demo](https://youtu.be/ZnH-U8DG3Y0)
 
 </div>
 
@@ -174,32 +174,32 @@ The two modes are built on deliberately opposite philosophies:
 
 ```mermaid
 flowchart TB
-    You([You]) --> CLI["kryonsec CLI<br/>cli.py"]
+    You(["You"]) --> CLI["kryonsec CLI<br/>cli.py"]
 
     CLI --> WIZ["setup wizard<br/>wizard.py"]
     CLI --> DOC["doctor<br/>doctor.py"]
-    CLI --> MODEA["Mode A · Copilot<br/>copilot/agent.py"]
-    CLI --> MODEB["Mode B · Purple engine<br/>purple/orchestrator.py"]
+    CLI --> MODEA["Mode A, Copilot<br/>copilot/agent.py"]
+    CLI --> MODEB["Mode B, Purple engine<br/>purple/orchestrator.py"]
 
     MODEA --> LLM["LiteLLM router<br/>llm.py"]
     MODEB --> LLM
-    LLM --> OLL["Ollama · local"]
+    LLM --> OLL["Ollama, local"]
     LLM --> OAI["OpenAI"]
     LLM --> BR["AWS Bedrock"]
-    LLM -. "secrets present<br/>→ local only" .-> OLL
+    LLM -.->|secrets present, stays local| OLL
 
-    MODEA --> CTOOLS["Copilot tools<br/>file · web · CVE · MCP"]
-    CTOOLS -. "approval gate<br/>deny by default" .-> You
+    MODEA --> CTOOLS["Copilot tools<br/>file, web, CVE, MCP"]
+    CTOOLS -.->|approval gate, deny by default| You
 
-    MODEB --> RUN["ToolRunner + allowlist<br/>runner.py · allowlist.py"]
+    MODEB --> RUN["ToolRunner + allowlist<br/>runner.py, allowlist.py"]
     MODEB --> AUD["audit chain<br/>audit.py"]
-    MODEB --> ZA["Zone A · passive<br/>zonea.py"]
+    MODEB --> ZA["Zone A, passive<br/>zonea.py"]
 
-    RUN --> SB["Zone B sandbox<br/>gVisor · non-root · read-only rootfs"]
-    SB --> TARGET([Authorized target])
-    ZA -. "zero packets" .-> THIRD([Third-party APIs only])
+    RUN --> SB["Zone B sandbox<br/>gVisor, non-root, read-only rootfs"]
+    SB --> TARGET(["Authorized target"])
+    ZA -.->|zero packets| THIRD(["Third-party APIs only"])
 
-    MODEA --> STORE[("Storage · SQLAlchemy<br/>PostgreSQL, or SQLite fallback")]
+    MODEA --> STORE["Storage, SQLAlchemy<br/>PostgreSQL, or SQLite fallback"]
     MODEB --> STORE
 
     classDef safe fill:#1f6f43,stroke:#0d3d24,color:#fff
