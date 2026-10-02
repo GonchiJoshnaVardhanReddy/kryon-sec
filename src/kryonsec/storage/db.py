@@ -15,6 +15,28 @@ log = logging.getLogger(__name__)
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
+# Purple Team's own engine, used only when DATABASE_URL is unset (see
+# get_purple_engine). Same models, same migration runner, different file.
+_purple_engine: Engine | None = None
+_purple_session_factory: sessionmaker[Session] | None = None
+
+
+def _open_engine(url: str, kind: str) -> Engine:
+    """Build an engine with this project's conventions applied."""
+    kwargs: dict = {"future": True}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False}
+    engine = create_engine(url, **kwargs)
+
+    if engine.name == "sqlite":
+        @event.listens_for(engine, "connect")
+        def _fk_on(dbapi_conn, _record):  # pragma: no cover - driver glue
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
+
+    log.info("storage backend: %s (%s)", kind, _safe_url(url))
+    return engine
 
 
 def get_engine(cfg: KryonsecConfig) -> Engine:
@@ -33,19 +55,7 @@ def get_engine(cfg: KryonsecConfig) -> Engine:
     else:
         url = f"sqlite:///{cfg.fallback_db_path}"
 
-    kwargs: dict = {"future": True}
-    if url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
-    _engine = create_engine(url, **kwargs)
-
-    if _engine.name == "sqlite":
-        @event.listens_for(_engine, "connect")
-        def _fk_on(dbapi_conn, _record):  # pragma: no cover - driver glue
-            cur = dbapi_conn.cursor()
-            cur.execute("PRAGMA foreign_keys=ON")
-            cur.close()
-
-    log.info("storage backend: %s (%s)", cfg.storage_kind, _safe_url(url))
+    _engine = _open_engine(url, cfg.storage_kind)
     return _engine
 
 
@@ -136,16 +146,79 @@ def get_session(cfg: KryonsecConfig) -> Session:
     return _session_factory()
 
 
+# ---- Purple Team storage --------------------------------------------------
+#
+# Engagement data (the Security Graph) needs a home on every supported
+# install, not just the PostgreSQL ones. Two cases, one set of models and one
+# migration runner — this is a second *database file* on embedded installs,
+# never a second memory system:
+#
+#   DATABASE_URL set   -> the system of record, the same engine as everything
+#                         else. One store, one schema history (spec §10.1).
+#   DATABASE_URL unset -> ~/.kryonsec/purple.db, its own SQLite file.
+#
+# The second case is the point of this section. ``init_db`` deliberately
+# leaves the purple tables out of the Copilot fallback database
+# (``include_purple = cfg.storage_is_postgres``), and an engagement graph is
+# not a reason to reverse that: Copilot memory is chat history, engagement
+# memory is a security record with its own retention and its own backup
+# story. Mixing them would also mean a Copilot-only install silently grows
+# engagement tables it never asked for.
+
+
+def get_purple_engine(cfg: KryonsecConfig) -> Engine:
+    """The engine that holds engagement data."""
+    if cfg.database_url:
+        return get_engine(cfg)
+
+    global _purple_engine
+    if _purple_engine is None:
+        cfg.ensure_dirs()
+        _purple_engine = _open_engine(
+            f"sqlite:///{cfg.purple_db_path}", cfg.purple_storage_kind
+        )
+    return _purple_engine
+
+
+def init_purple_db(cfg: KryonsecConfig) -> Engine:
+    """Bring engagement storage up to date. Returns its engine."""
+    from ..migrations import apply_pending
+
+    if cfg.database_url:
+        # The system of record carries both halves of the schema.
+        return init_db(cfg, include_purple=True)
+
+    engine = get_purple_engine(cfg)
+    apply_pending(engine, [t.__table__ for t in PURPLE_TABLES])
+    return engine
+
+
+def get_purple_session(cfg: KryonsecConfig) -> Session:
+    """Return a new session bound to the engagement-storage engine."""
+    if cfg.database_url:
+        return get_session(cfg)
+
+    global _purple_session_factory
+    engine = get_purple_engine(cfg)
+    if _purple_session_factory is None:
+        _purple_session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    return _purple_session_factory()
+
+
 def reset_engine() -> None:
     """For tests: close the pool and drop the cached engine/factory."""
-    global _engine, _session_factory
+    global _engine, _session_factory, _purple_engine, _purple_session_factory
     # dispose(), not just dropping the reference: it returns pooled
     # connections to the server. Without it every reset leaked its pool —
     # PostgreSQL hit max_connections after enough test/CLI cycles.
-    if _engine is not None:
+    for engine in (_engine, _purple_engine):
+        if engine is None:
+            continue
         try:
-            _engine.dispose()
+            engine.dispose()
         except Exception:  # pragma: no cover - dispose is best-effort
             log.debug("engine dispose failed", exc_info=True)
     _engine = None
     _session_factory = None
+    _purple_engine = None
+    _purple_session_factory = None

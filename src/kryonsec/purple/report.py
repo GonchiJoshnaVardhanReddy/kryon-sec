@@ -124,11 +124,13 @@ def cvss_severity(score: float | None) -> str:
 def dedup_hypotheses(graph: EngagementGraph, audit: AuditLog) -> int:
     """Merge hypotheses that propose the same (tool set, target asset) —
     the LLM regularly re-suggests the same test twice. The first
-    occurrence becomes canonical; duplicates are removed from the STM
-    (the audit chain keeps the full history) and every node that points
-    at a merged id (remediation, finding, verify_attempt,
-    exploit_attempt "H2:tool" labels) is remapped to the canonical one so
-    the report joins stay correct. Returns the number merged."""
+    occurrence becomes canonical; duplicates are merged into it rather
+    than dropped, so the relationships the duplicate had already observed
+    (``tests``, ``produced``, …) move to the canonical hypothesis instead
+    of disappearing with it. Every node that points at a merged id
+    (remediation, finding, verify_attempt, exploit_attempt "H2:tool"
+    labels) is remapped to the canonical one so the report joins stay
+    correct. Returns the number merged."""
     canonical: dict[tuple, dict] = {}
     aliases: dict[str, str] = {}
 
@@ -154,7 +156,9 @@ def dedup_hypotheses(graph: EngagementGraph, audit: AuditLog) -> int:
             fprops["enrichment"] = props["enrichment"]
         fprops.setdefault("merged_from", []).append(node["label"])
         aliases[node["label"]] = first["label"]
-        graph.remove_node(node)
+        # merge_node, not remove_node: whatever the duplicate was already
+        # related to follows it into the canonical hypothesis.
+        graph.merge_node(node, first)
 
     if not aliases:
         return 0

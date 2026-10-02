@@ -587,7 +587,7 @@ def _run_purple(
     # STATE_INFO (the per-state tool inventory) is deliberately not imported:
     # the console shows what is running as it runs, so the inventory is no
     # longer printed anywhere. STATES is imported where it is used, below.
-    from .purple.runner import sandbox_available, start_engagement
+    from .purple.runner import persist_graph, sandbox_available, start_engagement
     from .purple.zonea import validate_target
 
     try:
@@ -683,9 +683,21 @@ def _run_purple(
         ui.stop()
         detach_purple_logging(log_handler)
 
+    # After the panel is down, so the warning is a plain readable line and
+    # not something the live display has to paint around. An interrupted
+    # engagement (Ctrl+C, which propagates out of orch.run()) never reaches
+    # this: there is no checkpoint mechanism to resume one from, so it is
+    # not persisted — see the Phase 2 report.
+    graph_saved = persist_graph(cfg, engagement_id, graph, audit)
+    if not graph_saved:
+        err_console.print(
+            "[yellow]graph memory not saved — the engagement itself is "
+            "complete (audit chain, evidence and report are on disk); "
+            "see the debug log[/yellow]")
+
     _print_purple_summary(
         cfg, engagement_id, target, completed, orch, audit, graph,
-        debug_log=debug_log,
+        debug_log=debug_log, graph_saved=graph_saved,
     )
     return 0
 
@@ -699,6 +711,7 @@ def _print_purple_summary(
     audit: "Any",
     graph: "Any",
     debug_log: "Any" = None,
+    graph_saved: "Any" = None,
 ) -> None:
     """End-of-engagement summary: a verdict panel first, then the evidence.
 
@@ -739,6 +752,14 @@ def _print_purple_summary(
     rows.add_row("Hypotheses", str(len(hypotheses)))
     rows.add_row("Tool executions", str(len(attempts)))
     rows.add_row("Evidence artifacts", str(evidence_count))
+    if graph_saved is not None:
+        # Engagement memory, stated explicitly: the operator should never
+        # have to guess whether this run is reloadable later.
+        rows.add_row(
+            "Graph memory",
+            f"{len(graph.nodes)} nodes, {len(graph.edges)} edges — saved"
+            if graph_saved else "[yellow]not saved[/yellow] (see debug log)",
+        )
 
     report_path = cfg.home / "engagements" / engagement_id / "report.md"
     if report_path.exists():

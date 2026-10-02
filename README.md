@@ -783,12 +783,18 @@ SQLAlchemy models (`src/kryonsec/storage/models.py`). PostgreSQL via `DATABASE_U
 of record; without it, Kryonsec falls back to an embedded SQLite DB (`~/.kryonsec/kryonsec.db`)
 for Copilot-mode memory.
 
+Engagement data is kept separate from Copilot memory. With `DATABASE_URL` set, both live in the
+system of record. Without it, the Purple Team writes to its own file, `~/.kryonsec/purple.db` —
+an engagement graph is a security record with its own retention, and it never lands in the
+Copilot fallback database.
+
 | Table | Mode | Purpose |
 |---|---|---|
 | `general_sessions` | A | persisted chat sessions |
 | `general_user_ltm` | A | long-term facts + preferences about the user |
 | `system_knowledge` | A | system-level knowledge |
 | `stm_nodes` | B | engagement graph nodes (subdomains, hypotheses, attempts, findings) |
+| `stm_edges` | B | relationships between those nodes (`has_subdomain`, `has_service`, …) |
 | `ltm_target_profiles` | B | per-target knowledge across engagements |
 | `ltm_engagement_summaries` | B | sanitized summaries — the only engagement data Mode A can read |
 | `engagement_secret_map` | B | `«SECRET_n»` → secret mappings for an engagement |
@@ -985,7 +991,7 @@ want to use.
 | MCP | **mcp** SDK | Copilot is a real MCP client, stdio transport |
 | Sandbox | **Docker + gVisor (`runsc`)** | A hostile tool in a hostile-target engagement needs a real isolation boundary |
 | Sandbox base | **Kali Linux** | The tool inventory in the expansion doc is Kali-shaped |
-| Tests | **pytest** | 864 tests across 38 files |
+| Tests | **pytest** | 924 tests across 40 files |
 
 Why gVisor specifically: the sandbox runs tools that are *supposed* to be dangerous, against
 targets I don't control. A container alone shares the host kernel. `runsc` puts a user-space
@@ -1056,7 +1062,7 @@ kryonsec/
 │   ├── migrations/                   # schema migrations
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 38 files, 864 tests
+└── tests/                            # 40 files, 924 tests
 ```
 
 ---
@@ -1072,7 +1078,7 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 864 tests across 38 files, covering the
+- **Every safety layer has at least one unit test** — 924 tests across 40 files, covering the
   audit chain, allowlist, secrets redaction, orchestrator transitions, compaction, sandbox,
   enrichment, scanners, report validation, the CVSS calculator, TUI, wizard, and more
 

@@ -354,6 +354,71 @@ def start_engagement(
     return orch, audit, graph
 
 
+def persist_graph(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    graph: EngagementGraph,
+    audit: AuditLog,
+) -> bool:
+    """Write the engagement's Security Graph to engagement storage.
+
+    Called once, after the loop reaches HALT (whether the engagement ran to
+    REPORT or stopped early — a halted engagement's graph is still the
+    record of what was observed, and is exactly the one an operator wants
+    to inspect afterwards).
+
+    Failure policy: **reported, never fatal, never silent.** By the time
+    this runs the engagement is over — the audit chain, the evidence
+    directory and the report are already on disk — so a storage problem
+    here cannot undo or invalidate any of it, and failing the command would
+    only hide a successful engagement behind an unrelated error. But it
+    must not vanish either: the failure is written to the audit chain as
+    ``graph_persist_failed`` (the chain is append-only, so it stays
+    visible), logged with the traceback, and returned so the CLI can tell
+    the operator. ``save_graph`` commits once, at the end, so a failure
+    leaves the previously saved state of that engagement intact rather
+    than a half-written graph.
+
+    Returns True when the graph was stored.
+    """
+    from ..storage import get_purple_session, init_purple_db
+    from .graph_store import save_graph
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            nodes, edges = save_graph(session, graph)
+    except Exception as exc:
+        # Deliberately broad: anything at all going wrong here is the same
+        # outcome (no graph memory) and the same handling. It is caught so
+        # that it can be *reported* — audit event, log, return value — not
+        # so that it can be ignored. Truncated to the codebase's usual
+        # 200 characters for an audit field.
+        detail = f"{type(exc).__name__}: {exc}"
+        audit.write({
+            "event": "graph_persist_failed",
+            "engagement_id": engagement_id,
+            "error": detail[:200],
+        })
+        log.warning(
+            "engagement %s: graph not persisted: %s", engagement_id, detail,
+            exc_info=True,
+        )
+        return False
+
+    audit.write({
+        "event": "graph_persisted",
+        "engagement_id": engagement_id,
+        "nodes": nodes,
+        "edges": edges,
+    })
+    log.info(
+        "engagement %s: graph persisted (%d nodes, %d edges)",
+        engagement_id, nodes, edges,
+    )
+    return True
+
+
 def subagent_stub(state: str):
     """Placeholder subagent factory: every state reports 'not implemented'.
 

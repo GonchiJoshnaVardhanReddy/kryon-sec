@@ -71,12 +71,61 @@ def _baseline(conn: Connection, tables: list) -> None:
     Base.metadata.create_all(bind=conn, tables=tables)
 
 
+def _security_graph_edges(conn: Connection, tables: list) -> None:
+    """Revision 0002: relationships between STM nodes (Security Graph).
+
+    Creates ``stm_edges`` and back-fills the three ``stm_nodes`` columns the
+    graph layer added (canonical_key / provenance / status) on a database
+    that already existed. A fresh database already has all of it from the
+    baseline's ``create_all``, so every step here is guarded and idempotent
+    — this revision only does real work on a pre-existing schema.
+
+    Purple storage is opt-in per backend (see ``init_db``): when ``stm_nodes``
+    is not part of this database there is nothing to do. Creating an
+    engagement table inside the Copilot fallback database would be wrong, so
+    this checks the table list rather than the engine.
+
+    The added column types are written literally, not read from the model:
+    a revision describes the schema at the moment it ran and must not change
+    if the model later moves on. ``TEXT`` on SQLite, not ``JSON`` — SQLite
+    would give a ``JSON`` column NUMERIC affinity, and this column holds
+    objects.
+    """
+    from ..storage.models import StmEdge
+
+    if "stm_nodes" not in {t.name for t in tables}:
+        return
+
+    inspector = inspect(conn)
+    if "stm_nodes" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("stm_nodes")}
+        additions = (
+            ("canonical_key", "VARCHAR(255)"),
+            ("provenance", "JSONB" if conn.dialect.name == "postgresql" else "TEXT"),
+            ("status", "VARCHAR(32)"),
+        )
+        for name, ddl_type in additions:
+            if name in existing:
+                continue
+            # Fixed identifiers and types — no user input reaches this string.
+            conn.execute(text(
+                f'ALTER TABLE stm_nodes ADD COLUMN "{name}" {ddl_type}'
+            ))
+
+    StmEdge.__table__.create(bind=conn, checkfirst=True)
+
+
 # Append new revisions here; never edit or renumber an existing one.
 REVISIONS: list[Revision] = [
     Revision(
         id="0001_baseline",
         description="initial schema (general tables; purple tables on PostgreSQL)",
         upgrade=_baseline,
+    ),
+    Revision(
+        id="0002_security_graph_edges",
+        description="stm_edges table and the stm_nodes graph columns",
+        upgrade=_security_graph_edges,
     ),
 ]
 

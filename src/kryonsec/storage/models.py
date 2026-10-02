@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    ForeignKey,
+    Index,
     UniqueConstraint,
     String,
     Integer,
@@ -103,6 +105,52 @@ class StmNode(Base):
     # App-layer computed (spec §4.5): pg_column_size() is not IMMUTABLE.
     size_bytes: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Added with the Security Graph (migration 0002). Nullable because rows
+    # written before it exist; the graph layer fills the defaults in on read.
+    canonical_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provenance: Mapped[dict | None] = mapped_column(_json(), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class StmEdge(Base):
+    """A relationship between two STM nodes (SECURITY_GRAPH.md §5, §9).
+
+    ``id`` is the graph's own edge id — not an autoincrement — so a graph
+    round-trips through the database unchanged. The referenced node ids
+    are foreign keys: the storage layer refuses a dangling edge even if
+    application code ever tries to write one.
+
+    The unique constraint is what makes duplicate edges impossible, and it
+    is deliberately the same triple the in-memory graph de-duplicates on,
+    so the two can never disagree.
+    """
+
+    __tablename__ = "stm_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "engagement_id", "source_node_id", "relationship", "target_node_id",
+            name="uq_stm_edges_triple",
+        ),
+        Index(
+            "ix_stm_edges_lookup",
+            "engagement_id", "source_node_id", "target_node_id", "relationship",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    engagement_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("stm_nodes.id", ondelete="CASCADE"), index=True
+    )
+    relationship: Mapped[str] = mapped_column(String(64))
+    target_node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("stm_nodes.id", ondelete="CASCADE"), index=True
+    )
+    properties: Mapped[dict | None] = mapped_column(_json(), nullable=True)
+    provenance: Mapped[dict | None] = mapped_column(_json(), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class LtmTargetProfile(Base):
@@ -155,4 +203,11 @@ class Checkpoint(Base):
 
 
 GENERAL_TABLES = [GeneralSession, GeneralUserLtm, SystemKnowledge]
-PURPLE_TABLES = [StmNode, LtmTargetProfile, LtmEngagementSummary, EngagementSecretMap, Checkpoint]
+PURPLE_TABLES = [
+    StmNode,
+    StmEdge,
+    LtmTargetProfile,
+    LtmEngagementSummary,
+    EngagementSecretMap,
+    Checkpoint,
+]

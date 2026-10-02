@@ -405,6 +405,24 @@ class KryonsecConfig:
     def fallback_db_path(self) -> Path:
         return self.home / "kryonsec.db"
 
+    @property
+    def purple_db_path(self) -> Path:
+        """Engagement storage for an install with no DATABASE_URL.
+
+        A file of its own, not the Copilot fallback database: Copilot
+        memory and engagement memory have different lifetimes and
+        different backup needs, and ``init_db`` keeps the purple tables out
+        of the fallback database on purpose. See ``storage.db``.
+        """
+        return self.home / "purple.db"
+
+    @property
+    def purple_storage_kind(self) -> str:
+        """Human-readable description of where engagement data lives."""
+        if self.database_url:
+            return self.storage_kind
+        return "SQLite (embedded engagement store)"
+
 
 def load_config(**overrides) -> KryonsecConfig:
     """The app entry: read ~/.kryonsec/config.toml, apply environment

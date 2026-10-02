@@ -79,8 +79,11 @@ def test_existing_database_is_stamped_not_rebuilt(cfg):
         s.commit()
 
     applied = apply_pending(engine, _tables())
-    assert applied == []                       # nothing executed
-    assert current_version(engine) == REVISIONS[0].id   # but it is recorded
+    # The baseline was stamped, not executed. Later revisions still run —
+    # that is the whole point of having a runner — but this database has no
+    # purple tables, so the graph revision no-ops.
+    assert "0001_baseline" not in applied
+    assert current_version(engine) == REVISIONS[-1].id   # but it is recorded
 
     # the row survived, and the version row explains itself
     with get_session(cfg) as s:
@@ -111,7 +114,10 @@ def test_stamped_database_still_gets_later_revisions(cfg, monkeypatch):
     )
     monkeypatch.setattr("kryonsec.migrations.REVISIONS", [*REVISIONS, later])
 
-    assert apply_pending(engine, _tables()) == ["0002_add_later"]
+    # REVISIONS itself keeps growing, so assert on the revision under test
+    # rather than on the whole list.
+    applied = apply_pending(engine, _tables())
+    assert applied[-1] == "0002_add_later"
     assert ran == ["0002"]
     assert "later_added" in inspect(engine).get_table_names()
     assert current_version(engine) == "0002_add_later"
@@ -125,8 +131,10 @@ def test_stamp_can_be_disabled(cfg):
 
     engine = get_engine(cfg)
     Base.metadata.create_all(engine, tables=_tables())
-    assert apply_pending(engine, _tables(), stamp_existing=False) == [REVISIONS[0].id]
-    assert current_version(engine) == REVISIONS[0].id
+    assert apply_pending(engine, _tables(), stamp_existing=False) == [
+        r.id for r in REVISIONS
+    ]
+    assert current_version(engine) == REVISIONS[-1].id
     # ...but it is recorded as an application, not a stamp
     with engine.connect() as conn:
         note = conn.execute(text(f"SELECT note FROM {VERSION_TABLE}")).scalar()
@@ -160,7 +168,13 @@ def test_failing_revision_is_not_recorded(cfg, monkeypatch):
     with pytest.raises(RuntimeError, match="migration exploded"):
         apply_pending(engine, _tables())
 
-    assert current_version(engine) == REVISIONS[0].id   # baseline only
+    # the failed revision is not recorded; everything before it still is
+    assert current_version(engine) == REVISIONS[-1].id
+    with engine.connect() as conn:
+        recorded = {r[0] for r in conn.execute(
+            text(f"SELECT id FROM {VERSION_TABLE}")
+        ).fetchall()}
+    assert "0002_boom" not in recorded
 
 
 def test_failed_revision_can_be_retried_after_a_fix(cfg, monkeypatch):
@@ -180,8 +194,117 @@ def test_failed_revision_can_be_retried_after_a_fix(cfg, monkeypatch):
 
     with pytest.raises(RuntimeError):
         apply_pending(engine, _tables())
-    assert apply_pending(engine, _tables()) == ["0002_flaky"]
+    assert "0002_flaky" in apply_pending(engine, _tables())
     assert current_version(engine) == "0002_flaky"
+
+
+# --- revision 0002: the Security Graph tables ------------------------------
+
+def test_graph_revision_creates_the_edge_table(cfg):
+    from kryonsec.storage import get_engine
+
+    engine = get_engine(cfg)
+    apply_pending(engine, _tables(include_purple=True))
+
+    names = inspect(engine).get_table_names()
+    assert "stm_nodes" in names and "stm_edges" in names
+    edge_columns = {c["name"] for c in inspect(engine).get_columns("stm_edges")}
+    assert {"id", "engagement_id", "source_node_id", "relationship",
+            "target_node_id", "properties", "created_at"} <= edge_columns
+
+    node_columns = {c["name"] for c in inspect(engine).get_columns("stm_nodes")}
+    assert {"canonical_key", "provenance", "status"} <= node_columns
+
+
+def test_graph_revision_is_skipped_without_purple_storage(cfg):
+    """The Copilot fallback database must not grow engagement tables."""
+    from kryonsec.storage import get_engine
+
+    engine = get_engine(cfg)
+    apply_pending(engine, _tables(include_purple=False))
+    names = inspect(engine).get_table_names()
+    assert "stm_nodes" not in names
+    assert "stm_edges" not in names
+
+
+def test_graph_revision_upgrades_an_old_database(cfg):
+    """A database created before Phase 1 gains the edges table and the three
+    node columns, and keeps the nodes it already had."""
+    from kryonsec.storage import get_engine
+
+    engine = get_engine(cfg)
+    # the pre-Phase-1 stm_nodes, written out by hand: no canonical_key,
+    # provenance or status, and no stm_edges at all
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE stm_nodes ("
+            " id VARCHAR(36) NOT NULL PRIMARY KEY,"
+            " engagement_id VARCHAR(36) NOT NULL,"
+            " subagent VARCHAR(64) NOT NULL,"
+            " node_type VARCHAR(32) NOT NULL,"
+            " label TEXT NOT NULL,"
+            " properties JSON,"
+            " size_bytes INTEGER NOT NULL,"
+            " created_at DATETIME)"
+        ))
+        conn.execute(text(
+            "INSERT INTO stm_nodes"
+            " (id, engagement_id, subagent, node_type, label, size_bytes)"
+            " VALUES ('n-old', 'e-old', 'RECON_PASSIVE', 'target',"
+            " 'example.com', 2)"
+        ))
+
+    # the pre-existing schema is stamped, so only 0002 actually runs
+    assert apply_pending(engine, _tables(include_purple=True)) == [
+        "0002_security_graph_edges"
+    ]
+
+    names = inspect(engine).get_table_names()
+    assert "stm_edges" in names
+    node_columns = {c["name"] for c in inspect(engine).get_columns("stm_nodes")}
+    assert {"canonical_key", "provenance", "status"} <= node_columns
+
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT label, canonical_key FROM stm_nodes WHERE id = 'n-old'"
+        )).one()
+    assert row[0] == "example.com"      # the old node survived
+    assert row[1] is None               # and the new column is empty for it
+
+
+def test_graph_revision_rows_load_with_phase_1_defaults(cfg):
+    """The old row above must still load as a graph, with defaults filled in."""
+    from kryonsec.purple.graph_store import load_graph
+    from kryonsec.storage import get_engine, get_session
+
+    engine = get_engine(cfg)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE stm_nodes ("
+            " id VARCHAR(36) NOT NULL PRIMARY KEY,"
+            " engagement_id VARCHAR(36) NOT NULL,"
+            " subagent VARCHAR(64) NOT NULL,"
+            " node_type VARCHAR(32) NOT NULL,"
+            " label TEXT NOT NULL,"
+            " properties JSON,"
+            " size_bytes INTEGER NOT NULL,"
+            " created_at DATETIME)"
+        ))
+        conn.execute(text(
+            "INSERT INTO stm_nodes"
+            " (id, engagement_id, subagent, node_type, label, size_bytes)"
+            " VALUES ('n-old', 'e-old', 'RECON_PASSIVE', 'target',"
+            " 'example.com', 2)"
+        ))
+    apply_pending(engine, _tables(include_purple=True))
+
+    with get_session(cfg) as session:
+        graph = load_graph(session, "e-old")
+    node = graph.nodes[0]
+    assert node["label"] == "example.com"
+    assert node["canonical_key"] == "target:example.com"
+    assert node["status"] == "observed"
+    assert node["provenance"] == {}
 
 
 # --- shape -----------------------------------------------------------------
