@@ -50,22 +50,23 @@ and a deterministic purple-team engine that finds, tests and proves.
 11. [Install](#install)
 12. [Mode A — General Copilot](#mode-a--general-copilot)
 13. [Mode B — Purple Team](#mode-b--purple-team)
-14. [Configuration reference](#configuration-reference)
-15. [Storage schema](#storage-schema)
+14. [Memory browser](#memory-browser)
+15. [Configuration reference](#configuration-reference)
+16. [Storage schema](#storage-schema)
 
 **The honest parts**
 
-16. [What broke along the way](#what-broke-along-the-way)
-17. [What I learned](#what-i-learned)
-18. [Current status](#current-status)
-19. [What I want to build next](#what-i-want-to-build-next)
+17. [What broke along the way](#what-broke-along-the-way)
+18. [What I learned](#what-i-learned)
+19. [Current status](#current-status)
+20. [What I want to build next](#what-i-want-to-build-next)
 
 **Reference**
 
-20. [Safety design](#safety-design)
-21. [Technology stack](#technology-stack)
-22. [Repository structure](#repository-structure)
-23. [Development](#development)
+21. [Safety design](#safety-design)
+22. [Technology stack](#technology-stack)
+23. [Repository structure](#repository-structure)
+24. [Development](#development)
 
 ---
 
@@ -519,6 +520,7 @@ your API key. Environment variables still override the file for power users and 
 kryonsec                  # start the chat
 kryonsec doctor           # preflight checks
 kryonsec setup            # re-run the wizard
+kryonsec memory           # browse saved engagement memory (read-only)
 ```
 
 ### The agent
@@ -676,6 +678,65 @@ because Zone A works everywhere.
 
 ---
 
+## Memory browser
+
+Every finished engagement is saved: the Security Graph goes into the engagement store, so it
+is still there after Kryonsec exits. `kryonsec memory` opens a read-only view of it in your
+browser.
+
+```bash
+kryonsec memory                    # serves http://127.0.0.1:8899/ and opens it
+kryonsec memory --port 9200        # a different port
+kryonsec memory --no-browser       # print the URL instead (headless / remote shell)
+```
+
+You get the engagement list, a force-directed graph you can pan, zoom and drag, and an
+inspector for whatever you click:
+
+| What you can do | How |
+|---|---|
+| Pick an engagement | the list on the left — each row says how it ended |
+| Follow relationships | click a dot, then click any row under **Relationships** |
+| Inspect provenance | every node and edge shows where it came from (`source_type`, `source`, `agent`) |
+| Search | the search box dims everything that doesn't match the label |
+| Filter | the node-type and status chips |
+| Read the raw data | properties and provenance are shown as JSON |
+| Navigate a big graph | drag to pan, scroll to zoom, double-click to centre, or click a name in the inspector |
+
+A node in the graph is **a dot and its name** — nothing else. No cards, no boxes, no icons, no
+badges, no metadata floating next to the point. Everything known about a node (its canonical
+key, provenance, properties, every incoming and outgoing relationship) lives in the inspector
+panel on the right. A solid dot is a confirmed observation; a hollow one is a hypothesis nobody
+has verified yet. Relationship names stay out of the way until you hover or select a line.
+
+The browser wears the same clothes as [the Kryonsec landing page](https://kryonsec.in/): the
+same warm off-white paper and near-black ink, the same `#a855f7` purple as the one accent, the
+same 2px borders and hard offset shadows, the same dark mode (shared through the
+`kryonsec-theme` key, so your choice carries between the two). Both of the landing page's fonts
+are reused — **Press Start 2P** for headings, labels and counters, **VT323** for the things you
+actually have to read: URLs, JSON, timestamps, evidence and node names. They ship inside the
+package as OFL-licensed files rather than being fetched from Google Fonts, which is what lets
+the CSP stay `default-src 'none'` and the page work with no network at all.
+
+**It only reads.** There is no route that writes, no button that runs anything, and no way to
+reach the orchestrator, the sandbox or an approval gate from it — the browser holds no
+reference to any of them. Beyond that:
+
+- binds to **127.0.0.1 only**; a non-loopback `--host` is refused, with no flag to override it
+  (use an SSH tunnel if you need it from another machine)
+- the `Host` header must be loopback, which closes DNS rebinding
+- `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` all get `405`
+- engagement ids are validated before they touch a path or a query
+- responses carry no CORS header and a `default-src 'none'` CSP (`font-src 'self'`, `img-src
+  'self'`), and the page loads nothing from any CDN — it works fully offline
+- every asset is served from a fixed route table, so a request path can never name a file
+- anything secret-shaped in a stored property is masked as `«SECRET_n»` on the way out
+
+Engagements that stopped early are shown as such rather than hidden: `complete` (report
+written), `halted` (with the reason), or `incomplete`.
+
+---
+
 ## Safety design
 
 The safety layers:
@@ -691,6 +752,7 @@ The safety layers:
 | 7 | **Audit chain** — append-only JSONL, SHA256-linked, canonical-JSON hashed |
 | 8 | **Purple Team is Linux-only** — `doctor` checks Docker + `runsc` + pinned image and refuses otherwise |
 | 9 | **Mode isolation** — general mode reads only sanitized post-REPORT summaries |
+| 10 | **The memory browser only reads** — loopback-only bind, checked `Host` header, read-only routes, secrets masked on the way out |
 
 Plus, in Copilot mode: every file action outside the workspace requires explicit approval
 (deny by default), and tool output is size-bounded (`max_tool_output_chars`).
@@ -991,7 +1053,7 @@ want to use.
 | MCP | **mcp** SDK | Copilot is a real MCP client, stdio transport |
 | Sandbox | **Docker + gVisor (`runsc`)** | A hostile tool in a hostile-target engagement needs a real isolation boundary |
 | Sandbox base | **Kali Linux** | The tool inventory in the expansion doc is Kali-shaped |
-| Tests | **pytest** | 924 tests across 40 files |
+| Tests | **pytest** | 1020 tests across 41 files |
 
 Why gVisor specifically: the sandbox runs tools that are *supposed* to be dangerous, against
 targets I don't control. A container alone shares the host kernel. `runsc` puts a user-space
@@ -1058,11 +1120,17 @@ kryonsec/
 │   │   ├── audit.py                  #   SHA256-chained JSONL audit log
 │   │   ├── sandbox.py                #   Zone B gVisor container driver
 │   │   └── runtime_checks.py         #   Docker / runsc / image checks
+│   ├── memory/                       # `kryonsec memory` — read-only browser
+│   │   ├── data.py                   #   engagement list + graph reads
+│   │   ├── viewer.py                 #   loopback HTTP server (stdlib only)
+│   │   └── static/                   #   page, stylesheet, canvas client,
+│   │                                 #   brand mark + the landing page's
+│   │                                 #   two fonts (OFL, no CDN)
 │   ├── storage/                      # SQLAlchemy models + session layer
 │   ├── migrations/                   # schema migrations
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 40 files, 924 tests
+└── tests/                            # 41 files, 1020 tests
 ```
 
 ---
@@ -1078,7 +1146,7 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 924 tests across 40 files, covering the
+- **Every safety layer has at least one unit test** — 1020 tests across 41 files, covering the
   audit chain, allowlist, secrets redaction, orchestrator transitions, compaction, sandbox,
   enrichment, scanners, report validation, the CVSS calculator, TUI, wizard, and more
 

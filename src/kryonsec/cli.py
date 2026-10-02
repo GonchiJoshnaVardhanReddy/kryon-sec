@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import re
 import sys
 import threading
 import time
@@ -573,6 +572,30 @@ def _remember_facts(cfg: KryonsecConfig, user_text: str, reply: str) -> None:
         pass  # memory is best-effort by design
 
 
+def _run_memory(
+    cfg: KryonsecConfig,
+    host: str = "127.0.0.1",
+    port: int = 8899,
+    open_browser: bool = True,
+) -> int:
+    """Serve the read-only engagement memory browser on loopback.
+
+    This command only reads: there is no flag here — and no route in the
+    server behind it — that scans, edits the graph or contacts a target.
+    """
+    from .memory import is_loopback_host, serve
+
+    if not is_loopback_host(host):
+        err_console.print(
+            f"[red]Refusing to bind {host}:[/red] the memory browser is "
+            "loopback-only. For remote access, forward the port over SSH "
+            "(ssh -L 8899:127.0.0.1:8899 you@host) rather than binding wider."
+        )
+        return 2
+
+    return serve(cfg, host=host, port=port, open_browser=open_browser)
+
+
 def _run_purple(
     cfg: KryonsecConfig,
     target_arg: str,
@@ -587,6 +610,7 @@ def _run_purple(
     # STATE_INFO (the per-state tool inventory) is deliberately not imported:
     # the console shows what is running as it runs, so the inventory is no
     # longer printed anywhere. STATES is imported where it is used, below.
+    from .engagement_id import is_valid_engagement_id
     from .purple.runner import persist_graph, sandbox_available, start_engagement
     from .purple.zonea import validate_target
 
@@ -600,9 +624,10 @@ def _run_purple(
     # passed to docker as a bind-mount source. Unvalidated, "--id ../../../tmp/x"
     # walked out of the engagements tree and "--id /etc" pointed the mount at
     # the host's /etc. Auto-generated ids are uuid4 hex, so a conservative
-    # charset costs nothing and closes the traversal.
+    # charset costs nothing and closes the traversal. The rule lives in
+    # engagement_id so the memory browser validates an id the same way.
     if engagement_id is not None:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", engagement_id):
+        if not is_valid_engagement_id(engagement_id):
             err_console.print(
                 f"[red]Invalid engagement id:[/red] {engagement_id!r} — "
                 "use letters, digits, dot, dash or underscore (max 64 chars)"
@@ -889,6 +914,19 @@ def main(argv: list[str] | None = None) -> int:
         help="code folder for blue-team static scanning (mounted read-only "
              "into the sandbox)")
 
+    memory = sub.add_parser(
+        "memory",
+        help="browse saved engagement memory in a browser (read-only, localhost)")
+    memory.add_argument(
+        "--host", default="127.0.0.1",
+        help="bind address (loopback only; default: 127.0.0.1)")
+    memory.add_argument(
+        "--port", type=int, default=8899,
+        help="port (default: 8899; if it is busy, a free one is picked)")
+    memory.add_argument(
+        "--no-browser", dest="open_browser", action="store_false",
+        help="print the URL instead of opening a browser (headless boxes)")
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -905,6 +943,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "purple":
         return _run_purple(
             cfg, args.target, engagement_id=args.id, code_folder=args.code)
+
+    if args.command == "memory":
+        return _run_memory(
+            cfg, host=args.host, port=args.port, open_browser=args.open_browser)
 
     if args.command == "setup":
         from .wizard import run_setup

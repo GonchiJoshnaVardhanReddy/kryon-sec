@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta id="theme-color" name="theme-color" content="#f5f5f0">
+  <title>Kryonsec — engagement memory</title>
+  <link rel="icon" type="image/svg+xml" href="/static/assets/mark.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- sets data-theme before first paint; same key as the landing page -->
+  <script src="/static/theme-init.js"></script>
+</head>
+<body>
+
+<header class="app-header">
+  <span class="brand">
+    <img class="brand-mark" src="/static/assets/mark.svg" width="32" height="32" alt="">
+    <span>KRYONSEC</span>
+    <span class="brand-sub">MEMORY BROWSER</span>
+  </span>
+  <span class="header-right">
+    <span class="chip" id="storage-chip" title="where persisted memory is being read from">
+      <i aria-hidden="true"></i><span id="storage-text">checking storage</span>
+    </span>
+    <span class="chip chip-readonly" title="no route here writes anything">READ-ONLY</span>
+    <button class="theme-toggle" id="theme-toggle" type="button"
+            aria-label="Switch to dark mode" aria-pressed="false">
+      <span class="theme-icon" id="theme-icon" aria-hidden="true">◐</span>
+      <span class="theme-label" id="theme-label">DARK MODE</span>
+    </button>
+  </span>
+</header>
+
+<div id="layout">
+
+  <aside class="panel" id="sidebar" aria-label="Engagements">
+    <div class="panel-head">
+      <h2>ENGAGEMENTS</h2>
+      <span class="count" id="engagement-count">—</span>
+    </div>
+    <div id="engagements" class="list" role="list"></div>
+    <div class="section-bar">
+      <span>FILTERS</span>
+      <button class="text-button" id="clear-filters" type="button">clear</button>
+    </div>
+    <div class="field">
+      <input id="search" type="search" placeholder="search node names…"
+             autocomplete="off" spellcheck="false" aria-label="Search node names">
+      <span class="hint" id="search-count"></span>
+    </div>
+    <div class="check-group">
+      <h3>NODE TYPE</h3>
+      <div class="checks" id="type-filters"></div>
+    </div>
+    <div class="check-group">
+      <h3>STATUS</h3>
+      <div class="checks" id="status-filters"></div>
+    </div>
+  </aside>
+
+  <main id="stage">
+    <canvas id="graph" aria-label="Engagement graph"></canvas>
+    <div class="banner hidden" id="banner" role="status"></div>
+    <div class="overlay hidden" id="overlay">
+      <div class="overlay-card">
+        <h2 id="overlay-title"></h2>
+        <div id="overlay-body"></div>
+      </div>
+    </div>
+    <div class="hud">
+      <span class="stats" id="hud-stats"></span>
+      <button class="button" type="button" data-action="fit" title="Fit the graph to the view">FIT</button>
+      <button class="button" type="button" data-action="relayout" title="Run the layout again">RELAYOUT</button>
+    </div>
+    <div class="legend" id="legend"></div>
+  </main>
+
+  <aside class="panel" id="inspector" aria-label="Inspector">
+    <div class="panel-head">
+      <h2 id="inspector-title">ENGAGEMENT</h2>
+    </div>
+    <div class="status-grid" id="overview-grid"></div>
+    <p class="overview-note" id="overview-note"></p>
+
+    <div class="panel-head">
+      <h2 id="detail-head">INSPECTOR</h2>
+    </div>
+    <div id="detail" class="detail-body"></div>
+  </aside>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

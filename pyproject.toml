@@ -37,7 +37,18 @@ where = ["src"]
 # (containers/sandbox/*, incl. Dockerfile.kali and scripts/) are NOT in the
 # wheel — install.sh clones the repo to build the image, so nothing under
 # containers/sandbox should ever be added to package-data.
-kryonsec = ["templates/*.jinja", "containers/*.json"]
+kryonsec = [
+    "templates/*.jinja",
+    "containers/*.json",
+    # The memory browser's page, style and scripts, plus the brand mark and
+    # the two fonts it serves. These must ship in the wheel: `kryonsec memory`
+    # reads them off disk at request time, and a wheel without them would
+    # serve a page with no face. A glob does not recurse, so the fonts/ and
+    # assets/ subdirectories are named explicitly.
+    "memory/static/*",
+    "memory/static/assets/*",
+    "memory/static/fonts/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
