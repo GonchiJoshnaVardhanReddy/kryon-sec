@@ -23,6 +23,11 @@ from .recon_passive import EngagementGraph
 
 log = logging.getLogger(__name__)
 
+# Bumped whenever the prompt or the node contract changes, so a hypothesis
+# node can be read back against the shape that produced it. v2 is the
+# provenance-aware contract (A1): nodes are "proposed", never "observed".
+PROMPT_VERSION = "hypothesize-v2"
+
 
 class Hypothesis(BaseModel):
     """One vulnerability hypothesis proposed by the LLM."""
@@ -126,14 +131,23 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def propose_hypotheses(
+def propose_hypotheses_with_model(
     cfg: KryonsecConfig,
     prompt: str,
-) -> HypothesisSet:
+) -> tuple[HypothesisSet, str | None]:
     """Ask the LLM for hypotheses, structured. Raises on failure.
 
     Tries Instructor (strict schema) when available; otherwise a JSON
     prompt + Pydantic validation with one repair retry.
+
+    Returns the set and the model that served it, or None when that is
+    not genuinely knowable. The Instructor path calls the provider
+    directly with an explicit model and no fallback configured, so a
+    returned result means that model answered. The JSON path goes through
+    `llm.chat`, which rewrites the model for provider isolation, the
+    secrets gate and same-provider fallback without reporting the
+    substitution — so it returns None rather than naming a configured
+    model that may not be the one that ran.
     """
     system = (
         "You are the hypothesis engine of a purple-team engagement. "
@@ -160,7 +174,7 @@ def propose_hypotheses(
         from litellm import completion
 
         client = instructor.from_litellm(completion)
-        return client.chat.completions.create(
+        result = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -170,6 +184,7 @@ def propose_hypotheses(
             temperature=0.0,
             timeout=60,
         )
+        return result, model
     except ImportError:
         pass  # fall through to the JSON path
     except ValidationError:
@@ -194,7 +209,7 @@ def propose_hypotheses(
 
     text = chat(cfg, messages, model=model)
     try:
-        return HypothesisSet.model_validate(_extract_json(text))
+        return HypothesisSet.model_validate(_extract_json(text)), None
     except (ValueError, ValidationError):
         # one repair retry with the parse error spelled out
         retry = messages + [
@@ -206,7 +221,12 @@ def propose_hypotheses(
             },
         ]
         text = chat(cfg, retry, model=model)
-        return HypothesisSet.model_validate(_extract_json(text))
+        return HypothesisSet.model_validate(_extract_json(text)), None
+
+
+def propose_hypotheses(cfg: KryonsecConfig, prompt: str) -> HypothesisSet:
+    """The hypothesis set alone — the long-standing public signature."""
+    return propose_hypotheses_with_model(cfg, prompt)[0]
 
 
 class HypothesizeSubagent:
@@ -226,6 +246,11 @@ class HypothesizeSubagent:
         self.audit = audit
         # injectable for tests; default does the real LLM call
         self.llm_fn = llm_fn or self._default_llm
+        # the model that served the last proposal, when the provider was
+        # explicit about it. None means "not knowable" — an injected
+        # llm_fn, or the JSON path where llm.chat substitutes silently —
+        # and is written to no node rather than guessed at.
+        self._model_used: str | None = None
         # engagement budget (spec §4.3): LLM states accrue their usage so
         # the orchestrator's budget guard can actually trip on tokens
         self.budget = budget
@@ -234,7 +259,9 @@ class HypothesizeSubagent:
         self.sandbox = sandbox
 
     def _default_llm(self, prompt: str) -> HypothesisSet:
-        return propose_hypotheses(self.cfg, prompt)
+        result, model = propose_hypotheses_with_model(self.cfg, prompt)
+        self._model_used = model
+        return result
 
     def _record_budget(self, prompt: str, result: HypothesisSet) -> None:
         """Approximate token accounting (prompt + response); provider
@@ -254,6 +281,9 @@ class HypothesizeSubagent:
             "findings_nodes": len(self.graph.nodes),
         })
 
+        # last run's model must not be attributed to this run's nodes
+        self._model_used = None
+
         try:
             prompt = render_hypothesize_prompt(self.graph)
             hypothesis_set = self.llm_fn(prompt)
@@ -270,6 +300,18 @@ class HypothesizeSubagent:
         self._record_budget(prompt, hypothesis_set)
 
         for h in hypothesis_set.hypotheses:
+            # A hypothesis is what a model guessed, not something the
+            # engagement observed: the status and provenance say so, so a
+            # reader can never mistake it for recon. `model` is written
+            # only when the provider actually told us which one answered.
+            provenance = {
+                "source_type": "model",
+                "source": "HYPOTHESIZE",
+                "agent": "HYPOTHESIZE",
+                "prompt_version": PROMPT_VERSION,
+            }
+            if self._model_used:
+                provenance["model"] = self._model_used
             node = self.graph.add_node(
                 node_type="hypothesis",
                 label=h.id,
@@ -282,6 +324,8 @@ class HypothesizeSubagent:
                     "tools": h.tools,
                     "confidence": h.confidence,
                 },
+                provenance=provenance,
+                status="proposed",
             )
             self.audit.write({
                 "event": "hypothesis_proposed",

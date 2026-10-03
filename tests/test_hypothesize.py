@@ -292,3 +292,142 @@ def test_hypothesize_records_budget_usage(tmp_path):
     assert result.status == "ok"
     assert budget.used_tokens > 0
     assert budget.exhausted()  # the tiny cap is now actually enforced
+
+
+# --- A1: hypothesis truthfulness (status + provenance) ---
+
+def test_hypothesis_nodes_are_proposed_and_carry_provenance(tmp_path):
+    """A hypothesis is what a model guessed, never something the
+    engagement observed. Before A1 the nodes landed as `observed` with
+    empty provenance, which reads in the graph as recon fact."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+
+    def three_hypotheses(prompt):
+        return HypothesisSet(hypotheses=[
+            Hypothesis(id=f"H{i}", title=f"t{i}", target_asset=f"a{i}",
+                       rationale="r", confidence=0.5)
+            for i in (1, 2, 3)
+        ])
+
+    sub = HypothesizeSubagent(
+        cfg=cfg, graph=graph, audit=audit, llm_fn=three_hypotheses)
+    assert sub.run().status == "ok"
+
+    nodes = graph.by_type("hypothesis")
+    assert [n["label"] for n in nodes] == ["H1", "H2", "H3"]  # every one
+    for node in nodes:
+        assert node["status"] == "proposed"
+        assert node["provenance"]["source_type"] == "model"
+        assert node["provenance"]["source"] == "HYPOTHESIZE"
+        assert node["provenance"]["agent"] == "HYPOTHESIZE"
+        assert node["provenance"]["prompt_version"] == "hypothesize-v2"
+
+
+def test_hypothesis_provenance_claims_no_model_when_unknown(tmp_path):
+    """An injected llm_fn says nothing about which model answered, so no
+    node may name one — a configured model recorded as the actual model
+    would be a claim the run cannot support."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+
+    sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit,
+                              llm_fn=_good_llm)
+    assert sub.run().status == "ok"
+
+    assert "model" not in graph.by_type("hypothesis")[0]["provenance"]
+
+
+def test_hypothesis_provenance_names_the_served_model_when_known(
+        monkeypatch, tmp_path):
+    """When the provider path reports the model that answered, the node
+    records it."""
+    from kryonsec.purple import hypothesize as H
+
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+    served = HypothesisSet(hypotheses=[
+        Hypothesis(id="H1", title="t", target_asset="a", rationale="r")])
+
+    monkeypatch.setattr(
+        H, "propose_hypotheses_with_model",
+        lambda cfg, prompt: (served, "ollama/llama3.1:8b"))
+
+    sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit)
+    assert sub.run().status == "ok"
+
+    assert graph.by_type("hypothesis")[0]["provenance"]["model"] == \
+        "ollama/llama3.1:8b"
+
+
+def test_hypothesis_provenance_does_not_leak_a_previous_runs_model(tmp_path):
+    """HYPOTHESIZE can run again on a re-entered engagement (or the same
+    subagent object reused); the previous run's model must not be
+    attributed to the nodes of a run that never reported one."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+
+    sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit,
+                              llm_fn=_good_llm)
+    sub._model_used = "some-earlier-model"
+    assert sub.run().status == "ok"
+
+    assert "model" not in graph.by_type("hypothesis")[0]["provenance"]
+
+
+def test_hypothesis_properties_survive_the_provenance_change(tmp_path):
+    """A1 adds status/provenance and changes nothing else about the node."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_findings()
+
+    sub = HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit,
+                              llm_fn=_good_llm)
+    assert sub.run().status == "ok"
+
+    node = graph.by_type("hypothesis")[0]
+    assert node["label"] == "H1"
+    assert node["node_type"] == "hypothesis"
+    assert node["properties"] == {
+        "title": "Outdated framework on www host",
+        "target_asset": "www.testcorp.example",
+        "rationale": "Name suggests legacy stack",
+        "cvss_vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "cve": "",
+        "tools": ["nmap", "nikto"],
+        "confidence": 0.7,
+    }
+
+
+def test_json_path_reports_no_model(monkeypatch, tmp_path):
+    """llm.chat rewrites the model for provider isolation, the secrets
+    gate and same-provider fallback without saying so. The JSON path must
+    therefore report None rather than the model it merely asked for."""
+    import builtins
+    import sys
+
+    from kryonsec.purple.hypothesize import propose_hypotheses_with_model
+
+    cfg = KryonsecConfig(home=tmp_path)
+    reply = ('{"hypotheses": [{"id": "H1", "title": "t", '
+             '"target_asset": "a", "rationale": "r"}]}')
+
+    monkeypatch.setitem(sys.modules, "instructor", None)
+    real_import = builtins.__import__
+
+    def no_instructor(name, *args, **kwargs):
+        if name == "instructor":
+            raise ImportError("forced for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_instructor)
+    monkeypatch.setattr(
+        "kryonsec.llm.chat", lambda cfg, messages, model, **kw: reply)
+
+    result, model = propose_hypotheses_with_model(cfg, "prompt text")
+    assert result.hypotheses[0].id == "H1"
+    assert model is None
