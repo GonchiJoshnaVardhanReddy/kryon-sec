@@ -123,6 +123,39 @@ def _store(cfg, graph: EngagementGraph) -> None:
         save_graph(session, graph)
 
 
+def _store_unredacted(cfg, graph: EngagementGraph) -> None:
+    """Store ``graph``'s nodes with the secret still in the row.
+
+    Since Phase 4.3 ``save_graph`` redacts node and edge values on the way
+    in, so a graph that goes through ``_store`` no longer reaches the table
+    with a credential in it — which is the improvement, not a gap.
+
+    The browser's scrubbing is defence in depth and has to be tested against
+    what it defends against: a row that is genuinely still holding a secret.
+    Such rows exist — every engagement stored before Phase 4.3, and anything
+    that writes these tables without going through ``save_graph`` — so this
+    helper writes the rows directly, the way those do.
+    """
+    from kryonsec.storage.models import StmNode
+
+    init_purple_db(cfg)
+    with get_purple_session(cfg) as session:
+        for node in graph.nodes:
+            session.add(StmNode(
+                id=node["id"],
+                engagement_id=graph.engagement_id,
+                subagent=(node.get("provenance") or {}).get("agent") or "unknown",
+                node_type=node["node_type"],
+                label=node["label"],
+                properties=node.get("properties") or {},
+                size_bytes=node.get("size_bytes", 0),
+                canonical_key=node.get("canonical_key"),
+                provenance=node.get("provenance") or {},
+                status=node.get("status") or "observed",
+            ))
+        session.commit()
+
+
 def _write_audit(cfg, engagement_id: str, lines: list[dict]) -> None:
     """A minimal audit log on disk, with the real chain fields the summary
     reader expects."""
@@ -483,7 +516,9 @@ def test_a_hostile_engagement_directory_name_is_ignored(cfg):
 # --- STEP 5e: no secrets in a response -------------------------------------
 
 def test_secret_shaped_values_are_masked(cfg, server):
-    _store(cfg, _graph("eng-one", secret=True))
+    # Stored unredacted on purpose: this is the browser's own defence, and it
+    # must hold for a row the storage boundary did not clean up.
+    _store_unredacted(cfg, _graph("eng-one", secret=True))
     response = call(server, "/api/engagements/eng-one")
     payload = response.json()
 
@@ -501,7 +536,7 @@ def test_masking_keeps_the_response_valid_json(cfg, server):
     """Scrubbing the serialized body would corrupt it — the connection-string
     pattern runs to the next whitespace, which in compact JSON is the
     following key. Values are scrubbed before serialization instead."""
-    _store(cfg, _graph("eng-one", secret=True))
+    _store_unredacted(cfg, _graph("eng-one", secret=True))
     response = call(server, "/api/engagements/eng-one")
     payload = response.json()          # raises if the body is not valid JSON
     assert set(payload) >= {"meta", "graph", "redactions"}

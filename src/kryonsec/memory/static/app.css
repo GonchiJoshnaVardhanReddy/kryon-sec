@@ -274,6 +274,9 @@ input { font-family: var(--tech); }
 .pill-halted { border-color: var(--high); color: var(--high); }
 .pill-incomplete { border-color: var(--medium); color: var(--medium); }
 .pill-failed { border-color: var(--critical); color: var(--critical); }
+/* A run stopped by hand is neither a failure nor a halt — it gets the
+   neutral token so it does not read as an alarm. */
+.pill-interrupted { border-color: var(--low); color: var(--low); }
 
 /* ---------- engagement overview: the landing page's .status-grid ---------- */
 

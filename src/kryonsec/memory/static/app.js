@@ -128,9 +128,13 @@ function notice(text, warn) {
 
 /* ------------------------------------------------------- engagement list */
 
+/* The statuses the data layer can report. `interrupted` is what a run that
+ * was stopped by hand records; `unknown` has no style of its own and falls
+ * back to the plain outlined pill. */
 const STATUS_PILL = {
   complete: 'pill-complete', halted: 'pill-halted',
   incomplete: 'pill-incomplete', failed: 'pill-failed',
+  interrupted: 'pill-interrupted',
 };
 
 function pill(status) {
@@ -202,7 +206,16 @@ function renderEngagementList() {
 /* --------------------------------------------------------- overview panel */
 
 /* Every value here is read from the payload the server just returned.
- * When nothing is loaded the cells say so rather than showing a zero. */
+ * When nothing is loaded the cells say so rather than showing a zero.
+ *
+ * The lifecycle cells read the engagement's recorded ending, so a run that
+ * was interrupted or that died part-way still explains itself. A chain
+ * written before endings were recorded has none of those fields, and the
+ * cells fall back to the events it does have — the note says which.
+ *
+ * An id can host more than one run, and the server answers for the latest
+ * one. The RUN and RUNS cells make that visible; the note says when an
+ * artifact on disk belongs to an earlier run rather than to the one shown. */
 function renderOverview() {
   const grid = $('overview-grid');
   const note = $('overview-note');
@@ -220,34 +233,88 @@ function renderOverview() {
 
   if (!meta) {
     cell('ENGAGEMENT', 'none selected', true);
+    cell('RUN', null);
+    cell('RUNS', null);
     cell('TARGET', null);
     cell('STATUS', null);
+    cell('LAST STATE', null);
     cell('NODES', null);
     cell('RELATIONSHIPS', null);
     cell('GRAPH SAVED', null);
+    cell('CHECKPOINTS', null);
+    cell('REPORT', null);
+    cell('REASON', null);
     note.textContent = 'Pick an engagement on the left.';
     note.classList.remove('warn');
     $('inspector-title').textContent = 'ENGAGEMENT';
     return;
   }
 
+  // No audit chain at all is a different fact from a chain with nothing in
+  // it, and only the first should leave the checkpoint count blank.
+  const hasChain = meta.audit_readable !== null;
+
   cell('ENGAGEMENT', meta.engagement_id, true);
+  // The run the cells below describe. A chain written before run ids existed
+  // has none, and the cell stays blank rather than inventing one.
+  cell('RUN', meta.run_id, true);
+  cell('RUNS', meta.run_count, true);
   cell('TARGET', meta.target, true);
   cell('STATUS', meta.status);
+  cell('LAST STATE', meta.last_state, true);
   cell('NODES', state.nodes.length);
   cell('RELATIONSHIPS', state.links.length);
   cell('GRAPH SAVED', meta.persisted ? 'yes' : 'no');
+  cell('CHECKPOINTS', hasChain ? meta.checkpoints : null);
+  cell('REPORT', meta.report_available ? 'yes' : 'no');
+  cell('REASON', meta.reason || meta.halt_reason);
 
   const bits = [];
   if (!meta.persisted) bits.push('this engagement has no saved graph');
   if (meta.persist_failed) bits.push('the last attempt to save its graph failed');
-  if (meta.status === 'halted' && meta.halt_reason) bits.push('stopped: ' + meta.halt_reason);
+  // A reused id: the graph rows and report.md are replaced in place, so an
+  // artifact the current run did not write is still on disk from an earlier
+  // one — shown, but never as this run's.
+  if (meta.persisted && !meta.graph_current) {
+    bits.push('the saved graph is from an earlier run of this id');
+  }
+  if (meta.report_available && !meta.report_current) {
+    bits.push('the report on disk is from an earlier run of this id');
+  }
+  if (meta.run_count > 1) {
+    bits.push(`this id has been run ${meta.run_count} times — ` +
+              'the cells above describe the most recent run');
+  }
+  if (meta.checkpoint_failures) {
+    bits.push(`${meta.checkpoint_failures} checkpoint(s) failed — ` +
+              'the previously saved graph is intact');
+  }
+  // Only when the cell above is showing the engine's halt code. For a chain
+  // that predates the code, the cell already holds these words.
+  if (meta.reason && meta.halt_reason) bits.push('stopped: ' + meta.halt_reason);
+  if (meta.status === 'interrupted') bits.push('the run was stopped before it finished');
+  if (meta.status === 'failed') bits.push('the run ended with an unhandled error');
+  if (meta.exception_type) bits.push('exception: ' + meta.exception_type);
+  if (meta.audit_readable === false) bits.push('its audit chain could not be read');
+  if (meta.audit_damaged_lines) {
+    bits.push(`${meta.audit_damaged_lines} unreadable line(s) in its audit chain`);
+  }
+  if (meta.status === 'complete' && !meta.report_available) {
+    bits.push('it recorded a report but no report file is present');
+  }
+  if (meta.status === 'incomplete') bits.push('it has no recorded ending');
   if (state.current.redactions) {
     bits.push(`${state.current.redactions} secret-shaped value(s) masked`);
   }
   if (bits.length) {
     note.textContent = bits.join(' — ');
     note.classList.add('warn');
+  } else if (!meta.lifecycle_recorded) {
+    note.textContent = hasChain
+      ? 'No recorded ending in its audit chain — the status above is read from '
+        + 'the events that are present.'
+      : 'No audit chain for this engagement yet.';
+    note.classList.remove('warn');
   } else {
     note.textContent = 'Graph loaded from persisted memory.';
     note.classList.remove('warn');
