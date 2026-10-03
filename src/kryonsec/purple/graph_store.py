@@ -17,12 +17,22 @@ Copilot fallback database.
 
 How an engagement gets here
 ---------------------------
-``purple.runner.persist_graph`` calls ``save_graph`` once, after the
-engagement's loop reaches HALT, and reports any failure through the audit
-chain. Engagement storage itself is chosen by
-``storage.db.get_purple_engine``: the system of record when ``DATABASE_URL``
-is set, otherwise ``~/.kryonsec/purple.db`` — the Copilot fallback database
-never receives engagement tables.
+``purple.runner.persist_graph`` calls ``save_graph`` after the engagement's
+loop reaches HALT, and ``purple.runner.checkpoint_graph`` calls it again
+after every state, so an interrupted run still has a graph on disk
+(Phase 4.3). Both report any failure through the audit chain. Engagement
+storage itself is chosen by ``storage.db.get_purple_engine``: the system of
+record when ``DATABASE_URL`` is set, otherwise ``~/.kryonsec/purple.db`` —
+the Copilot fallback database never receives engagement tables.
+
+Redaction is applied here rather than in either caller, because this is the
+only door into storage. ``_redacted`` walks each node and edge and replaces
+secret-shaped strings with placeholders (spec §6.4, the same detector the
+compaction path uses), so the engagement record never holds a credential —
+including on the boundary checkpoints, which is the copy most likely to
+outlive an interrupted run. Node ids, edges, provenance keys, statuses and
+relationships are untouched: redaction only ever rewrites a *value* that
+matched a secret pattern.
 
 To read a graph back (what the localhost GUI will do)::
 
@@ -40,14 +50,38 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from ..secrets import redact
 from ..storage.models import StmEdge, StmNode
 from .recon_passive import (
     GRAPH_FORMAT_VERSION,
     EngagementGraph,
+    _json_size,
     _parse_timestamp,
 )
 
 __all__ = ["save_graph", "load_graph"]
+
+
+def _redacted(value):
+    """``value`` with secret-shaped strings replaced by placeholders.
+
+    Recursive over the payload rather than over its serialized text: a
+    private-key block holds real newlines here, which JSON would write as
+    ``\\n`` escapes, so a pattern matched against the serialized form would
+    miss it — and rewriting inside serialized text risks producing something
+    that is no longer valid JSON.
+
+    The placeholder map ``redact`` returns is deliberately discarded. It is
+    placeholder -> real value, so keeping it anywhere near the record would
+    defeat the point.
+    """
+    if isinstance(value, str):
+        return redact(value)[0]
+    if isinstance(value, list):
+        return [_redacted(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redacted(item) for key, item in value.items()}
+    return value
 
 
 def _iso(value: datetime | None) -> str:
@@ -79,6 +113,28 @@ def save_graph(session: Session, graph: EngagementGraph) -> tuple[int, int]:
     from the graph must not linger in the table. History is not lost — it
     lives in the append-only audit chain, which this never touches.
 
+    Replacing is also what makes the rows *one run's*. An engagement id can
+    be reused (``--id``), so the second run's save replaces the first run's
+    graph rather than mixing with it — but it also means the rows on disk
+    belong to whichever run saved last, which is not necessarily the run the
+    browser is describing. Phase 4.5B resolves that from the chain, not from
+    a column: each caller announces a successful save with
+    ``checkpoint_written`` / ``graph_persisted``, so the run whose segment
+    holds the last successful announcement is the run the rows belong to
+    (``memory.data``). Nothing here is run-keyed, and no schema change was
+    needed to say whose graph this is.
+
+    Replacing rather than merging is also what makes the write atomic, and
+    that is the property the boundary checkpoints depend on: the whole
+    delete-and-insert is one transaction committed once at the end, so a
+    crash part-way through it rolls back to the previous graph rather than
+    leaving half of a new one (Phase 4.3).
+
+    Secret-shaped strings in node and edge values are replaced with
+    placeholders on the way in — see ``_redacted``. Ids, types, labels that
+    match no pattern, statuses and relationships are unchanged, so a graph
+    with nothing sensitive in it round-trips byte for byte.
+
     Returns ``(node_count, edge_count)``. Commits before returning.
     """
     engagement_id = graph.engagement_id
@@ -91,15 +147,28 @@ def save_graph(session: Session, graph: EngagementGraph) -> tuple[int, int]:
         StmNode.engagement_id == engagement_id
     ).delete(synchronize_session=False)
 
-    for node in graph.nodes:
+    for raw in graph.nodes:
+        # Redacted before anything is read out of it, so the canonical_key
+        # fallback is derived from the label that is actually stored rather
+        # than from one that no longer exists.
+        node = _redacted(raw)
+        properties = node.get("properties") or {}
+        size = node.get("size_bytes", 0)
+        if properties != (raw.get("properties") or {}):
+            # Redaction shrank the payload, so the recorded size no longer
+            # describes what is stored. Compared rather than recomputed
+            # unconditionally: size_bytes is the graph's own accounting, and
+            # rewriting it for every node would change rows that have
+            # nothing to do with redaction.
+            size = _json_size(properties, f"node {node['id']!r} properties")
         session.add(StmNode(
             id=node["id"],
             engagement_id=engagement_id,
             subagent=_subagent_of(node),
             node_type=node["node_type"],
             label=node["label"],
-            properties=node.get("properties") or {},
-            size_bytes=node.get("size_bytes", 0),
+            properties=properties,
+            size_bytes=size,
             created_at=_parse_timestamp(node.get("created_at")),
             canonical_key=node.get("canonical_key")
             or f"{node['node_type']}:{node['label']}",
@@ -112,17 +181,22 @@ def save_graph(session: Session, graph: EngagementGraph) -> tuple[int, int]:
     # that ordering ours rather than the unit-of-work's.
     session.flush()
 
-    for edge in graph.edges:
+    for raw in graph.edges:
+        edge = _redacted(raw)
+        properties = edge.get("properties") or {}
+        size = edge.get("size_bytes", 0)
+        if properties != (raw.get("properties") or {}):
+            size = _json_size(properties, f"edge {edge['id']!r} properties")
         session.add(StmEdge(
             id=edge["id"],
             engagement_id=engagement_id,
             source_node_id=edge["source_node_id"],
             relationship=edge["relationship"],
             target_node_id=edge["target_node_id"],
-            properties=edge.get("properties") or {},
+            properties=properties,
             provenance=edge.get("provenance") or {},
             status=edge.get("status") or "observed",
-            size_bytes=edge.get("size_bytes", 0),
+            size_bytes=size,
             created_at=_parse_timestamp(edge.get("created_at")),
         ))
 

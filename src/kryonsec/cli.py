@@ -611,7 +611,14 @@ def _run_purple(
     # the console shows what is running as it runs, so the inventory is no
     # longer printed anywhere. STATES is imported where it is used, below.
     from .engagement_id import is_valid_engagement_id
-    from .purple.runner import persist_graph, sandbox_available, start_engagement
+    from .purple.runner import (
+        persist_graph,
+        record_engagement_ending,
+        safe_exception_type,
+        safe_halt_code,
+        sandbox_available,
+        start_engagement,
+    )
     from .purple.zonea import validate_target
 
     try:
@@ -684,41 +691,91 @@ def _run_purple(
     # of the engagement line, which is exactly the unfiltered-log look this
     # console replaces.
     log_handler, debug_log = attach_purple_logging(cfg.home, engagement_id, ui)
+
+    # The engagement proper spans start_engagement -> orch.run ->
+    # persist_graph, and this is the only boundary that covers every way it
+    # can end: a clean finish, a halt with a reason, an unhandled exception,
+    # and Ctrl+C. The inner try/finally is the existing UI teardown, left
+    # exactly where it was so the live panel is down before anything else
+    # runs — and so it still runs when start_engagement itself fails.
+    #
+    # The terminal event is written from the `finally` and from nowhere else,
+    # so there is one writer and one place to reason about. That means it is
+    # reached with an exception in flight, which is safe only because
+    # record_engagement_ending never raises and never masks.
+    orch = None
+    outcome: str | None = None
+    reason: str | None = None
+    exception_type: str | None = None
     try:
-        orch, audit, graph = start_engagement(
-            cfg, engagement_id, target=target, progress=_progress,
-            code_folder=code_folder,
-        )
-        # Two existing hooks, no new plumbing: the orchestrator announces
-        # state transitions (before the subagent is built, so HUMAN_REVIEW's
-        # prompt owns the terminal first), and the audit chain announces
-        # tool activity.
-        ui.graph = graph
-        orch.on_state = ui.on_state
-        audit.add_observer(ui.on_audit)
+        try:
+            orch, audit, graph = start_engagement(
+                cfg, engagement_id, target=target, progress=_progress,
+                code_folder=code_folder,
+            )
+            # Two existing hooks, no new plumbing: the orchestrator announces
+            # state transitions (before the subagent is built, so HUMAN_REVIEW's
+            # prompt owns the terminal first), and the audit chain announces
+            # tool activity.
+            ui.graph = graph
+            orch.on_state = ui.on_state
+            audit.add_observer(ui.on_audit)
 
-        console.print(
-            f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
-            f"target={target}")
-        console.print()
-        ui.started_at = time.monotonic()
-        ui.start()
-        completed = orch.run()
+            console.print(
+                f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
+                f"target={target}")
+            console.print()
+            ui.started_at = time.monotonic()
+            ui.start()
+            completed = orch.run()
+        finally:
+            ui.stop()
+            detach_purple_logging(log_handler)
+
+        # After the panel is down, so the warning is a plain readable line
+        # and not something the live display has to paint around. An
+        # interrupted engagement still never reaches this — the re-raise
+        # below leaves the function — so its graph is still not persisted.
+        # What Phase 4.2 added is that the interruption itself is now
+        # recorded before it goes.
+        graph_saved = persist_graph(cfg, engagement_id, graph, audit)
+        if not graph_saved:
+            err_console.print(
+                "[yellow]graph memory not saved — the engagement itself is "
+                "complete (audit chain, evidence and report are on disk); "
+                "see the debug log[/yellow]")
+
+        # Read after persist_graph, not before: a crash while saving the
+        # graph is a failure of the run, and reading the halt reason earlier
+        # would have already labelled it a clean finish. Interruption and
+        # failure are the exception handlers' to decide, not this line's.
+        outcome = "halted" if orch.halt_reason else "completed"
+        reason = safe_halt_code(orch.halt_reason)
+    except KeyboardInterrupt:
+        # Recorded, then re-raised. The operator asked for the run to stop,
+        # and it still stops — same traceback, same exit status as before
+        # this phase existed.
+        outcome, reason = "interrupted", "keyboard_interrupt"
+        raise
+    except BaseException as exc:
+        outcome, reason = "failed", "unhandled_exception"
+        exception_type = safe_exception_type(exc)
+        raise
     finally:
-        ui.stop()
-        detach_purple_logging(log_handler)
-
-    # After the panel is down, so the warning is a plain readable line and
-    # not something the live display has to paint around. An interrupted
-    # engagement (Ctrl+C, which propagates out of orch.run()) never reaches
-    # this: there is no checkpoint mechanism to resume one from, so it is
-    # not persisted — see the Phase 2 report.
-    graph_saved = persist_graph(cfg, engagement_id, graph, audit)
-    if not graph_saved:
-        err_console.print(
-            "[yellow]graph memory not saved — the engagement itself is "
-            "complete (audit chain, evidence and report are on disk); "
-            "see the debug log[/yellow]")
+        # orch is None only when start_engagement itself failed, which is
+        # exactly "no state was ever entered". Otherwise the loop appends to
+        # `completed` before each state runs, so the last entry is the last
+        # state reached — including one that halted, and including one that
+        # was interrupted part-way through.
+        entered = list(orch.completed) if orch is not None else []
+        record_engagement_ending(
+            cfg, engagement_id,
+            outcome=outcome or "failed",
+            reason=reason,
+            last_state=entered[-1] if entered else None,
+            states_entered=len(entered),
+            exception_type=exception_type,
+        )
 
     _print_purple_summary(
         cfg, engagement_id, target, completed, orch, audit, graph,

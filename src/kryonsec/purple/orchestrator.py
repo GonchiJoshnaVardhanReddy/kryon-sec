@@ -102,6 +102,13 @@ class PurpleOrchestrator:
     # Progress callback: called with the state name right before it runs.
     # Lets the CLI show which agent is working without knowing the loop.
     on_state: Callable[[str], None] | None = None
+    # Called with the state name once its subagent has returned and before
+    # the transition. That is the one moment the graph is quiescent — the
+    # state's work is finished and nothing is mid-write — which is what
+    # makes it the boundary a durable checkpoint is consistent at
+    # (Phase 4.3). Notified, never consulted: it cannot influence a
+    # transition, and a listener that raises is logged and ignored.
+    on_state_complete: Callable[[str], None] | None = None
 
     def run(self) -> list[str]:
         """Run the loop to HALT. Returns the list of completed states."""
@@ -149,6 +156,26 @@ class PurpleOrchestrator:
             if result.status == "halted" and result.halt_reason:
                 self.halt_reason = result.halt_reason
 
+            # After the state's work, before the transition. self.state still
+            # names the state that just ran, and the graph it produced is
+            # complete, so a listener sees a consistent boundary.
+            self._notify_state_complete()
+
             self.state = next_state(self.state, result)
 
         return self.completed
+
+    def _notify_state_complete(self) -> None:
+        """Tell a listener the state finished. Never raises.
+
+        Same contract as the ``on_state`` call above, for the same reason:
+        this runs inside the deterministic loop, so a listener must not be
+        able to change where the engagement goes next — or whether it gets
+        there at all.
+        """
+        if self.on_state_complete is None:
+            return
+        try:
+            self.on_state_complete(self.state)
+        except Exception:
+            log.exception("state-complete callback error (ignored)")
