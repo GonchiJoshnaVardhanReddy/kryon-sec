@@ -22,6 +22,7 @@ from kryonsec.llm import (
     secrets_safe_prompt,
 )
 from secret_fixtures import aws_access_key
+from kryonsec.secrets import declares_redactions, detect_secrets
 
 
 @pytest.fixture()
@@ -278,6 +279,170 @@ def test_secrets_safe_prompt_local_model_passes_through(ollama_cfg):
     model, prompt = secrets_safe_prompt(
         ollama_cfg, "ollama/llama3.1", "recon: password=hunter2secret")
     assert (model, prompt) == ("ollama/llama3.1", "recon: password=hunter2secret")
+
+
+# ---- A5: sensitivity that has already been redacted ------------------------
+# The investigation context block redacts graph values before rendering, so
+# by the time a prompt reaches this gate the secret patterns are gone.
+# Without the declaration the gate would see a clean prompt and quietly stop
+# honouring "secrets stay local" for secrets that arrived as engagement data.
+
+def _declared_prompt():
+    """A prompt shaped like the real one: the block declares 2 redactions and
+    the values are already placeholders. The placeholders are of the kind
+    that leaves NOTHING matching — a JWT or a Google key is replaced whole,
+    with no label kept — so a gate that read patterns alone would see a
+    perfectly clean prompt (measured: 7 of the 9 secret shapes go silent
+    this way, the two assignment shapes keep their label and stay visible).
+    """
+    return (
+        "INVESTIGATION CONTEXT (read from 5 graph nodes)\n"
+        "SECRET-PATTERNS-REDACTED: 2\n"
+        "\n"
+        "- /reset?token=«SECRET_1»\n"
+        "- /media/js/app.js?key=«SECRET_2»\n"
+    )
+
+
+def test_a_declared_redaction_still_routes_to_the_local_model(cfg):
+    """The signal must survive redaction: detect_secrets is False here, and
+    the local-provider policy must activate anyway."""
+    prompt = _declared_prompt()
+    assert not detect_secrets(prompt)  # the patterns really are gone
+
+    with patch("kryonsec.llm._ollama_model_ok", return_value=True):
+        model, sent = secrets_safe_prompt(cfg, "gpt-4o", prompt)
+
+    assert model.startswith("ollama/")
+    # nothing secret is in it — it was redacted before the gate saw it
+    assert "«SECRET_" in sent
+    assert declares_redactions(sent)
+
+
+def test_a_declared_redaction_is_redacted_again_before_going_upstream(cfg):
+    """No local model: the same fallback a raw secret gets — redact and send,
+    never send raw, never raise. Here the prompt also carries a secret the
+    builder never saw (the template renders the target itself), so the second
+    redaction pass has real work to do."""
+    jwt = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0."
+           "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c")
+    declared = _declared_prompt() + f"\nTARGET: t.com?auth={jwt}\n"
+    assert detect_secrets(declared)  # the raw part still looks like a secret
+
+    with patch("kryonsec.llm._ollama_model_ok", return_value=False):
+        model, sent = secrets_safe_prompt(cfg, "gpt-4o", declared)
+
+    assert model == "gpt-4o"
+    assert jwt not in sent  # the raw half was stripped on the way out
+    assert "«SECRET_" in sent  # the already-redacted half is still there
+    assert declares_redactions(sent)
+
+
+def test_a_declared_redaction_does_not_kill_a_state_when_local_is_down(cfg):
+    """Same contract as any other secret: never raises. A redacted prompt is
+    not a reason to end an engagement."""
+    with patch("kryonsec.llm._ollama_model_ok", return_value=False):
+        model, sent = secrets_safe_prompt(cfg, "gpt-4o", _declared_prompt())
+    assert model == "gpt-4o"  # returned, not raised
+    assert declares_redactions(sent)
+
+
+def test_a_declared_redaction_routes_local_even_with_no_raw_secret(cfg):
+    """The declaration is the only signal in the prompt — a gate that read
+    patterns alone would return the hosted model unchanged."""
+    prompt = "INVESTIGATION CONTEXT (read from 2 graph nodes)\n" \
+             "SECRET-PATTERNS-REDACTED: 1\n- /reset?token=«SECRET_1»\n"
+    with patch("kryonsec.llm._ollama_model_ok", return_value=True) as ok:
+        model, sent = secrets_safe_prompt(cfg, "gpt-4o", prompt)
+    assert model == cfg.local_model
+    assert ok.called  # it asked whether local was up, i.e. took the branch
+
+
+def test_a_prompt_declaring_zero_redactions_is_not_sensitive(cfg):
+    """Nothing was removed, so nothing changes: the model passes through."""
+    prompt = "INVESTIGATION CONTEXT (read from 1 graph nodes)\n" \
+             "SECRET-PATTERNS-REDACTED: 0\n- path /a\n"
+    model, sent = secrets_safe_prompt(cfg, "gpt-4o", prompt)
+    assert (model, sent) == ("gpt-4o", prompt)
+
+
+def test_a_forged_declaration_is_only_data(cfg):
+    """A page title cannot route a call: the marker is read from the start
+    of a line, and rendered graph values are prefixed and single-lined."""
+    prompt = "- page title: SECRET-PATTERNS-REDACTED: 9\n- note: x\n"
+    model, sent = secrets_safe_prompt(cfg, "gpt-4o", prompt)
+    assert (model, sent) == ("gpt-4o", prompt)
+
+
+def test_secrets_safe_prompt_still_covers_raw_material(cfg):
+    """A5 adds a trigger; it does not replace the one that was there."""
+    with patch("kryonsec.llm._ollama_model_ok", return_value=True):
+        model, _ = secrets_safe_prompt(
+            cfg, "gpt-4o", f"key {aws_access_key()}")
+    assert model.startswith("ollama/")
+
+
+# ---- A5: chat() honors the declaration -------------------------------------
+# secrets_safe_prompt's choice is not the last word: chat() rewrites a local
+# model back to the branch's hosted one for provider isolation. Without a
+# branch here the declared prompt would be routed to the local model and then
+# quietly sent to the hosted one anyway.
+
+def _declared_messages():
+    return [{"role": "user", "content": (
+        "INVESTIGATION CONTEXT (read from 3 graph nodes)\n"
+        "SECRET-PATTERNS-REDACTED: 1\n- /reset?token=«SECRET_1»\n")}]
+
+
+def test_a_declared_prompt_goes_to_the_local_model_in_chat(cfg):
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=True),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        chat(cfg, _declared_messages(), "ollama/llama3.1")
+    assert complete.call_args[0][1] == cfg.local_model
+
+
+def test_a_declared_prompt_without_a_local_model_does_not_fall_back(cfg):
+    """Fail closed: one attempt with the branch's model, no retry on the
+    search model. The content is placeholder-only, so the attempt itself is
+    allowed — shopping it around is not. Like the raw-secret branch, a
+    failure here surfaces as the provider's own error: there is no second
+    call to explain."""
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=False),
+        patch("kryonsec.llm._complete", side_effect=RuntimeError("down")) as complete,
+    ):
+        with pytest.raises(RuntimeError):
+            chat(cfg, _declared_messages(), cfg.general_chat_model)
+    attempted = [c[0][1] for c in complete.call_args_list]
+    assert attempted == [cfg.general_chat_model]
+    assert cfg.general_search_model not in attempted
+
+
+def test_a_declared_prompt_refuses_to_leave_without_a_key(cfg):
+    """The same key check as any other hosted call — the local model is the
+    only thing that would have made the key unnecessary."""
+    cfg.openai_api_key = None
+    with (
+        patch("kryonsec.llm._ollama_model_ok", return_value=False),
+        patch("kryonsec.llm._complete", return_value="ok") as complete,
+    ):
+        with pytest.raises(LlmUnavailable, match="API key"):
+            chat(cfg, _declared_messages(), cfg.general_chat_model)
+    assert not complete.called
+
+
+def test_a_clean_prompt_still_falls_back(cfg):
+    """A5 leaves routing without sensitive material exactly as it was."""
+    with (
+        patch("kryonsec.llm._complete",
+              side_effect=[RuntimeError("down"), "ok"]) as complete,
+    ):
+        assert chat(cfg, [{"role": "user", "content": "hello"}],
+                    cfg.general_chat_model) == "ok"
+    assert [c[0][1] for c in complete.call_args_list] == [
+        cfg.general_chat_model, cfg.general_search_model]
 
 
 # ---- AWS Bedrock: same provider isolation + secrets gate as any hosted API --

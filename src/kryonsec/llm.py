@@ -417,6 +417,22 @@ def _secrets_in_messages(messages: list[dict]) -> bool:
     return False
 
 
+def _declared_redactions_in_messages(messages: list[dict]) -> bool:
+    """True when any message declares it was already redacted (A5).
+
+    The complement of :func:`_secrets_in_messages`: material that has been
+    through ``redact()`` no longer matches a pattern, so the declaration the
+    redacting builder left is the only evidence left that it was sensitive.
+    """
+    from .secrets import declares_redactions
+
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and declares_redactions(content):
+            return True
+    return False
+
+
 def secrets_safe_model(
     cfg: KryonsecConfig, model: str, messages: list[dict]
 ) -> str:
@@ -453,17 +469,41 @@ def secrets_safe_prompt(
     the prompt is REDACTED instead — redacted material may go upstream,
     raw secrets never (CLAUDE.md rule 4). Never raises, so a false-
     positive secret pattern in recon data cannot kill an LLM state.
-    """
-    from .secrets import detect_secrets, redact
 
-    if model.startswith("ollama/") or not detect_secrets(prompt):
+    A prompt is sensitive in two ways. ``detect_secrets`` catches material
+    that is still raw. ``declares_redactions`` catches material that was
+    already redacted before it reached this function — the investigation
+    context block (A2/A3/A4) redacts graph values as it builds, so its
+    secret patterns are gone by the time the gate runs; the count it leaves
+    behind in the block is the signal (A5). Both are counted here and
+    nowhere else: the raw material never reaches this function in the
+    declared case, and a count never identifies anything.
+
+    Nothing raw can reach a hosted provider in either branch. The local
+    branch hands over the prompt as it arrived — for a declared prompt that
+    is already placeholder-only, and for a raw one the local model is the
+    sanctioned destination (it never leaves the machine). The upstream
+    branch runs ``redact`` again, so a secret this function has never seen
+    is stripped on the way out too.
+    """
+    from .secrets import declared_redaction_count, detect_secrets, redact
+
+    if model.startswith("ollama/"):
         return model, prompt
+    declared = declared_redaction_count(prompt)
+    if declared == 0 and not detect_secrets(prompt):
+        return model, prompt
+    # Logged as a kind and a count — never the material that triggered it.
+    detail = (f"{declared} declared redaction(s)" if declared
+              else "a raw secret pattern")
     if _ollama_model_ok(cfg, cfg.local_model):
-        log.warning("secrets detected — routing this call to the local model (spec §6.4)")
+        log.warning(
+            "secrets detected (%s) — routing this call to the local model "
+            "(spec §6.4)", detail)
         return cfg.local_model, prompt
     log.warning(
-        "secrets detected and no local model up — sending a redacted "
-        "prompt upstream (spec §6.4)")
+        "secrets detected (%s) and no local model up — sending a redacted "
+        "prompt upstream (spec §6.4)", detail)
     return model, redact(prompt)[0]
 
 
@@ -510,6 +550,10 @@ def chat(
 
     local_only=True restricts every attempt to the local model — used for
     compaction with secrets (spec §6.4: never a third-party provider).
+
+    A prompt that declares it was already redacted (A5) is not raw, so it is
+    allowed upstream when no local model is up — but it still takes the local
+    route when one is, and it never gets the same-provider retry.
     """
     if local_only:
         # Try the local model; a dead local is a hard error, not a fallback.
@@ -528,6 +572,13 @@ def chat(
     # override the branch's hosted choice with the local model — the one
     # sanctioned cross-provider move (secrets never leave the machine).
     secrets_present = _secrets_in_messages(messages)
+    # A5: material that was redacted BEFORE it reached us carries no pattern
+    # to find, only the count its builder declared. It is not raw — the
+    # placeholders may travel — but it is still sensitive material, so it
+    # takes the local route while one is up, exactly like a raw secret.
+    redactions_declared = (
+        not secrets_present and _declared_redactions_in_messages(messages)
+    )
 
     if cfg.provider == "ollama":
         # ---- ollama config: Ollama only, ever ---------------------------
@@ -551,11 +602,24 @@ def chat(
         # never send the hosted call; local model or hard refusal
         model = secrets_safe_model(cfg, model, messages)
         return _complete(cfg, model, messages, **kwargs)
+    if redactions_declared and _ollama_model_ok(cfg, cfg.local_model):
+        log.warning(
+            "prompt declares redacted secret material — routing this call to "
+            "the local model (spec §6.4)")
+        return _complete(cfg, cfg.local_model, messages, **kwargs)
     if not getattr(cfg, hosted.key_attr, None):
         raise LlmUnavailable(
             f"{hosted.label} is the configured provider but no API key is "
             "set — run `kryonsec setup`"
         )
+    if redactions_declared:
+        # The content is placeholder-only, so it may go upstream — but a
+        # sensitive prompt gets one attempt, not the same-provider retry
+        # below. Fail closed rather than shop it around.
+        log.warning(
+            "prompt declares redacted secret material and no local model is "
+            "up — sending it upstream redacted, with no fallback (spec §6.4)")
+        return _complete(cfg, model, messages, **kwargs)
     last_error: BaseException | None = None
     try:
         return _complete(cfg, model, messages, **kwargs)

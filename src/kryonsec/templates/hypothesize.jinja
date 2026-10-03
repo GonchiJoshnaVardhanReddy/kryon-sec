@@ -44,6 +44,11 @@ How to read that evidence:
   evidence: it tells you what could not be shown. Do not assume a category
   is empty just because the block is short — and where the evidence is
   silent or missing, say so in the rationale rather than filling the gap.
+- A value shown as «SECRET_n» was replaced by the engine: its text matched
+  a secret pattern and is NOT in this prompt. A line reading
+  SECRET-PATTERNS-REDACTED: n says how many such values were replaced.
+  Reason about the parameter, path or finding around the placeholder; never
+  guess at or reconstruct the hidden value, and never report it as known.
 
 Your task:
 1. For each asset above, hypothesize plausible vulnerabilities (max 10 total).

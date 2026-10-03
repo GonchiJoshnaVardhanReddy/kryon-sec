@@ -1,6 +1,13 @@
 """Tests for secret detection/redaction (spec §6.4)."""
 
-from kryonsec.secrets import detect_secrets, redact, restore
+from kryonsec.secrets import (
+    REDACTION_DECLARATION,
+    declared_redaction_count,
+    declares_redactions,
+    detect_secrets,
+    redact,
+    restore,
+)
 from secret_fixtures import google_api_key, private_key_block, slack_token
 
 
@@ -86,3 +93,46 @@ def test_credential_labels_do_not_false_positive():
         "What is the CVSS score for CVE-2021-44228?",
     ):
         assert not detect_secrets(text), f"false positive on: {text!r}"
+
+
+# ---- the redaction declaration (A5) ----------------------------------------
+# Redacting a prompt destroys the evidence the routing gate tests for: the
+# patterns are gone, so detect_secrets() is False and a secret that arrived
+# as engagement data stops activating the local-provider policy. The
+# declaration the redacting builder leaves behind is that signal.
+
+def test_a_declaration_is_read_with_its_count():
+    text = f"{REDACTION_DECLARATION}: 3\nrest of the prompt\n"
+    assert declares_redactions(text)
+    assert declared_redaction_count(text) == 3
+    # the declaration is the whole point: the patterns are already gone
+    assert not detect_secrets(text)
+
+
+def test_no_declaration_means_no_declaration():
+    assert not declares_redactions("nothing was redacted here")
+    assert declared_redaction_count("nothing was redacted here") == 0
+
+
+def test_a_declaration_of_zero_is_not_a_declaration():
+    """Nothing was removed, so nothing must be routed around."""
+    assert not declares_redactions(f"{REDACTION_DECLARATION}: 0")
+
+
+def test_a_declaration_mid_line_is_not_a_declaration():
+    """Untrusted text must not be able to forge the signal. Every line of
+    rendered graph content is prefixed with "- ", so a value can only ever
+    mention the marker inside a line — never start one with it."""
+    assert not declares_redactions(f"- page title: {REDACTION_DECLARATION}: 9")
+    assert not declares_redactions(f"the note says {REDACTION_DECLARATION}: 9 ok")
+    # ...and a trailing suffix on the line is not a count either
+    assert not declares_redactions(f"{REDACTION_DECLARATION}: 9 and more text")
+
+
+def test_the_declaration_carries_no_value():
+    """It is a count. Whatever was redacted cannot be read back out of it."""
+    secret = "supersecret123"
+    redacted, mapping = redact(f"password={secret}")
+    declared = f"{REDACTION_DECLARATION}: {len(mapping)}\n{redacted}"
+    assert declares_redactions(declared)
+    assert secret not in declared

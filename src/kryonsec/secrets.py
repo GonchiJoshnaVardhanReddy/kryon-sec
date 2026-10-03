@@ -117,3 +117,50 @@ def restore(text: str, mapping: dict[str, str]) -> str:
     for placeholder, value in mapping.items():
         text = text.replace(placeholder, value)
     return text
+
+
+# --- the redaction declaration --------------------------------------------
+#
+# A prompt assembled from material that has ALREADY been through redact()
+# cannot be tested for secret patterns: the patterns are gone. Without
+# something else in the text, llm.secrets_safe_prompt() would see a clean
+# prompt and quietly stop honouring "secrets stay local" for secrets that
+# arrived as engagement data — the gate would still hold for raw text, and
+# silently not hold for redacted text.
+#
+# So the builder that redacts leaves this declaration behind. It is computed
+# from the redaction itself (redact() returns the mapping, the builder counts
+# it), it is a separate signal carried alongside the text, and it encodes a
+# COUNT — never a value, never a fragment, nothing restorable.
+#
+# It is read from the START of a line. Every line of untrusted content the
+# context builder renders is prefixed with "- ", so no graph value can begin
+# a line with the marker: the signal cannot be forged from engagement data,
+# and a value that merely mentions the words is still just data.
+REDACTION_DECLARATION = "SECRET-PATTERNS-REDACTED"
+
+# Deliberately \d+ and not [1-9]\d*: the count only records, the check below
+# decides. A declaration of zero is not a declaration.
+_REDACTION_DECLARATION_RE = re.compile(
+    rf"^{re.escape(REDACTION_DECLARATION)}:[ \t]*(\d+)[ \t]*$", re.MULTILINE
+)
+
+
+def declared_redaction_count(text: str) -> int:
+    """How many redactions ``text`` declares, or 0 when it declares none.
+
+    A count, so it is safe to log: it says that sensitive material was
+    present, never what it was.
+    """
+    match = _REDACTION_DECLARATION_RE.search(text)
+    return int(match.group(1)) if match else 0
+
+
+def declares_redactions(text: str) -> bool:
+    """True when ``text`` says secret-shaped values were redacted out of it.
+
+    The converse of :func:`detect_secrets` for material that has already
+    been through :func:`redact`: the patterns are gone, so the only evidence
+    left that the material was sensitive is the producer's own declaration.
+    """
+    return declared_redaction_count(text) > 0

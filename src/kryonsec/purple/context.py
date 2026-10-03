@@ -30,6 +30,10 @@ Wired into the hypothesis prompt in A4: ``render_hypothesize_prompt``
 renders a block with :func:`build_investigation_context` and passes the
 text into ``hypothesize.jinja``, which is now the only door graph content
 comes through. Building a context still writes nothing.
+
+A5 adds one line to the block when something was redacted —
+``SECRET-PATTERNS-REDACTED: n`` — because redaction destroys the evidence
+the provider-routing gate tests for. See :data:`..secrets.REDACTION_DECLARATION`.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
-from ..secrets import redact
+from ..secrets import REDACTION_DECLARATION, redact
 from .recon_passive import EngagementGraph
 
 # --- limits ---------------------------------------------------------------
@@ -50,8 +54,12 @@ from .recon_passive import EngagementGraph
 DEFAULT_MAX_TOKENS = 800
 # The block cannot be rendered at all below this: the header that marks the
 # data as data is itself part of the block, and a budget that cannot hold it
-# would silently produce an over-budget context.
-MIN_MAX_TOKENS = 192
+# would silently produce an over-budget context. Measured worst case at the
+# floor — one truncated category, its longest heading, and a 300-char line
+# retained — is 222 tokens, with or without the A5 redaction declaration
+# (the declaration is part of the frame: it is the signal that survives
+# redaction, so the fit may not shrink it away). 256 holds that with room.
+MIN_MAX_TOKENS = 256
 # Per category, before the token fit. Certificate transparency alone can
 # return thousands of names; the point of the cap is that one noisy source
 # cannot consume the whole block.
@@ -472,6 +480,17 @@ def _render(context: InvestigationContext) -> str:
     """The block. Pure: same context, same bytes."""
     lines = [
         f"INVESTIGATION CONTEXT (read from {context.nodes_read} graph nodes)",
+    ]
+    # The block redacts before it writes, so by the time a caller holds this
+    # text the secret patterns are gone — and llm.secrets_safe_prompt() would
+    # have nothing left to see. This declaration is what is left of that
+    # signal: a count, never a value, read from the start of its own line and
+    # therefore not forgeable by any value rendered below (each of those is
+    # prefixed with "- "). Without it a graph secret would silently stop
+    # activating the local-provider policy.
+    if context.redactions:
+        lines.append(f"{REDACTION_DECLARATION}: {context.redactions}")
+    lines += [
         "",
         *_FRAME,
     ]

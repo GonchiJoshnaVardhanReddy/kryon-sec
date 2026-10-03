@@ -22,6 +22,7 @@ from kryonsec.purple.hypothesize import (
     render_hypothesize_prompt,
 )
 from kryonsec.purple.recon_passive import EngagementGraph
+from kryonsec.secrets import REDACTION_DECLARATION, detect_secrets
 
 
 def _graph_with_findings():
@@ -691,3 +692,188 @@ def test_the_model_still_cannot_approve_its_own_hypotheses(tmp_path):
 
     assert result.status == "ok"
     assert sandbox.spawned == []
+
+
+# --- A5: sensitivity survives redaction, end to end ------------------------
+# The block redacts graph values before rendering, which is what makes the
+# prompt safe to send — and also what removes the evidence llm's gate looks
+# for. These tests run the whole path for real: render -> propose -> chat ->
+# provider, with only the network call stubbed.
+
+# A JWT is replaced whole (no label survives), so the rendered block has
+# nothing left that matches a secret pattern — the case where the gate used
+# to go blind. 7 of the 9 secret shapes behave this way.
+_JWT = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c")
+
+_REPLY = ('{"hypotheses": [{"id": "H1", "title": "t", "target_asset": "/a", '
+          '"rationale": "r"}]}')
+
+
+def _hosted_cfg(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.provider = "openai"
+    cfg.general_chat_model = "gpt-4o"
+    cfg.general_search_model = "gpt-4o-mini"
+    cfg.openai_api_key = "sk-test"
+    return cfg
+
+
+def _graph_with_a_jwt():
+    graph = _graph_with_findings()
+    graph.add_node("path", f"/reset?token={_JWT}", {"source": "wayback"})
+    return graph
+
+
+def _capture_complete(monkeypatch, reply=_REPLY):
+    """Stub the provider call only — routing itself runs for real."""
+    calls = []
+
+    def fake_complete(cfg, model, messages, **kw):
+        calls.append({"model": model, "messages": messages})
+        return reply
+
+    monkeypatch.setattr("kryonsec.llm._complete", fake_complete)
+    return calls
+
+
+def test_a_secret_in_graph_data_activates_the_local_provider_policy(
+        monkeypatch, tmp_path):
+    """The A4 report's routing concern: the builder redacts, so detect_secrets
+    is False and the local-provider policy never fires for a graph secret.
+    The declaration is what makes it fire again."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    calls = _capture_complete(monkeypatch)
+
+    prompt = render_hypothesize_prompt(_graph_with_a_jwt())
+    assert not detect_secrets(prompt)  # nothing left for the old trigger
+    propose_hypotheses_with_model(cfg, prompt)
+
+    assert len(calls) == 1
+    assert calls[0]["model"] == cfg.local_model  # not gpt-4o-mini
+
+
+def test_the_raw_secret_never_reaches_the_provider(monkeypatch, tmp_path):
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    calls = _capture_complete(monkeypatch)
+
+    propose_hypotheses_with_model(cfg, render_hypothesize_prompt(_graph_with_a_jwt()))
+
+    sent = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert _JWT not in sent
+
+
+def test_the_placeholder_may_reach_the_provider(monkeypatch, tmp_path):
+    """Redaction replaces, it does not delete: the model still sees that a
+    token parameter exists, and the declaration says how many were replaced."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    calls = _capture_complete(monkeypatch)
+
+    propose_hypotheses_with_model(cfg, render_hypothesize_prompt(_graph_with_a_jwt()))
+
+    sent = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert "«SECRET_" in sent
+    assert "/reset?token=" in sent
+    assert REDACTION_DECLARATION in sent
+
+
+def test_a_secret_in_the_target_cannot_go_upstream_unredacted(
+        monkeypatch, tmp_path):
+    """The template renders the target itself, so that text never went
+    through the builder — the gate has to cover it on its own."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+    calls = _capture_complete(monkeypatch)
+
+    graph = EngagementGraph(engagement_id="e-a5-target")
+    graph.add_node("target", f"t.com?auth={_JWT}", {})
+    graph.add_node("path", "/a", {"source": "wayback"})
+    propose_hypotheses_with_model(cfg, render_hypothesize_prompt(graph))
+
+    sent = json.dumps(calls[-1]["messages"], ensure_ascii=False)
+    assert _JWT not in sent
+    assert "«SECRET_" in sent
+
+
+def test_mixed_redacted_and_raw_material_stays_safe(monkeypatch, tmp_path):
+    """Both kinds in one prompt: a redacted graph value and a raw target.
+    Redaction is not idempotent by accident — the raw half is stripped on
+    the way out even though the block was already clean."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    calls = _capture_complete(monkeypatch)
+
+    graph = _graph_with_a_jwt()
+    graph.add_node("target", f"t.com?auth={_JWT}", {})  # raw, plus the block's copy
+    propose_hypotheses_with_model(cfg, render_hypothesize_prompt(graph))
+
+    sent = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert _JWT not in sent
+    assert calls[0]["model"] == cfg.local_model
+
+
+def test_sensitive_content_never_falls_back_to_a_second_model(
+        monkeypatch, tmp_path):
+    """Fail closed: with no local model the redacted prompt gets one attempt
+    at the branch's model — never the same-provider retry, never a search."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: False)
+    seen = []
+
+    def failing_complete(cfg, model, messages, **kw):
+        seen.append(model)
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr("kryonsec.llm._complete", failing_complete)
+
+    with pytest.raises(Exception):
+        propose_hypotheses_with_model(
+            cfg, render_hypothesize_prompt(_graph_with_a_jwt()))
+
+    assert seen == ["gpt-4o-mini"]
+    assert cfg.general_chat_model not in seen  # no fallback, either kind
+
+
+def test_a_prompt_without_secrets_routes_exactly_as_before(monkeypatch, tmp_path):
+    """No secret, no declaration, no change: the local model is not even
+    consulted, and the configured search model answers."""
+    cfg = _hosted_cfg(tmp_path)
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok",
+                        lambda c, m: pytest.fail("local model consulted"))
+    calls = _capture_complete(monkeypatch)
+
+    propose_hypotheses_with_model(cfg, render_hypothesize_prompt(_graph_with_findings()))
+
+    assert calls[0]["model"] == "gpt-4o-mini"
+
+
+def test_a_sensitive_graph_still_proposes_and_still_cannot_approve(
+        monkeypatch, tmp_path):
+    """The A1/A4 gates hold on the sensitive path too: whatever the routing
+    decided, the nodes are `proposed`, carry no approval flag, and EXPLOIT
+    still runs only what a human approved."""
+    cfg = _hosted_cfg(tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph_with_a_jwt()
+    _force_json_path(monkeypatch)
+    monkeypatch.setattr("kryonsec.llm._ollama_model_ok", lambda c, m: True)
+    _capture_complete(monkeypatch)
+
+    # no llm_fn: the real default path, through the real gate
+    assert HypothesizeSubagent(cfg=cfg, graph=graph, audit=audit).run().status == "ok"
+
+    node = graph.by_type("hypothesis")[0]
+    assert node["status"] == "proposed"
+    assert "approved" not in node["properties"]
+    assert node["provenance"]["source"] == "HYPOTHESIZE"
+    assert node["provenance"]["prompt_version"] == "hypothesize-v2"

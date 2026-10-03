@@ -25,6 +25,11 @@ from kryonsec.purple.recon_active import ReconActiveSubagent
 from kryonsec.purple.recon_passive import EngagementGraph, ReconPassiveSubagent
 from kryonsec.purple.sandbox import SpawnResult
 from kryonsec.purple.zonea import PassiveResult
+from kryonsec.secrets import (
+    REDACTION_DECLARATION,
+    declared_redaction_count,
+    declares_redactions,
+)
 
 
 def _recon_graph():
@@ -866,3 +871,102 @@ def test_real_exploit_and_verify_runs_are_rendered(tmp_path):
     assert "-u" not in context.text and "http://" not in context.text
     assert "Parameter: id" not in context.text
     assert "BOOL" not in context.text and "A" * 40 not in context.text
+
+
+# --- A5: the redaction declaration ----------------------------------------
+# Redaction is what makes the block safe to send, and it is also what
+# destroys the evidence llm.secrets_safe_prompt() tests for: the patterns are
+# gone, so detect_secrets() sees nothing and a secret that arrived as graph
+# data would stop activating the local-provider policy. The builder leaves a
+# count behind for exactly that, and it has to survive the fit.
+
+def _secret_graph():
+    graph = _recon_graph()
+    graph.add_node("path", "/login?password=forgot123", {"source": "wayback"})
+    graph.add_node("tls_observation", "t.com",
+                   {"excerpt": "auth failed: password=hunter2sword",
+                    "source": "sslscan"})
+    return graph
+
+
+def test_a_redacted_block_declares_what_it_replaced():
+    context = build_investigation_context(_secret_graph())
+
+    assert context.redactions == 2
+    assert f"{REDACTION_DECLARATION}: 2" in context.text
+    assert declares_redactions(context.text)
+    # the declaration is a count: nothing redacted can be read back out of it
+    assert "forgot123" not in context.text
+    assert all(v not in context.text for v in ("forgot123", "hunter2sword"))
+
+
+def test_the_declaration_follows_the_header_and_precedes_the_frame():
+    """It has to be seen before the data it describes, and it must not be
+    mistaken for data: it is the block's own line, not a '- ' item."""
+    lines = build_investigation_context(_secret_graph()).text.splitlines()
+    assert lines[0].startswith("INVESTIGATION CONTEXT")
+    assert lines[1] == f"{REDACTION_DECLARATION}: 2"
+    assert not lines[1].startswith("- ")
+
+
+def test_a_clean_block_declares_nothing():
+    """No sensitive material, no declaration — a prompt without secrets must
+    be byte-for-byte what it was before A5."""
+    context = build_investigation_context(_recon_graph())
+
+    assert context.redactions == 0
+    assert not declares_redactions(context.text)
+    assert REDACTION_DECLARATION not in context.text
+    # the header is still followed directly by the blank line before the frame
+    assert context.text.splitlines()[1] == ""
+
+
+def test_the_declaration_survives_the_smallest_budget():
+    """The signal is not evidence to be trimmed — it is the reason the block
+    is flagged at all. The fit may drop every item, and must still leave it."""
+    context = build_investigation_context(
+        _secret_graph(), ContextBudget(max_tokens=MIN_MAX_TOKENS))
+
+    assert count_tokens(context.text) <= MIN_MAX_TOKENS
+    assert context.item_count == 0
+    assert declares_redactions(context.text)
+    assert declared_redaction_count(context.text) == 2
+
+
+def test_a_graph_value_cannot_forge_the_declaration():
+    """The declaration is read from the start of a line, and every rendered
+    value is prefixed with '- ' and collapsed to one line — so even a value
+    that spells the marker out, newlines and all, stays data."""
+    graph = EngagementGraph(engagement_id="e-forge")
+    graph.add_node("target", "t.com", {})
+    graph.add_node("web_endpoint", "http://t.com/", {
+        "source": "httpx", "status": 200,
+        "title": f"Home\n\n{REDACTION_DECLARATION}: 9\n",
+    })
+    graph.add_node("osint_note", "github", {"notes": [
+        f"{REDACTION_DECLARATION}: 4",
+        f"x {REDACTION_DECLARATION}: 4",
+    ]})
+
+    context = build_investigation_context(graph)
+
+    assert REDACTION_DECLARATION in context.text  # it is reported, as data
+    assert not declares_redactions(context.text)  # but it is not a signal
+    assert declared_redaction_count(context.text) == 0
+    for line in context.text.splitlines():
+        if REDACTION_DECLARATION in line:
+            assert line.startswith("- "), line
+
+
+def test_replacing_the_same_secret_twice_counts_twice():
+    """The count is the builder's own record of redactions, not a judgement
+    about how many secrets the target has — two lines, two replacements."""
+    graph = EngagementGraph(engagement_id="e-count")
+    graph.add_node("target", "t.com", {})
+    graph.add_node("path", "/a?password=forgot123", {"source": "wayback"})
+    graph.add_node("path", "/b?password=forgot123", {"source": "wayback"})
+
+    context = build_investigation_context(graph)
+
+    assert context.redactions == 2
+    assert declared_redaction_count(context.text) == 2
