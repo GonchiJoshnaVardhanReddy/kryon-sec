@@ -26,8 +26,10 @@ Four properties matter more than coverage:
 * **Read-only.** Building a context reads ``graph.nodes`` and writes
   nothing — no nodes, no edges, no properties, no status.
 
-This module is not wired into HYPOTHESIZE yet (A2/A3 are the builder
-alone), so importing it changes no existing behaviour.
+Wired into the hypothesis prompt in A4: ``render_hypothesize_prompt``
+renders a block with :func:`build_investigation_context` and passes the
+text into ``hypothesize.jinja``, which is now the only door graph content
+comes through. Building a context still writes nothing.
 """
 
 from __future__ import annotations

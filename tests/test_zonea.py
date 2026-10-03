@@ -179,8 +179,9 @@ def test_prompt_includes_paths():
     prompt = render_hypothesize_prompt(graph)
     assert "testasp.vulnweb.com" in prompt
     assert "/login.asp" in prompt
-    # subdomains section shows the "none found" fallback
-    assert "(none found)" in prompt
+    # the graph has no subdomains, and the block says so rather than
+    # leaving the category out of the prompt entirely
+    assert "SUBDOMAINS (passive sources) — 0 items" in prompt
 
 
 def test_crt_sh_parses_names(tmp_path):

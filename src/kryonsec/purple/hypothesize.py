@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..config import KryonsecConfig
 from .audit import AuditLog
+from .context import ContextBudget, build_investigation_context
 from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
 
@@ -75,11 +76,28 @@ class HypothesisSet(BaseModel):
         return len(ids) == len(set(ids))
 
 
-def render_hypothesize_prompt(graph: EngagementGraph) -> str:
-    """Render the Jinja2 prompt with the current passive-recon findings."""
+def render_hypothesize_prompt(
+    graph: EngagementGraph,
+    budget: ContextBudget | None = None,
+) -> str:
+    """Render the Jinja2 prompt with the investigation context (A4).
+
+    The evidence the model sees is the A2/A3 context block: one allowlisted,
+    redacted, single-line, token-fitted rendering of the graph. This used to
+    flatten subdomains, paths, notes and services here, each with its own
+    hardcoded slice and no way to report what had been left out.
+
+    The graph is read, never written: everything the block contains is a
+    snapshot taken by :func:`build_investigation_context`.
+
+    ``budget`` is the caller's :class:`ContextBudget`; None uses the
+    default, which is what the HYPOTHESIZE state runs with.
+    """
     from pathlib import Path
 
     from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+    from .allowlist import EXPLOIT_TEMPLATES
 
     template_dir = Path(__file__).resolve().parents[1] / "templates"
     env = Environment(
@@ -89,31 +107,18 @@ def render_hypothesize_prompt(graph: EngagementGraph) -> str:
     )
     template = env.get_template("hypothesize.jinja")
 
-    subdomains = sorted(n["label"] for n in graph.by_type("subdomain"))
-    paths = sorted(n["label"] for n in graph.by_type("path"))
     target_nodes = graph.by_type("target")
     target = target_nodes[0]["label"] if target_nodes else ""
-    # supporting OSINT context (registrar, ASN, registration age…) from
-    # notes-only sources — flatten to bounded prompt lines
-    notes: list[str] = []
-    for node in graph.by_type("osint_note"):
-        for note in node.get("properties", {}).get("notes", []):
-            notes.append(f"[{node['label']}] {note}")
-
-    # L8: the tool list is generated from the allowlist module — a
-    # hardcoded copy here silently drifted whenever a tool was added
-    from .allowlist import EXPLOIT_TEMPLATES
+    context = build_investigation_context(graph, budget)
 
     return template.render(
         target=target,
-        subdomains=subdomains[:50],
-        paths=paths[:50],
-        notes=notes[:20],
+        # the rendered block, not the object: the template may not reach
+        # back into the graph through it
+        context=context.text,
+        # L8: the tool list is generated from the allowlist module — a
+        # hardcoded copy here silently drifted whenever a tool was added
         tools=list(EXPLOIT_TEMPLATES),  # order-stable dict keys
-        services=[
-            {"label": n["label"], **n["properties"]}
-            for n in graph.by_type("service")
-        ],
     )
 
 
