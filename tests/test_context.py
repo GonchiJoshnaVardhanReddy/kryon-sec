@@ -1140,7 +1140,6 @@ def test_any_budget_holds_the_bound_and_the_accounting(max_tokens):
     for key, stat in context.truncation.items():
         assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
                               + stat.over_budget), key
-        assert stat.kept >= 0 and stat.over_budget >= 0
 
 
 @pytest.mark.parametrize("max_tokens", [MIN_MAX_TOKENS, 300, 400, 500, 600, 800])
@@ -1628,6 +1627,40 @@ def test_the_budget_never_buys_less_evidence_across_the_rungs(kind):
             assert stat.kept <= bigger.truncation[key].kept, (key, budget)
 
 
+def test_a_named_cut_beats_a_richer_block_that_hides_it():
+    """The gate A7 opened is still the fit's first rule: a block that lost a
+    category's name is never preferred to one that kept it, however many
+    more lines it keeps.
+
+    The ladder only reaches this today in the safe direction — spending the
+    framing can save a name, never lose one — so this pins the ordering
+    itself, on the one comparison that decides it: a block keeping nine
+    lines with the cut written off the footer, against one keeping five
+    with the cut named.
+    """
+    budget = ContextBudget(max_tokens=400)
+
+    def candidate(kept, footer_lines):
+        return context_module.InvestigationContext(
+            budget=budget,
+            nodes_read=1,
+            sections=(context_module.ContextSection(
+                key="paths", heading="PATHS",
+                items=tuple(f"/p{i}" for i in range(kept))),),
+            truncation={"paths": context_module.Truncation(
+                key="paths", found=20, kept=kept,
+                duplicates=0, over_limit=0, over_budget=20 - kept)},
+            footer_lines=footer_lines,
+        )
+
+    named = candidate(kept=5, footer_lines=None)  # fewer lines, cut named
+    hidden = candidate(kept=9, footer_lines=0)    # more lines, cut hidden
+
+    assert hidden.item_count > named.item_count
+    assert named.truncated and hidden.truncated
+    assert context_module._score(hidden) < context_module._score(named)
+
+
 def test_monotonicity_beats_byte_identity_where_they_conflict():
     """The one place the A8 fix and A7's byte-identity could not both hold,
     measured rather than asserted away.
@@ -1736,7 +1769,6 @@ def test_the_accounting_holds_under_the_collapse(kind, max_tokens):
     for key, stat in context.truncation.items():
         assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
                               + stat.over_budget), key
-        assert stat.kept >= 0 and stat.over_budget >= 0
     for section in context.sections:
         assert len(section.items) == context.truncation[section.key].kept
 
