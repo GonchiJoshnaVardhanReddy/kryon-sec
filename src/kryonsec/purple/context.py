@@ -477,10 +477,18 @@ class InvestigationContext:
     # Which of the two preambles this block renders, and whether its footer
     # lines carry the reason a category was cut. Both default to the fuller
     # form, so a caller-built context renders exactly what it always did.
-    # The fit turns them on only while the full form is leaving a reader
-    # without evidence or without a category name; see :func:`_fit`.
+    # The fit turns them on only where the fuller form would cost the reader
+    # a line; a tie leaves them off. See :func:`_fit`.
     compact_frame: bool = False
     terse_footer: bool = False
+    # Whether a category that lost nothing but holds no lines is named in one
+    # shared line instead of getting a heading of its own. A heading per
+    # category is the fuller way to say "we looked and found nothing", and it
+    # is what a caller-built context and every roomy build render; the fit
+    # turns this on only when the headings are what stands between the reader
+    # and the evidence; :func:`_visible` ignores it when no section holds a
+    # line at all, since then there is no evidence to buy. See :func:`_fit`.
+    collapse_empty: bool = False
 
     @property
     def text(self) -> str:
@@ -529,6 +537,13 @@ _FRAME_COMPACT = (
     "verdict — is not proof of absence.",
 )
 
+# The one line a collapsed block names its empty categories on. An engine
+# literal, like the footer's "TRUNCATED" and the redaction declaration: it
+# states what the engagement's own graph holds, never what a value says, so
+# no untrusted string can reach the start of a line to imitate it — every
+# value above it is rendered behind "- ".
+_NO_EVIDENCE = "NO EVIDENCE RECORDED"
+
 
 def _reasons(stat: Truncation) -> str:
     parts = []
@@ -561,19 +576,36 @@ def _visible(
     so its heading would be the same fact twice — and the tokens that frees
     are what pays for a line of evidence somewhere else.
 
+    A collapsed block (:attr:`InvestigationContext.collapse_empty`) says the
+    "we looked and found nothing" fact once instead of once per category —
+    one line naming every such category, which :func:`_render` writes. That
+    is a heading's worth of tokens per category handed back to the evidence,
+    so :func:`_fit` takes it whenever it buys a line, and not otherwise. The
+    collapse applies only while some section still holds a line: with no
+    lines anywhere there is no evidence to buy, and the headings are all the
+    block has left to say.
+
     At least one heading survives, so the block never becomes an unlabelled
     list — the same promise :func:`_shrink` makes when it drops sections.
     """
+    if context.collapse_empty and any(
+            section.items for section in context.sections):
+        return tuple(section for section in context.sections if section.items)
     kept = [section for section in context.sections
             if _worth_a_heading(context, section)]
     return tuple(kept or context.sections[:1])
 
 
+def _lost_nothing(context: InvestigationContext, section: ContextSection) -> bool:
+    """True when the block's budget is not why this section holds no lines."""
+    stat = context.truncation.get(section.key)
+    return stat is None or not stat.dropped
+
+
 def _worth_a_heading(context: InvestigationContext, section: ContextSection) -> bool:
     if section.items:
         return True
-    stat = context.truncation.get(section.key)
-    return stat is None or not stat.dropped
+    return _lost_nothing(context, section)
 
 
 def _render(context: InvestigationContext) -> str:
@@ -595,7 +627,8 @@ def _render(context: InvestigationContext) -> str:
         "",
         *(_FRAME_COMPACT if context.compact_frame else _FRAME),
     ]
-    for section in _visible(context):
+    visible = _visible(context)
+    for section in visible:
         count = len(section.items)
         lines.append("")
         lines.append(f"{section.heading} — {count} item"
@@ -614,6 +647,21 @@ def _render(context: InvestigationContext) -> str:
                 lines.append("- (none kept)")
             else:
                 lines.append("- (none)")
+
+    # A collapsed block's headings for the categories it looked at and found
+    # nothing in, said once. Only those: a category the budget emptied is in
+    # the footer with its count and its reason, and this line must not call it
+    # empty, so the two facts stay apart. The names are source keys, so this
+    # is engine text at the start of a line, and the values it summarises are
+    # all behind "- " above it.
+    if context.collapse_empty:
+        shown = {section.key for section in visible}
+        absent = [section.key for section in context.sections
+                  if section.key not in shown and not section.items
+                  and _lost_nothing(context, section)]
+        if absent:
+            lines.append("")
+            lines.append(f"{_NO_EVIDENCE} — {', '.join(absent)}")
 
     dropped = _footer_stats(context)
     if dropped:
@@ -793,24 +841,20 @@ def _score(context: InvestigationContext) -> tuple[int, int]:
     A category the block cut and did not name is a reader who cannot know
     the block is incomplete, which is worse than a reader who has less to
     read — so the count of those is the first term, negated to sort higher
-    when lower.
+    when lower. That is the gate A7 opened, and it stays dominant here: a
+    block that lost a name is never preferred to one that kept it, whatever
+    the second term says.
+
+    What A8's fix changes is only what happens when no name is in play. The
+    second term decides then, so the rung that keeps more lines wins — and a
+    tie leaves the fuller presentation standing — where A7 stopped at the
+    first rung that had nothing left to lose. A7's stop was the non-monotone
+    part: crossing it handed back lines a smaller budget had kept.
     """
     named = {stat.key for stat in _footer_stats(context)}
     unnamed = sum(1 for stat in context.truncation.values()
                   if stat.truncated and stat.key not in named)
     return (-unnamed, context.item_count)
-
-
-def _starved(context: InvestigationContext) -> bool:
-    """True when the block lost something a reader needed to see.
-
-    Two states, both of which a shorter preamble or a shorter footer line can
-    usually pay for: a category that was cut and that the footer no longer
-    names, or evidence that existed and none of which survived.
-    """
-    return _score(context)[0] < 0 or (
-        context.item_count == 0
-        and any(stat.found for stat in context.truncation.values()))
 
 
 def _fit_at(
@@ -821,6 +865,7 @@ def _fit_at(
     redactions: int,
     compact_frame: bool,
     terse_footer: bool,
+    collapse_empty: bool = False,
 ) -> InvestigationContext:
     """One fit, in one presentation. See :func:`_fit` for the bound."""
     context = InvestigationContext(
@@ -831,6 +876,7 @@ def _fit_at(
         redactions=redactions,
         compact_frame=compact_frame,
         terse_footer=terse_footer,
+        collapse_empty=collapse_empty,
     )
     costs = {section.key: _block_cost(section.items) for section in sections}
     while _token_count(context.text) > budget.max_tokens:
@@ -839,6 +885,22 @@ def _fit_at(
             break  # header, one frame and one name are all there is left
         context = smaller
     return context
+
+
+# The five presentations the bound can be spent in, fullest first. The order
+# is the tie-break: :func:`_fit` takes a rung only on a strictly better score,
+# so when two of them leave the reader with the same names and the same lines
+# the earlier one stands. Full preamble before compact, reasons in the footer
+# before a shorter footer, and a heading per category before the collapsed
+# line — so an engagement whose block already fits its framing renders the
+# same bytes it rendered before any of this existed.
+_RUNGS = (
+    (False, False, False),
+    (True, False, False),
+    (True, True, False),
+    (True, False, True),
+    (True, True, True),
+)
 
 
 def _fit(
@@ -861,29 +923,48 @@ def _fit(
     be close. The per-section costs A6 compares are estimates, and decide
     only *which* category pays — never whether the block fits.
 
-    The full preamble is the one to prefer, so it is tried first and kept
-    whenever it can carry the picture. A low budget on an engagement with
-    many categories is the case where it cannot: the fixed text alone can
-    exceed the budget, and then the fit spends the whole block on framing and
-    keeps no evidence. The same claims fit in a shorter preamble, and a
-    shorter footer line, so those are tried next — each step taken only while
-    the block is still starving, and kept only when it actually buys
-    something, so a shorter text is never adopted for nothing. That is what
-    leaves every budget that reads well today rendering today's bytes.
+    The bound can be spent in five presentations (:data:`_RUNGS`), and which
+    one it is spent in is decided on what the reader ends up with — names
+    first, then lines (:func:`_score`). The block that keeps the most is the
+    block the reader gets, whatever it costs in framing: a category the
+    footer no longer names, or a line of evidence the framing crowded out, is
+    the reader losing something, where a shorter preamble is only the block
+    saying less about itself. A rung therefore has to earn its place with a
+    strictly better score, and a tie leaves the fuller presentation standing
+    — so a budget that can pay for the full preamble, the footer's reasons
+    and a heading per category still renders today's bytes.
 
-    Costs at most three fits, and each is bounded by the same finite pool.
+    Choosing the best of the five at every budget is also what stops a bigger
+    budget from ever keeping less. Each presentation on its own keeps at
+    least as much as it did at a smaller budget, because the same items are
+    given up in the same order and a bigger bound stops the giving up no
+    later; the best of them therefore cannot fall behind. A rule that instead
+    stopped at the first presentation to leave some state behind would hand
+    back the evidence it had just bought as soon as the budget grew past that
+    state's boundary — and a reader who asks for more tokens would get fewer
+    lines.
+
+    Costs at most five fits, and each is bounded by the same finite pool. A
+    block that gave up nothing is settled by the first.
     """
-    context = _fit_at(sections, truncation, budget, nodes_read, redactions,
-                      compact_frame=False, terse_footer=False)
-    if not _starved(context):
+    def at(rung: tuple[bool, bool, bool]) -> InvestigationContext:
+        compact_frame, terse_footer, collapse_empty = rung
+        return _fit_at(sections, truncation, budget, nodes_read, redactions,
+                       compact_frame=compact_frame, terse_footer=terse_footer,
+                       collapse_empty=collapse_empty)
+
+    context = at(_RUNGS[0])
+    # Nothing gave way — every category kept every line it had, so no rung
+    # can keep more and the fuller one stands. This is the common case, and
+    # the only one that needs a single fit. What a category lost to the
+    # collector's own limits is not this: those lines are gone in every
+    # presentation, and the score already counts the ones left unnamed.
+    if context.sections == sections:
         return context
-    for compact_frame, terse_footer in ((True, False), (True, True)):
-        shorter = _fit_at(sections, truncation, budget, nodes_read, redactions,
-                          compact_frame=compact_frame, terse_footer=terse_footer)
-        if _score(shorter) > _score(context):
-            context = shorter
-        if not _starved(context):
-            break
+    for rung in _RUNGS[1:]:
+        candidate = at(rung)
+        if _score(candidate) > _score(context):
+            context = candidate
     return context
 
 
