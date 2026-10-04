@@ -34,6 +34,20 @@ comes through. Building a context still writes nothing.
 A5 adds one line to the block when something was redacted —
 ``SECRET-PATTERNS-REDACTED: n`` — because redaction destroys the evidence
 the provider-routing gate tests for. See :data:`..secrets.REDACTION_DECLARATION`.
+
+A6 makes the budget *fair* rather than merely bounded. A2–A5 dropped lines
+from the bottom of the priority order, so a scan that returned 40 services
+spent the whole block on services and left passive discovery with nothing:
+40 services / 120 subdomains / 300 paths at the default budget rendered 12
+service lines and zero subdomains and zero paths. The fit now drops from
+whichever category holds the most tokens *per unit of weight*
+(:attr:`_Source.weight`), so what survives is a share of the budget in
+proportion to how much the evidence is worth, and every non-empty category
+keeps at least one line while any other still holds two. Ordering still
+decides what a reader sees first; weight decides what a full block costs.
+Nothing else moved: the public API, the 800-token default, the minimum
+budget, the token counter, the redaction declaration and the truncation
+accounting are all as they were.
 """
 
 from __future__ import annotations
@@ -91,6 +105,14 @@ class _Source:
     # for the two types whose producer records an outcome as one bool that
     # cannot carry the whole truth. Returns engine-literal text only.
     status: Callable[[dict], str] | None = None
+    # The category's claim on a block that cannot hold everything, in whole
+    # units. Render order (the position in _SOURCES) says what a reader sees
+    # first; the weight says how many tokens a category may hold before the
+    # fit starts taking its lines away for a fairer one. The two agree in
+    # direction, not in size: the history is a handful of heavy lines, a
+    # scan's service list is hundreds of light ones, and a weight is what
+    # stops the second from emptying the block before the third arrives.
+    weight: int = 1
 
 
 def _props(node: dict) -> dict:
@@ -142,12 +164,19 @@ def _verify_status(node: dict) -> str:
 
 
 # Priority order is fixed and load-bearing: sections render in this order,
-# and a tight token budget drops from the bottom up, so what survives is the
-# top of this list. What the engagement has already established or tried
-# comes before raw reconnaissance — a new hypothesis has to avoid known
-# ground, and findings must never be squeezed out by an abundance of
-# scan output. Then live active-scan facts (the engine observed those
-# itself), then passive discovery, then third-party commentary.
+# and a tight token budget takes lines away from the bottom of it. What the
+# engagement has already established or tried comes before raw
+# reconnaissance — a new hypothesis has to avoid known ground, and findings
+# must never be squeezed out by an abundance of scan output. Then live
+# active-scan facts (the engine observed those itself), then passive
+# discovery, then third-party commentary.
+#
+# `weight` is the same priority made numeric, and it is what the fit reads:
+# when the block cannot hold everything, a category loses a line once it
+# holds more tokens per unit of weight than another non-empty category does.
+# The numbers are deliberately not the render positions — the history is
+# worth several times a scan excerpt because there is so much less of it,
+# and the whole list is short enough to read at a glance and to argue with.
 _SOURCES: tuple[_Source, ...] = (
     _Source(
         key="findings",
@@ -155,6 +184,7 @@ _SOURCES: tuple[_Source, ...] = (
         heading="FINDINGS RECORDED (tool marker matched — not human confirmation)",
         fields=("tool",),
         status=_finding_status,
+        weight=6,  # the results of the engagement: never the cheapest thing to lose
     ),
     _Source(
         key="exploit_attempts",
@@ -165,6 +195,7 @@ _SOURCES: tuple[_Source, ...] = (
         # tool output.
         fields=("tool", "ok", "exit_code", "confirmed"),
         relabel=(("ok", "spawn_ok"), ("confirmed", "marker_matched")),
+        weight=5,  # what has already been tried, so a new hypothesis can avoid it
     ),
     _Source(
         key="verify_attempts",
@@ -176,55 +207,68 @@ _SOURCES: tuple[_Source, ...] = (
         # should be doing arithmetic on.
         fields=("reason",),
         status=_verify_status,
+        weight=5,  # an outcome already reached, and one line per hypothesis
     ),
     _Source(
         key="services",
         node_type="service",
         heading="LIVE SERVICES (active port scan)",
         fields=("port", "proto", "service", "version"),
+        weight=4,  # the engine's own observation, but one of the noisiest sources
     ),
     _Source(
         key="web_endpoints",
         node_type="web_endpoint",
         heading="LIVE WEB ENDPOINTS (httpx)",
         fields=("status", "title", "tech"),
+        weight=4,
     ),
     _Source(
         key="dns",
         node_type="dns_resolution",
         heading="DNS RESOLUTION (dnsx)",
         fields=("ips",),
+        weight=3,
     ),
     _Source(
         key="tls",
         node_type="tls_observation",
         heading="TLS OBSERVATIONS (sslscan / testssl)",
         fields=("excerpt",),
+        weight=3,
     ),
     _Source(
         key="technologies",
         node_type="tech_fingerprint",
         heading="TECHNOLOGY FINGERPRINTS (whatweb)",
         fields=("excerpt",),
+        weight=3,
     ),
     _Source(
         key="subdomains",
         node_type="subdomain",
         heading="SUBDOMAINS (passive sources)",
+        weight=2,  # passive discovery: high volume, and the attack surface itself
     ),
     _Source(
         key="paths",
         node_type="path",
         heading="PATHS AND ARCHIVED URLS (passive sources + crawl)",
         fields=("status", "url"),
+        weight=2,
     ),
     _Source(
         key="osint",
         node_type="osint_note",
         heading="OSINT NOTES (passive sources)",
         list_property="notes",
+        weight=1,  # third-party commentary: worth reading, cheapest to lose
     ),
 )
+
+# key -> weight, for the fit. Read through ``.get(key, 1)`` so a context a
+# caller assembles by hand with a section key we do not know still fits.
+_WEIGHTS: dict[str, int] = {source.key: source.weight for source in _SOURCES}
 
 
 # --- normalisation --------------------------------------------------------
@@ -502,7 +546,17 @@ def _render(context: InvestigationContext) -> str:
         if section.items:
             lines.extend(f"- {item}" for item in section.items)
         else:
-            lines.append("- (none)")
+            # "nothing was found" and "everything found was left out" are
+            # different facts about the engagement, and a reader who only
+            # sees "(none)" cannot tell them apart. The how-many and the why
+            # are in the footer and in `truncation`; this line only has to
+            # stop the block claiming the category was empty, so it stays
+            # short enough not to cost a line somewhere else.
+            stat = context.truncation.get(section.key)
+            if stat is not None and stat.dropped:
+                lines.append("- (none kept)")
+            else:
+                lines.append("- (none)")
 
     dropped = _footer_stats(context)
     if dropped:
@@ -531,14 +585,63 @@ def _token_count(text: str) -> int:
     return count_tokens(text)
 
 
-def _shrink(context: InvestigationContext) -> InvestigationContext | None:
+def _block_cost(items: tuple[str, ...]) -> int:
+    """What a section's own lines cost, for comparing sections to each other.
+
+    An estimate, and only ever used to decide *which* category gives way
+    next. The bound itself is still measured on the rendered block, so a
+    tokeniser that does not add up the way this arithmetic does costs a
+    category a line it might have kept — never an over-budget block.
+    """
+    return _token_count("\n".join(items)) if items else 0
+
+
+def _cut_index(
+    sections: tuple[ContextSection, ...], costs: Mapping[str, int]
+) -> int | None:
+    """Which section gives up a line, or None when none has one to give.
+
+    Two tiers, so that one noisy category cannot take the block:
+
+    1. among sections holding more than one line, the one holding the most
+       tokens per unit of weight. Cutting there leaves the block costs
+       proportional to what each category is worth — the history keeps its
+       few lines because it has so few, and a 40-service list gives way to
+       the subdomains and paths underneath it;
+    2. only when every non-empty section is down to one line, that line:
+       the last line of a category is the difference between reading "the
+       dns answer" and reading "(none)", so it is not taken to pay for a
+       category that would still have two.
+
+    Ties go to the lower-priority section, and the lines themselves are in
+    sorted order, so the choice is a function of the content alone.
+    """
+    candidates = [i for i, section in enumerate(sections) if len(section.items) > 1]
+    if not candidates:
+        candidates = [i for i, section in enumerate(sections) if section.items]
+
+    best: int | None = None
+    best_ratio = 0.0
+    # Reversed, and only a strict improvement displaces: equal ratios leave
+    # the lowest-priority section (the highest index) as the one cut.
+    for index in reversed(candidates):
+        key = sections[index].key
+        ratio = costs.get(key, 0) / _WEIGHTS.get(key, 1)
+        if best is None or ratio > best_ratio:
+            best, best_ratio = index, ratio
+    return best
+
+
+def _shrink(
+    context: InvestigationContext, costs: dict[str, int]
+) -> InvestigationContext | None:
     """Give up one piece of the block, least valuable first.
 
     Three steps, in this order:
 
-    1. a line from the lowest-priority non-empty section — sections are in
-       priority order, so the tail is the least valuable evidence, and
-       within a section the tail is the end of the deterministic order;
+    1. a line from the section furthest above its fair share of the budget
+       (:func:`_cut_index`) — so what is lost is what the block can best
+       spare, not simply whatever sits lowest in the priority order;
     2. the lowest-priority section's heading, once every section is empty —
        the last section is kept, so the block always names at least one
        category and never collapses into an unlabelled list of lines;
@@ -546,21 +649,27 @@ def _shrink(context: InvestigationContext) -> InvestigationContext | None:
        what is lost is the rendered *name*, never the record, because
        ``truncation`` keeps every category whatever the footer shows.
 
+    ``costs`` is the caller's cache of :func:`_block_cost` per section, and
+    the one mutable thing here: it is updated in place for the section that
+    was cut, so the next call compares fresh numbers without re-measuring
+    the sections that did not change.
+
     Returns the smaller context, or None when there is nothing left to give.
     """
     sections = context.sections
-    for index in range(len(sections) - 1, -1, -1):
-        if sections[index].items:
-            trimmed = list(sections)
-            trimmed[index] = replace(
-                sections[index], items=sections[index].items[:-1])
-            key = sections[index].key
-            stat = context.truncation[key]
-            truncation = dict(context.truncation)
-            truncation[key] = replace(
-                stat, kept=stat.kept - 1, over_budget=stat.over_budget + 1)
-            return replace(
-                context, sections=tuple(trimmed), truncation=truncation)
+    index = _cut_index(sections, costs)
+    if index is not None:
+        trimmed = list(sections)
+        trimmed[index] = replace(
+            sections[index], items=sections[index].items[:-1])
+        key = sections[index].key
+        stat = context.truncation[key]
+        truncation = dict(context.truncation)
+        truncation[key] = replace(
+            stat, kept=stat.kept - 1, over_budget=stat.over_budget + 1)
+        costs[key] = _block_cost(trimmed[index].items)
+        return replace(
+            context, sections=tuple(trimmed), truncation=truncation)
 
     if len(sections) > 1:
         # An empty section costs only its heading; its accounting is already
@@ -622,17 +731,18 @@ def _fit(
     nodes_read: int,
     redactions: int,
 ) -> InvestigationContext:
-    """Give up whole items, lowest priority first, until the block fits.
+    """Give up whole items, least valuable first, until the block fits.
 
     Whole items only: half a line is worse than an absent line, and the
     footer then says how many are missing. Terminates because every pass
     removes exactly one item from a finite pool (and, once the items are
     gone, one heading, then one footer name).
 
-    Tokenisation is not perfectly additive across lines, so the fit is
+    Tokenisation is not perfectly additive across lines, so the bound is
     measured on the rendered text rather than estimated from per-line costs:
     the bound holds by construction instead of by arithmetic that happens to
-    be close.
+    be close. The per-section costs A6 compares are estimates, and decide
+    only *which* category pays — never whether the block fits.
     """
     context = InvestigationContext(
         budget=budget,
@@ -641,8 +751,9 @@ def _fit(
         truncation=truncation,
         redactions=redactions,
     )
+    costs = {section.key: _block_cost(section.items) for section in sections}
     while _token_count(context.text) > budget.max_tokens:
-        smaller = _shrink(context)
+        smaller = _shrink(context, costs)
         if smaller is None:
             break  # header, frame and one name are all there is left
         context = smaller

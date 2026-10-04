@@ -970,3 +970,256 @@ def test_replacing_the_same_secret_twice_counts_twice():
 
     assert context.redactions == 2
     assert declared_redaction_count(context.text) == 2
+
+
+# --- A6: balanced allocation under evidence pressure ----------------------
+# A2–A5 rendered in priority order and gave the budget up from the bottom of
+# it, so one noisy category bought its lines with the categories underneath.
+# Measured on the shape below (40 services, 120 subdomains, 300 paths) at the
+# default budget, the old fit rendered 12 service lines and zero subdomains
+# and zero paths. What replaced it: a category may hold the block in
+# proportion to its weight, no category's last line is spent on another's
+# second, and whatever goes missing anyway is named.
+
+def _pressure_nodes():
+    """The reported shape, as node rows so the order can be varied."""
+    nodes = [("finding", "H1", {"tool": "sqlmap", "verified": True})]
+    for i in range(40):
+        nodes.append(("service", f"t.com:{8000 + i}/tcp",
+                      {"port": 8000 + i, "proto": "tcp",
+                       "service": "http-proxy", "version": "nginx 1.18.0",
+                       "source": "nmap"}))
+    for i in range(120):
+        nodes.append(("subdomain", f"host-{i}.t.com", {"source": "crt.sh"}))
+    for i in range(300):
+        nodes.append(("path", f"/app/m{i}/index.asp?id={i}",
+                      {"status": 200,
+                       "url": f"http://t.com/app/m{i}/index.asp?id={i}",
+                       "source": "wayback"}))
+    return nodes
+
+
+def _pressure_graph(order=None):
+    graph = EngagementGraph(engagement_id="e-pressure")
+    for node_type, label, properties in (order or _pressure_nodes()):
+        graph.add_node(node_type, label, properties)
+    return graph
+
+
+def _section_tokens(context, key):
+    items = _sections(context)[key]
+    return count_tokens("\n".join(items)) if items else 0
+
+
+def test_the_reported_volume_no_longer_crowds_out_the_rest():
+    """What the whole phase is for: the service list still gives way, and
+    what sat underneath it in the priority order is in the block at all."""
+    context = build_investigation_context(_pressure_graph())
+    stat = context.truncation
+
+    assert count_tokens(context.text) <= 800
+    assert 0 < stat["services"].kept < 40  # 40 services do not all fit, and never did
+    assert stat["subdomains"].kept > 0  # this used to be zero
+    assert stat["paths"].kept > 0  # and so was this
+    assert stat["findings"].kept == 1
+
+
+def test_the_block_carries_substantially_more_of_the_graph():
+    """The old fit spent the whole evidence allowance on services — it kept
+    12 lines of the 461 nodes. The fair share keeps well over twice that."""
+    context = build_investigation_context(_pressure_graph())
+
+    assert context.item_count > 24
+    assert _section_tokens(context, "subdomains") > 0
+    assert _section_tokens(context, "paths") > 0
+
+
+def test_findings_survive_the_reported_volume():
+    """Nothing about the new policy is allowed to cost the engagement's own
+    results: the finding is kept, and it is not paid for by emptying a
+    reconnaissance category either."""
+    context = build_investigation_context(_pressure_graph())
+
+    assert _sections(context)["findings"] == ["H1 verified=yes tool=sqlmap"]
+    for key in ("services", "subdomains", "paths"):
+        assert context.truncation[key].kept > 0
+
+
+def test_a_category_is_allocated_by_weight_not_by_count():
+    """Not equal shares, and not first-come: services carry twice the weight
+    of passive discovery, so they hold more of the budget in tokens — while
+    the categories under them still hold some."""
+    context = build_investigation_context(_pressure_graph())
+
+    assert _section_tokens(context, "services") > _section_tokens(context, "subdomains")
+    assert _section_tokens(context, "services") > _section_tokens(context, "paths")
+
+
+def test_the_last_line_of_a_category_is_not_spent_on_another_second():
+    """A category down to one line keeps it while any other still has two,
+    however expensive that line is and however cheap the other's are."""
+    graph = EngagementGraph(engagement_id="e-floor")
+    graph.add_node("service", "t.com:443/tcp",
+                   {"port": 443, "proto": "tcp", "service": "https",
+                    "version": "nginx 1.18.0 " * 6, "source": "nmap"})
+    graph.add_node("osint_note", "rdap", {"notes": ["registrar: Example Inc"]})
+    for i in range(200):
+        graph.add_node("subdomain", f"h{i}.t.com", {"source": "crt.sh"})
+
+    context = build_investigation_context(graph, ContextBudget(max_tokens=500))
+
+    assert context.truncation["services"].kept == 1
+    assert context.truncation["osint"].kept == 1
+    assert context.truncation["subdomains"].kept > 1
+
+
+def test_the_allocation_is_the_same_whatever_order_the_graph_was_built_in():
+    forward = _pressure_graph(_pressure_nodes())
+    backward = _pressure_graph(list(reversed(_pressure_nodes())))
+
+    assert (build_investigation_context(forward).text
+            == build_investigation_context(backward).text)
+
+
+@pytest.mark.parametrize("max_tokens", [MIN_MAX_TOKENS, 300, 400, 500, 600, 800])
+def test_any_budget_holds_the_bound_and_the_accounting(max_tokens):
+    context = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=max_tokens))
+
+    assert count_tokens(context.text) <= max_tokens
+    for key, stat in context.truncation.items():
+        assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
+                              + stat.over_budget), key
+        assert stat.kept >= 0 and stat.over_budget >= 0
+
+
+@pytest.mark.parametrize("max_tokens", [MIN_MAX_TOKENS, 300, 400, 500, 600, 800])
+def test_a_bigger_budget_never_keeps_less_of_a_category(max_tokens):
+    """Fairness must not cost monotonicity: every category that gets more
+    budget keeps at least as many lines, and the block never shrinks."""
+    bigger = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=max_tokens + 100))
+    smaller = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=max_tokens))
+
+    assert smaller.item_count <= bigger.item_count
+    for key, stat in smaller.truncation.items():
+        assert stat.kept <= bigger.truncation[key].kept, key
+
+
+def test_a_category_emptied_by_the_budget_says_so():
+    """'(none kept)' and '(none)' are different facts. The first is a
+    tradeoff the reader can see and argue with; the second is a finding of
+    its own, and the block must not confuse them."""
+    context = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=400))
+    text = context.text
+
+    assert context.item_count == 0
+    assert "- (none kept)" in text  # every line was given up, and it is said
+    assert "- (none)" in text  # the categories that were genuinely empty
+
+    kept_none = [line for line in text.splitlines() if line == "- (none kept)"]
+    with_evidence = [stat for stat in context.truncation.values() if stat.found]
+    assert len(kept_none) <= len(with_evidence)
+    assert "- findings: 1 of 1 omitted" in text
+
+
+def test_every_omitted_category_is_named_in_the_footer():
+    """Nothing is dropped silently: at a budget that fits the footer, every
+    category with a loss is named there with the reason and the count."""
+    context = build_investigation_context(_pressure_graph())
+
+    omitted = [key for key, stat in context.truncation.items() if stat.dropped]
+    assert omitted == ["services", "subdomains", "paths"]
+    for key in omitted:
+        assert f"- {key}: " in context.text
+    assert "TRUNCATED — items omitted, by category:" in context.text
+
+
+def test_the_truncation_record_survives_a_footer_that_had_to_be_trimmed():
+    """At the floor the footer itself stops fitting, and the fit gives up
+    rendered *names*. The record is not the footer: `truncation` still
+    accounts for every category, so a caller never loses the tradeoff."""
+    context = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=MIN_MAX_TOKENS))
+
+    assert count_tokens(context.text) <= MIN_MAX_TOKENS
+    assert context.truncation["paths"].found == 300
+    assert context.truncation["paths"].kept == 0
+    assert context.truncation["paths"].found == (
+        context.truncation["paths"].over_limit
+        + context.truncation["paths"].over_budget)
+
+
+def test_the_declaration_outlives_the_evidence_it_describes():
+    """Redaction is what makes the block safe and also what destroys the
+    signal the provider policy reads. A block squeezed down to its frame
+    must still carry the count, whatever the allocation did to the items."""
+    graph = _pressure_graph()
+    graph.add_node("path", "/login?password=forgot123", {"source": "wayback"})
+
+    for max_tokens in (MIN_MAX_TOKENS, 400, 800):
+        context = build_investigation_context(
+            graph, ContextBudget(max_tokens=max_tokens))
+
+        assert count_tokens(context.text) <= max_tokens
+        assert declares_redactions(context.text)
+        assert declared_redaction_count(context.text) == 1
+        assert "forgot123" not in context.text
+
+
+def test_malformed_evidence_under_pressure_still_accounts():
+    graph = _pressure_graph()
+    graph.add_node("service", "t.com:22/tcp", None)
+    graph.add_node("subdomain", "ok.t.com", {"source": None})
+    graph.add_node("path", "/only-label")
+    graph.add_node("osint_note", "rdap", {"notes": "not a list"})
+    graph.add_node("dns_resolution", "t.com",
+                   {"ips": [None, True, {"a": 1}, 5, "1.2.3.4"]})
+
+    context = build_investigation_context(graph)
+
+    assert count_tokens(context.text) <= 800
+    for key, stat in context.truncation.items():
+        assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
+                              + stat.over_budget), key
+    # the one value that carried signal is rendered; the junk is simply absent
+    assert "ips=1.2.3.4, 5" in context.text
+    assert "True" not in context.text
+
+
+def test_an_empty_graph_is_untouched_by_the_allocation():
+    context = build_investigation_context(EngagementGraph(engagement_id="e0-a6"))
+
+    assert context.item_count == 0
+    assert context.truncated is False
+    assert context.text.count("- (none)") == 11
+    assert "- (none kept)" not in context.text
+
+
+def test_the_pressure_graph_is_never_mutated():
+    graph = _pressure_graph()
+    before = json.dumps(graph.to_dict(), sort_keys=True)
+    nodes_before = len(graph.nodes)
+    edges_before = len(graph.edges)
+
+    build_investigation_context(graph)
+    build_investigation_context(graph, ContextBudget(max_tokens=MIN_MAX_TOKENS))
+
+    assert json.dumps(graph.to_dict(), sort_keys=True) == before
+    assert len(graph.nodes) == nodes_before
+    assert len(graph.edges) == edges_before
+
+
+def test_a_modest_graph_is_rendered_exactly_as_before():
+    """A2/A3 behaviour is only meant to change where the block could not
+    hold everything: a graph that fits keeps every line it ever did."""
+    context = build_investigation_context(_history_graph())
+
+    assert context.truncated is False
+    assert count_tokens(context.text) <= 800
+    assert _sections(context)["findings"] == ["H1 verified=not_recorded tool=sqlmap"]
+    assert _sections(context)["exploit_attempts"] == [
+        "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=yes"]
+    assert _sections(context)["verify_attempts"] == ["H1 outcome=reproduced"]
