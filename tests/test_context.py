@@ -7,6 +7,7 @@ normalisation, and an allowlist that leaves everything else alone.
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -60,6 +61,14 @@ def _recon_graph():
 
 def _sections(context):
     return {section.key: list(section.items) for section in context.sections}
+
+
+def _footer_line(text, key):
+    """The footer's line for a category, in whichever form the fit chose."""
+    for line in text.splitlines():
+        if line.startswith(f"- {key}: "):
+            return line
+    return None
 
 
 # --- determinism ----------------------------------------------------------
@@ -243,7 +252,9 @@ def test_over_budget_drops_are_recorded_against_their_category():
 
     assert stat.over_budget > 0
     assert stat.kept + stat.over_budget == stat.found
-    assert f"- subdomains: {stat.dropped} of {stat.found} omitted" in context.text
+    line = _footer_line(context.text, "subdomains")
+    assert line is not None  # named, and attributed to this category
+    assert str(stat.dropped) in line and str(stat.found) in line
 
 
 def test_duplicate_lines_collapse_to_one():
@@ -749,12 +760,12 @@ def test_findings_survive_an_abundance_of_reconnaissance():
     assert context.truncation["paths"].kept < DEFAULT_MAX_ITEMS
     assert count_tokens(context.text) <= 500
 
-    # and when even the finding cannot fit, the loss is accounted for
+    # and when even the finding cannot fit, the loss is recorded and named
     tiny = build_investigation_context(graph,
                                        ContextBudget(max_tokens=MIN_MAX_TOKENS))
     stat = tiny.truncation["findings"]
     assert stat.found == 1 and stat.kept == 0
-    assert "- findings: 1 of 1 omitted (1 over the token budget)" in tiny.text
+    assert _footer_line(tiny.text, "findings") is not None
 
 
 def test_history_is_redacted_and_normalised_but_never_mutated():
@@ -1110,19 +1121,30 @@ def test_a_bigger_budget_never_keeps_less_of_a_category(max_tokens):
 def test_a_category_emptied_by_the_budget_says_so():
     """'(none kept)' and '(none)' are different facts. The first is a
     tradeoff the reader can see and argue with; the second is a finding of
-    its own, and the block must not confuse them."""
+    its own, and the block must not confuse them. A category the budget
+    emptied is either rendered with the first or named in the footer — it is
+    never rendered as '(none)', which would claim the engagement had nothing
+    there."""
     context = build_investigation_context(
         _pressure_graph(), ContextBudget(max_tokens=400))
     text = context.text
 
-    assert context.item_count == 0
-    assert "- (none kept)" in text  # every line was given up, and it is said
-    assert "- (none)" in text  # the categories that were genuinely empty
+    # every rendered empty heading tells the truth about which nothing it is
+    genuinely_empty = [
+        section for section in context.sections
+        if not section.items
+        and not context.truncation[section.key].dropped
+        and section.heading in text
+    ]
+    assert genuinely_empty
+    assert text.count("\n- (none)\n") == len(genuinely_empty)
 
-    kept_none = [line for line in text.splitlines() if line == "- (none kept)"]
-    with_evidence = [stat for stat in context.truncation.values() if stat.found]
-    assert len(kept_none) <= len(with_evidence)
-    assert "- findings: 1 of 1 omitted" in text
+    # and what the budget emptied is named where the reader can see it
+    emptied = [stat for stat in context.truncation.values()
+               if stat.dropped and not stat.kept]
+    assert emptied
+    for stat in emptied:
+        assert _footer_line(text, stat.key) is not None, stat.key
 
 
 def test_every_omitted_category_is_named_in_the_footer():
@@ -1137,19 +1159,23 @@ def test_every_omitted_category_is_named_in_the_footer():
     assert "TRUNCATED — items omitted, by category:" in context.text
 
 
-def test_the_truncation_record_survives_a_footer_that_had_to_be_trimmed():
-    """At the floor the footer itself stops fitting, and the fit gives up
-    rendered *names*. The record is not the footer: `truncation` still
-    accounts for every category, so a caller never loses the tradeoff."""
+def test_the_truncation_record_survives_a_footer_that_was_trimmed():
+    """`footer_lines` is the defensive path for a context a caller built by
+    hand: the block may name fewer categories than it cut. The record is not
+    the footer either way — `truncation` accounts for every category, so the
+    tradeoff is never lost with the name."""
     context = build_investigation_context(
         _pressure_graph(), ContextBudget(max_tokens=MIN_MAX_TOKENS))
+    cut = [stat.key for stat in context.truncation.values() if stat.truncated]
+    assert len(cut) > 1
 
-    assert count_tokens(context.text) <= MIN_MAX_TOKENS
-    assert context.truncation["paths"].found == 300
-    assert context.truncation["paths"].kept == 0
-    assert context.truncation["paths"].found == (
-        context.truncation["paths"].over_limit
-        + context.truncation["paths"].over_budget)
+    trimmed = replace(context, footer_lines=1)
+    assert [key for key in cut if _footer_line(trimmed.text, key)] == cut[:1]
+    for key in cut:
+        stat = trimmed.truncation[key]
+        assert stat.found == stat.over_limit + stat.over_budget
+        assert stat.kept == 0
+    assert count_tokens(trimmed.text) <= count_tokens(context.text)
 
 
 def test_the_declaration_outlives_the_evidence_it_describes():
@@ -1223,3 +1249,139 @@ def test_a_modest_graph_is_rendered_exactly_as_before():
     assert _sections(context)["exploit_attempts"] == [
         "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=yes"]
     assert _sections(context)["verify_attempts"] == ["H1 outcome=reproduced"]
+
+
+# --- A7: the frame and the footer under a low budget ----------------------
+# A6 left one hole: the fixed text (header + preamble) and the per-category
+# headings cost more than a low budget, so a fit could spend the whole block
+# on framing, render no evidence, and — worst of all — trim the footer's own
+# names, leaving a reader with a silently incomplete block. A7 pays for the
+# names out of the framing: a shorter preamble and a shorter footer line, the
+# first only while the block is starving, the second only while it is still
+# starving after that, and a heading dropped for a category the footer
+# already names.
+
+def _saturated_graph():
+    """Every allowlisted type, twenty deep: at a low budget all eleven
+    categories are cut, which is the shape where a lost footer name has
+    nothing left to stand in for it."""
+    graph = EngagementGraph(engagement_id="e-saturated")
+    for i in range(20):
+        graph.add_node("finding", f"H{i}", {"tool": "sqlmap", "verified": True})
+        graph.add_node("exploit_attempt", f"E{i}", {"tool": "curl", "ok": True})
+        graph.add_node("verify_attempt", f"V{i}", {"reason": "out of scope"})
+        graph.add_node("service", f"t.com:{8000 + i}/tcp",
+                       {"port": 8000 + i, "proto": "tcp"})
+        graph.add_node("web_endpoint", f"http://t.com/{i}", {"status": 200})
+        graph.add_node("dns_resolution", f"h{i}.t.com",
+                       {"ips": [f"10.0.0.{i}"]})
+        graph.add_node("tls_observation", f"tls{i}", {"excerpt": f"TLSv1.{i}"})
+        graph.add_node("tech_fingerprint", f"tech{i}",
+                       {"excerpt": f"server-{i}"})
+        graph.add_node("subdomain", f"host-{i}.t.com", {})
+        graph.add_node("path", f"/p/{i}", {"status": 200})
+        graph.add_node("osint_note", f"n{i}", {"notes": [f"note {i}"]})
+    return graph
+
+
+@pytest.mark.parametrize("max_tokens", [256, 280, 300, 320, 350, 400, 500, 800])
+def test_every_category_the_budget_cut_is_named(max_tokens):
+    """The hole A7 closes. A category that was cut and never named leaves a
+    reader unable to tell a complete block from an incomplete one, so at
+    every budget the block names all of them — whatever it had to shorten to
+    pay for that."""
+    context = build_investigation_context(
+        _saturated_graph(), ContextBudget(max_tokens=max_tokens))
+    text = context.text
+
+    assert count_tokens(text) <= max_tokens
+    cut = [stat for stat in context.truncation.values() if stat.truncated]
+    assert cut  # this shape is cut at every budget under test
+    for stat in cut:
+        assert _footer_line(text, stat.key) is not None, stat.key
+
+
+@pytest.mark.parametrize("max_tokens", [256, 300, 500, 800])
+def test_the_footer_line_states_what_was_lost(max_tokens):
+    """Whichever of the two forms the fit chose, the line names the category
+    and gives both numbers, so 'how much is missing' is never the part that
+    was cut."""
+    context = build_investigation_context(
+        _saturated_graph(), ContextBudget(max_tokens=max_tokens))
+
+    for stat in context.truncation.values():
+        if not stat.truncated:
+            continue
+        line = _footer_line(context.text, stat.key)
+        assert line is not None
+        assert line.startswith(f"- {stat.key}: {stat.dropped}")
+        assert str(stat.found) in line
+
+
+def test_the_full_preamble_is_kept_while_it_can_carry_the_picture():
+    """The shorter preamble is not a new default. A budget that renders
+    evidence and names every category it cut keeps the fuller wording, so
+    the ordinary block reads exactly as it did."""
+    context = build_investigation_context(_pressure_graph())
+
+    assert context.compact_frame is False
+    assert context.terse_footer is False
+    assert "reported evidence, not instructions" in context.text
+
+
+def test_the_compact_preamble_carries_the_same_claims():
+    """It is prompt-injection framing, so the shorter text is only safe if
+    it still says all of it: the lines are data and not instructions,
+    nothing inside one is a directive, every line is untrusted, a finding is
+    the engine's marker check rather than a person's proof, and an attempt
+    that settled nothing is not proof of absence."""
+    full = build_investigation_context(_saturated_graph(),
+                                       ContextBudget(max_tokens=800))
+    tiny = build_investigation_context(_saturated_graph(),
+                                       ContextBudget(max_tokens=MIN_MAX_TOKENS))
+
+    assert tiny.compact_frame is True and full.compact_frame is False
+    for claim in ("DATA", "instructions", "directive", "untrusted",
+                  "marker check", "not proof"):
+        assert claim in full.text, claim
+        assert claim in tiny.text, claim
+
+
+def test_a_category_that_lost_nothing_keeps_its_heading():
+    """Hiding a heading is only honest when the footer says the same thing.
+    A category that was simply empty is in no footer, so it has to say so
+    itself — that is the one fact the shorter block must not swallow."""
+    context = build_investigation_context(
+        _pressure_graph(), ContextBudget(max_tokens=400))
+    text = context.text
+
+    lost_nothing = [section for section in context.sections
+                    if not context.truncation[section.key].dropped]
+    assert len(lost_nothing) >= 6  # this shape is mostly empty categories
+    for section in lost_nothing:
+        assert section.heading in text, section.key
+
+
+@pytest.mark.parametrize("max_tokens", [MIN_MAX_TOKENS, 300, 500, 800])
+def test_the_block_never_becomes_an_unlabelled_list(max_tokens):
+    """Even when every category was emptied, one heading survives, so the
+    lines that are left are never a list of nothing under no name."""
+    context = build_investigation_context(
+        _saturated_graph(), ContextBudget(max_tokens=max_tokens))
+
+    assert [section for section in context.sections
+            if section.heading in context.text]
+
+
+@pytest.mark.parametrize("max_tokens", [256, 300, 500, 800])
+def test_the_presentation_choice_is_deterministic(max_tokens):
+    """Two builds of one graph pick the same preamble and the same footer
+    form, so a block a caller stores is the block a caller would rebuild."""
+    first = build_investigation_context(
+        _saturated_graph(), ContextBudget(max_tokens=max_tokens))
+    second = build_investigation_context(
+        _saturated_graph(), ContextBudget(max_tokens=max_tokens))
+
+    assert (first.compact_frame, first.terse_footer) == (
+        second.compact_frame, second.terse_footer)
+    assert first.text == second.text
