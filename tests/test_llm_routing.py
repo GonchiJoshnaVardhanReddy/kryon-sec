@@ -157,12 +157,38 @@ def test_ollama_model_ok_matches_base_name(cfg):
 # ---- completion_kwargs: provider + reasoning-model quirks -------------------
 
 def test_is_reasoning_model_prefixes():
-    assert is_reasoning_model("gpt-6-astra")
-    assert is_reasoning_model("openai/gpt-6-astra")
-    assert is_reasoning_model("gpt-5.5")
-    assert is_reasoning_model("o3-mini")
-    assert not is_reasoning_model("gpt-4o-mini")
-    assert not is_reasoning_model("ollama/llama3.1")
+    assert is_reasoning_model("gpt-6-astra", "openai")
+    assert is_reasoning_model("openai/gpt-6-astra", "openai")
+    assert is_reasoning_model("gpt-5.5", "openai")
+    assert is_reasoning_model("o3-mini", "openai")
+    assert not is_reasoning_model("gpt-4o-mini", "openai")
+    assert not is_reasoning_model("ollama/llama3.1", "openai")
+
+
+def test_the_reasoning_rule_is_scoped_to_the_openai_seat():
+    """The quirks are OpenAI's API, not a property of a model name.
+
+    A server that merely speaks the OpenAI *protocol* has never heard of
+    `reasoning_effort`, so the generic seat must never get these parameters
+    for a model whose name happens to start with o1/gpt-5.
+    """
+    for seat in ("openai_compatible", "ollama", "bedrock"):
+        assert not is_reasoning_model("o3-mini", seat)
+        assert not is_reasoning_model("gpt-5-local", seat)
+    assert is_reasoning_model("o3-mini", "openai")
+
+
+@pytest.mark.parametrize("seat", ["ollama", "bedrock"])
+def test_the_other_seats_are_untouched_by_the_scoping(seat):
+    """These seats' model ids never matched the prefixes anyway; assert the
+    kwargs shape directly so the scoping is proven not to have moved them."""
+    c = KryonsecConfig()
+    c.provider = seat
+    aws = completion_kwargs(c, "bedrock/gpt-5-lab-deployment" if seat == "bedrock"
+                            else "ollama/gpt-5-local")
+    # no OpenAI reasoning parameters, and a temperature as before
+    assert "reasoning_effort" not in aws
+    assert aws["temperature"] == 0.0
 
 
 def test_completion_kwargs_plain_model_gets_temperature(cfg):

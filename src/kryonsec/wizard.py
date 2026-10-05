@@ -137,7 +137,9 @@ def _pick_provider(answers: list[str] | None = None) -> str:
             text="Which LLM provider do you want to use?",
             values=[("openai", "OpenAI (needs an API key)"),
                     ("ollama", "Ollama (local, free)"),
-                    ("bedrock", "AWS Bedrock (needs an AWS Bedrock API key)")],
+                    ("bedrock", "AWS Bedrock (needs an AWS Bedrock API key)"),
+                    ("openai_compatible",
+                     "OpenAI-compatible endpoint (LiteLLM, vLLM, LM Studio, …)")],
         ).run()
         if result is None:
             raise KeyboardInterrupt
@@ -146,12 +148,17 @@ def _pick_provider(answers: list[str] | None = None) -> str:
         "LLM provider?\n"
         "  1. OpenAI (needs an API key)\n"
         "  2. Ollama (local, free)\n"
-        "  3. AWS Bedrock (needs an AWS Bedrock API key)\n> ")
+        "  3. AWS Bedrock (needs an AWS Bedrock API key)\n"
+        "  4. OpenAI-compatible endpoint (LiteLLM, vLLM, LM Studio, any gateway)\n> ")
     answer = answer.strip().lower()
     # "o" is NOT an OpenAI abbreviation — it reads as Ollama. Spell it out.
-    # Bedrock stays LAST in the list so the numbering above never shifts.
+    # Bedrock stays LAST of the hosted options so the numbering above never
+    # shifts; the compatible endpoint was appended after it for the same
+    # reason.
     return {"1": "openai", "openai": "openai",
-            "3": "bedrock", "bedrock": "bedrock"}.get(answer, "ollama")
+            "3": "bedrock", "bedrock": "bedrock",
+            "4": "openai_compatible",
+            "openai_compatible": "openai_compatible"}.get(answer, "ollama")
 
 
 def _ask_key(answers: list[str] | None = None, title: str = "OpenAI API key",
@@ -274,6 +281,22 @@ def _ask_optional_key(title: str, answers: list[str] | None = None) -> str:
             return ""
         return result.strip()
     raw = (answers or []).pop(0) if answers else input(f"{title} (blank = skip): ")
+    return raw.strip()
+
+
+def _ask_text(title: str, answers: list[str] | None = None,
+              prompt: str = "") -> str:
+    """A plain visible answer (a URL, a model name). `_ask_key` and
+    `_ask_optional_key` mask their input, which is right for a credential
+    and wrong for anything the user needs to read back."""
+    if _is_tty() and not answers:
+        from prompt_toolkit.shortcuts import input_dialog
+
+        result = input_dialog(title=title, text=prompt or title).run()
+        if result is None:
+            raise KeyboardInterrupt
+        return result.strip()
+    raw = (answers or []).pop(0) if answers else input(f"{prompt or title}: ")
     return raw.strip()
 
 
@@ -531,6 +554,90 @@ def _setup_bedrock(
     return True
 
 
+def _setup_openai_compatible(
+    cfg: KryonsecConfig, console, answers: list[str] | None = None
+) -> bool:
+    """The OpenAI-compatible branch of the wizard.
+
+    Returns True when cfg is configured, False to send the caller back to
+    the provider question (no URL, or no model).
+
+    Nothing here has a default — no endpoint, no key, no model — because the
+    whole point of this provider is that kryonsec knows nothing about the
+    server on the other end. Which software it is, whether it wants a key,
+    and what the model is called are all the user's to say, so all three are
+    asked and none is guessed.
+    """
+    from .llm import normalize_base_url
+    from .openai_compatible import format_capabilities, list_models, probe
+
+    while True:
+        raw = _ask_text(
+            "OpenAI-compatible endpoint",
+            answers,
+            prompt=(
+                "Base URL of your OpenAI-compatible API (blank = back).\n"
+                "  Include the /v1 path if your server uses one.\n"
+                "  e.g. https://<HOST>/v1"
+            ),
+        )
+        if not raw:
+            console.print("[yellow]no base URL entered[/yellow]")
+            return False
+        base = normalize_base_url(raw)
+        if not base.startswith(("http://", "https://")):
+            console.print(f"[red]that is not a URL:[/red] {raw}")
+            continue
+        # echo the normalized form: the user should see exactly what will be
+        # called, including the scheme we may have just added
+        console.print(f"[dim]endpoint:[/dim] {base}")
+        break
+
+    console.print(
+        "[dim]API key — blank for a server that needs none (a local one "
+        "usually does not).[/dim]")
+    key = _ask_optional_key("API key for this endpoint", answers)
+
+    cfg.openai_compatible_base_url = base
+    cfg.openai_compatible_api_key = key or None
+
+    models = list_models(base, key or None)
+    if models:
+        model = _pick_model(models, answers, noun="model",
+                            sort_note="as listed by the endpoint")
+    else:
+        # plenty of servers do not implement /models — that is not an error,
+        # it just means the user knows the name and we do not
+        console.print(
+            "[yellow]the endpoint did not list models[/yellow] — type the "
+            "model name exactly as your server expects it"
+        )
+        model = _ask_text("Model", answers, prompt="model name: ")
+    if not model:
+        console.print("[yellow]no model entered[/yellow]")
+        return False
+
+    cfg.general_chat_model = model
+    # search/compaction reuse the chosen model. A default here would be a
+    # model kryonsec invented for a server it knows nothing about, and the
+    # endpoint may well serve only this one.
+    cfg.general_search_model = model
+    cfg.compaction_model = model
+    cfg.local_model = "ollama/llama3.1"  # local fallback stays available
+
+    console.print(f"[dim]probing {model}…[/dim]")
+    caps = probe(cfg, model)
+    console.print(format_capabilities(caps))
+    if not caps.answers:
+        # never trap the user: they were told what the endpoint said, and a
+        # half-written config is worse than one that fails visibly
+        console.print(
+            "[yellow]the endpoint did not answer a test message — keeping "
+            "the config anyway; chat will fail until this is fixed.[/yellow]"
+        )
+    return True
+
+
 def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> KryonsecConfig:
     """The full wizard flow. Mutates and returns cfg; writes config.toml
     on success. answers: scripted plain-mode input (tests / pipes)."""
@@ -583,6 +690,11 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
             # False (bad key, no model) loops back to the provider question
             # rather than leaving the user with a half-written config
             if _setup_bedrock(cfg, console, answers):
+                break
+            continue
+
+        if provider == "openai_compatible":
+            if _setup_openai_compatible(cfg, console, answers):
                 break
             continue
 
@@ -716,6 +828,9 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
     table.add_row("chat model", cfg.general_chat_model)
     if cfg.provider == "bedrock":
         table.add_row("aws region", cfg.bedrock_region)
+    if cfg.provider == "openai_compatible":
+        # the endpoint, never the key
+        table.add_row("endpoint", cfg.openai_compatible_base_url or "")
     table.add_row("local model", cfg.local_model)
     table.add_row("tools", ", ".join(cfg.enabled_tools) or "none")
     table.add_row("mcp servers", ", ".join(s["name"] for s in cfg.mcp_servers) or "none")

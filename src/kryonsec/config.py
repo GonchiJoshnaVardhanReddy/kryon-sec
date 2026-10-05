@@ -176,7 +176,7 @@ class KryonsecConfig:
     )
 
     # --- LLM routing (spec §7.1) ---
-    provider: str = "openai"  # "openai" | "ollama" | "bedrock"
+    provider: str = "openai"  # "openai" | "ollama" | "bedrock" | "openai_compatible"
     general_chat_model: str = "ollama/llama3.1"
     general_search_model: str = "gpt-4o-mini"
     compaction_model: str = "gpt-4o-mini"
@@ -199,6 +199,21 @@ class KryonsecConfig:
             or os.environ.get("AWS_DEFAULT_REGION")
             or "us-east-1"
         )
+    )
+
+    # --- OpenAI-compatible endpoint (generic third-party, spec §7.1) ---
+    # One provider for any server that speaks the OpenAI Chat Completions
+    # protocol: LiteLLM, vLLM, llama.cpp, LM Studio, LocalAI, a gateway, or
+    # something written after this comment. Nothing here names a vendor and
+    # nothing is defaulted — the endpoint, the model and the key all come
+    # from the user, because kryonsec knows nothing about their deployment
+    # and should not guess. The key is optional: a local server usually has
+    # none. Never logged, never audited.
+    openai_compatible_base_url: str | None = field(
+        default_factory=lambda: os.environ.get("KRYONSEC_OPENAI_COMPATIBLE_BASE_URL")
+    )
+    openai_compatible_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("KRYONSEC_OPENAI_COMPATIBLE_API_KEY")
     )
 
     # --- Agent tools (v1.1) ---
@@ -260,6 +275,12 @@ class KryonsecConfig:
                 "ollama_host": self.ollama_host,
                 "bedrock_api_key": self.bedrock_api_key or "",
                 "bedrock_region": self.bedrock_region,
+                # the OpenAI-compatible endpoint's own fields. `api_key` is
+                # spelled plainly and lives beside openai_api_key on purpose:
+                # it belongs to the provider named by [llm].provider, and the
+                # spec asks for these two names.
+                "base_url": self.openai_compatible_base_url or "",
+                "api_key": self.openai_compatible_api_key or "",
             },
             "session": {
                 # round-trip the tunables — previously env-only, silently
@@ -308,8 +329,12 @@ class KryonsecConfig:
 
         cfg = cls(**overrides)
         cfg.provider = llm.get("provider", cfg.provider)
-        if llm.get("chat_model"):
-            cfg.general_chat_model = llm["chat_model"]
+        # `chat_model` is the canonical name and the one written back; `model`
+        # is accepted as an alias because that is what the OpenAI-compatible
+        # provider's config is documented as — one value, two spellings, not
+        # a second place for it to live.
+        if llm.get("chat_model") or llm.get("model"):
+            cfg.general_chat_model = llm.get("chat_model") or llm["model"]
         if llm.get("search_model"):
             cfg.general_search_model = llm["search_model"]
         if llm.get("compaction_model"):
@@ -324,6 +349,10 @@ class KryonsecConfig:
             cfg.bedrock_api_key = llm["bedrock_api_key"]
         if llm.get("bedrock_region"):
             cfg.bedrock_region = llm["bedrock_region"]
+        if llm.get("base_url"):
+            cfg.openai_compatible_base_url = llm["base_url"]
+        if llm.get("api_key"):
+            cfg.openai_compatible_api_key = llm["api_key"]
         if "enabled" in tools:
             # an explicitly empty list must round-trip as "no tools" —
             # a falsy check would resurrect the dataclass default
@@ -354,6 +383,15 @@ class KryonsecConfig:
             cfg.license_key = license_["key"]
         cfg.mcp_servers = [_server_from_row(r) for r in mcp.get("servers", [])]
 
+        # The OpenAI-compatible seat has no default model, deliberately: the
+        # dataclass defaults (`ollama/llama3.1`, `gpt-4o-mini`) belong to the
+        # other providers, and inheriting one here would send chat to a
+        # provider the user did not select while their configured endpoint sat
+        # unused. Empty is the honest value for "never named", and build_call
+        # refuses it with a message saying so.
+        if cfg.provider == "openai_compatible" and not (llm.get("chat_model") or llm.get("model")):
+            cfg.general_chat_model = ""
+
         # environment beats TOML (documented behavior for power users / CI)
         cfg.openai_api_key = os.environ.get("OPENAI_API_KEY") or cfg.openai_api_key
         cfg.database_url = os.environ.get("DATABASE_URL") or cfg.database_url
@@ -365,6 +403,14 @@ class KryonsecConfig:
             os.environ.get("AWS_REGION_NAME")
             or os.environ.get("AWS_DEFAULT_REGION")
             or cfg.bedrock_region
+        )
+        cfg.openai_compatible_base_url = (
+            os.environ.get("KRYONSEC_OPENAI_COMPATIBLE_BASE_URL")
+            or cfg.openai_compatible_base_url
+        )
+        cfg.openai_compatible_api_key = (
+            os.environ.get("KRYONSEC_OPENAI_COMPATIBLE_API_KEY")
+            or cfg.openai_compatible_api_key
         )
         cfg.shodan_api_key = os.environ.get("SHODAN_API_KEY") or cfg.shodan_api_key
         cfg.censys_api_id = os.environ.get("CENSYS_API_ID") or cfg.censys_api_id

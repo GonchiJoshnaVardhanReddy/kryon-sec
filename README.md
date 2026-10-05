@@ -14,7 +14,7 @@ and a deterministic purple-team engine that finds, tests and proves.
 [![Tests](https://img.shields.io/badge/tests-864%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
-[Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [AWS Bedrock](#aws-bedrock) · [Safety design](#safety-design) · [Repository structure](#repository-structure)
+[Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [AWS Bedrock](#aws-bedrock) · [OpenAI-compatible endpoints](#openai-compatible-endpoints) · [Safety design](#safety-design) · [Repository structure](#repository-structure)
 
 <a href="https://youtu.be/ZnH-U8DG3Y0">
   <img src="https://img.youtube.com/vi/ZnH-U8DG3Y0/maxresdefault.jpg"
@@ -43,30 +43,31 @@ and a deterministic purple-team engine that finds, tests and proves.
 7. [The 10-state loop](#the-10-state-loop)
 8. [The evidence ladder](#the-evidence-ladder)
 9. [AWS Bedrock](#aws-bedrock)
+10. [OpenAI-compatible endpoints](#openai-compatible-endpoints)
 
 **Using it**
 
-10. [Requirements](#requirements)
-11. [Install](#install)
-12. [Mode A — General Copilot](#mode-a--general-copilot)
-13. [Mode B — Purple Team](#mode-b--purple-team)
-14. [Memory browser](#memory-browser)
-15. [Configuration reference](#configuration-reference)
-16. [Storage schema](#storage-schema)
+11. [Requirements](#requirements)
+12. [Install](#install)
+13. [Mode A — General Copilot](#mode-a--general-copilot)
+14. [Mode B — Purple Team](#mode-b--purple-team)
+15. [Memory browser](#memory-browser)
+16. [Configuration reference](#configuration-reference)
+17. [Storage schema](#storage-schema)
 
 **The honest parts**
 
-17. [What broke along the way](#what-broke-along-the-way)
-18. [What I learned](#what-i-learned)
-19. [Current status](#current-status)
-20. [What I want to build next](#what-i-want-to-build-next)
+18. [What broke along the way](#what-broke-along-the-way)
+19. [What I learned](#what-i-learned)
+20. [Current status](#current-status)
+21. [What I want to build next](#what-i-want-to-build-next)
 
 **Reference**
 
-21. [Safety design](#safety-design)
-22. [Technology stack](#technology-stack)
-23. [Repository structure](#repository-structure)
-24. [Development](#development)
+22. [Safety design](#safety-design)
+23. [Technology stack](#technology-stack)
+24. [Repository structure](#repository-structure)
+25. [Development](#development)
 
 ---
 
@@ -187,6 +188,7 @@ flowchart TB
     LLM --> OLL["Ollama, local"]
     LLM --> OAI["OpenAI"]
     LLM --> BR["AWS Bedrock"]
+    LLM --> OAC["Any OpenAI-compatible<br/>endpoint (LiteLLM, vLLM, …)"]
     LLM -.->|secrets present, stays local| OLL
 
     MODEA --> CTOOLS["Copilot tools<br/>file, web, CVE, MCP"]
@@ -353,10 +355,10 @@ makes it feel like a researcher's workflow rather than a scanner dump.
 
 This was the hardest thing to get working, so it gets its own section. 😭
 
-Kryonsec supports **three providers** — Ollama (local, preferred), OpenAI, and AWS
-Bedrock. Bedrock is not bolted on as an afterthought; it goes through the same secrets
-gate as everything else, which means **your secrets are never sent to Bedrock either**,
-because Bedrock is a third party like any other.
+Kryonsec supports **four providers** — Ollama (local, preferred), OpenAI, AWS
+Bedrock, and any OpenAI-compatible endpoint. Bedrock is not bolted on as an afterthought;
+it goes through the same secrets gate as everything else, which means **your secrets are
+never sent to Bedrock either**, because Bedrock is a third party like any other.
 
 ```toml
 [llm]
@@ -393,6 +395,84 @@ The key is never logged and never placed in an error message.
 
 ---
 
+## OpenAI-compatible endpoints
+
+Kryonsec also speaks the **OpenAI Chat Completions protocol** to any endpoint you point
+it at. That one provider covers LiteLLM, vLLM, llama.cpp's server, LM Studio, LocalAI,
+OpenRouter, Ollama's own `/v1` route, or a gateway someone stood up this morning — because
+the *protocol* is the integration, not a vendor. There is no list of supported products to
+keep current, and no branch anywhere that keys off a hostname, a port or a model name.
+
+```toml
+[llm]
+provider = "openai_compatible"
+base_url = "<BASE_URL>"        # e.g. https://<HOST>/v1 — include the /v1 path if your server uses one
+api_key  = "<API_KEY>"         # optional: blank for a server that needs none
+chat_model = "<MODEL_NAME>"    # exactly as your server spells it
+```
+
+`model` is accepted as an alias for `chat_model` in the file. What you type is what gets
+sent — kryonsec never substitutes a model name of its own. There is no default model for
+this provider: the defaults that exist belong to the Ollama and OpenAI seats, so inheriting
+one here would send your chat somewhere you did not configure. A config that selects this
+provider without naming a model is reported as incomplete (`kryonsec doctor`) rather than
+quietly running against a different provider.
+
+The name is opaque to Kryonsec: anything your server answers to works, including
+OpenRouter-style `vendor/model` ids such as `openai/gpt-oss-120b` or `meta-llama/llama-3.1-70b`
+— those reach your endpoint exactly as typed, and are never sent to `api.openai.com`. There
+is no model allowlist, and `/models` is never consulted to decide whether a model is allowed
+to run; it only offers a list to pick from, and a server that does not implement it is
+perfectly fine. Two prefixes stay reserved, because they name other services rather than
+models: `ollama/` (the local model the secrets gate falls back to) and `bedrock/`.
+
+**Connecting a local server.** Run your server, note the host and port *it* chose, and give
+the wizard that URL. If your server mounts its API under `/v1`, include it; kryonsec appends
+nothing and guesses nothing, so the path you configure is the path that is called. A local
+server usually wants no API key — leave that blank and no `Authorization` header is sent at
+all.
+
+**Connecting LiteLLM.** LiteLLM's proxy is an OpenAI-compatible server, so it is configured
+exactly like any other: its base URL (which is where *your* LiteLLM instance listens, not a
+value baked in here), its key if it has one, and whichever model name your LiteLLM config
+exposes. No code change — that is the point.
+
+**Model support is not assumed.** When you finish setup the wizard probes the endpoint and
+reports what it actually answered:
+
+```text
+  connection            yes
+  model response        yes
+  tool calling          yes / no / unknown
+  server streaming      yes / no / unknown
+  kryonsec streaming    unimplemented
+```
+
+`unknown` is a real answer, not a missing one. A server accepting the `tools` parameter does
+not prove the model will use tools, and a model that replies in plain text to a tool-shaped
+prompt has told us nothing — so those report `unknown` rather than a `no` that would read as
+"broken". A `no` means the endpoint refused the parameter outright.
+
+Those rows describe the **endpoint**, not Kryonsec. `server streaming` is what your server
+accepts; `kryonsec streaming` is what Kryonsec can currently consume, and it cannot consume a
+stream yet — so a `yes` above is your server's capability, never a claim about a Kryonsec
+feature. A probe that fails blocks nothing: the result is reported and the configuration is
+kept, because an endpoint that will not answer a test message may still serve the model.
+
+**Tool calling.** Kryonsec's tool definitions go out in the standard OpenAI `tools` format
+and tool calls come back through the same abstraction the other providers use. The provider
+only talks to the model — it never executes anything. Whether a tool call is allowed, how it
+runs, and what gets logged stays with the orchestrator, exactly as before. Your endpoint's
+model needs to support tool calling for the agent loop to be useful; the probe tells you.
+
+**Security.** The key is stored in `config.toml` with owner-only permissions, never logged,
+and never echoed back in an error message. One subtlety worth knowing: Kryonsec does **not**
+let a keyless endpoint fall back to an `OPENAI_API_KEY` sitting in your environment — for a
+local server the header is sent empty rather than shipping your real OpenAI credential to a
+machine that has no business seeing it.
+
+---
+
 ## Requirements
 
 | Component | Copilot (Mode A) | Purple Team (Mode B) |
@@ -405,6 +485,7 @@ The key is never logged and never placed in an error message.
 | Ollama (local LLM) | optional (recommended) | optional (recommended) |
 | OpenAI API key | optional | optional |
 | AWS Bedrock API key | optional | optional |
+| OpenAI-compatible endpoint URL | optional | optional |
 | PostgreSQL | optional (SQLite fallback) | optional (SQLite fallback) |
 
 `kryonsec doctor` checks all of this and refuses to start Purple Team if anything is missing.
@@ -498,13 +579,15 @@ kryonsec setup
 The first launch without a config starts the wizard automatically (re-run anytime with
 `kryonsec setup`). It walks you through:
 
-1. **Pick your LLM provider** — OpenAI, Ollama (local), or AWS Bedrock
+1. **Pick your LLM provider** — OpenAI, Ollama (local), AWS Bedrock, or an OpenAI-compatible endpoint
 2. **Provider setup**
    - *OpenAI:* paste your API key → tested live → pick a model from the list (most recent first)
    - *Ollama:* pick from your already-pulled local models
    - *AWS Bedrock:* paste a Bedrock API key (starts with `ABSK`) → the wizard prints how to
      create one, **auto-detects your region**, then lists models with cross-region inference
      profiles first — and verifies the model actually answers before saving
+   - *OpenAI-compatible:* give it the base URL, an optional key, and the model name — then it
+     probes the endpoint and reports connection, model response, tool calling and streaming
 3. **Pick the built-in agent tools** (space to select, enter to continue)
 4. **Pick MCP servers** — presets or add your own (see [MCP integration](#mcp-integration))
 5. **A summary screen** of everything you chose
@@ -791,7 +874,7 @@ Written by the wizard; hand-editable.
 
 ```toml
 [llm]
-provider = "bedrock"                              # "openai" | "ollama" | "bedrock"
+provider = "bedrock"                              # "openai" | "ollama" | "bedrock" | "openai_compatible"
 chat_model = "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 search_model = "gpt-4o-mini"                      # fact-extraction / light calls
 compaction_model = "gpt-4o-mini"                  # chat compaction (local when secrets)
@@ -800,6 +883,8 @@ openai_api_key = "sk-..."
 ollama_host = "http://localhost:11434"
 bedrock_api_key = "ABSK..."                       # also AWS_BEARER_TOKEN_BEDROCK
 bedrock_region = "us-east-1"                      # detected by the wizard
+base_url = "<BASE_URL>"                           # openai_compatible: your endpoint
+api_key = "<API_KEY>"                             # openai_compatible: optional
 
 [session]
 max_session_tokens = 16000
@@ -823,7 +908,8 @@ env = "{}"
 ```
 
 Environment variables (they win over TOML): `OPENAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`,
-`AWS_REGION_NAME`, `DATABASE_URL`, `OLLAMA_HOST`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`,
+`AWS_REGION_NAME`, `DATABASE_URL`, `OLLAMA_HOST`, `KRYONSEC_OPENAI_COMPATIBLE_BASE_URL`,
+`KRYONSEC_OPENAI_COMPATIBLE_API_KEY`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`,
 `KRYONSEC_SANDBOX_IMAGE`, `KRYONSEC_VERSION` (installer).
 
 ### LLM backends
@@ -836,6 +922,8 @@ for the secrets gate.
 1. **Ollama (local, preferred):** `ollama serve` + `ollama pull llama3.1` — nothing leaves your machine
 2. **OpenAI:** API key from the wizard or `OPENAI_API_KEY` — never used for compaction when secrets are present
 3. **AWS Bedrock:** see [the Bedrock section](#aws-bedrock) above
+4. **OpenAI-compatible:** any server speaking the OpenAI protocol — see
+   [the OpenAI-compatible section](#openai-compatible-endpoints) above
 
 ---
 

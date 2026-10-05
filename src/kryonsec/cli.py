@@ -88,6 +88,7 @@ def welcome(cfg: "KryonsecConfig") -> str:
     provider = {
         "openai": "OpenAI",
         "bedrock": "AWS Bedrock",
+        "openai_compatible": "OpenAI-compatible endpoint",
     }.get(cfg.provider, "Ollama (local)")
     return (
         f"{banner_styled('copilot')}\n"
@@ -499,6 +500,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                             "every model on the OpenAI-compatible endpoint "
                             "kryonsec calls — `kryonsec setup` lists the ones "
                             "that work."
+                        ),
+                        "openai_compatible": (
+                            "Check the endpoint is reachable at the base URL "
+                            "you configured, that the model name is spelled "
+                            "the way the endpoint serves it, and the API key "
+                            "if it needs one. The message above is the "
+                            "endpoint's own reply. `kryonsec setup` re-probes "
+                            "it and shows what it can do."
                         ),
                     }.get(
                         cfg.provider,

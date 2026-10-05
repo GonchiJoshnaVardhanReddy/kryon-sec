@@ -71,6 +71,28 @@ def _check_bedrock(cfg: KryonsecConfig) -> tuple[bool, str]:
     return False, "no Bedrock API key (run `kryonsec setup`)"
 
 
+def _check_openai_compatible(cfg: KryonsecConfig) -> tuple[bool, str]:
+    # A live check, like the Ollama row and unlike the Bedrock one: an
+    # endpoint that is simply not running is the failure this row exists to
+    # catch, and GET /models is cheap. The key is passed straight through to
+    # the request headers and never appears in the message.
+    if not cfg.openai_compatible_base_url:
+        return False, "no base URL configured (run `kryonsec setup`)"
+    if not cfg.general_chat_model:
+        # the endpoint may be perfectly reachable — the config is what is
+        # incomplete, and saying "not reachable" here would send the user
+        # to debug their server instead of running setup
+        return False, "no model configured (run `kryonsec setup`)"
+
+    from .llm import normalize_base_url
+    from .openai_compatible import list_models
+
+    base = normalize_base_url(cfg.openai_compatible_base_url)
+    if list_models(base, cfg.openai_compatible_api_key) is None:
+        return False, f"not reachable at {base} (endpoint down, or URL wrong)"
+    return True, f"OK ({base})"
+
+
 def _check_docker() -> tuple[bool, str]:
     from .purple import runtime_checks
 
@@ -110,6 +132,7 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
         ("LLM: Ollama (local)", "compaction with secrets, local chat", _check_ollama),
         ("LLM: OpenAI", "third-party chat/analysis", _check_openai),
         ("LLM: AWS Bedrock", "third-party chat/analysis (Claude, Nova, Llama)", _check_bedrock),
+        ("LLM: OpenAI-compatible", "any compatible endpoint or gateway", _check_openai_compatible),
     ):
         ok, msg = check(cfg)
         checks.append((name, purpose, ok, msg))

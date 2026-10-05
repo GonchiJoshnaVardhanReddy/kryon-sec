@@ -64,8 +64,26 @@ _normalize_ollama_host = _normalize_host
 # model id prefix — a rigid code rule, not a prompt hope.
 _REASONING_PREFIXES = ("gpt-5", "gpt-6", "gpt-7", "o1", "o3", "o4", "o5")
 
+# ...and those quirks belong to OpenAI's own API, so the rule is scoped to the
+# seat that talks to it rather than to model names in general. The generic
+# OpenAI-compatible seat is protocol- and configuration-driven: a local or
+# gateway model that happens to be called `o1-something` is not OpenAI's o1,
+# and handing it `reasoning_effort` is a 400 from a server that has never
+# heard of the parameter. This is a provider identity, not a vendor read out
+# of a model name.
+_REASONING_PROVIDER = "openai"
 
-def is_reasoning_model(model: str) -> bool:
+
+def is_reasoning_model(model: str, provider: str) -> bool:
+    """Whether this model has OpenAI's reasoning-era API quirks.
+
+    The provider is a parameter because the answer depends on it: the quirks
+    are a property of OpenAI's API, not of a name, so every other seat —
+    including the generic OpenAI-compatible one — gets False. See
+    _REASONING_PROVIDER.
+    """
+    if provider != _REASONING_PROVIDER:
+        return False
     base = model.split("/")[-1].lower()
     return any(base.startswith(p) for p in _REASONING_PREFIXES)
 
@@ -150,6 +168,62 @@ BEDROCK_PREFIX = "bedrock/"
 _BEDROCK_ROUTE = "openai/"
 _BEDROCK_OPENAI_PATH = "/openai/v1"
 
+# ---- OpenAI-compatible endpoints: the generic third-party provider --------
+#
+# One branch for every server that speaks the OpenAI Chat Completions
+# protocol — LiteLLM, vLLM, llama.cpp, LM Studio, LocalAI, OpenRouter, a
+# gateway someone wrote last week. None of them is named here, and none of
+# them needs to be: litellm's `openai/` route takes an arbitrary api_base,
+# which is the same shape the Bedrock branch below already uses. The protocol
+# is the abstraction, so there is no vendor list to keep current.
+_COMPAT_ROUTE = "openai/"
+
+# Model ids that name a different service even under the OpenAI-compatible
+# seat, so a user model must never be able to capture them:
+#   ollama/  — the local model the secrets gate falls back to
+#   bedrock/ — a distinct service, and litellm_model() maps it to the
+#              Bedrock OpenAI-compatible endpoint before this check
+# An `openai/…` id is deliberately NOT here. Under a gateway, `openai/gpt-oss`
+# and `meta-llama/llama-3.1-70b` are ordinary OpenRouter-style model names,
+# and treating the prefix as a route sent them to api.openai.com with the
+# user's OpenAI key — a destination and a credential they never configured.
+_ROUTED_PREFIXES = ("ollama/", "bedrock/")
+
+# litellm's openai/ route will not build a client without an api_key, and a
+# missing one does not stay missing: it falls back to $OPENAI_API_KEY, which
+# would put the user's real OpenAI credential in an Authorization header
+# aimed at whatever endpoint they configured. A keyless local server is a
+# perfectly normal thing to run, so the client gets this sentinel and the
+# header is blanked in extra_headers — no credential is invented, and none
+# reaches the wire. Measured against litellm: an empty string still falls
+# back to the env var, so it has to be a non-empty value.
+_KEYLESS_KEY = "kryonsec-keyless"
+
+
+def normalize_base_url(url: str) -> str:
+    """A user-configured endpoint, cleaned for litellm.
+
+    Trailing slashes go: litellm rstrips one, but ``/v1//`` reached the
+    server as ``/v1//chat/completions``. A missing scheme gets ``http://``,
+    which is how OLLAMA_HOST is already treated. Nothing is APPENDED —
+    kryonsec has no idea whether a given server mounts its API at ``/v1``,
+    ``/api/v1`` or the root, and guessing would be a hardcoded assumption
+    about someone else's deployment. Whatever path is configured is the path
+    used.
+    """
+    url = url.strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+    return url
+
+
+def _is_compat_model(cfg: KryonsecConfig, model: str) -> bool:
+    """True when this kryonsec model id goes out the configured
+    OpenAI-compatible endpoint — not the local fallback that the secrets
+    gate can substitute, and not a Bedrock id."""
+    return (cfg.provider == "openai_compatible"
+            and not model.startswith(_ROUTED_PREFIXES))
+
 
 def bedrock_openai_base(region: str) -> str:
     """Bedrock's OpenAI-compatible base URL for a region.
@@ -164,11 +238,16 @@ def litellm_model(cfg: KryonsecConfig, model: str) -> str:
     """kryonsec's model id -> the string litellm routes on.
 
     The one place the two formats meet, and the only translation in the
-    system. `cfg` is unused for now and taken anyway so the signature does
-    not have to change if a provider ever needs more than the id to route.
+    system. A `bedrock/<id>` becomes the `openai/<id>` call described above.
+    A model the user configured for an OpenAI-compatible endpoint is passed
+    through untouched — the id is theirs and is sent exactly as typed; only
+    the `openai/` route is added, because that route with a custom api_base
+    IS the generic protocol.
     """
     if model.startswith(BEDROCK_PREFIX):
         return _BEDROCK_ROUTE + model[len(BEDROCK_PREFIX):]
+    if _is_compat_model(cfg, model):
+        return _COMPAT_ROUTE + model
     return model
 
 
@@ -180,7 +259,8 @@ def completion_kwargs(
 ) -> dict[str, Any]:
     """Provider/shape kwargs shared by every litellm.completion call:
     the config.toml api key (litellm only reads the env var), the Ollama
-    host, the Bedrock endpoint, and the reasoning-model quirks above.
+    host, the Bedrock endpoint, the user's OpenAI-compatible base URL, and
+    the reasoning-model quirks above.
 
     `model` is kryonsec's id — `bedrock/<id>`, not the routed `openai/<id>`
     litellm will actually be given. That distinction is load-bearing: the
@@ -207,9 +287,21 @@ def completion_kwargs(
         kwargs["api_base"] = bedrock_openai_base(cfg.bedrock_region)
         if cfg.bedrock_api_key:
             kwargs["api_key"] = cfg.bedrock_api_key
+    elif _is_compat_model(cfg, model):
+        # The user's own endpoint, and the standard OpenAI auth pattern:
+        # `Authorization: Bearer <key>` when they configured a key, nothing
+        # at all when they did not. See _KEYLESS_KEY for why the keyless case
+        # needs both a sentinel and a blanked header rather than just an
+        # omitted api_key — omitting it silently sends $OPENAI_API_KEY here.
+        kwargs["api_base"] = normalize_base_url(cfg.openai_compatible_base_url or "")
+        if cfg.openai_compatible_api_key:
+            kwargs["api_key"] = cfg.openai_compatible_api_key
+        else:
+            kwargs["api_key"] = _KEYLESS_KEY
+            kwargs["extra_headers"] = {"Authorization": ""}
     elif cfg.openai_api_key:
         kwargs["api_key"] = cfg.openai_api_key
-    if is_reasoning_model(model):
+    if is_reasoning_model(model, cfg.provider):
         if tools:
             # OpenAI: function tools need the effort off; litellm only
             # forwards reasoning_effort when it's in allowed_openai_params
@@ -369,6 +461,24 @@ def build_call(
                 f"{model} would be sent to OpenAI without its Bedrock "
                 "endpoint — refusing"
             )
+    if _is_compat_model(cfg, model) and not model.strip():
+        # No model was ever named for the compat seat (from_toml blanks it
+        # rather than inherit another provider's default). Refuse with a
+        # readable message instead of handing litellm a bare "openai/".
+        raise LlmUnavailable(
+            "the OpenAI-compatible provider is selected but no model is "
+            "configured — run `kryonsec setup`"
+        )
+    if _is_compat_model(cfg, model) and not call.get("api_base"):
+        # Same failure the Bedrock guard above exists for: a routed
+        # `openai/<id>` that lost its api_base goes to api.openai.com, with
+        # the user's key on it. build_call is the one place every caller
+        # goes through — chat(), the tool loop, the wizard's probe — so
+        # refusing here covers all of them at once.
+        raise LlmUnavailable(
+            "the OpenAI-compatible provider is selected but no base URL is "
+            "configured — run `kryonsec setup`"
+        )
     return call
 
 
@@ -512,6 +622,10 @@ class _HostedProvider(NamedTuple):
 
     label: str  # shown in errors, so the user knows which key to fix
     key_attr: str  # KryonsecConfig attribute holding the API key
+    # False for a provider whose endpoint may legitimately need no key at
+    # all (a local server). The missing-config check it needs instead —
+    # the base URL — lives in build_call, which every call path crosses.
+    key_required: bool = True
 
 
 # Hosted (third-party) providers. `ollama` is deliberately absent: it is the
@@ -519,6 +633,13 @@ class _HostedProvider(NamedTuple):
 _HOSTED_PROVIDERS: dict[str, _HostedProvider] = {
     "openai": _HostedProvider("OpenAI", "openai_api_key"),
     "bedrock": _HostedProvider("AWS Bedrock", "bedrock_api_key"),
+    # The generic one. Its label names no vendor on purpose — the endpoint is
+    # the user's, and which software answers there is not kryonsec's business.
+    "openai_compatible": _HostedProvider(
+        "the configured OpenAI-compatible endpoint",
+        "openai_compatible_api_key",
+        key_required=False,
+    ),
 }
 
 
@@ -607,7 +728,7 @@ def chat(
             "prompt declares redacted secret material — routing this call to "
             "the local model (spec §6.4)")
         return _complete(cfg, cfg.local_model, messages, **kwargs)
-    if not getattr(cfg, hosted.key_attr, None):
+    if hosted.key_required and not getattr(cfg, hosted.key_attr, None):
         raise LlmUnavailable(
             f"{hosted.label} is the configured provider but no API key is "
             "set — run `kryonsec setup`"
