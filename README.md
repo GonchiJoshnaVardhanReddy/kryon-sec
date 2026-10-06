@@ -500,7 +500,7 @@ than building it.
 ### One command (WSL / Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
 ```
 
 The installer:
@@ -528,12 +528,12 @@ The installer:
 To skip the sandbox image entirely and do it later:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
+curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
 # later — pull (fast):
 docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
 docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
 # or build (slow):
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryonsec.git
+git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
 cd kryonsec
 docker build --progress=plain -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 ```
@@ -552,7 +552,7 @@ If a build fails partway, already-downloaded layers are cached — re-running re
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
@@ -566,7 +566,7 @@ run on the Windows host. Use WSL2 for Mode B.
 ### From source (development)
 
 ```bash
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryonsec.git
+git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
 cd kryonsec
 pip install -e ".[dev]"
 kryonsec setup

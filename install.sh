@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kryonsec one-line installer (WSL / Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
 #
 # What it does:
 #   1. installs missing prerequisites (git, curl) on apt systems
@@ -21,7 +21,7 @@
 #      the exact command to run when PATH isn't active in this shell yet
 set -euo pipefail
 
-REPO="https://github.com/GonchiJoshnaVardhanReddy/kryonsec"
+REPO="https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
 KRYONSEC_HOME="${KRYONSEC_HOME:-$HOME/.kryonsec}"
 VENV="$KRYONSEC_HOME/venv"
 
@@ -156,12 +156,9 @@ fi
 # without tags. KRYONSEC_VERSION overrides both ("@v1.3.0", "@main",
 # "@<commit-sha>").
 #
-# THIS repo is a single-commit snapshot whose history was deliberately reset,
-# so it has no release tags — the fallback is the normal path here, and it
-# points at main rather than a version tag that cannot resolve. (v1.3.1 lives
-# in the other repo; asking for it here fails the install outright.) The tag
-# lookup still runs first, so cutting a tag here switches installs to it with
-# no edit to this script.
+# THIS repo's newest tag is the release installs land on, so a release that
+# is not tagged is a release nobody gets. Cutting the tag is part of shipping
+# it; the fallback covers offline installs and a repo with no tags at all.
 FALLBACK_REF="main"
 if [ -n "${KRYONSEC_VERSION:-}" ]; then
     say "installing kryonsec${KRYONSEC_VERSION} (KRYONSEC_VERSION override)"

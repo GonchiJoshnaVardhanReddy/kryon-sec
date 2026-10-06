@@ -1,6 +1,6 @@
 # Kryonsec installer (Windows PowerShell).
 #
-#   irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryonsec/main/install.ps1 -OutFile install.ps1
+#   irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 -OutFile install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #
 # Download-then-run rather than piping the response straight into PowerShell's
@@ -20,7 +20,7 @@
 # For Purple Team use WSL2: see install.sh / the README.
 
 $ErrorActionPreference = "Stop"
-$Repo = "https://github.com/GonchiJoshnaVardhanReddy/kryonsec"
+$Repo = "https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
 $Home1 = if ($env:KRYONSEC_HOME) { $env:KRYONSEC_HOME } else { Join-Path $env:USERPROFILE ".kryonsec" }
 $Venv = Join-Path $Home1 "venv"
 
@@ -87,10 +87,9 @@ Say "installing kryonsec (this pulls litellm, mcp, rich, ...)"
 # covers offline installs and repos without tags. KRYONSEC_VERSION overrides
 # both ("@v1.3.1", "@main", "@<commit-sha>").
 #
-# THIS repo is a single-commit snapshot whose history was deliberately reset,
-# so it has no tags and the fallback is the normal path here — it points at
-# main, not at a version tag that cannot resolve. (v1.3.1 lives in the other
-# repo; asking for it here fails the install outright.)
+# THIS repo's newest tag is the release installs land on, so a release that
+# is not tagged is a release nobody gets. Cutting the tag is part of shipping
+# it; the fallback covers offline installs and a repo with no tags at all.
 $FallbackRef = "main"
 $Version = $env:KRYONSEC_VERSION
 if (-not $Version) {
@@ -100,7 +99,7 @@ if (-not $Version) {
         # newest release past the first page (we sort by semver, so ordering
         # doesn't matter, but the cutoff would)
         $resp = Invoke-RestMethod -TimeoutSec 20 `
-            -Uri "https://api.github.com/repos/GonchiJoshnaVardhanReddy/kryonsec/tags?per_page=100"
+            -Uri "https://api.github.com/repos/GonchiJoshnaVardhanReddy/kryon-sec/tags?per_page=100"
         $tagNames = @($resp | ForEach-Object { $_.name })
     } catch {
         Say "could not query tags ($($_.Exception.Message))"
