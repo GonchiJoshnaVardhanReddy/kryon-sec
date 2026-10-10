@@ -1103,3 +1103,54 @@ def test_the_purple_security_gates_still_hold():
     b = two.add_node("target", "b.example")
     with pytest.raises(CrossEngagementError):
         one.add_edge(a, "targets", b)
+
+
+# ---- the link purple mode prints ----------------------------------------
+
+
+@pytest.fixture()
+def purple_browser():
+    """Tear down the background browser a purple run leaves serving."""
+    yield
+    if cli._memory_browser is not None:
+        server, _ = cli._memory_browser
+        server.shutdown()
+        server.server_close()
+        cli._memory_browser = None
+
+
+def test_a_purple_link_is_a_live_server_that_is_reused(cfg, purple_browser):
+    """The URL purple prints has to answer, and one process gets one
+    browser — a second engagement must not bind a second port."""
+    url = cli._start_memory_browser(cfg)
+    assert url is not None and url.startswith("http://127.0.0.1:")
+    assert cli._start_memory_browser(cfg) == url
+
+    with urllib.request.urlopen(url + "api/engagements", timeout=5) as response:
+        assert response.status == 200
+        assert "engagements" in json.loads(response.read())
+
+
+def test_purple_mode_prints_the_browser_link(tmp_path, capsys, monkeypatch,
+                                             purple_browser):
+    """Purple mode hands the operator a URL for the memory browser. It is
+    printed with the engagement line, and a real server is behind it."""
+    from kryonsec.purple.zonea import PassiveResult
+
+    monkeypatch.setattr("kryonsec.purple.runner.sandbox_available",
+                        lambda *a, **k: (False, "not Linux"))
+    monkeypatch.setattr(
+        "kryonsec.purple.recon_passive.zone_a_fetchers",
+        lambda *a, **k: [lambda d: PassiveResult(source="crt.sh",
+                                                 subdomains=["www." + d])])
+
+    rc = cli._run_purple(KryonsecConfig(home=tmp_path), "target-corp.com",
+                         engagement_id="e-mem", memory_browser=True)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "memory browser" in out
+    url = cli._memory_browser[1]
+    assert url in out
+    with urllib.request.urlopen(url + "api/engagements", timeout=5) as response:
+        assert response.status == 200

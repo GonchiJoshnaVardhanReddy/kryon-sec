@@ -432,7 +432,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
             # ---- purple mode: typed text is a target domain -------------------
             if _mode[0] == "purple":
-                _run_purple(cfg, text)
+                _run_purple(cfg, text, memory_browser=True)
                 continue
 
             session.add("user", text)
@@ -605,14 +605,86 @@ def _run_memory(
     return serve(cfg, host=host, port=port, open_browser=open_browser)
 
 
+# The memory browser a purple engagement started, if any: (server, url).
+# One per process — a second engagement in the same chat session is handed
+# the first one's URL instead of binding another port.
+_memory_browser: "tuple[Any, str] | None" = None
+
+
+def _start_memory_browser(
+    cfg: KryonsecConfig, host: str = "127.0.0.1", port: int = 8899,
+) -> str | None:
+    """Serve the read-only memory browser in the background; return its URL.
+
+    The same server `kryonsec memory` runs, on a thread instead of in main.
+    Started before an engagement rather than after it, because the browser
+    reads what the run writes: the link is worth having while the run is
+    still going. Returns None when the server cannot be built at all — a
+    browser must never be able to stop an engagement, so every failure here
+    is silent.
+    """
+    global _memory_browser
+    if _memory_browser is not None:
+        return _memory_browser[1]
+
+    from .memory import create_server
+
+    try:
+        try:
+            server = create_server(cfg, host, port)
+        except OSError:
+            # Taken — by `kryonsec memory`, or by another program entirely.
+            # The same fallback serve() uses, minus its notice, which would
+            # interleave with the live engagement panel.
+            server = create_server(cfg, host, 0)
+    except (OSError, ValueError):
+        return None
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://{host}:{server.server_address[1]}/"
+    _memory_browser = (server, url)
+    return url
+
+
+def _wait_for_memory_browser(rc: int) -> int:
+    """Hold the process open on the browser the engagement just printed.
+
+    Only the `purple` subcommand calls this: it is the one entry point that
+    ends, and ending closes the server the operator was told to open. The
+    chat loop has no counterpart — it stays in its own loop, so the browser
+    lives on for the rest of the session. Ctrl+C is how this stops, which is
+    the key the engagement itself uses.
+    """
+    if _memory_browser is None:
+        return rc
+
+    server, url = _memory_browser
+    console.print(f"\n[dim]memory browser serving {url} — Ctrl+C to stop[/dim]")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        console.print("[dim]memory browser stopped[/dim]")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return rc
+
+
 def _run_purple(
     cfg: KryonsecConfig,
     target_arg: str,
     engagement_id: str | None = None,
     code_folder: str | None = None,
+    *,
+    memory_browser: bool = False,
 ) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
-    subcommand and the /mode toggle inside the chat loop."""
+    subcommand and the /mode toggle inside the chat loop.
+
+    `memory_browser` is what those two callers pass: it prints the loopback
+    URL of the read-only memory browser and leaves it serving. It is off by
+    default so a caller driving this function directly gets no socket."""
     import uuid
     from pathlib import Path
 
@@ -733,6 +805,15 @@ def _run_purple(
             console.print(
                 f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
                 f"target={target}")
+            # Printed here, with the engagement line and before the live
+            # panel owns the terminal, so it arrives as one readable line
+            # rather than something the panel has to paint around.
+            memory_url = _start_memory_browser(cfg) if memory_browser else None
+            if memory_url:
+                console.print(
+                    f"[magenta]\\[PURPLE]>[/magenta] memory browser "
+                    f"[cyan]{memory_url}[/cyan] [dim](read-only, loopback — "
+                    "open it in a browser; it fills in as the run goes)[/dim]")
             console.print()
             ui.started_at = time.monotonic()
             ui.start()
@@ -1007,8 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(cfg)
 
     if args.command == "purple":
-        return _run_purple(
-            cfg, args.target, engagement_id=args.id, code_folder=args.code)
+        return _wait_for_memory_browser(_run_purple(
+            cfg, args.target, engagement_id=args.id, code_folder=args.code,
+            memory_browser=True))
 
     if args.command == "memory":
         return _run_memory(
