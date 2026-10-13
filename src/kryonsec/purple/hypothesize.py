@@ -14,20 +14,107 @@ import json
 import logging
 from typing import Callable
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from ..config import KryonsecConfig
 from .audit import AuditLog
 from .context import ContextBudget, build_investigation_context
 from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
+# A14: the engine-derived views moved to their own module — the report, the
+# blue-team prompt, human review, the memory browser and this subagent all
+# render the same answers from it. Re-exported here because every caller has
+# always imported them from this module (A11 put them here).
+from .views import (  # noqa: F401
+    _ASSET_NODE_TYPES,
+    _claim_text,
+    ASSET_NODE_TYPES,
+    ATTEMPT_CONFIRMED,
+    ATTEMPT_INCONCLUSIVE,
+    ATTEMPT_NONE,
+    ATTEMPT_NOTES,
+    ATTEMPT_NOT_RUN,
+    ATTEMPT_UNRECORDED,
+    BASIS_NOTES,
+    BASIS_PROPOSED,
+    BASIS_SUPPORTED,
+    BASIS_TESTED,
+    BASIS_VALIDATED,
+    MAX_ASSET_CHARS,
+    MAX_RELATIONSHIP_CHARS,
+    MAX_ROLE_CHARS,
+    OUTCOMES_RUN,
+    asset_key,
+    attempt_names,
+    attempt_outcome,
+    claim_text,
+    exploit_status,
+    observed_assets,
+    primary_asset_observed,
+    related_asset_views,
+    relationship_basis,
+)
 
 log = logging.getLogger(__name__)
 
 # Bumped whenever the prompt or the node contract changes, so a hypothesis
 # node can be read back against the shape that produced it. v2 is the
 # provenance-aware contract (A1): nodes are "proposed", never "observed".
-PROMPT_VERSION = "hypothesize-v2"
+# v3 adds the structured multi-asset claim (A11); a v2 node has neither
+# field and reads exactly as it did.
+PROMPT_VERSION = "hypothesize-v3"
+
+
+# --- the multi-asset claim and its standing (A11) ---------------------------
+#
+# The claim caps, the standing ladder and the engine-derived views live in
+# ``views`` — they are what the *engagement* can say about a claim, not part
+# of the subagent that produced it, and the memory browser has to render the
+# same answers without holding a reference to a subagent (A14). Re-exported
+# at the top of this module.
+#
+# What stays here is this subagent's own contract, and one rule about it:
+# every cap is applied by *sanitising*, not by rejecting. A model that writes
+# something useful in a badly-shaped way should still be proposing it — a
+# ValidationError fails the whole state (the JSON path retries once, then
+# HYPOTHESIZE dies), and a formatting excess is not worth an engagement.
+# Sanitising also means the stored value is bounded whatever the model did,
+# which is what "untrusted" has to mean in practice. The *standing* of the
+# claim is never a field at all: see ``views``.
+MAX_RELATED_ASSETS = 4
+
+
+class AssetReference(BaseModel):
+    """One further asset a hypothesis says it needs, and the part it plays.
+
+    A claim about the target's surface, never an observation: nothing here
+    says the asset exists, belongs to the engagement, or is reachable from
+    the hypothesis's own asset. The engine decides that
+    (:func:`related_asset_views`), not this.
+    """
+
+    # ``["/a", "/b"]`` is read as two references that give no role — a model
+    # that names assets without roles is unambiguous about what it means.
+    @model_validator(mode="before")
+    @classmethod
+    def _from_shorthand(cls, value):
+        if isinstance(value, str):
+            return {"asset": value}
+        return value
+
+    asset: str = Field(
+        default="", description="The referenced asset, e.g. /admin/list.asp"
+    )
+    role: str = Field(
+        default="", description="What this asset does in the relationship, "
+        "e.g. 'carries the input the other acts on'"
+    )
+
+    @field_validator("asset", "role", mode="before")
+    @classmethod
+    def _bounded(cls, value, info):
+        limit = MAX_ASSET_CHARS if info.field_name == "asset" else MAX_ROLE_CHARS
+        return _claim_text(value, limit)
 
 
 class Hypothesis(BaseModel):
@@ -63,6 +150,53 @@ class Hypothesis(BaseModel):
         description="Tools from the allowlist that could test this",
     )
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    # A11 — the structured multi-asset claim. Optional: a legacy hypothesis
+    # (or a single-asset one) has neither, and both default to empty. Extra
+    # keys in the model's reply are ignored (pydantic's default), which is
+    # what keeps a model from inventing, say, a `validated: true` field.
+    related_assets: list[AssetReference] = Field(
+        default_factory=list,
+        description="Further assets this depends on, each with its role",
+    )
+    relationship: str = Field(
+        default="",
+        description="The proposed relationship between the assets — a claim, "
+        "never something observed or tested",
+    )
+
+    @field_validator("relationship", mode="before")
+    @classmethod
+    def _bounded_relationship(cls, value):
+        return _claim_text(value, MAX_RELATIONSHIP_CHARS)
+
+    @field_validator("related_assets", mode="before")
+    @classmethod
+    def _bounded_references(cls, value):
+        """At most :data:`MAX_RELATED_ASSETS` references that name an asset.
+
+        The list is the model's, so it is bounded and filtered rather than
+        trusted: an entry that names no asset (or is not an asset reference
+        at all) is dropped instead of failing the state. The drop happens
+        *before* the cap, so a model that pads the list with junk cannot
+        push a real reference past the limit and out of the claim. Trimming
+        here means no later reader has to re-check the bound.
+        """
+        if not isinstance(value, (list, tuple)):
+            return []
+        kept: list = []
+        for entry in value:
+            if isinstance(entry, str):
+                entry = {"asset": entry}
+            elif isinstance(entry, AssetReference):
+                entry = entry.model_dump()
+            elif not isinstance(entry, dict):
+                continue
+            if not _claim_text(entry.get("asset"), MAX_ASSET_CHARS):
+                continue  # names nothing: no claim, and no slot taken
+            kept.append(entry)
+            if len(kept) == MAX_RELATED_ASSETS:
+                break
+        return kept
 
 
 class HypothesisSet(BaseModel):
@@ -97,7 +231,7 @@ def render_hypothesize_prompt(
 
     from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-    from .allowlist import EXPLOIT_TEMPLATES
+    from .allowlist import exploit_tool_names
 
     template_dir = Path(__file__).resolve().parents[1] / "templates"
     env = Environment(
@@ -117,8 +251,12 @@ def render_hypothesize_prompt(
         # back into the graph through it
         context=context.text,
         # L8: the tool list is generated from the allowlist module — a
-        # hardcoded copy here silently drifted whenever a tool was added
-        tools=list(EXPLOIT_TEMPLATES),  # order-stable dict keys
+        # hardcoded copy here silently drifted whenever a tool was added.
+        # A10: the *names* only. One EXPLOIT_TEMPLATES key is a script
+        # inside the sandbox image, allowlisted so enrichment can spawn it;
+        # advertising it here invited a `tools` value the execution engine
+        # could only skip.
+        tools=exploit_tool_names(),  # order-stable dict keys
     )
 
 
@@ -204,7 +342,10 @@ def propose_hypotheses_with_model(
         "Respond with ONLY a JSON object of this exact shape:\n"
         '{"hypotheses": [{"id": "H1", "title": "...", "target_asset": "...", '
         '"rationale": "...", "cvss_vector": "...", "cve": "...", '
-        '"tools": ["..."], "confidence": 0.0-1.0}]}\n'
+        '"tools": ["..."], "confidence": 0.0-1.0, '
+        '"related_assets": [{"asset": "/other.asp?id=1", '
+        '"role": "what this asset does in the relationship"}], '
+        '"relationship": "how the assets are proposed to work together"}]}\n'
         "Maximum 10 hypotheses. No other text."
     )
     messages = [
@@ -317,18 +458,29 @@ class HypothesizeSubagent:
             }
             if self._model_used:
                 provenance["model"] = self._model_used
+            properties = {
+                "title": h.title,
+                "target_asset": h.target_asset,
+                "rationale": h.rationale,
+                "cvss_vector": h.cvss_vector,
+                "cve": h.cve,
+                "tools": h.tools,
+                "confidence": h.confidence,
+            }
+            # A11: the claim is written only when the model actually made
+            # one, so a single-asset hypothesis's node is byte-identical to
+            # what every earlier phase wrote. The model's text arrives here
+            # already bounded and single-lined (see _claim_text) — this is a
+            # claim, and the node's status/provenance say whose.
+            if h.related_assets:
+                properties["related_assets"] = [
+                    ref.model_dump() for ref in h.related_assets]
+            if h.relationship:
+                properties["relationship"] = h.relationship
             node = self.graph.add_node(
                 node_type="hypothesis",
                 label=h.id,
-                properties={
-                    "title": h.title,
-                    "target_asset": h.target_asset,
-                    "rationale": h.rationale,
-                    "cvss_vector": h.cvss_vector,
-                    "cve": h.cve,
-                    "tools": h.tools,
-                    "confidence": h.confidence,
-                },
+                properties=properties,
                 provenance=provenance,
                 status="proposed",
             )
@@ -338,6 +490,9 @@ class HypothesizeSubagent:
                 "target_asset": h.target_asset,
                 "tools": h.tools,
                 "confidence": h.confidence,
+                # how many further assets the model claimed, so the chain
+                # records that a multi-asset claim was made at all
+                "related_assets": len(h.related_assets),
                 "node_size": node["size_bytes"],
             })
         # duplicate ids would corrupt the finding->hypothesis joins

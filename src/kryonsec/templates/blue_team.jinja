@@ -8,8 +8,24 @@ HYPOTHESES FROM THE ENGAGEMENT (with operator decisions):
 {% for h in hypotheses %}
 - {{ h.id }}: {{ h.title }}
   target: {{ h.target_asset }}
+{#- A15/D3: deduplication runs later (REPORT), so two entries here can be one
+    issue, or two issues that merely share a test. Named by the same relation
+    the report acts on; no hypothesis is ever dropped for matching another. #}
+{%- if h.duplicate_note %}
+  relation to the other entries: {{ h.duplicate_note }}{% endif %}
   approved by operator: {{ h.approved | default(false) }}
-  status: {% if h.approved | default(false) %}tested-by-exploit-phase{% else %}proposed-only (not tested){% endif %}
+{#- A14: "approved" means the operator allowed this to be tested — it is set
+    before EXPLOIT runs, so it is never evidence that a test happened. The
+    status line is read from what the exploit phase actually recorded
+    (exploit_status), so an unrun test can never be handed to a model as a
+    tested one and come back as remediation advice for a check nobody ran. #}
+  status: {% if h.exploit_status == 'confirmed' %}tested-by-exploit-phase (the tool's own output confirmed it){% elif h.exploit_status == 'inconclusive' %}tested-by-exploit-phase (a test ran and did not confirm it){% elif h.exploit_status == 'not-run' %}approved, but the test could not run — treat as risk to verify{% elif h.exploit_status == 'unrecorded' %}approved, but no test run was recorded — treat as risk to verify{% else %}proposed-only (not tested){% endif %}
+{% if h.related_assets %}  also involves (the assistant's proposal, not a finding):
+{% for a in h.related_assets %}    - {{ a.asset }}{% if a.role %} — {{ a.role }}{% endif %}{% if not a.observed %} (never recorded by this engagement){% endif %}
+{% endfor %}{% endif %}
+{% if h.relationship %}  proposed relationship (the assistant's claim, untested): {{ h.relationship }}
+  what the engagement can say about it: {{ h.basis }} — {{ h.basis_note }}
+{% endif %}
 {% else %}
 - (no hypotheses — recommend hardening based on the target's public footprint only)
 {% endfor %}
@@ -52,3 +68,8 @@ Your task:
    owasp_api for API-shaped issues (e.g. API1:2023-BOLA). These
    are SUGGESTIONS for the defender to verify, not established fact —
    leave them empty rather than guess.
+7. Some hypotheses carry a "relation to the other entries" note. Two entries
+   marked as the same test and claim are ONE issue — write a single fix for
+   it, not two near-identical ones. Entries marked as the same test but a
+   different claim are TWO issues — fix each on its own terms. Never skip a
+   hypothesis because another one looks like it.

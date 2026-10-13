@@ -896,10 +896,15 @@ def _print_purple_summary(
     from rich.table import Table
 
     from .purple.orchestrator import STATES
+    from .purple.views import OUTCOMES_RUN, attempt_outcome
 
     findings = graph.by_type("finding")
     verified = [n for n in findings if n["properties"].get("verified")]
     attempts = graph.by_type("exploit_attempt")
+    # A14: an attempt node exists for every tool EXPLOIT *tried*, so the node
+    # count is not a run count — a sandbox that never started leaves 31 nodes
+    # and zero executions. Every "tools ran" line below reads the record.
+    runs = [a for a in attempts if attempt_outcome(a) in OUTCOMES_RUN]
     hypotheses = graph.by_type("hypothesis")
     subdomains = [n["label"] for n in graph.by_type("subdomain")]
 
@@ -922,7 +927,7 @@ def _print_purple_summary(
     rows.add_row("Verified findings", f"[red]{len(verified)}[/red]"
                  if verified else "0")
     rows.add_row("Hypotheses", str(len(hypotheses)))
-    rows.add_row("Tool executions", str(len(attempts)))
+    rows.add_row("Tool executions", str(len(runs)))
     rows.add_row("Evidence artifacts", str(evidence_count))
     if graph_saved is not None:
         # Engagement memory, stated explicitly: the operator should never
@@ -962,8 +967,14 @@ def _print_purple_summary(
         verdict = (
             f"[yellow]{len(findings)} possible finding(s) — "
             "none independently verified[/yellow]")
+    elif runs:
+        verdict = f"[green]no findings confirmed[/green] ({len(runs)} tool runs)"
     elif attempts:
-        verdict = f"[green]no findings confirmed[/green] ({len(attempts)} tool runs)"
+        # A14: something was tried and nothing ran, so there is no absence of
+        # findings to report — saying "no findings confirmed" here would read
+        # as a clean result for a check no tool performed.
+        verdict = ("[yellow]no tests could be run[/yellow] (the tools did not "
+                   "start — nothing was checked)")
     else:
         verdict = f"[green]no testing performed[/green] (engagement stopped before EXPLOIT)"
 

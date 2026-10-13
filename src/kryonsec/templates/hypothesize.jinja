@@ -62,11 +62,18 @@ Your task:
    URL, not the payload. Strip payload characters; keep the parameter.
 4. Prefer parameters that look like they reach a database (id, artist, cat,
    product, search) over redirect parameters (RetURL, next, url).
-5. A hypothesis that depends on more than one asset must name the assets it
-   needs in target_asset AND explain the relationship between them in the
-   rationale: which asset carries the input, which one is reached through
-   it, and why the two together would be exploitable. If the evidence does
-   not establish that relationship, do not imply it.
+5. When a hypothesis depends on more than one asset, keep target_asset as the
+   single asset the test would act on, and name the others in
+   related_assets — a list of up to 4 objects, each
+   {"asset": "/the/other/path", "role": "what this asset does here"} — and
+   explain the relationship between them in relationship: which asset
+   carries the input, which one is reached through it, and why the two
+   together would be exploitable. related_assets and relationship are
+   PROPOSALS you are making, never facts: you must never write that a
+   relationship is verified, confirmed, proven, or tested — no test has run
+   yet. If the evidence above does not establish the relationship, omit it
+   rather than implying it, and a hypothesis about one asset needs neither
+   field.
 6. Suggest a CVSS 3.1 vector estimate for impact if it were confirmed.
 7. Suggest testing tools ONLY from this allowlist (generated from the
    engine's allowlist — never edited by hand):

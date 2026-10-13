@@ -802,8 +802,15 @@ def test_an_error_body_carries_no_internals(server):
 # has no way to start a process.
 _ALLOWED_IMPORTS = {
     ".", ".data", ".viewer",
-    "..config", "..engagement_id", "..purple.graph_store", "..secrets",
-    "..storage",
+    # ``purple.views`` and ``purple.text`` are the two purple modules this
+    # package may hold: both are read-only and stdlib-only. ``views`` derives
+    # the engine's own standing/execution/asset views, which the browser now
+    # exposes exactly as the report renders them (A13 D4) — and ``text`` is
+    # where the line normaliser moved so that importing ``views`` cannot drag
+    # ``purple.context`` (and with it litellm and the tool allowlist) into a
+    # viewer process.
+    "..config", "..engagement_id", "..purple.graph_store", "..purple.views",
+    "..secrets", "..storage",
     "__future__", "json", "logging", "re", "threading", "webbrowser",
     "http", "pathlib", "typing", "urllib", "sqlalchemy",
 }

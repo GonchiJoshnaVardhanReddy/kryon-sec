@@ -276,10 +276,45 @@ def load_engagement(cfg: KryonsecConfig, engagement_id: str) -> dict:
         "nodes": len(graph.nodes),
         "edges": len(graph.edges),
     })
-    return {"meta": meta, "graph": graph.to_dict()}
+    payload = graph.to_dict()
+    _add_engine_views(payload["nodes"], graph)
+    return {"meta": meta, "graph": payload}
 
 
 # ---- internals ------------------------------------------------------------
+
+def _add_engine_views(nodes: list[dict], graph) -> None:
+    """Stamp each hypothesis node with what the *engine* makes of it.
+
+    The browser showed the node's stored properties and nothing else, so a
+    hypothesis whose own prose said ``"confirmed": true`` or named an asset
+    the engagement never saw looked the same there as one the engine had
+    actually tested — while the report, reading the engine's records through
+    ``purple.views``, said otherwise. Two surfaces describing one graph must
+    not disagree (A13 D4), so the browser now exposes the same derivation the
+    report renders, from the same function.
+
+    Written as ``properties.engine``, and written **after** the stored
+    properties are in place: merging is what would let a model-supplied
+    ``basis``/``tested``/``confirmed`` outrank the engine's own record, and
+    the nested key means a model that happened to write ``engine`` in its
+    properties is overwritten rather than merged with.
+
+    ``purple.views`` is read-only, holds no subagent, sandbox, allowlist or
+    LLM client and imports nothing outside the standard library — which is
+    what makes it reachable from this package (the import allowlist in
+    tests/test_memory.py says so). The graph is untouched: ``to_dict``
+    already returned a deep copy.
+    """
+    from ..purple.views import hypothesis_engine_view
+
+    for node in nodes:
+        if node.get("node_type") != "hypothesis":
+            continue
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            properties["engine"] = hypothesis_engine_view(node, graph)
+
 
 def _graph_counts(cfg: KryonsecConfig) -> dict[str, dict]:
     """Node and edge counts per engagement, straight from the tables."""

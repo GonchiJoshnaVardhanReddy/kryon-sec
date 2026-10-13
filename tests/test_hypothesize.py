@@ -62,12 +62,20 @@ def test_prompt_contains_findings():
 
 def test_prompt_tool_list_cannot_drift_from_allowlist():
     """L8: the prompt's tool list is generated from EXPLOIT_TEMPLATES —
-    a tool added to the allowlist must appear in the prompt automatically."""
-    from kryonsec.purple.allowlist import EXPLOIT_TEMPLATES
+    a tool added to the allowlist must appear in the prompt automatically.
+
+    A10 narrows it to the entries that name a tool: the one key that is a
+    path to a script in the sandbox image is not a testing tool, and the
+    prompt must not advertise it as one.
+    """
+    from kryonsec.purple.allowlist import EXPLOIT_TEMPLATES, is_program_name
 
     prompt = render_hypothesize_prompt(_graph_with_findings())
     for tool in EXPLOIT_TEMPLATES:
-        assert tool in prompt, f"allowlisted tool {tool!r} missing from prompt"
+        if is_program_name(tool):
+            assert tool in prompt, f"allowlisted tool {tool!r} missing from prompt"
+        else:
+            assert tool not in prompt, f"script location {tool!r} in the prompt"
 
 
 def test_prompt_empty_graph():
@@ -328,7 +336,7 @@ def test_hypothesis_nodes_are_proposed_and_carry_provenance(tmp_path):
         assert node["provenance"]["source_type"] == "model"
         assert node["provenance"]["source"] == "HYPOTHESIZE"
         assert node["provenance"]["agent"] == "HYPOTHESIZE"
-        assert node["provenance"]["prompt_version"] == "hypothesize-v2"
+        assert node["provenance"]["prompt_version"] == "hypothesize-v3"
 
 
 def test_hypothesis_provenance_claims_no_model_when_unknown(tmp_path):
@@ -466,18 +474,20 @@ def test_the_rendered_prompt_carries_the_investigation_context():
     prompt = render_hypothesize_prompt(graph)
 
     assert build_investigation_context(graph).text in prompt
-    assert "H9 verified=yes tool=sqlmap" in prompt
+    assert "H9 asset=unresolved verified=yes tool=sqlmap" in prompt
 
 
 def test_the_prompt_keeps_the_variables_the_template_needs():
     """A4 replaces the ad-hoc listings, not the target or the tool list."""
-    from kryonsec.purple.allowlist import EXPLOIT_TEMPLATES
+    from kryonsec.purple.allowlist import is_program_name, exploit_tool_names
 
     prompt = render_hypothesize_prompt(_graph_with_findings())
 
     assert "TARGET: testcorp.example" in prompt
-    for tool in EXPLOIT_TEMPLATES:
+    for tool in exploit_tool_names():
         assert tool in prompt
+    # the script location is not a tool name and is not offered as one
+    assert all(is_program_name(t) for t in exploit_tool_names())
 
 
 def test_the_task_instructions_survive_a_tight_context_budget():
@@ -633,7 +643,7 @@ def test_hypotheses_proposed_from_the_context_prompt_are_still_proposed(tmp_path
         "source_type": "model",
         "source": "HYPOTHESIZE",
         "agent": "HYPOTHESIZE",
-        "prompt_version": "hypothesize-v2",
+        "prompt_version": "hypothesize-v3",
     }
 
 
@@ -876,4 +886,4 @@ def test_a_sensitive_graph_still_proposes_and_still_cannot_approve(
     assert node["status"] == "proposed"
     assert "approved" not in node["properties"]
     assert node["provenance"]["source"] == "HYPOTHESIZE"
-    assert node["provenance"]["prompt_version"] == "hypothesize-v2"
+    assert node["provenance"]["prompt_version"] == "hypothesize-v3"

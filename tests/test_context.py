@@ -574,14 +574,19 @@ def _history_graph():
 def test_producer_shaped_history_is_rendered():
     items = _sections(build_investigation_context(_history_graph()))
 
-    # a finding that no VERIFY pass has touched says so, rather than
-    # reading as an unqualified confirmation
-    assert items["findings"] == ["H1 verified=not_recorded tool=sqlmap"]
+    # A10: every history line names the asset its hypothesis resolves to,
+    # beside the id, so "already recorded as a finding" is checkable.
+    # A finding that no VERIFY pass has touched says so, rather than
+    # reading as an unqualified confirmation.
+    assert items["findings"] == [
+        "H1 asset=/Login.asp?id=1 verified=not_recorded tool=sqlmap"]
     # the producer's own names would read as verdicts on the target:
     # `ok` is the spawn, `confirmed` is a marker in tool output
     assert items["exploit_attempts"] == [
-        "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=yes"]
-    assert items["verify_attempts"] == ["H1 outcome=reproduced"]
+        "H1:sqlmap asset=/Login.asp?id=1 tool=sqlmap spawn_ok=yes "
+        "exit_code=0 marker_matched=yes"]
+    assert items["verify_attempts"] == [
+        "H1 asset=/Login.asp?id=1 outcome=reproduced"]
 
 
 def test_history_property_allowlists_are_exact():
@@ -610,11 +615,13 @@ def test_history_property_allowlists_are_exact():
     items = _sections(context)
 
     assert "SECRETMARKER" not in context.text
-    # the allowlisted fields are all still there
+    # the allowlisted fields are all still there. No hypothesis node carries
+    # these ids, so the asset is reported as unresolved rather than guessed.
     assert items["exploit_attempts"] == [
-        "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=no"]
-    assert items["findings"] == ["H1 verified=no tool=sqlmap"]
-    assert items["verify_attempts"] == ["H2 outcome=not_reproduced"]
+        "H1:sqlmap asset=unresolved tool=sqlmap spawn_ok=yes exit_code=0 "
+        "marker_matched=no"]
+    assert items["findings"] == ["H1 asset=unresolved verified=no tool=sqlmap"]
+    assert items["verify_attempts"] == ["H2 asset=unresolved outcome=not_reproduced"]
     # `truncated` describes the sandbox capture, not the target
     assert "truncated=" not in context.text
 
@@ -634,9 +641,9 @@ def test_a_finding_status_is_three_valued():
     items = _sections(build_investigation_context(graph))["findings"]
 
     assert items == [
-        "H1 verified=not_recorded tool=sqlmap",
-        "H2 verified=yes tool=sqlmap",
-        "H3 verified=no tool=sqlmap",
+        "H1 asset=unresolved verified=not_recorded tool=sqlmap",
+        "H2 asset=unresolved verified=yes tool=sqlmap",
+        "H3 asset=unresolved verified=no tool=sqlmap",
     ]
 
 
@@ -665,10 +672,12 @@ def test_verification_outcomes_never_invent_a_negative():
     items = _sections(context)["verify_attempts"]
 
     assert items == [
-        "H1 outcome=inconclusive reason=asset outside engagement scope",
-        "H2 outcome=inconclusive reason=no numeric query parameter",
-        "H3 outcome=inconclusive reason=probe run failed",
-        "H4 outcome=not_reproduced",
+        "H1 asset=unresolved outcome=inconclusive "
+        "reason=asset outside engagement scope",
+        "H2 asset=unresolved outcome=inconclusive "
+        "reason=no numeric query parameter",
+        "H3 asset=unresolved outcome=inconclusive reason=probe run failed",
+        "H4 asset=unresolved outcome=not_reproduced",
     ]
     # nothing here may be worded as a result about the target
     assert "verified=no" not in context.text
@@ -684,9 +693,9 @@ def test_a_missing_verification_outcome_is_inconclusive():
     items = _sections(build_investigation_context(graph))["verify_attempts"]
 
     assert items == [
-        "H1 outcome=inconclusive",
-        "H2 outcome=inconclusive",
-        "H3 outcome=inconclusive",
+        "H1 asset=unresolved outcome=inconclusive",
+        "H2 asset=unresolved outcome=inconclusive",
+        "H3 asset=unresolved outcome=inconclusive",
     ]
 
 
@@ -739,7 +748,8 @@ def test_history_order_does_not_depend_on_discovery_order():
     assert (build_investigation_context(graph).text
             == build_investigation_context(reversed_graph).text)
     assert _sections(build_investigation_context(graph))["findings"] == [
-        "H1 verified=yes tool=sqlmap", "H2 verified=not_recorded tool=nuclei"]
+        "H1 asset=unresolved verified=yes tool=sqlmap",
+        "H2 asset=unresolved verified=not_recorded tool=nuclei"]
 
 
 def test_truncation_accounting_covers_the_new_categories():
@@ -785,7 +795,8 @@ def test_findings_survive_an_abundance_of_reconnaissance():
     context = build_investigation_context(graph, ContextBudget(max_tokens=300))
 
     assert context.truncation["findings"].kept == 1
-    assert _sections(context)["findings"] == ["H1 verified=yes tool=sqlmap"]
+    assert _sections(context)["findings"] == [
+        "H1 asset=unresolved verified=yes tool=sqlmap"]
     # the reconnaissance was what paid for it: the per-category cap took
     # most of it, and the token budget took more beyond that
     assert context.truncation["paths"].over_budget > 0
@@ -800,7 +811,8 @@ def test_findings_survive_an_abundance_of_reconnaissance():
                                        ContextBudget(max_tokens=MIN_MAX_TOKENS))
     assert tiny.collapse_empty is True
     assert tiny.truncation["findings"].kept == 1
-    assert _sections(tiny)["findings"] == ["H1 verified=yes tool=sqlmap"]
+    assert _sections(tiny)["findings"] == [
+        "H1 asset=unresolved verified=yes tool=sqlmap"]
     assert _footer_line(tiny.text, "findings") is None  # nothing to explain
     assert 0 < tiny.truncation["paths"].kept < 400
     assert _footer_line(tiny.text, "paths") is not None
@@ -850,12 +862,13 @@ def test_malformed_history_values_do_not_crash():
     items = _sections(context)
 
     # a non-bool `verified` is not a verdict, so it is not claimed as one
-    assert items["findings"] == ["H1 verified=not_recorded",
-                                 "H2 verified=not_recorded"]
+    assert items["findings"] == ["H1 asset=unresolved verified=not_recorded",
+                                 "H2 asset=unresolved verified=not_recorded"]
     assert items["exploit_attempts"] == [
-        "H3:sqlmap spawn_ok=1 exit_code=0 marker_matched=yes"]
-    assert items["verify_attempts"] == ["H4 outcome=inconclusive reason=7",
-                                        "H5 outcome=inconclusive"]
+        "H3:sqlmap asset=unresolved spawn_ok=1 exit_code=0 marker_matched=yes"]
+    assert items["verify_attempts"] == [
+        "H4 asset=unresolved outcome=inconclusive reason=7",
+        "H5 asset=unresolved outcome=inconclusive"]
 
 
 class _HistorySandbox:
@@ -913,9 +926,12 @@ def test_real_exploit_and_verify_runs_are_rendered(tmp_path):
     items = _sections(context)
 
     assert items["exploit_attempts"] == [
-        "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=yes"]
-    assert items["findings"] == ["H1 verified=yes tool=sqlmap"]
-    assert items["verify_attempts"] == ["H1 outcome=reproduced"]
+        "H1:sqlmap asset=/Login.asp?id=1 tool=sqlmap spawn_ok=yes "
+        "exit_code=0 marker_matched=yes"]
+    assert items["findings"] == [
+        "H1 asset=/Login.asp?id=1 verified=yes tool=sqlmap"]
+    assert items["verify_attempts"] == [
+        "H1 asset=/Login.asp?id=1 outcome=reproduced"]
     # the raw material the producers captured stays out of the block
     assert "-u" not in context.text and "http://" not in context.text
     assert "Parameter: id" not in context.text
@@ -1090,7 +1106,8 @@ def test_findings_survive_the_reported_volume():
     reconnaissance category either."""
     context = build_investigation_context(_pressure_graph())
 
-    assert _sections(context)["findings"] == ["H1 verified=yes tool=sqlmap"]
+    assert _sections(context)["findings"] == [
+        "H1 asset=unresolved verified=yes tool=sqlmap"]
     for key in ("services", "subdomains", "paths"):
         assert context.truncation[key].kept > 0
 
@@ -1311,10 +1328,13 @@ def test_a_modest_graph_is_rendered_exactly_as_before():
 
     assert context.truncated is False
     assert count_tokens(context.text) <= 800
-    assert _sections(context)["findings"] == ["H1 verified=not_recorded tool=sqlmap"]
+    assert _sections(context)["findings"] == [
+        "H1 asset=/Login.asp?id=1 verified=not_recorded tool=sqlmap"]
     assert _sections(context)["exploit_attempts"] == [
-        "H1:sqlmap tool=sqlmap spawn_ok=yes exit_code=0 marker_matched=yes"]
-    assert _sections(context)["verify_attempts"] == ["H1 outcome=reproduced"]
+        "H1:sqlmap asset=/Login.asp?id=1 tool=sqlmap spawn_ok=yes "
+        "exit_code=0 marker_matched=yes"]
+    assert _sections(context)["verify_attempts"] == [
+        "H1 asset=/Login.asp?id=1 outcome=reproduced"]
 
 
 # --- A7: the frame and the footer under a low budget ----------------------

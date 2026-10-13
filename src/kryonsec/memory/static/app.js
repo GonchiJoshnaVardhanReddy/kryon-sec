@@ -1012,6 +1012,30 @@ function provenanceRows(raw) {
   return entries.map(([key, value]) => [key, typeof value === 'object' ? JSON.stringify(value) : value]);
 }
 
+/* What the ENGINE recorded about a hypothesis, as opposed to what the model
+ * wrote about it. Derived server-side by the same function the report renders
+ * (purple.views.hypothesis_engine_view), so this panel and report.md cannot
+ * describe one graph differently — a hypothesis whose own prose says
+ * "confirmed" still reads as untested here when no tool ran. Absent on nodes
+ * saved before A14 and on every non-hypothesis node: nothing to show, and no
+ * invented default. */
+function engineRows(engine) {
+  const rows = [['standing', `${engine.basis} — ${engine.basis_note}`]];
+  rows.push(['tested by the exploit phase',
+    `${engine.tested ? 'yes' : 'no'} — ${engine.exploit_note}`]);
+  rows.push(['the asset it names',
+    engine.primary_asset_observed
+      ? 'recorded by this engagement'
+      : 'NOT recorded by this engagement']);
+  const assets = engine.related_assets || [];
+  if (assets.length) {
+    rows.push(['also involves', assets.map((a) =>
+      `${a.asset}${a.role ? ' (' + a.role + ')' : ''}`
+      + (a.observed ? '' : ' — not recorded by this engagement')).join('; ')]);
+  }
+  return rows;
+}
+
 function renderNodeDetail(body, node) {
   const raw = node.raw;
   $('detail-head').textContent = 'NODE';
@@ -1032,6 +1056,11 @@ function renderNodeDetail(body, node) {
   ]);
 
   kv(section(body, 'PROVENANCE'), provenanceRows(raw));
+
+  const engine = (raw.properties || {}).engine;
+  if (engine && typeof engine === 'object') {
+    kv(section(body, 'WHAT THE ENGINE RECORDED'), engineRows(engine));
+  }
 
   jsonBlock(body, 'properties.json', raw.properties || {});
 

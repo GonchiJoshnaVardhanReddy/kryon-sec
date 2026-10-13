@@ -15,13 +15,51 @@ import sys
 from typing import Callable
 
 from .audit import AuditLog
+from .context import normalize_line
+from .hypothesize import (
+    BASIS_NOTES,
+    MAX_RELATIONSHIP_CHARS,
+    related_asset_views,
+    relationship_basis,
+)
 from .orchestrator import SubagentResult
 from .recon_passive import EngagementGraph
 
 log = logging.getLogger(__name__)
 
 
-def _approval_panel(index: int, total: int, hypothesis: dict):
+def _claim_rows(hypothesis: dict, graph: EngagementGraph | None) -> list[tuple]:
+    """The A11 multi-asset claim, as rows — or nothing when there is none.
+
+    The operator is deciding whether to test this, so the claim is shown
+    labelled as what it is: the assistant's proposal. The standing is the
+    engine's (:func:`relationship_basis`), never the model's own word, and
+    is omitted when no graph is available to derive it from.
+    """
+    p = hypothesis.get("properties", {}) or {}
+    views = related_asset_views(hypothesis, graph) if graph is not None else []
+    relationship = normalize_line(
+        p.get("relationship"), MAX_RELATIONSHIP_CHARS) or ""
+    rows: list[tuple] = []
+    if views:
+        rows.append((
+            "Also involves",
+            "\n".join(
+                f"{v['asset']}" + (f" — {v['role']}" if v["role"] else "")
+                + ("" if v["observed"]
+                   else "  (not recorded by this engagement)")
+                for v in views),
+        ))
+    if relationship:
+        rows.append(("Proposed link", relationship))
+    if (views or relationship) and graph is not None:
+        basis = relationship_basis(hypothesis, graph)
+        rows.append(("Engine's view", f"{basis} — {BASIS_NOTES[basis]}"))
+    return rows
+
+
+def _approval_panel(index: int, total: int, hypothesis: dict,
+                    graph: EngagementGraph | None = None):
     """One hypothesis, as a decision — not as a log line.
 
     The operator is being asked to authorise active testing, so this shows
@@ -45,6 +83,8 @@ def _approval_panel(index: int, total: int, hypothesis: dict):
     facts.add_column()
     facts.add_row("Confidence", confidence_text)
     facts.add_row("Target", str(p.get("target_asset", "") or "—"))
+    for label, value in _claim_rows(hypothesis, graph):
+        facts.add_row(label, value)
     if p.get("cvss_vector"):
         facts.add_row("CVSS", str(p["cvss_vector"]))
     tools = ", ".join(p.get("tools", []) or []) or "none"
@@ -68,7 +108,8 @@ def _approval_panel(index: int, total: int, hypothesis: dict):
     )
 
 
-def terminal_reviewer(hypotheses: list[dict]) -> set[str]:
+def terminal_reviewer(hypotheses: list[dict],
+                      graph: EngagementGraph | None = None) -> set[str]:
     """Interactive terminal reviewer: show each hypothesis, ask A/R.
 
     Returns the set of approved hypothesis ids. Non-TTY stdin (tests,
@@ -78,6 +119,9 @@ def terminal_reviewer(hypotheses: list[dict]) -> set[str]:
     orchestrator routes on ``approved_count > 0`` alone, so a third
     disposition ("skip") would either be a lie or require changing that
     transition. It is not offered.
+
+    ``graph`` is optional and used only to derive the standing of a
+    multi-asset claim for display; it is never consulted for the decision.
     """
     approved: set[str] = set()
 
@@ -95,7 +139,7 @@ def terminal_reviewer(hypotheses: list[dict]) -> set[str]:
 
     total = len(hypotheses)
     for i, h in enumerate(hypotheses, start=1):
-        _render_hypothesis(i, total, h)
+        _render_hypothesis(i, total, h, graph)
         try:
             answer = input("    approve? [A/R] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -109,7 +153,8 @@ def terminal_reviewer(hypotheses: list[dict]) -> set[str]:
     return approved
 
 
-def _render_hypothesis(index: int, total: int, hypothesis: dict) -> None:
+def _render_hypothesis(index: int, total: int, hypothesis: dict,
+                       graph: EngagementGraph | None = None) -> None:
     """Print the approval panel, falling back to plain text.
 
     The reviewer may be driven from somewhere we do not own a console for,
@@ -119,7 +164,7 @@ def _render_hypothesis(index: int, total: int, hypothesis: dict) -> None:
     try:
         from rich.console import Console
 
-        Console().print(_approval_panel(index, total, hypothesis))
+        Console().print(_approval_panel(index, total, hypothesis, graph))
         return
     except Exception:  # pragma: no cover - terminal we cannot drive
         pass
@@ -127,6 +172,10 @@ def _render_hypothesis(index: int, total: int, hypothesis: dict) -> None:
     p = hypothesis.get("properties", {})
     print(f"\n  {hypothesis.get('label', '?')}: {p.get('title', '')}")
     print(f"    target:  {p.get('target_asset', '')}")
+    for label, value in _claim_rows(hypothesis, graph):
+        print(f"    {label}:")
+        for line in str(value).splitlines():
+            print(f"      {line}")
     print(f"    CVSS:    {p.get('cvss_vector', '') or '(not estimated)'}")
     print(f"    tools:   {', '.join(p.get('tools', []) or []) or 'none'}")
     print(f"    why:     {p.get('rationale', '')}")
@@ -155,7 +204,14 @@ class HumanReviewSubagent:
         })
 
         try:
-            approved_ids = self.reviewer(hypotheses)
+            # the built-in reviewer also takes the graph, to derive the
+            # standing of a multi-asset claim for display; an injected one
+            # keeps its single-argument contract
+            approved_ids = (
+                self.reviewer(hypotheses, self.graph)
+                if self.reviewer is terminal_reviewer
+                else self.reviewer(hypotheses)
+            )
         except Exception as e:
             # A crash in the reviewer must fail the state, not halt it —
             # and never count as approval.

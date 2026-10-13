@@ -9,7 +9,6 @@
 ## What we did
 
 {% set tested = hypotheses | selectattr('approved', 'equalto', true) | list | length %}
-{% set exploit_ran = (exploit_attempts | length) > 0 %}
 
 We collected public information about {{ target }} from third-party
 sources (certificate records and web archives). We did **not** send any
@@ -23,16 +22,36 @@ You approved {{ tested }} of them
 {% if exploit_ran %}
 Tools were run against the target to test the approved items.
 Here is what each test did:
-
-{% for a in attempts %}
-- **{{ a.label }}** ({{ a.properties.tool }}): ran
-  {%- if a.properties.confirmed %} and **found the issue confirmed**{% endif %}.
-{% endfor %}
+{% elif exploit_attempted %}
+**The tests could not be run, so nothing was checked.** The automated
+testing phase tried to run its tools against the website and they could
+not start — see the test history below for what each one reported. Every
+issue below is therefore an unconfirmed suggestion: none of them was
+looked for.
 {% else %}
 **No testing was done against the website.** The approved items were
 not checked — the automated testing phase did not run in this
 engagement, so every issue below is an unconfirmed suggestion.
 {% endif %}
+
+{#- One line per attempt, whatever the phase as a whole did: an attempt that
+    could not start is a thing the reader needs to see next to the ones that
+    did, and it is never worded as a result. -#}
+{% for a in attempts %}
+{% if a.properties.outcome == 'confirmed' %}
+- **{{ a.label }}** ({{ a.properties.tool }}): ran, and **the tool said the
+  issue is real**.
+{% elif a.properties.outcome == 'inconclusive' %}
+- **{{ a.label }}** ({{ a.properties.tool }}): ran and did **not** confirm
+  the issue. A test that finds nothing is not proof that nothing is there.
+{% elif a.properties.outcome == 'not-run' %}
+- **{{ a.label }}** ({{ a.properties.tool }}): **could not be run**, so
+  nothing was checked{% if a.properties.not_run_reason %} ({{ a.properties.not_run_reason }}){% endif %}.
+{% else %}
+- **{{ a.label }}** ({{ a.properties.tool }}): an attempt was recorded, but
+  this engagement did not record whether the tool actually started.
+{% endif %}
+{% endfor %}
 
 {% if halt_reason %}
 The engagement stopped early. Reason: {{ halt_reason }}.
@@ -52,19 +71,28 @@ No timeline events were recorded in the audit chain.
 ## How the testing was done (steps you can repeat)
 
 {% if attempts %}
-A tester can check any item below by hand. Every test was run inside a
+A tester can check any item below by hand. Every test runs inside a
 locked-down sandbox container, one test at a time, against the target
 website only.
 
 {% for a in attempts %}
 ### Steps for {{ a.label }}
 
+{% if a.properties.outcome in ('confirmed', 'inconclusive') %}
 1. The tool {{ a.properties.tool }} was run with these settings:
    `{{ a.properties.argv | join(' ') }}`
 2. The tool sent test requests to the target website and watched how
    it answered.
-3. Result: {% if a.properties.confirmed %}the tool said the issue is real ("confirmed"). The tool's own words:
-   `{{ a.properties.output_excerpt | trim | truncate(200) }}`{% else %}the tool did not find the issue (it checked and got no proof).{% endif %}
+3. Result: {% if a.properties.outcome == 'confirmed' %}the tool said the issue is real ("confirmed"). The tool's own words:
+   `{{ a.properties.output_excerpt | trim | truncate(200) }}`{% else %}the tool ran and did not find the issue — it looked and got no
+   proof.{% endif %}
+{% else %}
+**This test did not run in this engagement**, so there is no result to
+compare against{% if a.properties.outcome == 'not-run' %} — the tool reported:
+{{ a.properties.not_run_reason or "(no reason was recorded)" }}{% endif %}. The
+command it would have used was:
+`{{ a.properties.argv | join(' ') }}`
+{% endif %}
 
 To repeat it yourself: run the same command (shown in step 1) in a safe
 test environment and compare what the tool answers. Only test websites
@@ -97,10 +125,17 @@ information and guessed what might be wrong. Nothing below is confirmed
 
 {% for h in hypotheses %}
 ### {{ h.id }} — {{ h.title }}
-- Where: {{ h.target_asset }}
+- Where: {{ h.target_asset }}{% if not h.primary_asset_observed %} (this engagement never recorded this asset){% endif %}
+{% if h.related_assets %}- Also involves (the assistant's proposal — these are not findings):
+{% for a in h.related_assets %}  - {{ a.asset }}{% if a.role %} — {{ a.role }}{% endif %}{% if not a.observed %} (this engagement never recorded this asset){% endif %}
+{% endfor %}{% endif %}{% if h.relationship %}- Proposed relationship (the assistant's claim, not something that was tested): {{ h.relationship }}
+{% endif %}{% if h.related_assets or h.relationship %}- What the engagement itself can say about that claim: {{ h.basis }} — {{ h.basis_note }}
+{% endif %}{% if h.merged_claims %}- The duplicate check folded these into this item (the same test, worded differently — kept so nothing is lost):
+{% for m in h.merged_claims %}  - {{ m.id }}{% if m.title %}: "{{ m.title }}"{% endif %}{% if m.rationale %} — {{ m.rationale }}{% endif %}{% if m.relationship %} (it also claimed: {{ m.relationship }}){% endif %}{% for a in m.related_assets %} [{{ a.asset }}{% if not a.observed %} — never recorded by this engagement{% endif %}]{% endfor %}
+{% endfor %}{% endif %}
 - How sure the assistant is: {{ "%.0f" | format((h.confidence or 0) * 100) }}%
 - Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
-{% if exploit_ran %}- Tested: {% if h.tested | default(false) %}yes{% else %}no{% endif %}{% endif %}
+{% if exploit_ran or h.exploit_status != 'none' %}- Tested: {{ "yes" if h.tested | default(false) else "no" }}{% if h.exploit_status in ('not-run', 'unrecorded') %} — {{ h.exploit_note }}{% endif %}{% endif %}
 {% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
 {% if h.verified | default(false) %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.confirmed | default(false) %}- Double-checked: the second check ran but did not agree or could not run — treat this finding with care{% endif %}
 {% if h.cvss_vector %}- Severity guess (CVSS vector): {{ h.cvss_vector }}
@@ -144,7 +179,8 @@ No code scanners ran (no --code folder was provided, or the sandbox was unavaila
 
 {% for r in remediations %}
 ### Fix for {{ r.hypothesis_id }} — {{ r.title }}
-- How serious: {{ r.severity }}
+{% if not r.resolved %}- **This fix is not linked to anything in this report.** {{ r.reference_note }}.
+{% endif %}- How serious: {{ r.severity }}
 - What to do: {{ r.fix }}
 {% if r.detection %}- How to spot attacks: {{ r.detection }}{% endif %}
 {% if r.cwe or r.owasp or r.attack or r.owasp_api %}- Weakness types (suggested, not verified): {{ r.cwe if r.cwe else "—" }}{{ "; " if r.cwe and r.owasp }}{{ r.owasp if r.owasp else "—" }}{{ "; " if (r.cwe or r.owasp) and r.attack }}{{ r.attack if r.attack else "—" }}{{ "; " if (r.cwe or r.owasp or r.attack) and r.owasp_api }}{{ r.owasp_api if r.owasp_api else "—" }}{% endif %}

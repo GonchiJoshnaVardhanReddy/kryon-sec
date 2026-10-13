@@ -66,16 +66,40 @@ budget had kept. Per rung the fit is monotone and the choice is a maximum
 of them, so no boundary can cost a line — and a block the budget can carry
 whole still renders the bytes it always did. See :func:`_fit`,
 :func:`_score` and :func:`_visible`.
+
+A10 makes the history *locatable*, so "prefer the untested" is something
+the model can act on. No producer writes an asset onto a finding, an
+exploit attempt or a verification — each carries only the hypothesis id in
+its label, and the asset lives on the hypothesis node alone. Every history
+line therefore joins through that id and names the asset beside the id
+(:func:`_hypothesis_assets`, :data:`_Source.link`), or says ``unresolved``
+when the join cannot be made — a missing hypothesis node, or two nodes
+sharing an id and disagreeing about the asset. It is never guessed from the
+label, the tool or the engagement target. The A10 change also stops the
+`tool` field rendering a value that is a location rather than a program
+(:data:`_Source.name_only`), which is what kept a sandbox script path out
+of the prompt. The join reads the graph and writes nothing; redaction,
+normalisation, ordering, the token bound and the truncation accounting are
+unchanged (a history line is longer, so it costs more of the budget — the
+weights still decide how many tokens a category may hold).
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
 from ..secrets import REDACTION_DECLARATION, redact
+from .allowlist import is_program_name
 from .recon_passive import EngagementGraph
+# The line normaliser lives in its own module (``text``) because it is the one
+# piece of this file that a *display* surface also needs, and this file drags
+# the LLM client and the tool allowlist behind it — the memory browser must be
+# able to reach the normaliser without them (A14/D4). Re-exported below, so
+# every existing `from .context import normalize_line` still works.
+from .text import DEFAULT_MAX_ITEM_CHARS, normalize_line  # noqa: F401
+from .text import cap as _cap
+
 
 # --- limits ---------------------------------------------------------------
 
@@ -97,8 +121,8 @@ MIN_MAX_TOKENS = 256
 # cannot consume the whole block.
 DEFAULT_MAX_ITEMS = 40
 # Per line, so one 500-char whatweb excerpt or 300-char crawled URL cannot
-# dominate a section.
-DEFAULT_MAX_ITEM_CHARS = 300
+# dominate a section. Defined with the normaliser it belongs to (``text``).
+
 
 
 # --- what may be read -----------------------------------------------------
@@ -131,6 +155,18 @@ class _Source:
     # scan's service list is hundreds of light ones, and a weight is what
     # stops the second from emptying the block before the third arrives.
     weight: int = 1
+    # Which hypothesis this node belongs to, for the history. No producer
+    # writes an asset onto a finding or an attempt — the id in its label is
+    # the only join key there is — so the line names the asset the id
+    # resolves to, or says so when it does not (:func:`_hypothesis_assets`).
+    # A source with no link renders no asset and is not history.
+    link: Callable[[dict], str | None] | None = None
+    # Fields whose value must be a bare program name. The producers store
+    # whatever tool the hypothesis named; a value carrying a path separator
+    # is a location in the sandbox image, not a tool, and rendering it would
+    # put a sandbox path in the prompt. It renders as unresolved instead of
+    # being read, or shortened to a basename that invents a tool name.
+    name_only: tuple[str, ...] = ()
 
 
 def _props(node: dict) -> dict:
@@ -155,6 +191,70 @@ def _finding_status(node: dict) -> str:
     if value is False:
         return "verified=no"
     return "verified=not_recorded"
+
+
+# --- history: which hypothesis a record belongs to ------------------------
+
+# The producers record no asset on a finding, an exploit attempt or a
+# verification: the asset lives on the hypothesis node, and the hypothesis id
+# in the record's label is the only key to it. EXPLOIT labels an attempt
+# "<hypothesis id>:<tool>" (exploit.py:479) so one hypothesis's tool runs can
+# be told apart; the finding it may record and VERIFY's attempt both use the
+# bare id (exploit.py:496, verify.py:135).
+
+
+def _label(node: dict) -> str | None:
+    """The node's label when it is a non-empty string, else None."""
+    label = node.get("label")
+    return label if isinstance(label, str) and label else None
+
+
+def _id_before_tool(node: dict) -> str | None:
+    """The hypothesis id in an ``"<id>:<tool>"`` attempt label.
+
+    Split once: an id may not contain the separator and a tool name cannot,
+    so the first segment is the id and the tail is never re-parsed.
+    """
+    label = _label(node)
+    if label is None:
+        return None
+    return label.split(":", 1)[0] or None
+
+
+def _verifying_hypothesis(node: dict) -> str | None:
+    """The hypothesis a verification or finding belongs to — its whole label."""
+    return _label(node)
+
+
+def _hypothesis_assets(nodes: list[dict]) -> dict[str, str]:
+    """hypothesis id -> the one asset every node carrying that id agrees on.
+
+    An id is left out of the map — never resolved to a guess — when no
+    hypothesis node carries it, when the node records no usable asset, or
+    when two nodes share the id and name different assets. The caller
+    renders that as ``unresolved``. A value is the producer's raw property,
+    cleaned where it is rendered like every other value in the block.
+    """
+    seen: dict[str, set[str | None]] = {}
+    for node in nodes:
+        if node.get("node_type") != "hypothesis":
+            continue
+        label = _label(node)
+        if label is None:
+            continue
+        asset = _props(node).get("target_asset")
+        seen.setdefault(label, set()).add(
+            asset if isinstance(asset, str) and asset.strip() else None)
+
+    return {label: next(iter(assets)) for label, assets in seen.items()
+            if len(assets) == 1 and None not in assets}
+
+
+def _asset_field(ref: str | None, assets: dict[str, str], limit: int
+                 ) -> tuple[str, int]:
+    """``asset=<value>`` for a history line, plus the redactions it caused."""
+    value, reds = _clean(assets.get(ref) if ref else None, limit)
+    return f"asset={value or _UNRESOLVED}", reds
 
 
 def _verify_status(node: dict) -> str:
@@ -203,6 +303,8 @@ _SOURCES: tuple[_Source, ...] = (
         fields=("tool",),
         status=_finding_status,
         weight=6,  # the results of the engagement: never the cheapest thing to lose
+        link=_verifying_hypothesis,  # the finding is labelled with the hypothesis id
+        name_only=("tool",),
     ),
     _Source(
         key="exploit_attempts",
@@ -214,6 +316,8 @@ _SOURCES: tuple[_Source, ...] = (
         fields=("tool", "ok", "exit_code", "confirmed"),
         relabel=(("ok", "spawn_ok"), ("confirmed", "marker_matched")),
         weight=5,  # what has already been tried, so a new hypothesis can avoid it
+        link=_id_before_tool,  # the attempt is labelled "<hypothesis id>:<tool>"
+        name_only=("tool",),
     ),
     _Source(
         key="verify_attempts",
@@ -226,6 +330,7 @@ _SOURCES: tuple[_Source, ...] = (
         fields=("reason",),
         status=_verify_status,
         weight=5,  # an outcome already reached, and one line per hypothesis
+        link=_verifying_hypothesis,  # VERIFY labels the attempt with the finding id
     ),
     _Source(
         key="services",
@@ -290,40 +395,8 @@ _WEIGHTS: dict[str, int] = {source.key: source.weight for source in _SOURCES}
 
 
 # --- normalisation --------------------------------------------------------
-
-# C0 controls minus the whitespace ones (tab, LF, VT, FF, CR) and DEL. The
-# whitespace five are left for the pass below so they become a space rather
-# than nothing — deleting them would glue "user\nadmin" into "useradmin".
-_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
-# Python's \s on str is Unicode-aware: it also covers NEL (U+0085), the
-# line/paragraph separators (U+2028/2029) and no-break space, any of which
-# some downstream parser could read as a line break.
-_WHITESPACE = re.compile(r"\s+")
-
-
-def _cap(text: str, limit: int) -> str:
-    """Cut to ``limit`` characters, marking the cut."""
-    if limit <= 0 or len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
-
-
-def normalize_line(value: Any, limit: int = DEFAULT_MAX_ITEM_CHARS) -> str | None:
-    """One prompt-safe line from untrusted content, or None if nothing is left.
-
-    Every run of whitespace — newlines, tabs, and the Unicode characters
-    some parsers treat as line breaks — collapses to a single space, and the
-    remaining control characters are dropped. A value therefore cannot add a
-    line, a bullet or a section heading of its own to the block: whatever it
-    contains, it arrives as one line of data.
-    """
-    if not isinstance(value, str):
-        return None
-    text = _CONTROL.sub("", value)
-    text = _WHITESPACE.sub(" ", text).strip()
-    if not text:
-        return None
-    return _cap(text, limit)
+# ``normalize_line`` and its helpers moved to ``purple.text`` (A14/D4) and are
+# imported at the top of this file, so this module's public API is unchanged.
 
 
 def _scalar(value: Any, limit: int) -> str | None:
@@ -376,8 +449,14 @@ def _clean(raw: Any, limit: int) -> tuple[str | None, int]:
     return _scalar(raw, limit), 0
 
 
-def _items(node: dict, source: _Source, limit: int) -> list[tuple[str, int]]:
-    """The lines one node contributes: (line, redactions). Empty is fine."""
+def _items(
+    node: dict, source: _Source, limit: int, assets: Mapping[str, str]
+) -> list[tuple[str, int]]:
+    """The lines one node contributes: (line, redactions). Empty is fine.
+
+    ``assets`` is the hypothesis-id -> asset map :func:`_collect` built once
+    for the whole block; only a source with a :attr:`_Source.link` reads it.
+    """
     label, reds = _clean(node.get("label"), limit)
     properties = _props(node)
     items: list[tuple[str, int]] = []
@@ -395,12 +474,25 @@ def _items(node: dict, source: _Source, limit: int) -> list[tuple[str, int]]:
         return items
 
     parts = [label] if label else []
+    if source.link is not None and label:
+        # The asset the record's hypothesis resolves to, beside the id that
+        # named it, so "already recorded" is a thing the reader can check.
+        # Only with a label: without one there is no id to resolve, and the
+        # line would be the word "unresolved" and nothing else.
+        field, field_reds = _asset_field(source.link(node), assets, limit)
+        parts.append(field)
+        reds += field_reds
     if source.status is not None:
         # engine-literal text, derived from the producer's own fields
         parts.append(source.status(node))
     names = dict(source.relabel)
     for prop in source.fields:
-        value, value_reds = _clean(properties.get(prop), limit)
+        raw = properties.get(prop)
+        if (prop in source.name_only and isinstance(raw, str) and raw
+                and not is_program_name(raw)):
+            parts.append(f"{names.get(prop, prop)}={_UNRESOLVED}")
+            continue
+        value, value_reds = _clean(raw, limit)
         if value is None:
             continue
         parts.append(f"{names.get(prop, prop)}={value}")
@@ -569,6 +661,15 @@ _FRAME_COMPACT = (
 # no untrusted string can reach the start of a line to imitate it — every
 # value above it is rendered behind "- ".
 _NO_EVIDENCE = "NO EVIDENCE RECORDED"
+
+# What a history line says when the fact it needs is not in the graph. An
+# engine literal for the same reason as the line above, and deliberately not
+# a value: an asset is named only when the hypothesis id in the record's
+# label resolves to exactly one, and a `tool` is named only when the recorded
+# value is a name rather than a location. Neither is inferred from the other
+# fields, and neither is left out — a reader who cannot see that the engine
+# tried to resolve it would read the absence as "there was none".
+_UNRESOLVED = "unresolved"
 
 
 def _reasons(stat: Truncation) -> str:
@@ -833,13 +934,16 @@ def _collect(
     sections: list[ContextSection] = []
     truncation: dict[str, Truncation] = {}
     redactions = 0
+    # Built once, read by every history line: the hypothesis nodes are the
+    # only place an asset is recorded, and no history node carries one.
+    assets = _hypothesis_assets(nodes)
 
     for source in _SOURCES:
         found: list[str] = []
         for node in nodes:
             if node.get("node_type") != source.node_type:
                 continue
-            for line, reds in _items(node, source, budget.max_item_chars):
+            for line, reds in _items(node, source, budget.max_item_chars, assets):
                 found.append(line)
                 redactions += reds
 

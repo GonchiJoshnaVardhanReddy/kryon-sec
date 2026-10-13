@@ -748,9 +748,11 @@ def test_dedup_merges_same_tools_and_asset(tmp_path):
     from kryonsec.purple.report import dedup_hypotheses
 
     graph = _graph()
-    # H2 in _graph is (ffuf, target-corp.com) — add a duplicate suggestion
+    # H2 in _graph is (ffuf, target-corp.com) — add a duplicate suggestion.
+    # A15: the title names the same class as H2's ("xss"), because a title the
+    # class table cannot read no longer merges into one it can.
     graph.add_node("hypothesis", "H3", {
-        "title": "search page may reflect input",
+        "title": "Reflected XSS on the search page",
         "target_asset": "target-corp.com",
         "rationale": "same idea again",
         "cvss_vector": "",
@@ -801,7 +803,7 @@ def test_report_subagent_merges_duplicates_before_rendering(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = _graph()
     graph.add_node("hypothesis", "H3", {
-        "title": "dup", "target_asset": "target-corp.com",
+        "title": "Reflected XSS on the search page", "target_asset": "target-corp.com",
         "rationale": "r", "cvss_vector": "", "tools": ["ffuf"],
         "confidence": 0.5,
     })
@@ -810,7 +812,11 @@ def test_report_subagent_merges_duplicates_before_rendering(tmp_path):
     assert len(graph.by_type("hypothesis")) == 2
     content = (tmp_path / "engagements" / "e-d" / "report.md").read_text(
         encoding="utf-8")
-    assert "H3" not in content
+    # H3 is not an issue of its own any more — but its claim is kept and the
+    # report says so, so nothing about the merge is hidden from the reader
+    assert "### H3" not in content
+    assert "folded these into this item" in content
+    assert "Reflected XSS on the search page" in content
     assert validate_report(content, graph) == []
 
 
@@ -818,7 +824,7 @@ def test_validate_report_catches_unmerged_duplicate(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = _graph()
     graph.add_node("hypothesis", "H3", {
-        "title": "dup", "target_asset": "target-corp.com",
+        "title": "Reflected XSS on the search page", "target_asset": "target-corp.com",
         "rationale": "r", "cvss_vector": "", "tools": ["ffuf"],
         "confidence": 0.5,
     })

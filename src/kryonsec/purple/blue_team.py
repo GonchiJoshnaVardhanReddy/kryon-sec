@@ -16,9 +16,23 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..config import KryonsecConfig
 from .audit import AuditLog
-from .hypothesize import _extract_json
+from .context import normalize_line
+from .hypothesize import (
+    BASIS_NOTES,
+    MAX_RELATIONSHIP_CHARS,
+    _extract_json,
+    related_asset_views,
+    relationship_basis,
+)
 from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
+# A15/D3: the duplicate relation is REPORT's, not a second opinion written
+# here. Importing the pass (not a copy of it) is what keeps the prompt from
+# telling the model a pair is one issue that the report then treats as two.
+from .report import hypothesis_relations
+# A14: whether a test actually ran — see views.exploit_status. The prompt may
+# not call a hypothesis tested on the strength of the operator's approval.
+from .views import exploit_status
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +245,43 @@ class RemediationSet(BaseModel):
     remediations: list[Remediation] = Field(default_factory=list, max_length=20)
 
 
+def _relation_notes(nodes: list[dict]) -> dict[str, str]:
+    """One plain sentence per hypothesis that shares its test with another.
+
+    REPORT deduplicates *after* BLUE_TEAM, so the model is asked to write
+    advice for hypotheses the report may fold into one item — and before A15
+    it had no way to tell. Two hypotheses with the same tool and target
+    looked like two issues (two near-identical fixes for one problem, or two
+    contradictory ones) or were silently assumed to be one.
+
+    Nothing is suppressed here: every hypothesis still reaches the prompt with
+    its own id, title, assets and exploit status. Only the relationship is
+    named, and it is read from :func:`hypothesis_relations` — the same pass
+    REPORT acts on — so the prompt cannot promise a merge the report does not
+    make. There is no canonical relationship to hand over yet (nothing has
+    been merged at this point in the loop, and nothing is renumbered), so the
+    note names the pair and what the report will do with it rather than
+    inventing an absorbed-claim record that does not exist yet.
+    """
+    aliases, kept_apart = hypothesis_relations(nodes)
+    notes = {
+        label: (
+            f"same test and same claim as {canonical} — the report's duplicate "
+            f"check folds them into one item under {canonical}'s id, keeping "
+            f"this title as a folded-in claim. This is ONE issue: write one "
+            f"fix that covers it (either id may carry it)."
+        )
+        for label, canonical in aliases.items()
+    }
+    for entry in kept_apart:
+        notes[entry["kept"]] = (
+            f"same test as {entry['apart_from']}, but a different claim "
+            f"({entry['reason']}) — the report keeps these as two separate "
+            f"items. Write a fix for each on its own terms."
+        )
+    return notes
+
+
 def render_blue_team_prompt(graph: EngagementGraph) -> str:
     """Render the Jinja2 prompt with hypotheses + approval decisions."""
     from pathlib import Path
@@ -245,13 +296,34 @@ def render_blue_team_prompt(graph: EngagementGraph) -> str:
     )
     template = env.get_template("blue_team.jinja")
 
-    hypotheses = [
-        {
+    # A11: a multi-asset claim is part of what the blue team must defend
+    # against, so it rides along — normalised and marked, exactly as the
+    # report renders it, and with the engine's own standing rather than the
+    # model's word for it.
+    nodes = graph.by_type("hypothesis")
+    notes = _relation_notes(nodes)
+    hypotheses = []
+    for n in nodes:
+        # A14: defaults under the node's own properties — the template is
+        # StrictUndefined, so a node written before these fields existed must
+        # still render. Same reason the report's hypothesis view has them.
+        props = {"title": "", "target_asset": "", **n["properties"]}
+        basis = relationship_basis(n, graph)
+        hypotheses.append({
+            **props,
             "id": n["label"],
-            **{k: v for k, v in n["properties"].items()},
-        }
-        for n in graph.by_type("hypothesis")
-    ]
+            "related_assets": related_asset_views(n, graph),
+            "relationship": normalize_line(
+                props.get("relationship"), MAX_RELATIONSHIP_CHARS) or "",
+            "basis": basis,
+            "basis_note": BASIS_NOTES[basis],
+            # A14/D2: the engine's record of what EXPLOIT did, so the status
+            # line cannot read "tested-by-exploit-phase" off `approved`.
+            "exploit_status": exploit_status(n["label"], graph),
+            # A15/D3: how this one relates to the others — "" when it stands
+            # alone
+            "duplicate_note": notes.get(n["label"], ""),
+        })
     findings = [
         {"label": n["label"], **n["properties"]}
         for n in graph.by_type("finding")

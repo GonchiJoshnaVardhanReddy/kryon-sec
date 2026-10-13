@@ -16,6 +16,29 @@ from __future__ import annotations
 import re
 
 
+def is_program_name(name: str) -> bool:
+    """True when ``name`` is a bare program name, not a path to one.
+
+    The allowlist keys are mostly tools (``sqlmap``, ``nuclei``) and a few
+    are scripts inside the sandbox image (``/opt/kryonsec/nuclei_meta.py``).
+    Both are spawnable, but only the first is a *tool*: the second is a
+    location, and rendering it where a tool name is expected invites a
+    caller to treat it as one.
+    """
+    return bool(name) and "/" not in name and "\\" not in name
+
+
+def exploit_tool_names() -> list[str]:
+    """The entries of :data:`EXPLOIT_TEMPLATES` that name a tool.
+
+    One entry is the HYPOTHESIZE enrichment helper — a script in the image,
+    allowlisted so enrichment can spawn it, never run against a target.
+    Everything else is a tool the execution engine can actually run, which
+    is what a caller advertising the allowlist means to advertise.
+    """
+    return [name for name in EXPLOIT_TEMPLATES if is_program_name(name)]
+
+
 class AllowlistViolation(Exception):
     pass
 

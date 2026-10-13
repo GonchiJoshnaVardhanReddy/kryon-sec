@@ -536,7 +536,9 @@ def test_final_summary_is_a_report_panel(tmp_path):
     for i in range(6):
         graph.add_node("hypothesis", f"H{i}")
     for i in range(31):
-        graph.add_node("exploit_attempt", f"A{i}")
+        # A14: the panel counts executions, so the fixture records executions
+        # — a node with no outcome recorded is not one (see the test below).
+        graph.add_node("exploit_attempt", f"A{i}", {"ok": True, "confirmed": False})
 
     out = summary(tmp_path, graph, list(STATES), FakeOrch())
 
@@ -547,6 +549,25 @@ def test_final_summary_is_a_report_panel(tmp_path):
     assert "Hypotheses" in out and "6" in out
     assert "Tool executions" in out and "31" in out
     assert "Evidence artifacts" in out
+
+
+def test_a_sandbox_that_never_started_is_not_a_clean_result(tmp_path):
+    """A14/D1: EXPLOIT writes an attempt node for every tool it *tries*, so a
+    panel that counts nodes reads a sandbox that never came up as 31
+    executions and says "no findings confirmed" about checks no tool ran."""
+    graph = EngagementGraph(engagement_id="abc12345")
+    graph.add_node("target", "target-corp.com")
+    graph.add_node("hypothesis", "H0")
+    for i in range(3):
+        graph.add_node("exploit_attempt", f"A{i}", {
+            "ok": False, "exit_code": -1,
+            "error_excerpt": "Cannot connect to the Docker daemon"})
+
+    out = summary(tmp_path, graph, list(STATES), FakeOrch())
+
+    assert "Tool executions" in out
+    assert "no findings confirmed" not in out
+    assert "no tests could be run" in out
 
 
 def test_halted_summary_says_why_and_how_far_it_got(tmp_path):
