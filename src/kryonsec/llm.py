@@ -504,6 +504,25 @@ def build_call(
     return call
 
 
+# A server sitting behind a web front end answers a path it does not route
+# with its console's HTML — a single-page app serves index.html for
+# everything, usually with a 200. litellm then hands us that page as the
+# "error", so the message the user reads is 3KB of markup instead of the
+# useful sentence. The page IS the diagnosis: the request reached a web
+# server, not the API. In practice that means the configured base URL is
+# missing a path segment — almost every OpenAI-compatible server mounts
+# the API under /v1 — which is why the hint names it. No vendor is named:
+# any gateway, any reverse proxy, any console behind the same port does
+# this.
+_WEB_PAGE_RE = re.compile(r"<!doctype html|<html[\s>]", re.IGNORECASE)
+
+_WEB_PAGE_HINT = (
+    "the endpoint answered with a web page, not an API response — the base "
+    "URL is probably missing a path segment (most OpenAI-compatible servers "
+    "serve the API under /v1); check it in `kryonsec setup`"
+)
+
+
 def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
     """The provider's own words for a failed call, shortened and scrubbed.
 
@@ -528,6 +547,11 @@ def provider_reason(exc: BaseException | None, limit: int = 240) -> str:
     prefix = f"litellm.{type(exc).__name__}: "
     if text.startswith(prefix):
         text = text[len(prefix):]
+    # Not the provider's words at all, just its front end's markup — the one
+    # case where repeating the reply verbatim tells the user nothing (see
+    # _WEB_PAGE_HINT). Checked before the truncation so the hint is not cut.
+    if _WEB_PAGE_RE.search(text):
+        return _WEB_PAGE_HINT
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
     return scrub_secrets(text)

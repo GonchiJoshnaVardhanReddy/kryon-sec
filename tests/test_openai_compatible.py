@@ -177,6 +177,21 @@ def test_configured_key_is_not_echoed_into_the_log(cfg, caplog):
     assert cfg.openai_compatible_api_key not in reason
 
 
+def test_web_page_reply_is_diagnosed_not_quoted(cfg):
+    """A base URL pointing at a console instead of the API: the server
+    answers with its SPA's index.html and a 200, which litellm reports as
+    an invalid response with the whole page inlined. The user has to be
+    told the URL is wrong — not shown 3KB of markup."""
+    exc = RuntimeError(
+        "litellm.InternalServerError: Empty or invalid response from LLM "
+        "endpoint. Received: '<!doctype html> <html lang=\"zh\"> "
+        "<title>Agent Router</title> ... 3KB more'"
+    )
+    reason = provider_reason(exc)
+    assert "<!doctype" not in reason and "3KB more" not in reason
+    assert "/v1" in reason          # the likely fix, named
+
+
 # ---- chat() routing -------------------------------------------------------
 
 def test_chat_routes_to_the_configured_endpoint(cfg):
