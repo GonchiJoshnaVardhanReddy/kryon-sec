@@ -23,6 +23,21 @@ log = logging.getLogger(__name__)
 _ollama_available: bool | None = None
 _ollama_models: list[str] | None = None
 
+# Probes, not calls — but not 2 s either. Windows resolves `localhost` to ::1
+# first, and Ollama binds IPv4 only, so every probe to http://localhost:11434
+# spends ~2.1 s being refused on [::1] before urllib falls back to 127.0.0.1
+# (measured: 2139 ms via localhost, 12 ms via 127.0.0.1). A 2 s budget sat
+# *under* that penalty, so a perfectly healthy server read as "down".
+_OLLAMA_PROBE_TIMEOUT_S = 5
+
+# A local model is read off disk into RAM/VRAM on the first call after it is
+# evicted (Ollama's default keep_alive is 5 minutes). An 8B GGUF measured 38 s
+# cold on the dev machine, so the 30 s default failed the first message of
+# every session — and it failed it as "Ollama unavailable", which describes
+# none of what happened. Hosted providers keep 30 s; local calls get room.
+_LOCAL_CALL_TIMEOUT_S = 120
+_DEFAULT_CALL_TIMEOUT_S = 30
+
 
 def reset_provider_cache() -> None:
     """Tests: forget the cached provider availability."""
@@ -39,7 +54,7 @@ def ollama_models(host: str) -> list[str] | None:
 
     normalized = _normalize_host(host)
     try:
-        with urllib.request.urlopen(f"{normalized}/api/tags", timeout=2) as r:
+        with urllib.request.urlopen(f"{normalized}/api/tags", timeout=_OLLAMA_PROBE_TIMEOUT_S) as r:
             body = _json.loads(r.read())
             return [m.get("name", "") for m in body.get("models", [])]
     except Exception:
@@ -314,14 +329,17 @@ def completion_kwargs(
 
 
 def _ollama_ok(cfg: KryonsecConfig) -> bool:
-    global _ollama_available
+    # both names, in one statement: without _ollama_models here the list below
+    # binds a *local* and the module cache stays None forever — which reads as
+    # "model not pulled" for every ollama/* model on a perfectly healthy server
+    global _ollama_available, _ollama_models
     if _ollama_available is None:
         host = _normalize_host(cfg.ollama_host)
         try:
             import json as _json
             import urllib.request
 
-            with urllib.request.urlopen(f"{host}/api/tags", timeout=2) as r:
+            with urllib.request.urlopen(f"{host}/api/tags", timeout=_OLLAMA_PROBE_TIMEOUT_S) as r:
                 body = _json.loads(r.read())
                 _ollama_available = r.status == 200
                 _ollama_models = [m.get("name", "") for m in body.get("models", [])]
@@ -368,9 +386,13 @@ def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: A
 
     tool_schemas = kwargs.pop("tools", None)
     temperature = kwargs.pop("temperature", 0.0)
+    default_timeout = (
+        _LOCAL_CALL_TIMEOUT_S if model.startswith("ollama/")
+        else _DEFAULT_CALL_TIMEOUT_S
+    )
     call_kwargs: dict[str, Any] = {
         "messages": messages,
-        "timeout": kwargs.pop("timeout", 30),
+        "timeout": kwargs.pop("timeout", default_timeout),
         "num_retries": kwargs.pop("num_retries", 0),  # we own the fallback chain
         **kwargs,
     }

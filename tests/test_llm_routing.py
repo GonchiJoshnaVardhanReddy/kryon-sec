@@ -154,6 +154,63 @@ def test_ollama_model_ok_matches_base_name(cfg):
         assert _ollama_model_ok(cfg, "gpt-4o-mini")
 
 
+def test_ollama_ok_fills_the_model_cache(cfg):
+    """Regression: _ollama_ok assigned _ollama_models without declaring it
+    global, so the assignment bound a local and the module cache stayed None
+    forever — every ollama/* model then read as "not pulled" on a perfectly
+    healthy server, and chat refused with "start it (ollama serve)".
+
+    The test above patches the cache directly, which is exactly what hid this:
+    a mocked cache is the one case where the scoping bug cannot show. This one
+    goes through the real probe."""
+    import io
+    import json
+
+    import kryonsec.llm as llm_mod
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+    body = json.dumps({"models": [{"name": "llama3.1:latest"}]}).encode()
+    with patch("urllib.request.urlopen", return_value=_Resp(body)):
+        assert llm_mod._ollama_ok(cfg)
+        # the probe must leave the real module cache populated...
+        assert llm_mod._ollama_models == ["llama3.1:latest"]
+        # ...so a pulled model is recognised, and an unpulled one is not
+        assert _ollama_model_ok(cfg, "ollama/llama3.1")
+        assert not _ollama_model_ok(cfg, "ollama/gemma2")
+
+
+def test_local_models_get_a_longer_call_timeout(cfg):
+    """A local model is read into RAM on its first call after eviction (38 s
+    measured for an 8B GGUF), so it must not share the hosted 30 s budget —
+    the cold load failed as "Ollama unavailable", which describes nothing."""
+    with patch("litellm.completion") as fake:
+        fake.return_value.choices = [
+            type("C", (), {"message": type("M", (), {"content": "hi",
+                                                     "tool_calls": None})()})()]
+        from kryonsec.llm import _complete
+
+        _complete(cfg, "ollama/llama3.1", [{"role": "user", "content": "hi"}])
+        local_timeout = fake.call_args.kwargs["timeout"]
+
+        _complete(cfg, "gpt-4o", [{"role": "user", "content": "hi"}])
+        hosted_timeout = fake.call_args.kwargs["timeout"]
+
+    assert local_timeout > hosted_timeout
+    assert hosted_timeout == 30
+    # an explicit timeout still wins over the per-model default
+    with patch("litellm.completion") as fake:
+        fake.return_value.choices = [
+            type("C", (), {"message": type("M", (), {"content": "hi",
+                                                     "tool_calls": None})()})()]
+        from kryonsec.llm import _complete
+
+        _complete(cfg, "ollama/llama3.1", [{"role": "user", "content": "hi"}],
+                  timeout=7)
+        assert fake.call_args.kwargs["timeout"] == 7
+
+
 # ---- completion_kwargs: provider + reasoning-model quirks -------------------
 
 def test_is_reasoning_model_prefixes():
