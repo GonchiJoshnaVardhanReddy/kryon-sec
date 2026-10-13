@@ -404,5 +404,70 @@ def test_install_gvisor_installs_the_package_rather_than_copying_a_binary():
     assert "install -m 0755" not in body
 
 
+# ---- the Ollama install needs zstd, and cannot say so ----------------------
+
+def _ollama_case(with_zstd: bool) -> subprocess.CompletedProcess:
+    """Run install_ollama() against a PATH that may or may not carry zstd.
+
+    `command -v zstd` searches PATH, so the dependency is controlled by
+    building the PATH rather than by mocking: exactly how a bare WSL2 Ubuntu
+    differs from a workstation. curl is a stub that fails, which stops the
+    function at the real installer — the test never touches the network.
+    """
+    zstd = 'printf "#!/bin/sh\\nexit 0\\n" > "$BIN/zstd"; chmod +x "$BIN/zstd"' \
+        if with_zstd else ":"
+    return _bash(f"""
+BIN=$(mktemp -d)
+REAL_SH=$(command -v sh)
+printf '#!/bin/sh\\nexit 1\\n' > "$BIN/curl"
+chmod +x "$BIN/curl"
+ln -s "$REAL_SH" "$BIN/sh"
+{zstd}
+export PATH="$BIN"
+APT_LOG=$(mktemp)
+apt_install() {{ echo "$*" >> "$APT_LOG"; }}
+{_function("install_ollama")}
+install_ollama || true
+echo "--- apt calls ---"
+cat "$APT_LOG"
+""")
+
+
+def test_ollama_install_installs_zstd_when_it_is_missing():
+    """The failure that produced "Ollama install failed" on a fresh machine.
+
+    Ollama's installer unpacks a .tar.zst and exits before installing
+    anything without zstd. A bare WSL2 Ubuntu does not ship it, and the
+    script's own error is the only fix: "install zstd and try again". The
+    installer knows the dependency — it must satisfy it, or the user is sent
+    to pick OpenAI over one apt command.
+    """
+    result = _ollama_case(with_zstd=False)
+    assert "zstd" in result.stdout, result.stdout + result.stderr
+
+
+def test_ollama_install_leaves_a_working_zstd_alone():
+    """No apt call at all when the dependency is already satisfied.
+
+    Distinct from the test above: this is what fails if the guard is written
+    as a bare `apt_install zstd` that runs unconditionally — noisy, and it
+    demands sudo on a machine that needs nothing.
+    """
+    result = _ollama_case(with_zstd=True)
+    assert "zstd" not in result.stdout, result.stdout + result.stderr
+
+
+def test_ollama_install_names_the_command_when_it_cannot_install_zstd():
+    """No apt, no sudo — the user still needs to know what to type.
+
+    The message names the package manager per distro because the machine
+    that hits this is the one where guessing is expensive: a fresh server,
+    a bare container, a WSL2 image nobody has touched.
+    """
+    body = _function("install_ollama")
+    assert "apt-get install -y zstd" in body
+    assert "dnf install -y zstd" in body
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

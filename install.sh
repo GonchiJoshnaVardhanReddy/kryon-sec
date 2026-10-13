@@ -602,6 +602,23 @@ ollama_up() {
 
 install_ollama() {
     say "installing Ollama (local LLM — nothing leaves your machine)"
+    # Ollama's installer unpacks a .tar.zst and exits before installing
+    # anything when zstd is absent. Minimal images — a bare WSL2 Ubuntu, a
+    # slim container, a fresh server install — do not ship it, and the
+    # failure arrives as "Ollama install failed", which reads as a dead end
+    # and sends the user to pick OpenAI instead of running one apt command.
+    # Satisfy the dependency here, and name the command when we cannot.
+    if ! command -v zstd >/dev/null 2>&1; then
+        say "installing zstd (Ollama's installer needs it to unpack its archive)"
+        apt_install zstd || true
+        if ! command -v zstd >/dev/null 2>&1; then
+            say "WARNING: zstd is missing and could not be installed automatically"
+            say "         install it, then re-run this installer:"
+            say "           Debian/Ubuntu:  sudo apt-get install -y zstd"
+            say "           Fedora/RHEL:    sudo dnf install -y zstd"
+            say "           Arch:           sudo pacman -S zstd"
+        fi
+    fi
     curl -fsSL https://ollama.com/install.sh | sh || return 1
     # start it: systemd unit when present, detached background server otherwise
     if ! (systemctl is-active --quiet ollama 2>/dev/null ||
