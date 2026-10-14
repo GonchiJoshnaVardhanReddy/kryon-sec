@@ -270,10 +270,14 @@ def verify(cfg: Any) -> VerifyResult:
         expires = state.get("expires", "")
         days_left = None
         if expires:
-            try:
-                days_left = (datetime.fromisoformat(expires) - now).days
-            except ValueError:
-                pass
+            # _parse_ts, not fromisoformat: the documented shape is a DATE
+            # ("2027-01-01"), which fromisoformat returns naive — and
+            # naive - aware is a TypeError, which the ValueError guard around
+            # this did not catch, so verify() raised out of the function whose
+            # whole contract is that it never does.
+            parsed = _parse_ts(expires)
+            if parsed is not None:
+                days_left = (parsed - now).days
         return VerifyResult(VALID, expires=expires, days_left=days_left)
 
     import platform

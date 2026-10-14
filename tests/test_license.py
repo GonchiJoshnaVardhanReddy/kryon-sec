@@ -203,6 +203,32 @@ def test_the_purple_command_stops_at_the_gate(tmp_path):
     assert _run_purple(cfg, "target-corp.com", "e-stopped") == 3
 
 
+def test_a_date_only_expiry_does_not_crash_the_cached_path(tmp_path, monkeypatch):
+    """The endpoint's documented shape is a date, not a datetime. Subtracting
+    a naive date from an aware `now` is a TypeError, and the ValueError guard
+    that was there did not catch it — so verify() would raise out of a
+    function whose whole contract is that it never does, on the one path a
+    member hits every launch for a day after a successful check.
+    """
+    monkeypatch.setattr(license, "_http_get_json", lambda *a, **k: {"valid": True})
+    cfg = _Cfg(GOOD_KEY, home=tmp_path)
+    license.verify(cfg)  # populates the state file
+
+    state = license.load_state(cfg)
+    state["expires"] = "2027-01-01"          # a date, as documented
+    state["cached_status"] = license.VALID
+    state["last_check"] = license._now().isoformat()
+    state["last_success"] = license._now().isoformat()
+    license.save_state(cfg, state)
+
+    # no network: this must be answered from the cache, and must not raise
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("the cache should have answered this")))
+    result = license.verify(cfg)
+    assert result.status == license.VALID
+    assert result.days_left is not None and result.days_left > 0
+
+
 def test_post_identifies_itself_and_sends_json(monkeypatch):
     """The connect flow posts to the same zone as the verify call, so it
     inherits the same banned-default-User-Agent trap."""
