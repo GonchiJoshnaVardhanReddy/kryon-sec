@@ -692,6 +692,7 @@ def _run_purple(
     # the console shows what is running as it runs, so the inventory is no
     # longer printed anywhere. STATES is imported where it is used, below.
     from .engagement_id import is_valid_engagement_id
+    from .license import LicenseError, ensure_purple_allowed
     from .purple.runner import (
         persist_graph,
         record_engagement_ending,
@@ -731,6 +732,25 @@ def _run_purple(
                 f"[red]--code path is not a folder:[/red] {code_folder}")
             return 2
         code_folder = str(code_path.resolve())
+
+    # The membership gate. It lives here, at the one function both Purple
+    # entry points (`kryonsec purple` and the /mode toggle) share, so neither
+    # can be the one that forgets. Copilot mode never reaches this and stays
+    # free.
+    #
+    # Placed AFTER the argument checks above and BEFORE sandbox_available
+    # below, which is the only gap where both things hold: a bad --id or
+    # --code is answered instantly and locally instead of costing a network
+    # round trip, and the path-traversal guard can never be masked by a
+    # licensing problem — and nothing has run a container or touched the
+    # target yet.
+    try:
+        ensure_purple_allowed(cfg)
+    except LicenseError as e:
+        err_console.print(f"[red]Purple Team is not available:[/red] {e}")
+        console.print(
+            "[dim]Copilot mode is free and unaffected — just run `kryonsec`.[/dim]")
+        return 3
 
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     if not sandbox_ok:
@@ -1055,6 +1075,42 @@ def _elapsed_text(orch: "Any") -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _offer_connect(cfg: KryonsecConfig) -> None:
+    """Mention the one-time connect step, once per machine.
+
+    Purple Team requires a registered machine, so the honest moment to raise
+    it is before a member hits the refusal — but only once. Declining is
+    remembered: a prompt that comes back every launch is one people learn to
+    ignore. `kryonsec connect` is always there if they change their mind.
+    """
+    from .license import load_state, member_email, save_state
+
+    if not cfg.license_key or member_email(cfg):
+        return
+    state = load_state(cfg)
+    # No terminal (piped, CI, detached) means no question to ask.
+    if state.get("connect_offered") or not sys.stdin.isatty():
+        return
+
+    state["connect_offered"] = True
+    save_state(cfg, state)
+
+    console.print(
+        "\n[dim]This machine is not connected to your membership yet. "
+        "Purple Team needs that; Copilot mode does not.[/dim]"
+    )
+    try:
+        answer = input(
+            "  Connect now? This opens a browser once. [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("")
+        return
+    if answer in ("", "y", "yes"):
+        from .connect import connect
+
+        connect(cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="kryonsec", description=__doc__)
     parser.add_argument("--version", action="version", version=f"kryonsec {__version__}")
@@ -1063,6 +1119,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="run preflight checks (storage, LLMs, Purple Team prerequisites)")
 
     sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
+
+    connect = sub.add_parser(
+        "connect",
+        help="register this machine to your membership (opens a browser once)")
+    connect.add_argument(
+        "--no-browser", dest="open_browser", action="store_false",
+        help="print the link instead of opening a browser (headless boxes)")
 
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
@@ -1124,6 +1187,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "connect":
+        from .connect import connect
+
+        try:
+            return connect(cfg, open_browser=args.open_browser)
+        except KeyboardInterrupt:
+            # Ctrl+C while waiting on the browser. Nothing was written, so
+            # saying so is the whole message.
+            console.print("\n[yellow]cancelled — nothing was changed[/yellow]")
+            return 1
+
     # first run without a config -> wizard before the chat loop
     from .config import config_path
 
@@ -1146,6 +1220,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if not config_path(cfg.home).is_file():
             return 0  # aborted before writing — nothing to start
+
+    _offer_connect(cfg)
 
     console.print(welcome(cfg))
     try:

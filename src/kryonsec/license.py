@@ -14,13 +14,18 @@ starts. The check is honest, not aggressive:
 The verify endpoint is a Cloudflare Pages Function on kryonsec.in
 (`functions/api/license/verify.js`). Contract:
 
-    GET {VERIFY_URL}?key=KRYO-XXXX-XXXX-XXXX
+    GET {VERIFY_URL}?device=..&os=..&arch=..&version=..
+    X-Kryonsec-Key: KRYO-XXXX-XXXX-XXXX
     200 {"valid": true,  "expires": "2027-01-01"}
     200 {"valid": false, "reason": "expired"}
 
 A refusal is a 200 carrying `valid: false`, never a 4xx — this file reads
 a non-200 as "the network is down" and falls back to grace, so serving a
 revocation as an error status is what would keep a revoked key alive.
+
+Machine registration (the one-time browser step) lives in `connect.py` and
+talks to the same site; this file owns the device id and the state file both
+of them use.
 
 Keys are crockford-base32 groups (no 0/O/1/I) after a "KRYO-" prefix.
 """
@@ -44,6 +49,11 @@ KEY_PATTERN = re.compile(
 
 VERIFY_URL = os.environ.get(
     "KRYONSEC_LICENSE_URL", "https://kryonsec.in/api/license/verify")
+# The connect flow (kryonsec/connect.py) talks to the same site.
+CONNECT_START_URL = os.environ.get(
+    "KRYONSEC_CONNECT_START_URL", "https://kryonsec.in/api/device/start")
+CONNECT_POLL_URL = os.environ.get(
+    "KRYONSEC_CONNECT_POLL_URL", "https://kryonsec.in/api/device/poll")
 VERIFY_TIMEOUT_S = 8         # matches doctor's ollama probe
 GRACE_DAYS = 7               # offline tolerance after a successful check
 CHECK_INTERVAL_H = 24        # phone home at most once a day
@@ -109,6 +119,32 @@ def save_state(cfg: Any, state: dict) -> None:
         pass  # state is an optimization; a read-only home must not crash
 
 
+def device_id(cfg: Any) -> str:
+    """A random id for this installation, made once and kept in the state file.
+
+    It is how the admin view tells one machine from another. Deliberately NOT
+    a credential — it authorises nothing, so leaking it costs nothing — and
+    deliberately NOT derived from the host: no hostname, no MAC, no machine
+    id. Just 128 random bits that identify this install and nothing else.
+    """
+    state = load_state(cfg)
+    existing = str(state.get("device_id") or "")
+    if existing:
+        return existing
+
+    import secrets
+
+    fresh = secrets.token_hex(16)
+    state["device_id"] = fresh
+    save_state(cfg, state)
+    return fresh
+
+
+def member_email(cfg: Any) -> str:
+    """The email this machine was connected to, or "" if it never was."""
+    return str(load_state(cfg).get("member_email") or "")
+
+
 # ---- helpers ----------------------------------------------------------------
 
 def _now() -> datetime:
@@ -125,26 +161,48 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
-def _http_get_json(url: str) -> dict | None:
-    """GET url, parse a JSON object response. None on any failure —
-    the caller decides whether that means grace or first-run-invalid.
+def _http_json(url: str, payload: dict | None = None, *, key: str = "") -> dict | None:
+    """GET url, or POST `payload` to it as JSON. Returns the parsed JSON
+    object, or None on any failure — the caller decides whether that means
+    grace, a refusal, or "the network is down".
     (Seam for tests: monkeypatch this.)"""
-    import urllib.parse
     import urllib.request
 
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if key:
+        # A membership key is a credential, and a URL is a leaky place to put
+        # one: query strings land in access logs, in proxy logs, and in
+        # Referer headers. A request header goes nowhere but the request. The
+        # endpoint still accepts ?key= so older installs keep working.
+        headers["X-Kryonsec-Key"] = key
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+
     # An explicit Request, not urlopen(url): the default agent is refused by
-    # the verify endpoint's zone. See USER_AGENT.
-    req = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    # the verify endpoint's zone. See USER_AGENT. One builder for both verbs,
+    # so the agent can't be fixed in one path and drift in the other.
+    req = urllib.request.Request(url, data=data, headers=headers)
 
     try:
         with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT_S) as r:
             if r.status != 200:
                 return None
-            data = json.loads(r.read().decode("utf-8"))
-            return data if isinstance(data, dict) else None
+            body = json.loads(r.read().decode("utf-8"))
+            return body if isinstance(body, dict) else None
     except Exception:
         return None
+
+
+def _http_get_json(url: str, *, key: str = "") -> dict | None:
+    """GET url, parse a JSON object response. None on any failure."""
+    return _http_json(url, None, key=key)
+
+
+def http_post_json(url: str, payload: dict) -> dict | None:
+    """POST a JSON body, parse a JSON object response. None on any failure.
+    The connect flow (kryonsec/connect.py) is the caller."""
+    return _http_json(url, payload)
 
 
 def _days_between(later: datetime, earlier: datetime) -> int:
@@ -218,9 +276,21 @@ def verify(cfg: Any) -> VerifyResult:
                 pass
         return VerifyResult(VALID, expires=expires, days_left=days_left)
 
+    import platform
     import urllib.parse
 
-    data = _http_get_json(f"{VERIFY_URL}?{urllib.parse.urlencode({'key': key})}")
+    # The device parameters are what let the admin view show a machine as
+    # alive: an id this install made up, the OS, the architecture, the app
+    # version. Nothing about the work being done — no hostname, no path, no
+    # target — and nothing that could be replayed as a credential.
+    params = {
+        "device": device_id(cfg),
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "version": __version__,
+    }
+    data = _http_get_json(
+        f"{VERIFY_URL}?{urllib.parse.urlencode(params)}", key=key)
     if data is None:
         # unreachable/broken endpoint: grace decides; last_success is
         # never overwritten by a failure, so a dead webhook cannot lock
@@ -262,9 +332,20 @@ def verify(cfg: Any) -> VerifyResult:
 
 def ensure_purple_allowed(cfg: Any) -> VerifyResult:
     """Blocking gate for Purple Team engagements. Raises LicenseError
-    unless the license is valid or in offline grace — callers print the
-    message, never a stack trace."""
+    unless the license is valid or in offline grace AND this machine has
+    been connected to a membership once — callers print the message, never
+    a stack trace.
+
+    Every Purple entry point routes through here rather than checking the
+    license itself, so a new caller cannot forget one of the two conditions.
+    Copilot mode never calls it: the free mode has no gate.
+    """
     result = verify(cfg)
     if not result.purple_allowed:
         raise LicenseError(result.message or f"license {result.status}")
+    if not member_email(cfg):
+        raise LicenseError(
+            "this machine has not been connected to a membership yet — run "
+            "`kryonsec connect` (it opens a browser once; after that the "
+            "machine is registered and never asks again)")
     return result

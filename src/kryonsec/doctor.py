@@ -93,6 +93,34 @@ def _check_openai_compatible(cfg: KryonsecConfig) -> tuple[bool, str]:
     return True, f"OK ({base})"
 
 
+def _check_membership(cfg: KryonsecConfig) -> tuple[bool | None, str]:
+    """The paid gate, reported honestly.
+
+    Tri-state on purpose. No key is a SKIP, not a FAIL: a Copilot-only
+    install is fully supported and free, and a red row would tell those
+    users something is broken when nothing is.
+
+    `verify()` phones home at most once a day, so this is normally a cache
+    read — the one time it isn't is the one time the answer matters.
+    """
+    from .license import member_email, verify
+
+    if not cfg.license_key:
+        return None, "no membership key — Copilot mode only, which is free"
+
+    result = verify(cfg)
+    who = member_email(cfg)
+    # Which machine, not just whether: the key being fine and this box not
+    # being registered are different problems with different fixes.
+    where = (
+        f"machine connected as {who}" if who
+        else "this machine is NOT connected — run `kryonsec connect`"
+    )
+    if result.purple_allowed:
+        return True, f"OK ({result.status}; {where})"
+    return False, f"{result.status} — {result.message}; {where}"
+
+
 def _check_docker() -> tuple[bool, str]:
     from .purple import runtime_checks
 
@@ -137,6 +165,9 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
         ok, msg = check(cfg)
         checks.append((name, purpose, ok, msg))
         any_llm = any_llm or ok
+
+    ok, msg = _check_membership(cfg)
+    checks.append(("Membership", "Purple Team (paid); Copilot is free", ok, msg))
 
     checks.append((
         "Purple Team: platform", "gVisor requires Linux",
@@ -200,8 +231,9 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
     elif copilot_ok:
         console.print(Panel(
             "[green]PASS — Profile 1 (Copilot) is fully working on this machine.[/green]\n"
-            "[yellow]Profile 2 (Purple Team) needs Linux + Docker + gVisor "
-            "+ a PostgreSQL DATABASE_URL.[/yellow]",
+            "[yellow]Profile 2 (Purple Team) also needs Linux + Docker + gVisor "
+            "+ a PostgreSQL DATABASE_URL + a membership and a connected machine "
+            "(see the Membership row above).[/yellow]",
             title="What works here",
             border_style="green",
         ))
@@ -209,8 +241,9 @@ def run_doctor(cfg: KryonsecConfig | None = None) -> int:
         console.print(Panel(
             "[red]FAIL — Profile 1 (Copilot) is NOT usable: storage and at "
             "least one LLM provider must pass (see above).[/red]\n"
-            "[yellow]Profile 2 (Purple Team) needs Linux + Docker + gVisor "
-            "+ a PostgreSQL DATABASE_URL.[/yellow]",
+            "[yellow]Profile 2 (Purple Team) also needs Linux + Docker + gVisor "
+            "+ a PostgreSQL DATABASE_URL + a membership and a connected machine "
+            "(see the Membership row above).[/yellow]",
             title="What works here",
             border_style="red",
         ))
