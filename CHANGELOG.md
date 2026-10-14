@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.3.5 — closed source, key-gated install
+
+Kryonsec is commercial software now. The security engine is untouched: no
+state transition, tool allowlist, sandbox behaviour, exploit or verify logic,
+authorization gate, or provider code was modified.
+
+- **The licence is proprietary and the repository is private.** Nothing had
+  ever granted reuse rights, but a public repo fronting a one-command install
+  read as open source.
+- **Installing needs a membership key.** `install.sh` / `install.ps1` fetch the
+  built wheel from `kryonsec.in` instead of cloning a repo, and save the key to
+  `~/.kryonsec/config.toml` so Purple Team does not ask for it twice. Building
+  the sandbox image locally is no longer a fallback — it is a pull, or nothing.
+- **Purple Team asks `kryonsec.in` whether the key is still good**, at most once
+  a day per machine, with a multi-day offline grace period. Copilot mode stays
+  free and needs no key.
+- **`zstd` is installed first.** Ollama's installer cannot unpack its own
+  archive without it.
+
 ## v1.3.2 — Purple Team operations console
 
 Presentation-only change. The security engine is untouched: no state
