@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.7 — a crash the licence cache could reach
+
+One fix. Test suite: **1676 tests green**.
+
+- **A date-only expiry crashed the offline path.** The endpoint's documented
+  `expires` shape is a date, not a datetime, and `fromisoformat` returns a
+  naive one — subtracting it from an aware `now` is a `TypeError`, which the
+  `ValueError` guard around it did not catch. So `verify()` could raise out of
+  a function whose whole contract is that it never does, on the cached path a
+  member hits on every launch for a day after a successful check. It now uses
+  the `_parse_ts` helper that already existed for exactly this. Not reachable
+  today, because the endpoint answers `expires: ""` — it becomes reachable the
+  day expiry is added, which is the reason to fix it now rather than then.
+
 ## v1.3.6 — the membership gate, and `kryonsec connect`
 
 The security engine is untouched: no state transition, tool allowlist,
