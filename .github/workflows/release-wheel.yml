@@ -6,8 +6,8 @@ name: release-wheel
 # be public.
 #
 # The repo is private, so the Release is private too — whoever serves the
-# download (the n8n workflow behind kryonsec.in/api/download) needs a token
-# with read access to fetch the asset from here. See RELEASING.md.
+# download (the Cloudflare Pages Function at kryonsec.in/api/download) needs a
+# token with read access to fetch the asset from here. See RELEASING.md.
 #
 # Manual run: Actions -> release-wheel -> Run workflow. Re-running a tag
 # replaces the attached wheel rather than failing.
@@ -82,7 +82,7 @@ jobs:
             echo "\`$(ls dist/*.whl)\` is attached to the release for"
             echo "\`${{ inputs.tag || github.ref_name }}\`."
             echo ""
-            echo "Next: point \`kryonsec.in/api/download\` at this asset (see"
-            echo "RELEASING.md). Until that exists, members can install with"
-            echo "\`KRYONSEC_WHEEL=<path-to-this-file>\`."
+            echo "The download endpoint reads \`/releases/latest\`, so this is now"
+            echo "what \`kryonsec.in/api/download\` serves — no further change"
+            echo "needed. See RELEASING.md."
           } >> "$GITHUB_STEP_SUMMARY"
