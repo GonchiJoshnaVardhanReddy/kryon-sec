@@ -1,7 +1,11 @@
 # Kryonsec installer (Windows PowerShell).
 #
-#   irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 -OutFile install.ps1
+#   irm https://kryonsec.in/install.ps1 -OutFile install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
+#
+# Kryonsec is commercial, closed-source software: there is no public repository
+# to clone. The release below is a built wheel, and the membership key is what
+# unlocks it, so this script asks for one before it downloads anything.
 #
 # Download-then-run rather than piping the response straight into PowerShell's
 # expression evaluator: fetching to a file means you can read the script before
@@ -10,9 +14,10 @@
 # outright under the Windows client default policy.
 #
 # What it does:
-#   1. checks for Python 3.11+ and git (installs git via winget if missing)
+#   1. checks for Python 3.11+
 #   2. creates ~\.kryonsec\venv
-#   3. installs the latest released tag of kryonsec into it (from GitHub)
+#   3. fetches the kryonsec release from kryonsec.in using your key, and
+#      saves the key so Purple Team can use it later
 #   4. adds ~\.kryonsec\venv\Scripts to the user PATH
 #   5. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
 #
@@ -20,7 +25,11 @@
 # For Purple Team use WSL2: see install.sh / the README.
 
 $ErrorActionPreference = "Stop"
-$Repo = "https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
+$Site = if ($env:KRYONSEC_SITE) { $env:KRYONSEC_SITE } else { "https://kryonsec.in" }
+$DownloadUrl = "$Site/api/download"
+# The membership key unlocks the download here and Purple Team later.
+# KRYONSEC_LICENSE_KEY is the name the app itself reads, so accept both.
+$Key = if ($env:KRYONSEC_KEY) { $env:KRYONSEC_KEY } else { $env:KRYONSEC_LICENSE_KEY }
 $Home1 = if ($env:KRYONSEC_HOME) { $env:KRYONSEC_HOME } else { Join-Path $env:USERPROFILE ".kryonsec" }
 $Venv = Join-Path $Home1 "venv"
 
@@ -48,84 +57,72 @@ $Pip = Join-Path $Venv "Scripts\pip.exe"
 $Kryo = Join-Path $Venv "Scripts\kryonsec.exe"
 
 # ---- 3. install --------------------------------------------------------------
-# git powers the release-tag lookup and the pip install itself (pip shells out
-# to git for a git+https URL). Check early so the failure is actionable.
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Say "git not found - required to install kryonsec from GitHub"
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Say "installing git via winget"
-        # winget frequently exits non-zero for reasons that don't matter here
-        # (already installed, source refresh warning). $ErrorActionPreference
-        # is "Stop" script-wide, so a native-command failure must not be
-        # allowed to abort the install — we re-check for git instead.
-        $eap = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            & winget install --id Git.Git -e --source winget `
-                --accept-package-agreements --accept-source-agreements
-        } catch {
-            Say "winget could not install git: $($_.Exception.Message)"
-        } finally {
-            $ErrorActionPreference = $eap
+# Kryonsec is closed-source, so there is no repo to clone and no public tag
+# list to read. The release ships as a built wheel and the site decides which
+# version the key gets, which is why nothing here resolves a version at all.
+#
+# KRYONSEC_WHEEL overrides the download entirely — a URL or a local .whl. It
+# is the escape hatch for air-gapped machines, and it is how support hands
+# someone a build without going through the site.
+$Wheel = $env:KRYONSEC_WHEEL
+if ($Wheel) {
+    Say "installing from KRYONSEC_WHEEL override"
+} else {
+    if (-not $Key) {
+        # This script is meant to be read and run interactively (see the
+        # header), so asking here beats dying with a usage line — but a
+        # non-interactive run has no one to ask and must not hang.
+        if ([Environment]::UserInteractive) {
+            $Key = Read-Host "Membership key (KRYO-XXXX-XXXX-XXXX)"
         }
-        # winget updates the machine/user PATH, not this process's copy
-        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-        $userPathNow = [Environment]::GetEnvironmentVariable("Path", "User")
-        $env:Path = (@($machinePath, $userPathNow) | Where-Object { $_ }) -join ";"
+        if (-not $Key) {
+            Die "a membership key is required. Request access at $Site"
+        }
     }
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Die "git is required. Install it from https://git-scm.com/downloads and re-run."
+    $Wheel = Join-Path ([System.IO.Path]::GetTempPath()) "kryonsec.whl"
+    Say "fetching the kryonsec release"
+    try {
+        # -UseBasicParsing: the full parser needs Internet Explorer's engine,
+        # which is absent or unconfigured on plenty of Windows installs, and
+        # fails as an unrelated "cannot parse the response" error.
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 600 `
+            -Uri "$DownloadUrl`?key=$Key&os=windows" -OutFile $Wheel
+    } catch {
+        Die "could not download kryonsec - the key was rejected, or $Site is unreachable. Check the key, or request access again at $Site"
     }
-    Say "git installed"
 }
 
 Say "installing kryonsec (this pulls litellm, mcp, rich, ...)"
 & $Pip install --quiet --upgrade pip
 
-# Install a released version, not whatever is on main at this moment (matches
-# install.sh). The latest tag comes from the GitHub tags API; the fallback
-# covers offline installs and repos without tags. KRYONSEC_VERSION overrides
-# both ("@v1.3.1", "@main", "@<commit-sha>").
-#
-# THIS repo's newest tag is the release installs land on, so a release that
-# is not tagged is a release nobody gets. Cutting the tag is part of shipping
-# it; the fallback covers offline installs and a repo with no tags at all.
-$FallbackRef = "main"
-$Version = $env:KRYONSEC_VERSION
-if (-not $Version) {
-    $tagNames = @()
-    try {
-        # per_page: the default page is 30 tags — a busy repo would hide the
-        # newest release past the first page (we sort by semver, so ordering
-        # doesn't matter, but the cutoff would)
-        $resp = Invoke-RestMethod -TimeoutSec 20 `
-            -Uri "https://api.github.com/repos/GonchiJoshnaVardhanReddy/kryon-sec/tags?per_page=100"
-        $tagNames = @($resp | ForEach-Object { $_.name })
-    } catch {
-        Say "could not query tags ($($_.Exception.Message))"
-    }
-    $latest = $null
-    if ($tagNames.Count -gt 0) {
-        $latest = $tagNames | Sort-Object -Property @{ Expression = {
-            $parts = $_.TrimStart("v") -split "\."
-            try { [int]$parts[0] * 1000000 + [int]$parts[1] * 1000 + [int]$parts[2] }
-            catch { 0 }
-        } } | Select-Object -Last 1
-    }
-    if ($latest) {
-        $Version = "@$latest"
-        Say "installing latest release $latest"
-    } else {
-        $Version = "@$FallbackRef"
-        Say "no tags found - installing $FallbackRef"
-    }
-}
 # Not --quiet: the dependency tree takes minutes and pip prints nothing while
 # it resolves, so a silent install reads as a hung one.
 Say "installing kryonsec (a few minutes - pip is quiet while it resolves)"
-& $Pip install "git+$Repo.git$Version"
+& $Pip install $Wheel
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Kryo)) { Die "installation failed" }
 & $Kryo --version
+
+# Remember the key. It gated the download, and Purple Team will ask for it
+# again at the first engagement - making the user paste it twice, from an
+# email they may no longer have open, is the kind of small friction that
+# reads as broken. Failure here is not fatal: the app also reads
+# KRYONSEC_LICENSE_KEY from the environment.
+if ($Key) {
+    $saveKey = @'
+import sys
+from kryonsec.config import load_config
+cfg = load_config()
+cfg.license_key = sys.argv[1].strip()
+cfg.save()
+'@
+    & (Join-Path $Venv "Scripts\python.exe") -c $saveKey $Key
+    if ($LASTEXITCODE -eq 0) {
+        Say "membership key saved"
+    } else {
+        Say "WARNING: could not save the membership key"
+        Say "         add it later under [license] in $Home1\config.toml"
+    }
+}
 
 # uvx runs a Python CLI tool without installing it - npx for Python. It is
 # what the wizard's `fetch` MCP preset starts, it ships with uv, and most

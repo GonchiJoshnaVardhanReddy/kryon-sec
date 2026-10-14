@@ -1,0 +1,86 @@
+Kryonsec — Proprietary Software License
+Copyright (c) 2026 Joshna Vardhan Reddy. All rights reserved.
+
+Kryonsec is commercial, closed-source software. It is NOT open source. This
+license is the entire agreement between you and the copyright holder for the
+Kryonsec software, its source code, its sandbox images, and its documentation
+(together, "the Software"). By installing, copying, or using the Software you
+accept these terms.
+
+1. LICENSE GRANT
+
+   Subject to these terms and to payment of any applicable fee, the copyright
+   holder grants you a personal, non-exclusive, non-transferable, revocable
+   license to install and use the Software for your own internal security
+   testing, or for security testing you are authorized in writing to perform
+   for a client.
+
+   Early-access keys grant the same rights for the term stated in your
+   membership confirmation, and no longer.
+
+2. RESTRICTIONS
+
+   You may not:
+
+   (a) copy, publish, distribute, sublicense, sell, rent, lease, or otherwise
+       make the Software available to any third party;
+   (b) share, publish, or resell your membership key, or use it to obtain the
+       Software on behalf of anyone else;
+   (c) reverse engineer, decompile, disassemble, or otherwise attempt to derive
+       the source code of any part of the Software that you were not given in
+       source form, except to the extent this restriction is prohibited by
+       applicable law;
+   (d) remove, obscure, or alter any copyright, license, or ownership notice;
+   (e) use the Software to attack any system you do not own or do not have
+       explicit written permission to test.
+
+3. NO OPEN SOURCE RIGHTS
+
+   No license, express or implied, is granted to any Kryonsec source code,
+   and no rights are granted under any open source license. Third-party
+   components included in or fetched by the Software remain under their own
+   licenses, which are listed with the Software and are unaffected by this
+   agreement.
+
+4. OWNERSHIP
+
+   The copyright holder retains all right, title, and interest in the Software,
+   including all intellectual property rights. This license transfers no
+   ownership. All rights not expressly granted are reserved.
+
+5. MEMBERSHIP KEYS AND VERIFICATION
+
+   Purple Team features require a valid membership key. The Software may
+   contact kryonsec.in to verify that key, at most once per day, and may
+   operate offline on a limited grace period after a successful check. Keys
+   may be revoked if these terms are broken.
+
+6. YOUR RESPONSIBILITIES
+
+   You are solely responsible for the systems you point the Software at, for
+   holding the authorization required to test them, and for complying with all
+   laws that apply to you. Do not use the Software where you lack permission.
+
+7. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+8. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE
+   LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH
+   THE SOFTWARE OR ITS USE. IN NO EVENT SHALL TOTAL LIABILITY EXCEED THE AMOUNT
+   YOU PAID FOR THE SOFTWARE IN THE TWELVE MONTHS BEFORE THE CLAIM.
+
+9. TERMINATION
+
+   This license terminates automatically if you breach any of these terms, and
+   at the end of any early-access term. On termination you must stop using the
+   Software and delete all copies.
+
+10. CONTACT
+
+    Licensing and permissions: joshnavardhan97@gmail.com

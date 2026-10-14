@@ -11,6 +11,7 @@ and a deterministic purple-team engine that finds, tests and proves.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/version-1.3.2-8e44ad)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-proprietary-red)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-864%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
@@ -490,84 +491,87 @@ machine that has no business seeing it.
 
 `kryonsec doctor` checks all of this and refuses to start Purple Team if anything is missing.
 On apt-based Linux (Ubuntu/Debian/Kali) with sudo, the one-line installer sets up Docker and
-gVisor for you, and fetches the sandbox image from a registry (a fast `docker pull`) rather
-than building it.
+gVisor for you, and fetches the sandbox image from a registry as a fast `docker pull`.
 
 ---
 
 ## Install
 
+Kryonsec is commercial, closed-source software. There is no public repository
+and no public download: the release is a built wheel, and a membership key is
+what unlocks it. [Request access](https://kryonsec.in) to get one.
+
 ### One command (WSL / Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
+curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
 ```
 
 The installer:
 
-1. Installs missing prerequisites (`git`, `curl`) on apt systems
+1. Installs missing prerequisites (`curl`) on apt systems
 2. Checks for Python 3.11+ (tries `python3.13`, `python3.12`, `python3.11`, then a bare
    `python3` — and warns if the only one present is a very new 3.14, where pip may have to
    compile dependencies from source and the install looks stalled)
 3. Creates a dedicated virtualenv at `~/.kryonsec/venv`
-4. Installs kryonsec into it from GitHub — the newest release tag if the repo has tags,
-   otherwise `main`. `KRYONSEC_VERSION=@main` or `@<sha>` overrides both.
+4. Downloads the release from `kryonsec.in` with your key, and saves that key to
+   `~/.kryonsec/config.toml` so Purple Team never asks for it again
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
 6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing.** On WSL2
    with **Docker Desktop** it also installs a Docker daemon *inside* the distro and moves the
    CLI onto it, because Docker Desktop's daemon runs outside the distro and can never be
    given a gVisor runtime.
 7. **Fetches the Zone B sandbox image** when Docker is available — a `docker pull` from
-   `ghcr.io` in the normal case, which is minutes instead of tens of minutes. If the registry
-   is unreachable, the image for this version isn't published yet, or you're offline, it
-   falls back to building locally with live progress (2+ GB, 30+ min on slow links). Either
-   way it's tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look for.
+   `ghcr.io`, tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look
+   for. If the image can't be pulled, Purple Team won't start; Copilot is unaffected, and the
+   installer prints the exact pull command to retry.
 8. Runs `kryonsec setup` — the first-run wizard
 9. Runs `kryonsec doctor` so the final state is visible
 
 To skip the sandbox image entirely and do it later:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | KRYONSEC_SKIP_SANDBOX=1 bash
-# later — pull (fast):
+curl -fsSL https://kryonsec.in/install.sh | \
+  KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX KRYONSEC_SKIP_SANDBOX=1 bash
+# later:
 docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
 docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
-# or build (slow):
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
-cd kryonsec
-docker build --progress=plain -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 ```
 
-Sandbox-image environment variables:
+Installer environment variables:
 
 | Variable | Effect |
 |---|---|
+| `KRYONSEC_KEY` | Your membership key. Required — it unlocks the download. |
+| `KRYONSEC_LICENSE_KEY` | The same key, under the name the app itself reads |
+| `KRYONSEC_WHEEL` | Install a specific wheel instead of downloading — a path or URL. For air-gapped machines and support hand-offs. |
+| `KRYONSEC_SITE` | Base URL to download from (default `https://kryonsec.in`) |
 | `KRYONSEC_SANDBOX_IMAGE` | Override the image ref the installer pulls; may carry a `@sha256:<digest>` |
-| `KRYONSEC_REGISTRY_TOKEN` | GHCR token — only needed if the repo/image is private (`read:packages`) |
+| `KRYONSEC_REGISTRY_TOKEN` | GHCR token — only needed if the sandbox image is private (`read:packages`) |
 | `KRYONSEC_REGISTRY_USER` | Username for that token (default `kryonsec`) |
-| `KRYONSEC_SKIP_SANDBOX=1` | Skip the image fetch/build entirely |
-
-If a build fails partway, already-downloaded layers are cached — re-running resumes where it stopped.
+| `KRYONSEC_SKIP_SANDBOX=1` | Skip the image fetch entirely |
+| `KRYONSEC_HOME` | Install location (default `~/.kryonsec`) |
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.ps1 -OutFile install.ps1
+irm https://kryonsec.in/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Download it first, read it if you like, then run it. `-ExecutionPolicy Bypass` applies to
-that one process only — a freshly downloaded script is blocked outright under the Windows
-client default policy.
+Download it first, read it if you like, then run it — it asks for your key. `-ExecutionPolicy
+Bypass` applies to that one process only; a freshly downloaded script is blocked outright
+under the Windows client default policy.
 
 Windows gets Copilot mode only. Purple Team is gated behind a runtime check and must never
 run on the Windows host. Use WSL2 for Mode B.
 
 ### From source (development)
 
+The repository is private, so this path is for people who have been given access to it.
+If that's you, you already have the checkout:
+
 ```bash
-git clone https://github.com/GonchiJoshnaVardhanReddy/kryon-sec.git
-cd kryonsec
 pip install -e ".[dev]"
 kryonsec setup
 ```
@@ -910,7 +914,7 @@ env = "{}"
 Environment variables (they win over TOML): `OPENAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`,
 `AWS_REGION_NAME`, `DATABASE_URL`, `OLLAMA_HOST`, `KRYONSEC_OPENAI_COMPATIBLE_BASE_URL`,
 `KRYONSEC_OPENAI_COMPATIBLE_API_KEY`, `KRYONSEC_HOME`, `KRYONSEC_WORKSPACE`,
-`KRYONSEC_SANDBOX_IMAGE`, `KRYONSEC_VERSION` (installer).
+`KRYONSEC_LICENSE_KEY`, `KRYONSEC_SANDBOX_IMAGE`.
 
 ### LLM backends
 
@@ -1260,27 +1264,44 @@ first run on a new version, fetch the new sandbox image (new tools are baked in)
 ```bash
 docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
 docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
-# or, from a source checkout:
-docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 ```
+
+Rebuilding the image locally needs `containers/sandbox/` and the `kryonsec` sources, so it
+only works from a maintainer checkout — the installer pulls rather than builds for
+everyone else.
 
 ### Publishing a release (maintainer)
 
-The sandbox image is published to GHCR by `.github/workflows/sandbox-image.yml`, so users pull
-instead of building.
+Two workflows run on a tag: `.github/workflows/release-wheel.yml` builds the wheel that
+`kryonsec.in` serves to members, and `.github/workflows/sandbox-image.yml` publishes the
+sandbox image to GHCR so users pull instead of building. See [RELEASING.md](RELEASING.md)
+for the download endpoint members' installs call.
 
 1. **One-time repo setup:** Settings → Actions → General → Workflow permissions → *Read and write
-   permissions*. The default `GITHUB_TOKEN` cannot push packages without this.
+   permissions*. The default `GITHUB_TOKEN` cannot push packages or create releases without this.
 2. **First image:** the workflow can't retro-publish for tags that predate it. Run it once by
    hand: Actions → *sandbox-image* → *Run workflow* on `main`.
-3. **Every release:** tag and push (`git tag v1.3.2 && git push --tags`). The workflow builds and
-   pushes `:v1.3.2` plus `:latest` (non-prerelease tags only).
+3. **Every release:** bump `version` in `pyproject.toml`, commit, then tag and push
+   (`git tag v1.3.3 && git push origin main --tags`). The workflows build the wheel release and
+   push the image as `:v1.3.3` plus `:latest` (non-prerelease tags only).
 4. **Read the digest** off the run's job summary.
 5. **Optionally pin it** via `KRYONSEC_SANDBOX_IMAGE` (spec §8.6). Pinning is a deliberate
    per-release choice: the installer retags the pulled image as `kryonsec/sandbox:latest`, so a
-   digest-pinned default only works for users who pull that digest. Leaving the tag default keeps
-   offline rebuilds working.
+   digest-pinned default only works for users who pull that digest.
 6. **Verify** on a clean machine: `docker pull` the new tag, then `kryonsec doctor` must pass.
+
+---
+
+## License
+
+**Proprietary. All rights reserved.** Kryonsec is commercial, closed-source software — it is
+not open source, and no open source rights are granted to any part of it. See
+[LICENSE](LICENSE) for the full terms.
+
+In short: a membership key licenses you to use Kryonsec for your own security testing, or for
+client work you are authorized to perform. You may not redistribute it, publish it, share your
+key, or reverse engineer it. Third-party components that Kryonsec ships with or fetches stay
+under their own licenses, which this does not change.
 
 ---
 

@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Kryonsec one-line installer (WSL / Linux / macOS).
+# Kryonsec installer (WSL / Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/GonchiJoshnaVardhanReddy/kryon-sec/main/install.sh | bash
+#   curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
+#
+# Kryonsec is commercial, closed-source software: there is no public repository
+# to clone. The release below is a built wheel, and the membership key is what
+# unlocks it, so this script does nothing useful without one.
 #
 # What it does:
-#   1. installs missing prerequisites (git, curl) on apt systems
+#   1. installs missing prerequisites (curl) on apt systems
 #   2. checks for Python 3.11+
 #   3. creates ~/.kryonsec/venv
-#   4. installs kryonsec into it (from GitHub)
+#   4. fetches the kryonsec release from kryonsec.in using your key, and
+#      saves the key so Purple Team can use it later
 #   5. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
 #   6. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
-#      then fetches the Zone B sandbox image — pulled from ghcr.io (fast),
-#      falling back to a local build (slow) when the pull isn't available.
+#      then fetches the Zone B sandbox image from ghcr.io.
 #      On WSL2 talking to Docker Desktop it installs a daemon inside the
 #      distro and moves the CLI onto it, because Docker Desktop's daemon
 #      cannot host gVisor at all.
@@ -21,7 +25,11 @@
 #      the exact command to run when PATH isn't active in this shell yet
 set -euo pipefail
 
-REPO="https://github.com/GonchiJoshnaVardhanReddy/kryon-sec"
+SITE="${KRYONSEC_SITE:-https://kryonsec.in}"
+DOWNLOAD_URL="$SITE/api/download"
+# The membership key unlocks the download here and Purple Team later.
+# KRYONSEC_LICENSE_KEY is the name the app itself reads, so accept both.
+KEY="${KRYONSEC_KEY:-${KRYONSEC_LICENSE_KEY:-}}"
 KRYONSEC_HOME="${KRYONSEC_HOME:-$HOME/.kryonsec}"
 VENV="$KRYONSEC_HOME/venv"
 
@@ -82,7 +90,7 @@ purge_broken_apt_sources() {
 purge_broken_apt_sources
 
 MISSING=""
-for tool in git curl; do
+for tool in curl; do
     command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
 if [ -n "$MISSING" ]; then
@@ -95,21 +103,6 @@ if [ -n "$MISSING" ]; then
         say "         install them manually and re-run"
     fi
 fi
-command -v git >/dev/null 2>&1 ||
-    say "WARNING: git is unavailable — the latest-tag lookup and the sandbox source clone will be skipped"
-
-# Clone the repo at a tag/branch/SHA ref (shallow) into $2.
-clone_ref() {
-    if git clone --quiet --depth 1 --branch "$1" "$REPO.git" "$2"; then
-        return 0
-    fi
-    # commit SHAs can't be cloned via --branch; fetch the exact ref instead.
-    # advice off + stderr swallowed: the detached-HEAD chatter a tag fetch
-    # produces looks like an error to users (it isn't — the checkout works)
-    git init --quiet "$2" &&
-        git -C "$2" fetch --quiet --depth 1 origin "$1" 2>/dev/null &&
-        git -C "$2" -c advice.detachedHead=false checkout --quiet FETCH_HEAD 2>/dev/null
-}
 
 # ---- 1. python 3.11+ ------------------------------------------------------
 # Newest-supported first, but 3.14 is deliberately absent from the list: it is
@@ -150,47 +143,65 @@ if ! "$PY" -m venv "$VENV" 2>/dev/null; then
 fi
 
 # ---- 3. install -------------------------------------------------------------
-# Install a released version, not whatever is on main at this moment. The
-# latest tag comes from git ls-remote (plain tags count — no GitHub Release
-# needed, no API rate limits); a fallback covers offline installs and repos
-# without tags. KRYONSEC_VERSION overrides both ("@v1.3.0", "@main",
-# "@<commit-sha>").
+# Kryonsec is closed-source, so there is no repo to clone and no public tag
+# list to read. The release ships as a built wheel and the site decides which
+# version the key gets, which is why nothing here resolves a version at all.
 #
-# THIS repo's newest tag is the release installs land on, so a release that
-# is not tagged is a release nobody gets. Cutting the tag is part of shipping
-# it; the fallback covers offline installs and a repo with no tags at all.
-FALLBACK_REF="main"
-if [ -n "${KRYONSEC_VERSION:-}" ]; then
-    say "installing kryonsec${KRYONSEC_VERSION} (KRYONSEC_VERSION override)"
+# KRYONSEC_WHEEL overrides the download entirely — a URL or a local .whl. It
+# is the escape hatch for air-gapped machines, and it is how support hands
+# someone a build without going through the site.
+WHEEL=""
+if [ -n "${KRYONSEC_WHEEL:-}" ]; then
+    say "installing from KRYONSEC_WHEEL override"
+    WHEEL="$KRYONSEC_WHEEL"
 else
-    # `|| true` is load-bearing: under `set -o pipefail` the assignment takes
-    # the pipeline's status, so a failing git (not installed → 127, or GitHub
-    # unreachable → 128) used to kill the script right here — the exact
-    # offline case the fallback exists for. Without it the "no tags on the
-    # remote" branch below was unreachable dead code.
-    LATEST_TAG="$(git ls-remote --tags --refs "$REPO.git" 2>/dev/null \
-        | sed 's|.*refs/tags/||' | "$PY" -c '
-import sys
-def key(t):
-    return [int(p) if p.isdigit() else 0 for p in t.lstrip("v").split(".")]
-tags = [l.strip() for l in sys.stdin if l.strip()]
-print(max(tags, key=key) if tags else "")' || true)"
-    if [ -n "$LATEST_TAG" ]; then
-        KRYONSEC_VERSION="@$LATEST_TAG"
-        say "installing latest release $LATEST_TAG"
-    else
-        KRYONSEC_VERSION="@$FALLBACK_REF"
-        say "no release tags in this repo — installing $FALLBACK_REF"
+    if [ -z "$KEY" ]; then
+        die "a membership key is required. Re-run with:
+           curl -fsSL $SITE/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
+         Request access at $SITE"
+    fi
+    TMP_DIR="$(mktemp -d)"
+    WHEEL="$TMP_DIR/kryonsec.whl"
+    say "fetching the kryonsec release"
+    # -f makes the site's rejection a failure rather than saving an error page
+    # as a "wheel", which pip would then report as a corrupt archive.
+    if ! curl -fsSL --max-time 600 -o "$WHEEL" \
+        "$DOWNLOAD_URL?key=$KEY&os=linux"; then
+        rm -rf "$TMP_DIR"
+        die "could not download kryonsec — the key was rejected, or $SITE is unreachable.
+         Check the key, or request access again at $SITE"
     fi
 fi
+
 # Deliberately NOT --quiet: a tree this size takes minutes and pip prints
 # nothing while it resolves and downloads, so a silent install reads as a
 # hung one — which is exactly how it gets reported. The output is the
 # reassurance that it is still working.
 say "installing kryonsec (this pulls litellm, mcp, rich, … — takes a few minutes)"
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install "git+$REPO.git$KRYONSEC_VERSION"
+"$VENV/bin/pip" install "$WHEEL"
 "$VENV/bin/kryonsec" --version || die "installation failed"
+
+# Remember the key. It gated the download, and Purple Team will ask for it
+# again at the first engagement — making the user paste it twice, from an
+# email they may no longer have open, is the kind of small friction that
+# reads as broken. Failure here is not fatal: the app also reads
+# KRYONSEC_LICENSE_KEY from the environment.
+if [ -n "$KEY" ]; then
+    if "$VENV/bin/python" - "$KEY" <<'PY'
+import sys
+from kryonsec.config import load_config
+cfg = load_config()
+cfg.license_key = sys.argv[1].strip()
+cfg.save()
+PY
+    then
+        say "membership key saved"
+    else
+        say "WARNING: could not save the membership key"
+        say "         add it later under [license] in $KRYONSEC_HOME/config.toml"
+    fi
+fi
 
 # uvx runs a Python CLI tool without installing it — npx for Python. It is
 # what the wizard's `fetch` MCP preset starts, it ships with uv, and most
@@ -491,31 +502,35 @@ if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
 fi
 
 # Registry image published by .github/workflows/sandbox-image.yml on every
-# release tag. Pulling beats building: ready-made layers download in parallel
-# and resume on failure, where a local build downloads ~50 tools (~2 GB)
-# inside a Docker build and takes 30+ min on a slow link. The build path is
-# kept forever as the fallback, so an older copy of this script never hard-breaks.
+# release tag. Pulling is the only path: ready-made layers download in
+# parallel and resume on failure, where a local build downloaded ~50 tools
+# (~2 GB) inside a Docker build and took 30+ min on a slow link. That build
+# path needed the repository sources, which are no longer public, so it is
+# gone rather than left in place to fail confusingly.
 SANDBOX_REGISTRY_IMAGE="ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox"
+
+# The version we actually installed, straight from the package metadata. The
+# old code read it off the git tag it installed from; with the release served
+# as a wheel there is no tag to read, and the wheel knows its own version.
+INSTALLED_VERSION="$("$VENV/bin/python" -c \
+    'import importlib.metadata as m; print(m.version("kryonsec"))' 2>/dev/null || true)"
 
 # Image refs to try, in order, one per line.
 #
 # KRYONSEC_SANDBOX_IMAGE wins and is the ONLY ref tried: it may carry a
 # @sha256: digest, and quietly pulling some other image would defeat the pin
-# the operator asked for. Otherwise: the release tag we installed (its image
-# matches the code), then :latest, which the publish workflow always maintains.
-#
-# That :latest fallback is what keeps installs FAST. A tagged install used to
-# ask for :vX.Y.Z, try exactly once, and drop to the 30+ min local build
-# whenever that tag had not been published — which is most of the time, since
-# the tag only appears if the workflow happened to run on that exact tag.
+# the operator asked for. Otherwise: the image for the version we installed
+# (so image and code match), then :latest, which the publish workflow always
+# maintains — that fallback is what keeps installs fast when a tag's image was
+# never published.
 sandbox_image_refs() {
     if [ -n "${KRYONSEC_SANDBOX_IMAGE:-}" ]; then
         printf '%s\n' "$KRYONSEC_SANDBOX_IMAGE"
         return 0
     fi
-    case "${KRYONSEC_VERSION:-}" in
-        @v*) printf '%s:%s\n' "$SANDBOX_REGISTRY_IMAGE" "${KRYONSEC_VERSION#@}" ;;
-    esac
+    if [ -n "$INSTALLED_VERSION" ]; then
+        printf '%s:v%s\n' "$SANDBOX_REGISTRY_IMAGE" "$INSTALLED_VERSION"
+    fi
     printf '%s:latest\n' "$SANDBOX_REGISTRY_IMAGE"
     return 0
 }
@@ -545,29 +560,6 @@ pull_sandbox_image() {
     return 1
 }
 
-build_sandbox_image() {
-    say "building the Zone B sandbox image (kali + ~50 tools, 2+ GB download)"
-    say "this is the slow part — on a slow link it can take 30+ min; progress is shown below"
-    TMP=$(mktemp -d)
-    # same ref the package was installed from — image and package must match
-    if clone_ref "${KRYONSEC_VERSION#@}" "$TMP/kryonsec-src"; then
-        # no -q: stream the build steps so it never looks frozen, and
-        # completed layers are cached, so a retry resumes where it stopped
-        if ! dkr build --progress=plain -t kryonsec/sandbox \
-            -f "$TMP/kryonsec-src/containers/sandbox/Dockerfile.kali" \
-            "$TMP/kryonsec-src"; then
-            say "WARNING: sandbox image build failed — sources kept at $TMP/kryonsec-src"
-            say "retry later with: docker build --progress=plain -t kryonsec/sandbox -f $TMP/kryonsec-src/containers/sandbox/Dockerfile.kali $TMP/kryonsec-src"
-            return 1
-        fi
-        rm -rf "$TMP"
-        return 0
-    fi
-    say "WARNING: could not fetch sandbox sources (git missing or network down) — skipping image build"
-    rm -rf "$TMP"
-    return 1
-}
-
 if [ -n "${KRYONSEC_SKIP_SANDBOX:-}" ]; then
     say "KRYONSEC_SKIP_SANDBOX set — skipping the sandbox image"
     # no pipeline here: `sandbox_image_refs | head -1` would let pipefail turn
@@ -582,9 +574,15 @@ elif dkr info >/dev/null 2>&1; then
         if pull_sandbox_image; then
             say "sandbox image pulled: $PULLED_IMAGE_REF"
         else
-            say "registry pull unavailable — falling back to a local build"
-            build_sandbox_image ||
-                say "WARNING: no sandbox image — Purple Team will not start (Copilot is unaffected)"
+            # No local-build fallback any more: it needed the repository
+            # sources, which are private. Say what to actually do instead of
+            # dropping into a build that cannot fetch anything.
+            say "WARNING: could not pull the sandbox image — Purple Team will not start."
+            say "         Copilot mode is unaffected. Retry manually with:"
+            say "           docker pull ${SANDBOX_REGISTRY_IMAGE}:latest"
+            say "           docker tag ${SANDBOX_REGISTRY_IMAGE}:latest kryonsec/sandbox:latest"
+            say "         If the image has been made private, set KRYONSEC_REGISTRY_TOKEN"
+            say "         and KRYONSEC_REGISTRY_USER, then re-run this installer."
         fi
     fi
 else
