@@ -11,12 +11,16 @@ starts. The check is honest, not aggressive:
 - nothing is ever deleted; the only enforcement is refusing to START a
   new Purple Team engagement
 
-The verify endpoint starts life as an n8n webhook on kryonsec.in — no
-backend code of ours runs there. Contract:
+The verify endpoint is a Cloudflare Pages Function on kryonsec.in
+(`functions/api/license/verify.js`). Contract:
 
     GET {VERIFY_URL}?key=KRYO-XXXX-XXXX-XXXX
     200 {"valid": true,  "expires": "2027-01-01"}
     200 {"valid": false, "reason": "expired"}
+
+A refusal is a 200 carrying `valid: false`, never a 4xx — this file reads
+a non-200 as "the network is down" and falls back to grace, so serving a
+revocation as an error status is what would keep a revoked key alive.
 
 Keys are crockford-base32 groups (no 0/O/1/I) after a "KRYO-" prefix.
 """
@@ -31,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+
 # crockford base32, ambiguous characters removed (0/O look alike, 1/I)
 KEY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 KEY_PATTERN = re.compile(
@@ -44,6 +50,13 @@ CHECK_INTERVAL_H = 24        # phone home at most once a day
 EXPIRING_SOON_DAYS = 14      # doctor shows "renews soon" inside this window
 
 STATE_FILENAME = "license.state.json"
+
+# Cloudflare answers urllib's default "Python-urllib/3.x" User-Agent with
+# 403 (error 1010, "banned browser signature") — the zone's Browser Integrity
+# Check reads it as a bot. That 403 is indistinguishable from an outage here,
+# so every member would have fallen through to grace and never activated.
+# Identify the client instead; any well-formed agent is allowed through.
+USER_AGENT = f"kryonsec/{__version__} (+https://kryonsec.in)"
 
 # statuses a VerifyResult can carry
 VALID = "valid"
@@ -119,8 +132,13 @@ def _http_get_json(url: str) -> dict | None:
     import urllib.parse
     import urllib.request
 
+    # An explicit Request, not urlopen(url): the default agent is refused by
+    # the verify endpoint's zone. See USER_AGENT.
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+
     try:
-        with urllib.request.urlopen(url, timeout=VERIFY_TIMEOUT_S) as r:
+        with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT_S) as r:
             if r.status != 200:
                 return None
             data = json.loads(r.read().decode("utf-8"))
