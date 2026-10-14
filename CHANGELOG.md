@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.3.6 — the membership gate, and `kryonsec connect`
+
+The security engine is untouched: no state transition, tool allowlist,
+sandbox behaviour, exploit or verify logic, or authorization gate was
+modified. Test suite: **1675 tests green** (was 1667).
+
+v1.3.5 shipped a licence check that nothing called. The key gated the
+download and stopped there, so a Purple Team engagement ran for anyone who
+had the code. This release wires it in and adds the one-time step that makes
+it know *who*, not just *whether*.
+
+- **`kryonsec connect` registers this machine.** It prints a link, opens a
+  browser once, and waits for you to confirm your email. After that the
+  machine is known and never asks again. Nothing types a password into a
+  terminal, and the key is never pasted into a web page.
+- **Purple Team now needs a connected machine, not just a valid key.** A key
+  proves a membership exists; it does not say whose machine this is. Copilot
+  mode is free and calls nothing.
+- **The key travels in a header, not the URL.** A query string lands in access
+  logs, proxy logs and Referer headers, and a membership key is a credential.
+  Older installs still work — the endpoint accepts `?key=` as well.
+- **Cloudflare no longer refuses the app's own requests.** urllib's default
+  User-Agent is on the zone's banned-signature list, so every activation was
+  answered 403 and silently interpreted as "offline", which the grace period
+  then covered. What looked like working offline tolerance was a wall.
+- **`kryonsec doctor` reports the membership and the machine.** A new row says
+  whether the key is good *and* whether this box is connected, because those
+  are different problems with different fixes.
+
 ## v1.3.5 — closed source, key-gated install
 
 Kryonsec is commercial software now. The security engine is untouched: no
