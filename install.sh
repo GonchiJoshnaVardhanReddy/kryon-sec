@@ -3,6 +3,11 @@
 #
 #   curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
 #
+# Beta accounts do not use a key. Sign in at the site and its dashboard prints
+# the command with KRYONSEC_DOWNLOAD_URL set to a one-time link:
+#
+#   curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_DOWNLOAD_URL='https://kryonsec.in/api/beta/download?t=dl_...' bash
+#
 # Kryonsec is commercial, closed-source software: there is no public repository
 # to clone. The release below is a built wheel, and the membership key is what
 # unlocks it, so this script does nothing useful without one.
@@ -12,7 +17,8 @@
 #   2. checks for Python 3.11+
 #   3. creates ~/.kryonsec/venv
 #   4. fetches the kryonsec release from kryonsec.in using your key, and
-#      saves the key so Purple Team can use it later
+#      saves the key so Purple Team can use it later — or, for a beta account,
+#      fetches the one-time link the dashboard gave you and saves no key
 #   5. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
 #   6. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
 #      then fetches the Zone B sandbox image from ghcr.io.
@@ -154,6 +160,24 @@ WHEEL=""
 if [ -n "${KRYONSEC_WHEEL:-}" ]; then
     say "installing from KRYONSEC_WHEEL override"
     WHEEL="$KRYONSEC_WHEEL"
+elif [ -n "${KRYONSEC_DOWNLOAD_URL:-}" ]; then
+    # The beta path, and the only reason it needs a branch of its own: pip
+    # decides a wheel's name from the URL's last path segment and refuses a
+    # wheel it cannot name, so a gated URL has to be fetched to a file first.
+    # (KRYONSEC_WHEEL looks like it would do — it accepts a URL — but piping an
+    # extensionless URL straight into pip fails with "Invalid wheel filename".)
+    #
+    # No key is asked for and none is saved: the URL carries a one-time
+    # credential that the account's own dashboard minted, and there is no
+    # membership key in the beta for Purple Team to read later.
+    TMP_DIR="$(mktemp -d)"
+    WHEEL="$TMP_DIR/kryonsec.whl"
+    say "fetching the kryonsec release"
+    if ! curl -fsSL --max-time 600 -o "$WHEEL" "$KRYONSEC_DOWNLOAD_URL"; then
+        rm -rf "$TMP_DIR"
+        die "could not download kryonsec — that link was refused, has expired, or $SITE is unreachable.
+         Reload your dashboard at $SITE/dashboard for a fresh one."
+    fi
 else
     if [ -z "$KEY" ]; then
         die "a membership key is required. Re-run with:

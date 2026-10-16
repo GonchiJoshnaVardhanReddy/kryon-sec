@@ -3,6 +3,13 @@
 #   irm https://kryonsec.in/install.ps1 -OutFile install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #
+# Beta accounts do not use a key. Sign in at the site and its dashboard prints
+# the command with KRYONSEC_DOWNLOAD_URL set to a one-time link:
+#
+#   $env:KRYONSEC_DOWNLOAD_URL='https://kryonsec.in/api/beta/download?t=dl_...'
+#   irm https://kryonsec.in/install.ps1 -OutFile install.ps1
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1
+#
 # Kryonsec is commercial, closed-source software: there is no public repository
 # to clone. The release below is a built wheel, and the membership key is what
 # unlocks it, so this script asks for one before it downloads anything.
@@ -17,7 +24,8 @@
 #   1. checks for Python 3.11+
 #   2. creates ~\.kryonsec\venv
 #   3. fetches the kryonsec release from kryonsec.in using your key, and
-#      saves the key so Purple Team can use it later
+#      saves the key so Purple Team can use it later — or, for a beta account,
+#      fetches the one-time link the dashboard gave you and saves no key
 #   4. adds ~\.kryonsec\venv\Scripts to the user PATH
 #   5. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
 #
@@ -67,6 +75,19 @@ $Kryo = Join-Path $Venv "Scripts\kryonsec.exe"
 $Wheel = $env:KRYONSEC_WHEEL
 if ($Wheel) {
     Say "installing from KRYONSEC_WHEEL override"
+} elseif ($env:KRYONSEC_DOWNLOAD_URL) {
+    # The beta path. A signed-in account is handed a URL carrying a one-time
+    # credential instead of a membership key, so this fetches to a file and
+    # lets pip install the file. No key is asked for and none is saved: there
+    # is no membership key in the beta, and Purple Team is Linux-only anyway.
+    $Wheel = Join-Path ([System.IO.Path]::GetTempPath()) "kryonsec-beta.whl"
+    Say "fetching the kryonsec release"
+    try {
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 600 `
+            -Uri $env:KRYONSEC_DOWNLOAD_URL -OutFile $Wheel
+    } catch {
+        Die "could not download kryonsec - that link was refused, has expired, or $Site is unreachable. Reload your dashboard at $Site/dashboard for a fresh one."
+    }
 } else {
     if (-not $Key) {
         # This script is meant to be read and run interactively (see the
