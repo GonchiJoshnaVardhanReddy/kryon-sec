@@ -3,6 +3,9 @@
 Usage:
   kryonsec          start the interactive CLI (Copilot mode)
   kryonsec doctor   run preflight checks
+  kryonsec login    sign in to a beta account (browser once, no key)
+  kryonsec logout   revoke this machine's token and forget it
+  kryonsec auth     show how this machine is signed in
   kryonsec --version
 """
 
@@ -1127,6 +1130,24 @@ def main(argv: list[str] | None = None) -> int:
         "--no-browser", dest="open_browser", action="store_false",
         help="print the link instead of opening a browser (headless boxes)")
 
+    login = sub.add_parser(
+        "login",
+        help="sign in to a beta account (opens a browser once; no key needed)")
+    login.add_argument(
+        "--no-browser", dest="open_browser", action="store_false",
+        help="print the link instead of opening a browser (headless boxes)")
+
+    sub.add_parser(
+        "logout",
+        help="sign this machine out: revoke the token, then delete it here")
+
+    auth = sub.add_parser(
+        "auth",
+        help="show how this machine is signed in, and whether access is live")
+    auth.add_argument(
+        "what", nargs="?", default="status", choices=["status"],
+        help="only `status` for now; `kryonsec auth status`")
+
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
     purple.add_argument("--id", default=None, help="engagement id (default: auto-generated)")
@@ -1197,6 +1218,27 @@ def main(argv: list[str] | None = None) -> int:
             # saying so is the whole message.
             console.print("\n[yellow]cancelled — nothing was changed[/yellow]")
             return 1
+
+    if args.command == "login":
+        from .auth import login
+
+        try:
+            return login(cfg, open_browser=args.open_browser)
+        except KeyboardInterrupt:
+            console.print(
+                "\n[yellow]cancelled — nothing was stored on this machine[/yellow]"
+            )
+            return 1
+
+    if args.command == "logout":
+        from .auth import logout
+
+        return logout(cfg)
+
+    if args.command == "auth":
+        from .auth import status
+
+        return status(cfg)
 
     # first run without a config -> wizard before the chat loop
     from .config import config_path

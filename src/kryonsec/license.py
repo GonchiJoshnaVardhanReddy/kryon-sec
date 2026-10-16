@@ -1,10 +1,21 @@
 """License verification (membership model, 2026-09 plan).
 
-Copilot mode is free. Purple Team (the paid feature) is gated: a valid
-membership key must verify against kryonsec.in before an engagement
-starts. The check is honest, not aggressive:
+Copilot mode is free. Purple Team (the paid feature) is gated: the machine
+must be authorised before an engagement starts, by one of two credentials:
 
-- phones home at most once per day (result cached in the state file)
+- a **membership key** (`KRYO-XXXX-XXXX-XXXX`), typed in once, posted by
+  email, and not revocable in any meaningful sense
+- a **beta session token** (`s_…`), obtained by `kryonsec login`, revocable
+  from the dashboard, and what an early-access account gets
+
+Both end at the same endpoint and the same `accessFor()` answer there; the
+key is checked first. See kryonsec/auth.py for the token's half.
+
+The check is honest, not aggressive:
+
+- phones home at most once per day (result cached in the state file, keyed on
+  which credential was checked, so switching accounts cannot replay a stale
+  "valid")
 - a dead network never locks a member out: offline operation runs on a
   7-day grace period from the last successful verification
 - a clock rollback (state timestamp in the future) counts as tampering
@@ -15,7 +26,8 @@ The verify endpoint is a Cloudflare Pages Function on kryonsec.in
 (`functions/api/license/verify.js`). Contract:
 
     GET {VERIFY_URL}?device=..&os=..&arch=..&version=..
-    X-Kryonsec-Key: KRYO-XXXX-XXXX-XXXX
+    X-Kryonsec-Key: KRYO-XXXX-XXXX-XXXX     — or —
+    Authorization: Bearer s_<64 hex>
     200 {"valid": true,  "expires": "2027-01-01"}
     200 {"valid": false, "reason": "expired"}
 
@@ -57,6 +69,16 @@ CONNECT_POLL_URL = os.environ.get(
 VERIFY_TIMEOUT_S = 8         # matches doctor's ollama probe
 GRACE_DAYS = 7               # offline tolerance after a successful check
 CHECK_INTERVAL_H = 24        # phone home at most once a day
+# ...but a key and a token are not the same promise. A key is a flat allowlist
+# entry with no expiry: this daily check IS the enforcement, so it cannot be
+# more or less often than "once a day". A token is revocable, and the dashboard
+# offers a button that says so — a day of stale "valid" after someone clicks it
+# is the difference between cutting an account off and cutting it off tomorrow.
+#
+# An hour costs one request per hour of use. It does not cost offline operation:
+# a failed check falls through to grace, which is the offline mechanism, and is
+# unchanged. See LIMITATIONS in SECURITY-NOTES.md for what this window is.
+TOKEN_CHECK_INTERVAL_H = 1
 EXPIRING_SOON_DAYS = 14      # doctor shows "renews soon" inside this window
 
 STATE_FILENAME = "license.state.json"
@@ -161,11 +183,20 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
-def _http_json(url: str, payload: dict | None = None, *, key: str = "") -> dict | None:
+def _http_json(
+    url: str, payload: dict | None = None, *, key: str = "", token: str = ""
+) -> dict | None:
     """GET url, or POST `payload` to it as JSON. Returns the parsed JSON
     object, or None on any failure — the caller decides whether that means
     grace, a refusal, or "the network is down".
-    (Seam for tests: monkeypatch this.)"""
+    (Seam for tests: monkeypatch this.)
+
+    Sends whichever credentials it is given. The verify endpoint checks the
+    key first and the token only when there is no key, so passing both from a
+    machine that somehow has both is not ambiguous — the server's precedence
+    decides, and it is the same precedence this file uses when it decides
+    whether anything is configured at all.
+    """
     import urllib.request
 
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -176,6 +207,8 @@ def _http_json(url: str, payload: dict | None = None, *, key: str = "") -> dict 
         # Referer headers. A request header goes nowhere but the request. The
         # endpoint still accepts ?key= so older installs keep working.
         headers["X-Kryonsec-Key"] = key
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if data is not None:
         headers["Content-Type"] = "application/json"
 
@@ -194,19 +227,47 @@ def _http_json(url: str, payload: dict | None = None, *, key: str = "") -> dict 
         return None
 
 
-def _http_get_json(url: str, *, key: str = "") -> dict | None:
+def _http_get_json(url: str, *, key: str = "", token: str = "") -> dict | None:
     """GET url, parse a JSON object response. None on any failure."""
-    return _http_json(url, None, key=key)
+    return _http_json(url, None, key=key, token=token)
 
 
-def http_post_json(url: str, payload: dict) -> dict | None:
+def http_post_json(url: str, payload: dict, *, token: str = "") -> dict | None:
     """POST a JSON body, parse a JSON object response. None on any failure.
-    The connect flow (kryonsec/connect.py) is the caller."""
-    return _http_json(url, payload)
+    The connect and login flows (kryonsec/connect.py, kryonsec/auth.py) are
+    the callers; `token` is how logout revokes the credential it presents."""
+    return _http_json(url, payload, token=token)
 
 
 def _days_between(later: datetime, earlier: datetime) -> int:
     return (later - earlier).days
+
+
+def _hours_between(later: datetime, earlier: datetime) -> float:
+    """Exact hours, not `_days_between * 24`: timedelta.days truncates, so a
+    day-based comparison of a sub-day interval can only ever be 0 or 24."""
+    return (later - earlier).total_seconds() / 3600
+
+
+def _remember(cfg: Any, updates: dict) -> None:
+    """Merge `updates` into the state file instead of replacing it.
+
+    `member_email`, `device_id`, and `connect_offered` live in the same file
+    and belong to other flows; a plain save_state here would silently drop
+    every field this function did not think to name.
+    """
+    state = load_state(cfg)
+    state.update(updates)
+    save_state(cfg, state)
+
+
+def _credential_id(key: str, token: str) -> str:
+    """A short, non-reversible label for whichever credential was checked, so
+    the daily cache can tell one account from another. Not a credential: it is
+    a hash of one, and it only ever goes into this machine's own state file."""
+    import hashlib
+
+    return hashlib.sha256((key or token).encode("utf-8")).hexdigest()[:16]
 
 
 def _from_state_grace(state: dict, now: datetime) -> VerifyResult:
@@ -240,14 +301,31 @@ def _from_state_grace(state: dict, now: datetime) -> VerifyResult:
 
 def verify(cfg: Any) -> VerifyResult:
     """Check the license. One call for every consumer (doctor, wizard,
-    purple gate). Never raises; the result object tells the story."""
+    purple gate). Never raises; the result object tells the story.
+
+    Two credentials can authorise this machine, and they are not
+    interchangeable: a membership key (typed in once, posted by email, cannot
+    be taken back) and a beta session token (`kryonsec login`, revocable). The
+    key is checked first, matching the server, so a machine that holds both
+    behaves the same here as it does there.
+    """
     key = (getattr(cfg, "license_key", None) or "").strip()
-    if not key:
+    # Imported here rather than at the top: auth.py imports this module for
+    # `http_post_json`, so a module-level import back would be a cycle.
+    from . import auth
+
+    token = auth.token(cfg)
+
+    if not key and not token:
         return VerifyResult(
             NOT_CONFIGURED,
-            message="no membership key configured — Copilot mode only "
-                    "(Purple Team needs a key from kryonsec.in)")
-    if not KEY_PATTERN.match(key):
+            message="no account on this machine — Copilot mode only. Purple "
+                    "Team needs either `kryonsec login` (beta) or a "
+                    "membership key from kryonsec.in")
+    # Only a key is shape-checked here. A token's shape is checked where it is
+    # read (auth.load), which cannot return one that is malformed — so a bad
+    # token is indistinguishable from no token, and lands above.
+    if key and not KEY_PATTERN.match(key):
         return VerifyResult(
             INVALID,
             message="malformed key (expected KRYO-XXXX-XXXX-XXXX) — "
@@ -258,14 +336,26 @@ def verify(cfg: Any) -> VerifyResult:
     state = load_state(cfg)
 
     # daily cache: a successful check inside the interval is replayed
-    # without touching the network (phone home at most once a day)
+    # without touching the network (phone home at most once a day).
+    #
+    # Keyed on *which* credential was checked. Without that, signing out and
+    # back in as an account that has since been revoked — or swapping a key in
+    # config.toml — would replay the previous account's "valid" for up to a
+    # day, which is exactly the window revocation exists to close.
+    credential_id = _credential_id(key, token)
+    # A key is checked daily because there is nothing to check it against more
+    # often; a token is checked hourly because the server can revoke it at any
+    # moment and the dashboard says so. See TOKEN_CHECK_INTERVAL_H.
+    interval_h = CHECK_INTERVAL_H if key else TOKEN_CHECK_INTERVAL_H
     last_check = _parse_ts(state.get("last_check"))
+    last_success = _parse_ts(state.get("last_success"))
     if (
         last_check is not None
         and state.get("cached_status") == VALID
-        and _days_between(now, last_check) * 24 < CHECK_INTERVAL_H
-        and _parse_ts(state.get("last_success")) is not None
-        and _days_between(now, _parse_ts(state.get("last_success"))) >= 0
+        and state.get("cached_for") == credential_id
+        and _hours_between(now, last_check) < interval_h
+        and last_success is not None
+        and _days_between(now, last_success) >= 0
     ):
         expires = state.get("expires", "")
         days_left = None
@@ -294,7 +384,7 @@ def verify(cfg: Any) -> VerifyResult:
         "version": __version__,
     }
     data = _http_get_json(
-        f"{VERIFY_URL}?{urllib.parse.urlencode(params)}", key=key)
+        f"{VERIFY_URL}?{urllib.parse.urlencode(params)}", key=key, token=token)
     if data is None:
         # unreachable/broken endpoint: grace decides; last_success is
         # never overwritten by a failure, so a dead webhook cannot lock
@@ -303,10 +393,15 @@ def verify(cfg: Any) -> VerifyResult:
 
     if data.get("valid") is True:
         expires = str(data.get("expires", ""))
-        save_state(cfg, {
+        # Re-read before writing: `device_id()` may have minted an id into the
+        # file after the `state` above was loaded, and save_state replaces the
+        # whole document — writing the stale copy dropped it, so the admin view
+        # saw a brand-new machine id every single day.
+        _remember(cfg, {
             "last_check": now.isoformat(),
             "last_success": now.isoformat(),
             "cached_status": VALID,
+            "cached_for": credential_id,
             "expires": expires,
         })
         days_left = None
@@ -321,24 +416,26 @@ def verify(cfg: Any) -> VerifyResult:
     # doesn't hammer a revoked key) but keep last_success untouched —
     # a later genuine renewal overwrites cached_status again
     reason = str(data.get("reason", "key not valid"))
-    save_state(cfg, {
+    _remember(cfg, {
         "last_check": now.isoformat(),
-        "last_success": state.get("last_success"),
         "cached_status": EXPIRED if reason == "expired" else INVALID,
-        "expires": state.get("expires", ""),
+        "cached_for": credential_id,
     })
     status = EXPIRED if reason == "expired" else INVALID
-    return VerifyResult(
-        status,
-        message=f"license {reason} — renew at kryonsec.in "
-                "(membership: your key stops working when it lapses)")
+    # The advice has to match the credential. A beta account told to renew a
+    # membership key has been sent to look for something it never had.
+    hint = (
+        "renew at kryonsec.in (membership: your key stops working when it lapses)"
+        if key
+        else "run `kryonsec login` again — the sign-in on this machine has ended"
+    )
+    return VerifyResult(status, message=f"license {reason} — {hint}")
 
 
 def ensure_purple_allowed(cfg: Any) -> VerifyResult:
     """Blocking gate for Purple Team engagements. Raises LicenseError
     unless the license is valid or in offline grace AND this machine has
-    been connected to a membership once — callers print the message, never
-    a stack trace.
+    been registered once — callers print the message, never a stack trace.
 
     Every Purple entry point routes through here rather than checking the
     license itself, so a new caller cannot forget one of the two conditions.
@@ -349,7 +446,7 @@ def ensure_purple_allowed(cfg: Any) -> VerifyResult:
         raise LicenseError(result.message or f"license {result.status}")
     if not member_email(cfg):
         raise LicenseError(
-            "this machine has not been connected to a membership yet — run "
-            "`kryonsec connect` (it opens a browser once; after that the "
-            "machine is registered and never asks again)")
+            "this machine has not been registered yet — run `kryonsec login` "
+            "(beta) or `kryonsec connect` (membership key). Either opens a "
+            "browser once; after that the machine never asks again")
     return result
