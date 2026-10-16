@@ -175,6 +175,23 @@ def test_login_says_so_when_the_site_cannot_be_reached(cfg, monkeypatch):
     assert auth.token(cfg) == ""
 
 
+def test_a_denial_reports_the_server_reason_when_there_is_one(cfg, monkeypatch, capsys):
+    """`denied` covers two different events: the person clicked no, and the
+    access behind the approval was withdrawn in the minutes since. The route
+    sends a reason for the second. Printing "you denied it" then sends someone
+    to check a browser they already closed."""
+    monkeypatch.setattr(license, "http_post_json", lambda url, payload, **kw: (
+        {"code": "AB12-CD34", "device_code": "d" * 64, "url": "https://kryonsec.in/x"}
+        if url == auth.LOGIN_START_URL
+        else {"status": "denied", "reason": "Access to this account has expired."}
+    ))
+    assert auth.login(cfg, open_browser=False) == 1
+
+    printed = capsys.readouterr().out
+    assert "Access to this account has expired." in printed
+    assert "denied in the browser" not in printed
+
+
 def test_login_refuses_a_machine_that_already_has_a_key(cfg, monkeypatch):
     """A key is checked first by the verify endpoint, so a token obtained
     alongside one would be stored and then never consulted. Accepting it would

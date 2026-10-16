@@ -241,8 +241,17 @@ def login(cfg: Any, *, open_browser: bool = True) -> int:
         if status == "approved":
             return _keep(cfg, answer)
         if status == "denied":
+            # "denied" means two different things on the wire. Usually the
+            # person clicked no. Sometimes the entitlement behind the approval
+            # went away in the minutes since, and the route sends a reason for
+            # that case — telling someone they declined when their access was
+            # withdrawn sends them to look in the wrong place.
+            why = str(answer.get("reason") or "").strip()
             console.print(
-                "\n[yellow]That sign-in was denied in the browser.[/yellow] "
+                f"\n[yellow]That sign-in was denied — {why}[/yellow] "
+                "Nothing was stored on this machine."
+                if why
+                else "\n[yellow]That sign-in was denied in the browser.[/yellow] "
                 "Nothing was stored on this machine."
             )
             return 1
