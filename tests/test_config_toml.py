@@ -10,6 +10,7 @@ from kryonsec.config import (
     KryonsecConfig,
     config_path,
     read_config,
+    update_config_sections,
     write_config,
 )
 
@@ -63,6 +64,33 @@ def test_read_config_corrupt_file_is_empty(tmp_path):
     path = tmp_path / "broken.toml"
     path.write_text("this is not [ valid toml", encoding="utf-8")
     assert read_config(path) == {}
+
+
+def test_installer_updates_one_section_without_erasing_other_settings(tmp_path):
+    path = tmp_path / "config.toml"
+    write_config(path, {
+        "llm": {"provider": "ollama", "chat_model": "ollama/test"},
+        "tools": {"enabled": ["file_read"]},
+        "license": {"key": "old"},
+    })
+    update_config_sections(path, {
+        "license": {"key": "new"},
+        "sandbox": {"image": "registry/image@sha256:" + "a" * 64},
+    })
+    data = read_config(path)
+    assert data["llm"]["provider"] == "ollama"
+    assert data["tools"]["enabled"] == ["file_read"]
+    assert data["license"]["key"] == "new"
+    assert data["sandbox"]["image"].endswith("a" * 64)
+
+
+def test_installer_refuses_to_update_corrupt_config(tmp_path):
+    path = tmp_path / "config.toml"
+    original = "this is not valid toml ["
+    path.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError):
+        update_config_sections(path, {"license": {"key": "new"}})
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_config_round_trip(tmp_path, clean_env):

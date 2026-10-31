@@ -15,6 +15,7 @@ users, CI); the old .env loading is gone.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -97,8 +98,35 @@ def write_config(path: Path, data: dict) -> Path:
                 lines.append(f"[[{key}.{arr_key}]]")
                 _flatten(f"{key}.{arr_key}", entry, lines)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:  # restrict to owner where the OS supports it (the file holds the API key)
+    # Write beside the destination and replace it only after the complete
+    # document is on disk. A killed installer or a full filesystem must not
+    # leave a half-written config that the next run silently treats as empty.
+    temporary: Path | None = None
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temporary = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:  # pragma: no cover - filesystems may not support it
+                pass
+        try:  # restrict to owner where the OS supports it (the file holds keys)
+            temporary.chmod(0o600)
+        except OSError:  # pragma: no cover - Windows
+            pass
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    try:  # keep the final path owner-only even when replacing an old file
         path.chmod(0o600)
     except OSError:  # pragma: no cover - Windows
         pass
@@ -115,6 +143,55 @@ def read_config(path: Path) -> dict:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError):
         return {}
+
+
+def config_file_error(path: Path) -> str | None:
+    """Return a safe parse/read error, or ``None`` for a valid/missing file.
+
+    ``read_config`` intentionally keeps its historical "missing or corrupt is
+    empty" contract for startup callers. Install and doctor need to tell a
+    corrupt existing file apart from a first run so they do not overwrite a
+    user's configuration while trying to recover.
+    """
+    import tomllib
+
+    if not path.exists():
+        return None
+    try:
+        if not path.is_file():
+            return "configuration path is not a regular file"
+        tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        return f"invalid TOML ({exc})"
+    except OSError:
+        return "configuration file could not be read"
+    return None
+
+
+def update_config_sections(path: Path, updates: dict[str, dict[str, object]]) -> Path:
+    """Update selected TOML sections without inventing a fresh config.
+
+    Installers use this for values learned after installation (the membership
+    key and the resolved sandbox digest).  An existing malformed file is a
+    hard error: silently treating it as an empty first-run config would erase
+    the user's settings.  Parsed sections are round-tripped atomically by the
+    same writer used by ``KryonsecConfig.save``.
+    """
+    error = config_file_error(path)
+    if error:
+        raise ValueError(error)
+    data = read_config(path)
+    if not isinstance(data, dict):
+        data = {}
+    for section, values in updates.items():
+        current = data.get(section)
+        if current is None:
+            current = {}
+            data[section] = current
+        if not isinstance(current, dict):
+            raise ValueError(f"configuration section [{section}] is not a table")
+        current.update(values)
+    return write_config(path, data)
 
 
 def _server_from_row(row: dict) -> dict:
@@ -232,18 +309,11 @@ class KryonsecConfig:
     max_tool_output_chars: int = 20000
 
     # --- Zone B sandbox (spec §8.5/§8.6) ---
-    # Defaults to the local tag install.sh produces: it pulls the published
-    # image from GHCR (see .github/workflows/sandbox-image.yml) and retags it
-    # as kryonsec/sandbox:latest, falling back to a local build. KRYONSEC_SANDBOX_IMAGE
-    # may hold "kryonsec/sandbox@sha256:<digest>".
-    #
-    # Spec §8.6 wants the image pinned by digest. We don't ship one by default
-    # because the digest is only known after the release workflow runs, and a
-    # stale or wrong digest makes doctor refuse to start Mode B for everyone.
-    # The workflow prints the digest in its job summary; to pin a release,
-    # replace the default below with "ghcr.io/gonchijoshnavardhanreddy/
-    # kryonsec-sandbox@sha256:<digest>" — doctor and the runner then verify the
-    # exact bytes that release was tested against.
+    # The source-tree default is intentionally a local tag so `kryonsec` can be
+    # imported without release metadata.  It is never accepted by the Purple
+    # runtime: the installer replaces it with the selected release's verified
+    # registry digest, and doctor/runner fail closed if it remains a tag.
+    # KRYONSEC_SANDBOX_IMAGE may hold a custom digest-pinned image.
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get(
             "KRYONSEC_SANDBOX_IMAGE", "kryonsec/sandbox:latest"
