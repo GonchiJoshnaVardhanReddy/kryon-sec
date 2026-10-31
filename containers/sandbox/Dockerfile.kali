@@ -6,7 +6,13 @@
 # Pin by digest after the smoke test (spec §8.6):
 #   docker inspect --format '{{index .RepoDigests 0}}' kryonsec/sandbox
 # Then set KRYONSEC_SANDBOX_IMAGE in the environment / .env.
+ARG KRYONSEC_VERSION=dev
 FROM kalilinux/kali-rolling:latest
+
+ARG KRYONSEC_VERSION=dev
+LABEL org.kryonsec.version="${KRYONSEC_VERSION}" \
+      org.opencontainers.image.version="${KRYONSEC_VERSION}" \
+      org.opencontainers.image.title="Kryonsec Zone B sandbox"
 
 # jq is REQUIRED (entrypoint uses it) and is NOT in the base image.
 # Minimal toolset only: no metasploit-framework/beef-xss/setoolkit

@@ -16,6 +16,7 @@ import platform
 import uuid
 
 from ..config import KryonsecConfig
+from .. import __version__
 from ..secrets import redact
 from . import runtime_checks
 from .audit import AuditLog
@@ -123,9 +124,23 @@ def sandbox_available(image: str = "kryonsec/sandbox:latest") -> tuple[bool, str
             f"{platform.system()}. Use WSL2 or a Linux VM."
         )
 
+    docker_ok, docker_reason = runtime_checks.docker_server_ok()
+    if not docker_ok:
+        if "permission" in docker_reason.lower():
+            return False, docker_reason
+        return False, f"docker CLI not found or daemon unreachable ({docker_reason})"
+
+    context = runtime_checks.docker_context_info()
+    if context.error:
+        return False, context.error
+
+    info = runtime_checks.docker_info()
+    if info is None:
+        return False, "Docker daemon details unavailable"
+
     runtimes = runtime_checks.docker_runtimes()
     if runtimes is None:
-        return False, "docker CLI not found or daemon unreachable"
+        return False, "Docker daemon runtime list is unavailable"
 
     if "runsc" not in runtimes:
         # the notice line is a single line in the prompt, so the how-to-fix
@@ -135,8 +150,13 @@ def sandbox_available(image: str = "kryonsec/sandbox:latest") -> tuple[bool, str
             "run `kryonsec doctor` for the fix"
         )
 
-    if not runtime_checks.image_present(image):
-        return False, f"sandbox image not found locally: {image}"
+    image_check = runtime_checks.validate_image(
+        image,
+        expected_version=__version__,
+        server_architecture=info.architecture,
+    )
+    if image_check.status != "PASS":
+        return False, image_check.detail
 
     return True, "ok"
 

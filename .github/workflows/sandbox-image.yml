@@ -3,8 +3,9 @@ name: sandbox-image
 # Publishes the Zone B sandbox image to GHCR so installs can `docker pull`
 # instead of building ~2 GB of tooling from source.
 #
-# The installer falls back to a local build whenever the pull isn't available,
-# so a failed run here never breaks installs — it only makes them slow again.
+# The installer does not silently fall back to a mutable or locally rebuilt
+# image.  A missing release image is a release failure and must be fixed before
+# members are told to install that release.
 #
 # Manual first run: Actions -> sandbox-image -> Run workflow (main). The
 # workflow can't retro-publish for tags that predate it.
@@ -90,6 +91,8 @@ jobs:
         with:
           context: .
           file: containers/sandbox/Dockerfile.kali
+          build-args: |
+            KRYONSEC_VERSION=${{ inputs.tag || github.ref_name }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

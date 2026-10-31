@@ -53,25 +53,16 @@ def test_gvisor_hint_names_docker_desktop_and_points_at_a_distro_daemon(monkeypa
     _fake_docker_info(monkeypatch, "Docker Desktop")
     hint = runtime_checks.gvisor_fix_hint()
     assert "Docker Desktop" in hint
-    # the fix is installing docker inside the distro — not re-running runsc
-    assert "docker.io" in hint
+    assert "same host" in hint
+    assert "will not switch contexts" in hint
 
 
-def test_docker_desktop_hint_includes_the_context_switch(monkeypatch):
-    """The step that looks unnecessary and is not.
-
-    Docker Desktop leaves currentContext set to "desktop-linux" in
-    ~/.docker/config.json, so a newly installed docker.io daemon is
-    invisible to the CLI until the context is switched. Without this the
-    user installs Docker in the distro, re-runs doctor, and gets the same
-    FAIL — because every probe is still reading Docker Desktop.
-    """
+def test_docker_desktop_hint_does_not_switch_context(monkeypatch):
+    """A context is an operator choice, not an installer side effect."""
     _fake_docker_info(monkeypatch, "Docker Desktop")
     hint = runtime_checks.gvisor_fix_hint()
-    assert "docker context use default" in hint
-    # client-side config only: under sudo this would edit root's config and
-    # change nothing for the user who is actually running kryonsec
-    assert "sudo docker context use default" not in hint
+    assert "will not switch contexts" in hint
+    assert "docker context use" not in hint
 
 
 def test_gvisor_hint_is_self_contained(monkeypatch):
@@ -85,7 +76,7 @@ def test_gvisor_hint_is_self_contained(monkeypatch):
     for os_string in ("Docker Desktop", "Ubuntu 24.04.3 LTS"):
         _fake_docker_info(monkeypatch, os_string)
         hint = runtime_checks.gvisor_fix_hint()
-        assert "installer" in hint, os_string
+        assert "install" in hint.lower(), os_string
         assert "sudo runsc install" not in hint, os_string
 
 
@@ -103,35 +94,27 @@ def test_docker_desktop_hint_warns_that_the_switch_does_not_stick(monkeypatch):
     assert "DOCKER_HOST" in hint
 
 
-def test_docker_desktop_hint_leads_with_the_installer(monkeypatch):
-    """The by-hand sequence fails on the state this hint is reached from.
-
-    A user in this branch very likely has a malformed gvisor.list on disk —
-    our own installer used to write one — and while it is there apt refuses
-    every install, docker.io included. "Re-run the installer" does the whole
-    thing in the working order, so it goes first rather than last.
-    """
+def test_docker_desktop_hint_leads_with_the_selected_daemon(monkeypatch):
+    """The fix must address the daemon actually being queried."""
     _fake_docker_info(monkeypatch, "Docker Desktop")
     hint = runtime_checks.gvisor_fix_hint()
-    assert hint.index("installer") < hint.index("docker.io")
+    assert "selected Docker daemon" in hint
+    assert "same host" in hint
 
 
-def test_the_by_hand_fix_clears_the_bad_source_first(monkeypatch):
-    """Without the rm, `apt-get install docker.io` is the command that
-    fails — and it fails with a message about a gVisor repository, which is
-    not a thing the user set up on purpose."""
+def test_the_hint_does_not_embed_destructive_cleanup(monkeypatch):
+    """Diagnostics must not remove apt sources or switch Docker contexts."""
     _fake_docker_info(monkeypatch, "Docker Desktop")
     hint = runtime_checks.gvisor_fix_hint()
-    assert "rm -f /etc/apt/sources.list.d/gvisor.list" in hint
-    assert hint.index("rm -f /etc/apt/sources.list.d/gvisor.list") < \
-        hint.index("apt-get install -y docker.io")
+    assert "rm -f" not in hint
+    assert "docker context use" not in hint
 
 
 def test_gvisor_hint_is_a_plain_install_otherwise(monkeypatch):
     _fake_docker_info(monkeypatch, "Ubuntu 24.04.3 LTS")
     hint = runtime_checks.gvisor_fix_hint()
     assert "Docker Desktop" not in hint
-    assert "gVisor is missing" in hint
+    assert "not registered" in hint
 
 
 def test_runsc_registered_reads_the_runtime_list(monkeypatch):
@@ -204,3 +187,78 @@ def test_a_genuinely_dead_daemon_still_says_so(monkeypatch):
     ok, detail = runtime_checks.docker_server_ok()
     assert ok is False
     assert detail == "daemon not reachable"
+
+
+def test_safe_endpoint_does_not_print_userinfo():
+    assert runtime_checks.safe_endpoint("ssh://alice:secret@example.test:2376/path") == "ssh://example.test:2376/path"
+
+
+def test_validate_image_rejects_mutable_tags(monkeypatch):
+    monkeypatch.setattr(
+        runtime_checks,
+        "image_inspect",
+        lambda image: runtime_checks.ImageInfo(
+            image_id="sha256:abc",
+            architecture="amd64",
+            operating_system="linux",
+            entrypoint=("/entrypoint.sh",),
+            user="kryonsec-runner",
+            repo_digests=("ghcr.io/example/image@sha256:abc",),
+            labels={"org.kryonsec.version": "1.3.7"},
+        ),
+    )
+    check = runtime_checks.validate_image(
+        "ghcr.io/example/image:1.3.7",
+        expected_version="1.3.7",
+        server_architecture="amd64",
+    )
+    assert check.status == "FAIL"
+    assert "mutable tag" in check.detail
+
+
+def test_validate_image_accepts_matching_digest_and_release(monkeypatch):
+    monkeypatch.setattr(
+        runtime_checks,
+        "image_inspect",
+        lambda image: runtime_checks.ImageInfo(
+            image_id="sha256:abc",
+            architecture="amd64",
+            operating_system="linux",
+            entrypoint=("/entrypoint.sh",),
+            user="kryonsec-runner",
+            repo_digests=("ghcr.io/example/image@sha256:abc",),
+            labels={"org.kryonsec.version": "v1.3.7"},
+        ),
+    )
+    check = runtime_checks.validate_image(
+        "ghcr.io/example/image@sha256:abc",
+        expected_version="1.3.7",
+        server_architecture="x86_64",
+    )
+    assert check.status == "PASS"
+
+
+def test_runtime_smoke_uses_runsc_entrypoint_and_cleans_up(monkeypatch):
+    calls = []
+
+    def fake(args):
+        calls.append(args)
+        if args[0] == "create":
+            return type("Result", (), {"returncode": 0, "stdout": "name", "stderr": ""})()
+        if args[0] == "inspect":
+            return type("Result", (), {"returncode": 0, "stdout": "runsc\n", "stderr": ""})()
+        if args[0] == "start":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[0] == "rm":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(runtime_checks.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runtime_checks, "_run_docker", fake)
+    ok, detail = runtime_checks.runtime_smoke_test("image@sha256:abc")
+    assert ok, detail
+    create = calls[0]
+    assert "--runtime" in create and create[create.index("--runtime") + 1] == "runsc"
+    assert "--network" in create and create[create.index("--network") + 1] == "none"
+    assert create[create.index("--entrypoint") + 1] == "/entrypoint.sh"
+    assert calls[-1][0:2] == ["rm", "--force"]

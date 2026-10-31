@@ -7,10 +7,420 @@ error wording) — one module, both callers.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
+import uuid
+from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 PROBE_TIMEOUT_S = 10
+
+# Release images are accepted only after the installer resolves them to a
+# registry digest.  Keeping the repository name here avoids several callers
+# inventing slightly different image references.
+SANDBOX_REGISTRY_IMAGE = (
+    "ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox"
+)
+SANDBOX_ENTRYPOINT = ("/entrypoint.sh",)
+SANDBOX_REQUIRED_FILES = (
+    "/entrypoint.sh",
+    "/opt/kryonsec/probe.py",
+    "/opt/kryonsec/openapi_probe.py",
+)
+
+
+@dataclass(frozen=True)
+class DockerContextInfo:
+    """The Docker target selected by the current client configuration."""
+
+    name: str = ""
+    endpoint: str = ""
+    contexts: tuple[str, ...] = ()
+    docker_host_override: bool = False
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class DockerInfo:
+    """Facts returned by the daemon selected by the Docker CLI."""
+
+    server_version: str = ""
+    operating_system: str = ""
+    architecture: str = ""
+    default_runtime: str = ""
+    runtimes: tuple[str, ...] = ()
+    rootless: bool = False
+
+
+@dataclass(frozen=True)
+class ImageInfo:
+    """Safe metadata for a sandbox image on the selected daemon."""
+
+    image_id: str = ""
+    architecture: str = ""
+    operating_system: str = ""
+    entrypoint: tuple[str, ...] = ()
+    user: str = ""
+    repo_digests: tuple[str, ...] = ()
+    labels: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ImageCheck:
+    status: str
+    detail: str
+    info: ImageInfo | None = None
+
+
+def _run_docker(args: list[str]) -> subprocess.CompletedProcess:
+    """Run one read-only Docker CLI query with a bounded timeout."""
+    return subprocess.run(
+        ["docker", *args],
+        capture_output=True,
+        text=True,
+        timeout=PROBE_TIMEOUT_S,
+    )
+
+
+def _safe_docker_failure(proc: subprocess.CompletedProcess) -> str:
+    """Turn Docker's often noisy error into a useful, secret-free category."""
+    text = f"{proc.stderr or ''} {proc.stdout or ''}".lower()
+    if "permission denied" in text or "permission is required" in text:
+        return "permission denied opening the selected Docker endpoint"
+    if "context" in text and ("not found" in text or "does not exist" in text):
+        return "the selected Docker context does not exist"
+    if "cannot connect" in text or "is the docker daemon running" in text:
+        return "Docker daemon is not reachable"
+    if "timeout" in text or "timed out" in text:
+        return "Docker CLI request timed out"
+    return "Docker CLI request failed"
+
+
+def _normalise_arch(value: str) -> str:
+    value = (value or "").lower().strip()
+    return {
+        "x86_64": "amd64",
+        "x86-64": "amd64",
+        "aarch64": "arm64",
+        "armv8": "arm64",
+    }.get(value, value)
+
+
+def _normalise_version(value: str) -> str:
+    """Compare release labels whether a registry includes the leading ``v``."""
+    value = (value or "").strip()
+    return value[1:] if value.lower().startswith("v") else value
+
+
+def safe_endpoint(value: str | None) -> str:
+    """Return a Docker endpoint without userinfo, query, or fragment data."""
+    value = (value or "").strip()
+    if not value:
+        return "default local endpoint"
+    if value.startswith(("unix://", "npipe://")):
+        return value
+    try:
+        parts = urlsplit(value)
+        if not parts.scheme:
+            return "configured endpoint"
+        # Do not print userinfo.  SSH context URLs commonly contain a user
+        # name, and custom endpoints sometimes contain credentials by
+        # mistake.  Neither belongs in a diagnostic report.
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except (ValueError, UnicodeError):
+        return "configured endpoint"
+
+
+def docker_context_info() -> DockerContextInfo:
+    """Report the selected context and effective endpoint without changing it."""
+    if not shutil.which("docker"):
+        return DockerContextInfo(error="docker CLI not found")
+
+    try:
+        current = _run_docker(["context", "show"])
+        if current.returncode != 0:
+            return DockerContextInfo(error=_safe_docker_failure(current))
+        name = (current.stdout or "").strip() or "default"
+
+        listed = _run_docker(["context", "ls", "--format", "{{.Name}}"])
+        contexts = tuple(
+            line.strip() for line in (listed.stdout or "").splitlines()
+            if line.strip()
+        ) if listed.returncode == 0 else ()
+
+        host_override = bool(os.environ.get("DOCKER_HOST"))
+        raw_endpoint = os.environ.get("DOCKER_HOST", "")
+        if not raw_endpoint:
+            inspected = _run_docker([
+                "context", "inspect", name,
+                "--format", "{{json .Endpoints.docker.Host}}",
+            ])
+            if inspected.returncode == 0:
+                raw_endpoint = (inspected.stdout or "").strip()
+                try:
+                    decoded = json.loads(raw_endpoint)
+                    if isinstance(decoded, str):
+                        raw_endpoint = decoded
+                except json.JSONDecodeError:
+                    raw_endpoint = raw_endpoint.strip('"')
+
+        return DockerContextInfo(
+            name=name,
+            endpoint=safe_endpoint(raw_endpoint),
+            contexts=contexts,
+            docker_host_override=host_override,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return DockerContextInfo(error="could not inspect Docker context")
+
+
+def docker_info() -> DockerInfo | None:
+    """Read server facts from the daemon selected by the Docker CLI."""
+    if not shutil.which("docker"):
+        return None
+    try:
+        proc = _run_docker(["info", "--format", "{{json .}}"])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    runtimes = data.get("Runtimes") or {}
+    runtime_names = tuple(str(k) for k in runtimes) if isinstance(runtimes, dict) else ()
+    security = data.get("SecurityOptions") or []
+    security_text = " ".join(str(item) for item in security).lower()
+    return DockerInfo(
+        server_version=str(data.get("ServerVersion") or ""),
+        operating_system=str(data.get("OperatingSystem") or ""),
+        architecture=_normalise_arch(str(data.get("Architecture") or "")),
+        default_runtime=str(data.get("DefaultRuntime") or ""),
+        runtimes=runtime_names,
+        rootless="rootless" in security_text,
+    )
+
+
+def docker_version() -> tuple[str, str]:
+    """Return (client, server) versions, or empty strings when unavailable."""
+    if not shutil.which("docker"):
+        return "", ""
+    try:
+        proc = _run_docker(["version", "--format", "{{json .}}"])
+    except (OSError, subprocess.TimeoutExpired):
+        return "", ""
+    if proc.returncode != 0:
+        return "", ""
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", ""
+    client = data.get("Client") or {}
+    server = data.get("Server") or {}
+    return str(client.get("Version") or ""), str(server.get("Version") or "")
+
+
+def runsc_info() -> tuple[str, str]:
+    """Return (path, version) for local runsc, not daemon registration."""
+    path = shutil.which("runsc")
+    if not path:
+        return "", ""
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return path, "could not run runsc --version"
+    if proc.returncode != 0:
+        return path, "could not run runsc --version"
+    first = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return path, (first[0][:120] if first else "version unavailable")
+
+
+def image_inspect(image: str) -> ImageInfo | None:
+    """Inspect an image on the selected daemon; never inspect a local file."""
+    if not shutil.which("docker") or not image:
+        return None
+    try:
+        proc = _run_docker(["image", "inspect", image, "--format", "{{json .}}"])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    config = data.get("Config") or {}
+    entrypoint = config.get("Entrypoint") or []
+    if isinstance(entrypoint, str):
+        entrypoint = [entrypoint]
+    repo_digests = data.get("RepoDigests") or []
+    labels = config.get("Labels") or {}
+    return ImageInfo(
+        image_id=str(data.get("Id") or ""),
+        architecture=_normalise_arch(str(data.get("Architecture") or "")),
+        operating_system=str(data.get("Os") or ""),
+        entrypoint=tuple(str(value) for value in entrypoint),
+        user=str(config.get("User") or ""),
+        repo_digests=tuple(str(value) for value in repo_digests),
+        labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+    )
+
+
+def validate_image(
+    image: str,
+    *,
+    expected_version: str | None = None,
+    server_architecture: str | None = None,
+) -> ImageCheck:
+    """Validate the metadata required by the Zone B entrypoint.
+
+    A tag is deliberately a failure here, rather than a warning.  The
+    installer resolves the release tag to a registry digest and stores that
+    digest in config.toml.  Allowing a mutable tag through this function would
+    make the actual toolset depend on whatever a registry serves later.
+    """
+    info = image_inspect(image)
+    if info is None:
+        return ImageCheck(
+            "FAIL",
+            f"image is not present on the selected Docker daemon: {image}; "
+            "pull the documented release image and retry",
+        )
+    if not info.operating_system:
+        return ImageCheck("FAIL", "image OS metadata is missing", info)
+    if info.operating_system.lower() != "linux":
+        return ImageCheck("FAIL", f"image OS is {info.operating_system}, not Linux", info)
+    if info.entrypoint != SANDBOX_ENTRYPOINT:
+        return ImageCheck(
+            "FAIL",
+            "image entrypoint is not /entrypoint.sh; this is not a compatible "
+            "Kryonsec sandbox image",
+            info,
+        )
+    if not info.architecture:
+        return ImageCheck("FAIL", "image architecture metadata is missing", info)
+    if server_architecture and info.architecture:
+        expected_arch = _normalise_arch(server_architecture)
+        if info.architecture != expected_arch:
+            return ImageCheck(
+                "FAIL",
+                f"image architecture {info.architecture} does not match the "
+                f"selected Docker daemon architecture {expected_arch}",
+                info,
+            )
+    labels = info.labels or {}
+    image_version = (
+        labels.get("org.kryonsec.version")
+        or labels.get("org.opencontainers.image.version")
+    )
+    if expected_version and image_version and (
+        _normalise_version(image_version) != _normalise_version(expected_version)
+    ):
+        return ImageCheck(
+            "FAIL",
+            f"image version {image_version} does not match Kryonsec {expected_version}",
+            info,
+        )
+    if expected_version and not image_version:
+        return ImageCheck(
+            "FAIL",
+            "image has no Kryonsec release-version label; use the image built "
+            "for this Kryonsec release",
+            info,
+        )
+    else:
+        version_note = f"image version {image_version}" if image_version else "image metadata valid"
+
+    digest = next((d for d in info.repo_digests if "@sha256:" in d), "")
+    if "@sha256:" not in image:
+        return ImageCheck(
+            "FAIL",
+            f"{version_note}; configured ref is a mutable tag; resolved digest "
+            f"{digest or info.image_id or 'unavailable'} — configure the digest "
+            "before starting Purple Team",
+            info,
+        )
+    requested_digest = image.split("@sha256:", 1)[1].lower()
+    if digest and not digest.lower().endswith(requested_digest):
+        return ImageCheck(
+            "FAIL",
+            "configured image digest does not match the digest reported by the "
+            "selected Docker daemon",
+            info,
+        )
+    if not info.user or info.user in ("0", "root"):
+        return ImageCheck(
+            "FAIL",
+            "image runs as root; the Kryonsec sandbox must use the non-root "
+            "kryonsec-runner user",
+            info,
+        )
+    return ImageCheck("PASS", f"{version_note}; digest-pinned image is compatible", info)
+
+
+def runtime_smoke_test(image: str) -> tuple[bool, str]:
+    """Run the packaged entrypoint with runsc and clean up the test container.
+
+    This is intentionally separate from image inspection.  ``docker info`` can
+    list a runtime that is registered but unusable, and an image can have the
+    right metadata while a required file is missing.  The command is harmless:
+    it has no network, a read-only root, tight limits, and only asks the image's
+    entrypoint to run a small Python file-existence check.
+    """
+    if not shutil.which("docker"):
+        return False, "docker CLI not found"
+    name = f"kryonsec-preflight-{uuid.uuid4().hex[:12]}"
+    create_args = [
+        "create", "--name", name, "--runtime", "runsc", "--network", "none",
+        "--read-only", "--tmpfs", "/tmp:size=16m", "--memory", "64m",
+        "--cpus", "0.10", "--pids-limit", "32",
+        "--user", "kryonsec-runner", "--entrypoint", "/entrypoint.sh",
+        image, "python3", "-c",
+        (
+            "import os; required = "
+            f"{SANDBOX_REQUIRED_FILES!r}; "
+            "missing = [p for p in required if not os.path.isfile(p)]; "
+            "raise SystemExit('missing: ' + ','.join(missing) if missing else 0)"
+        ),
+    ]
+    created = False
+    try:
+        proc = _run_docker(create_args)
+        if proc.returncode != 0:
+            return False, _safe_docker_failure(proc)
+        created = True
+        inspected = _run_docker([
+            "inspect", name, "--format", "{{.HostConfig.Runtime}}",
+        ])
+        if inspected.returncode != 0 or (inspected.stdout or "").strip() != "runsc":
+            return False, "Docker did not record runsc as the container runtime"
+        started = _run_docker(["start", "--attach", name])
+        if started.returncode != 0:
+            detail = (started.stderr or started.stdout or "").strip()[:300]
+            return False, (
+                "runsc container was created but the sandbox entrypoint did not "
+                f"complete successfully{(': ' + detail) if detail else ''}"
+            )
+        return True, "sandbox entrypoint and required files ran with runtime runsc"
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "runtime smoke test timed out or could not start"
+    finally:
+        if created:
+            try:
+                _run_docker(["rm", "--force", name])
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def docker_server_ok() -> tuple[bool, str]:
@@ -23,7 +433,7 @@ def docker_server_ok() -> tuple[bool, str]:
             capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
         )
         if out.returncode == 0:
-            return True, f"OK (server {out.stdout.strip()})"
+            return True, f"OK (server {out.stdout.strip() or 'version unavailable'})"
         # A daemon that is up but unreachable to this user is a different
         # problem with a different fix, and it is the one that appears right
         # after installing Docker in a distro: the socket is root-owned, so
@@ -37,9 +447,13 @@ def docker_server_ok() -> tuple[bool, str]:
                 "yourself to the docker group: sudo usermod -aG docker $USER "
                 "(then log out and back in)"
             )
+        if "timeout" in stderr.lower() or "timed out" in stderr.lower():
+            return False, "Docker daemon request timed out"
         return False, "daemon not reachable"
-    except Exception as e:
-        return False, str(e)
+    except subprocess.TimeoutExpired:
+        return False, "Docker daemon request timed out"
+    except OSError:
+        return False, "Docker CLI could not be started"
 
 
 def docker_runtimes() -> str | None:
@@ -84,7 +498,7 @@ def docker_desktop_in_use() -> bool:
     return "docker desktop" in docker_os_string().lower()
 
 
-# Why a Docker Desktop host can never pass the gVisor check, and what to do.
+# Why a Docker Desktop host can fail the gVisor check, and what to do.
 #
 # Docker Desktop keeps its daemon outside the WSL distro, where nothing run
 # inside the distro can add a runtime to it. `runsc install` writes the
@@ -95,31 +509,18 @@ def docker_desktop_in_use() -> bool:
 # configured is not the thing being asked. So this needs saying out loud,
 # and the fix is a different daemon — not a retry.
 #
-# `docker context use default` is the step that is easy to miss and looks
-# like it should not be needed. Docker Desktop writes a currentContext of
-# "desktop-linux" into ~/.docker/config.json, so a freshly installed
-# docker.io daemon on the default socket is invisible to the CLI until the
-# context is switched — every probe still reads Docker Desktop. It is
-# client-side only (it edits that config file, no daemon involved), and it
-# must NOT be run under sudo, which would write root's config instead of
-# the user's and change nothing.
+# A context switch is a user decision, not an installer repair. Docker
+# Desktop can select its own context again, and DOCKER_HOST overrides the
+# context entirely. Kryonsec reports the selected context and never changes
+# it behind the operator's back.
 #
-# The switch is not permanent, and saying so is the difference between a
-# fix and a loop: Docker Desktop re-creates and re-selects its own context
-# on every launch, and a DOCKER_HOST env var overrides the context
-# entirely. A user who only runs the commands above gets a working daemon
-# this login and the same FAIL after the next reboot, with nothing in the
-# message to explain why. Turning Docker Desktop's WSL integration off for
-# this distro is the durable version of the same fix.
-# The by-hand equivalent, for anyone who would rather not re-run the
-# installer. The `rm` comes first because a malformed gVisor source left in
-# /etc/apt/sources.list.d makes apt refuse to install *anything* — so the
-# docker.io step fails with an error about a repository the user never
-# knowingly configured, and the real cause is one line away.
+# No destructive command is embedded in this hint. If an apt source is
+# malformed, the operator must inspect and back it up before deciding how to
+# repair it.
 DISTRO_DOCKER_FIX = (
-    "sudo rm -f /etc/apt/sources.list.d/gvisor.list && sudo apt-get update && "
-    "sudo apt-get install -y docker.io && docker context use default && "
-    "sudo service docker start"
+    "choose a Docker daemon you administer, install gVisor on that same daemon "
+    "host, register runsc, then restart Docker after backing up and validating "
+    "its configuration"
 )
 DOCKER_CONTEXT_CAVEAT = (
     "Docker Desktop re-selects its own context every launch, so this can "
@@ -131,29 +532,23 @@ DOCKER_CONTEXT_CAVEAT = (
 def gvisor_fix_hint() -> str:
     """The most accurate fix for a missing runsc runtime, in one line.
 
-    Both branches end at the installer rather than at `sudo runsc install`:
-    runsc may not be present at all yet, and naming a command that fails
-    with "runsc: command not found" is how a user ends up stuck. install.sh
-    already installs runsc (apt repo, with a direct-binary fallback) and
-    registers it, so sending them back through it is the reliable path.
-
-    The installer is named first, not last. It does the whole sequence in
-    the order that works — clear the bad apt source, install a distro
-    daemon, move the CLI onto it, then install and register runsc — where
-    the by-hand version is four commands that each depend on the previous.
+    The hint deliberately names the selected daemon and the required manual
+    action. The installer does not silently install packages, edit daemon
+    configuration, switch contexts, or restart services.
     """
     if docker_desktop_in_use():
         return (
-            "runsc runtime not registered — your docker CLI is talking to "
-            "Docker Desktop, whose daemon runs outside WSL and can never load "
-            "a runtime from inside the distro. Re-run the kryonsec installer: "
-            "it gives the distro its own daemon, points the CLI at it, then "
-            "installs runsc and registers it. By hand that is: "
+            "runsc runtime not registered — the selected Docker daemon is "
+            "Docker Desktop, while the local WSL runsc cannot configure that "
+            "external daemon. Select a daemon you administer and install "
+            "gVisor on that same host. Kryonsec will not switch contexts or "
+            "change Docker Desktop settings automatically. Safe next step: "
             f"{DISTRO_DOCKER_FIX}. {DOCKER_CONTEXT_CAVEAT}"
         )
     return (
-        "runsc runtime not registered — gVisor is missing. Re-run the "
-        "kryonsec installer: it installs runsc and registers it with Docker"
+        "runsc runtime not registered with the selected daemon — install gVisor "
+        "on that daemon host, register runsc there, and restart that Docker "
+        "service only after backing up and validating its configuration"
     )
 
 

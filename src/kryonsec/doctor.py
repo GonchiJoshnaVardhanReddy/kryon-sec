@@ -12,27 +12,43 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import KryonsecConfig
+from . import __version__
 
 console = Console()
 
 
 def _check_storage(cfg: KryonsecConfig) -> tuple[bool, str]:
+    """Check storage without creating directories or applying migrations.
+
+    Doctor is a preflight command.  Startup and engagement execution remain
+    responsible for schema creation; a diagnostic command must not mutate a
+    user's home merely because it was run to understand a failure.
+    """
     try:
-        cfg.ensure_dirs()
-        from .storage import get_engine, init_db
+        if cfg.database_url:
+            from sqlalchemy import create_engine
+            from .storage.db import _normalize_database_url
 
-        init_db(cfg)
-        kind = cfg.storage_kind
-        # surface the schema revision: "my database is from an older release"
-        # is otherwise invisible until a query fails on a missing column
+            engine = create_engine(_normalize_database_url(cfg.database_url), future=True)
+            try:
+                with engine.connect():
+                    pass
+            finally:
+                engine.dispose()
+            return True, f"reachable ({cfg.storage_kind}; schema not modified)"
+
+        path = cfg.fallback_db_path
+        if not path.exists():
+            return True, f"SQLite fallback not initialized yet ({path}); first use will create it"
+        import sqlite3
+
+        uri = f"file:{path.as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
         try:
-            from .migrations import current_version
-
-            version = current_version(get_engine(cfg))
-        except Exception:  # pragma: no cover - never fail doctor over this
-            version = None
-        suffix = f", schema {version}" if version else ""
-        return True, f"OK ({kind}{suffix})"
+            connection.execute("PRAGMA schema_version").fetchone()
+        finally:
+            connection.close()
+        return True, f"reachable (SQLite fallback; schema not modified)"
     except Exception as e:  # pragma: no cover - environment-dependent
         return False, f"FAILED ({e})"
 
@@ -138,113 +154,337 @@ def _check_gvisor() -> tuple[bool, str]:
     return False, runtime_checks.gvisor_fix_hint()
 
 
-def run_doctor(cfg: KryonsecConfig | None = None) -> int:
-    """Run all checks; return exit code (0 = all pass)."""
+def _check_config(cfg: KryonsecConfig) -> tuple[bool | None, str]:
+    """Check an existing config without creating or rewriting it."""
+    from .config import config_file_error, config_path
+
+    path = config_path(cfg.home)
+    if not path.exists():
+        return None, f"not configured yet ({path}); run `kryonsec setup`"
+    error = config_file_error(path)
+    if error:
+        return False, f"{error}; preserve a backup, repair TOML, then re-run setup"
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0
+    permission_note = ""
+    if sys.platform != "win32" and mode & 0o077:
+        permission_note = (
+            f"; permissions are {mode:o}, run `chmod 600 {path}`"
+        )
+    return True, f"valid TOML at {path}{permission_note}"
+
+
+def _docker_context_row() -> tuple[str, str]:
+    from .purple import runtime_checks
+
+    context = runtime_checks.docker_context_info()
+    if context.error:
+        return "FAIL", (
+            f"{context.error}; check Docker installation and the selected "
+            "context before changing anything"
+        )
+    contexts = ", ".join(context.contexts) if context.contexts else "unknown"
+    detail = (
+        f"selected context {context.name}; endpoint {context.endpoint}; "
+        f"available contexts: {contexts}"
+    )
+    if context.docker_host_override:
+        return "WARNING", (
+            f"{detail}; DOCKER_HOST overrides context selection — unset it "
+            "only if this is not the intended daemon"
+        )
+    if len(context.contexts) > 1:
+        return "WARNING", (
+            f"{detail}; multiple contexts exist, and Kryonsec will not switch "
+            "between them automatically"
+        )
+    return "PASS", detail
+
+
+def _docker_versions_row() -> tuple[str, str]:
+    from .purple import runtime_checks
+
+    client, server = runtime_checks.docker_version()
+    info = runtime_checks.docker_info()
+    if not client and not server:
+        return "WARNING", (
+            "Docker version details unavailable; daemon connectivity may still "
+            "be usable, but client/server compatibility is unverified"
+        )
+    if not server:
+        return "WARNING", (
+            f"client {client or 'unknown'}, server unavailable; the selected "
+            "daemon cannot be validated"
+        )
+    suffix = ""
+    if info:
+        suffix = (
+            f", daemon OS {info.operating_system or 'unknown'}, "
+            f"architecture {info.architecture or 'unknown'}, "
+            f"default runtime {info.default_runtime or 'unknown'}"
+        )
+    return "PASS", f"client {client or 'unknown'}, server {server}{suffix}"
+
+
+def _runsc_local_row() -> tuple[str, str]:
+    from .purple import runtime_checks
+
+    context = runtime_checks.docker_context_info()
+    path, version = runtime_checks.runsc_info()
+    # A local binary is not evidence about an SSH/TCP daemon. Registration on
+    # that daemon is checked separately from docker info.
+    endpoint = context.endpoint.lower()
+    remote = endpoint.startswith(("ssh://", "tcp://", "http://", "https://"))
+    if remote and not path:
+        return "PASS", (
+            f"selected daemon is remote ({context.endpoint}); local runsc is "
+            "not required; daemon registration is the authoritative check"
+        )
+    if not path:
+        return "FAIL", (
+            "runsc is not installed on this host; install the gVisor package "
+            "on the selected daemon host (administrator change; no service "
+            "restart is performed by Kryonsec)"
+        )
+    arch = runtime_checks._normalise_arch(__import__("platform").machine())
+    return "PASS", f"runsc {version} at {path}; host architecture {arch}"
+
+
+def _image_row(cfg: KryonsecConfig) -> tuple[str, str]:
+    from .purple import runtime_checks
+
+    info = runtime_checks.docker_info()
+    check = runtime_checks.validate_image(
+        cfg.sandbox_image,
+        expected_version=__version__,
+        server_architecture=info.architecture if info else None,
+    )
+    return check.status, check.detail
+
+
+def _runtime_smoke_row(cfg: KryonsecConfig) -> tuple[str, str]:
+    from .purple import runtime_checks
+
+    ok, detail = runtime_checks.runtime_smoke_test(cfg.sandbox_image)
+    if ok:
+        return "PASS", detail
+    return "FAIL", (
+        f"{detail}; this proves the configured runsc runtime cannot start the "
+        "sandbox. No fallback to runc is allowed"
+    )
+
+
+def run_doctor(
+    cfg: KryonsecConfig | None = None,
+    *,
+    deep: bool = False,
+    strict: bool = False,
+) -> int:
+    """Run the actual preflight checks; return 0 when Copilot is usable.
+
+    ``deep`` adds a harmless, network-disabled container create/start/remove
+    test. The normal command remains read-only with respect to the host and
+    Docker daemon configuration.
+    """
     cfg = cfg or KryonsecConfig()
     is_linux = sys.platform.startswith("linux")
 
-    # ok is None for deliberate skips (non-Linux platform) — rendered as
-    # yellow SKIP, never as a red FAIL that looks like something broke
-    checks: list[tuple[str, str, bool | None, str]] = []
+    # status is one of PASS, FAIL, WARNING, SKIPPED. Keeping it as a string
+    # avoids treating a warning as a successful Purple prerequisite.
+    checks: list[tuple[str, str, str, str]] = []
+    purple_names: list[str] = []
 
-    ok, msg = _check_storage(cfg)
-    checks.append(("Storage", "", ok, msg))
-    storage_ok = ok
+    def add(name: str, purpose: str, status: str, message: str, *, purple: bool = False):
+        checks.append((name, purpose, status, message))
+        if purple:
+            purple_names.append(status)
 
-    # LLM providers: any ONE of these being usable is enough for Copilot
-    # mode. The results are accumulated here rather than read back out of
-    # `checks` by index — the old checks[1]/checks[2] arithmetic silently
-    # changed meaning the moment a provider row was inserted.
-    any_llm = False
-    for name, purpose, check in (
-        ("LLM: Ollama (local)", "compaction with secrets, local chat", _check_ollama),
-        ("LLM: OpenAI", "third-party chat/analysis", _check_openai),
-        ("LLM: AWS Bedrock", "third-party chat/analysis (Claude, Nova, Llama)", _check_bedrock),
-        ("LLM: OpenAI-compatible", "any compatible endpoint or gateway", _check_openai_compatible),
-    ):
-        ok, msg = check(cfg)
-        checks.append((name, purpose, ok, msg))
-        any_llm = any_llm or ok
+    storage_ok, storage_msg = _check_storage(cfg)
+    add("Storage", "Copilot memory", "PASS" if storage_ok else "FAIL", storage_msg)
 
-    ok, msg = _check_membership(cfg)
-    checks.append(("Membership", "Purple Team (paid); Copilot is free", ok, msg))
+    config_ok, config_msg = _check_config(cfg)
+    add(
+        "Configuration",
+        "first run and provider selection",
+        "SKIPPED" if config_ok is None else ("PASS" if config_ok else "FAIL"),
+        config_msg,
+    )
 
-    checks.append((
-        "Purple Team: platform", "gVisor requires Linux",
-        True if is_linux else None,
-        "OK (Linux)" if is_linux else "NOT Linux — this machine cannot run Purple Team",
-    ))
-    if is_linux:
-        ok, msg = _check_docker()
-        checks.append(("Purple Team: Docker", "sandbox host", ok, msg))
-        if ok:
-            ok, msg = _check_gvisor()
-            checks.append(("Purple Team: gVisor (runsc)", "sandbox runtime", ok, msg))
-            if ok:
-                from .purple import runtime_checks
+    # The selected provider is required. Other providers are optional and are
+    # not contacted merely because they happen to have credentials in the
+    # environment.
+    provider_checks = (
+        ("ollama", "LLM: Ollama (local)", "local chat / secret handling", _check_ollama),
+        ("openai", "LLM: OpenAI", "third-party chat/analysis", _check_openai),
+        ("bedrock", "LLM: AWS Bedrock", "third-party chat/analysis", _check_bedrock),
+        ("openai_compatible", "LLM: OpenAI-compatible", "configured endpoint", _check_openai_compatible),
+    )
+    selected_llm_ok = False
+    selected_provider_seen = False
+    for provider, name, purpose, check in provider_checks:
+        selected = cfg.provider == provider
+        if selected:
+            selected_provider_seen = True
+            ok, msg = check(cfg)
+            status = "PASS" if ok else "FAIL"
+            selected_llm_ok = ok
+        else:
+            status = "SKIPPED"
+            msg = "optional provider not selected"
+        add(name, purpose, status, msg)
 
-                image = cfg.sandbox_image
-                if runtime_checks.image_present(image):
-                    checks.append(("Purple Team: sandbox image", "Zone B tool container", True, f"OK ({image})"))
-                else:
-                    checks.append((
-                        "Purple Team: sandbox image", "Zone B tool container", False,
-                        f"missing: {image} — build with: docker build -t kryonsec/sandbox "
-                        "-f containers/sandbox/Dockerfile.kali .",
-                    ))
+    if not selected_provider_seen:
+        add(
+            "LLM provider selection",
+            "Copilot chat",
+            "FAIL",
+            f"unknown provider {cfg.provider!r}; run `kryonsec setup`",
+        )
+
+    membership_ok, membership_msg = _check_membership(cfg)
+    add(
+        "Membership",
+        "Purple Team access",
+        "SKIPPED" if membership_ok is None else ("PASS" if membership_ok else "FAIL"),
+        membership_msg,
+        purple=True,
+    )
+
+    if not is_linux:
+        add(
+            "Purple Team: platform",
+            "Linux + gVisor",
+            "SKIPPED",
+            "this host is not Linux; use WSL2 with a Linux daemon or a Linux VM",
+            purple=True,
+        )
+        add(
+            "Purple Team: Docker",
+            "selected sandbox daemon",
+            "SKIPPED",
+            "not checked on this host because Purple Team is Linux-only",
+            purple=True,
+        )
     else:
-        checks.append((
-            "Purple Team: Docker", "sandbox host", None,
-            "skipped (non-Linux; use WSL2 or a Linux VM for Purple Team)",
-        ))
+        add("Purple Team: platform", "Linux + gVisor", "PASS", "Linux host", purple=True)
+        docker_ok, docker_msg = _check_docker()
+        add(
+            "Purple Team: Docker",
+            "selected sandbox daemon",
+            "PASS" if docker_ok else "FAIL",
+            docker_msg,
+            purple=True,
+        )
+        if docker_ok:
+            context_status, context_msg = _docker_context_row()
+            add("Docker context", "daemon selection", context_status, context_msg, purple=True)
+            version_status, version_msg = _docker_versions_row()
+            add("Docker versions", "client/server compatibility", version_status, version_msg, purple=True)
+
+            runsc_status, runsc_msg = _runsc_local_row()
+            add("gVisor binary", "local daemon host", runsc_status, runsc_msg, purple=True)
+            registered, registered_msg = _check_gvisor()
+            add(
+                "gVisor registration",
+                "the selected Docker daemon",
+                "PASS" if registered else "FAIL",
+                registered_msg,
+                purple=True,
+            )
+            if registered:
+                image_status, image_msg = _image_row(cfg)
+                add(
+                    "Sandbox image",
+                    "architecture, entrypoint, version, digest",
+                    image_status,
+                    image_msg,
+                    purple=True,
+                )
+                if deep and image_status in ("PASS", "WARNING"):
+                    smoke_status, smoke_msg = _runtime_smoke_row(cfg)
+                    add(
+                        "gVisor runtime smoke",
+                        "actual container lifecycle",
+                        smoke_status,
+                        smoke_msg,
+                        purple=True,
+                    )
+                elif not deep:
+                    add(
+                        "gVisor runtime smoke",
+                        "actual container lifecycle",
+                        "SKIPPED",
+                        "run `kryonsec doctor --deep` to create a harmless network-disabled test container",
+                        purple=True,
+                    )
+        else:
+            add(
+                "Docker context",
+                "daemon selection",
+                "SKIPPED",
+                "daemon is unavailable; context and image checks cannot be trusted",
+                purple=True,
+            )
+            add(
+                "gVisor registration",
+                "the selected Docker daemon",
+                "SKIPPED",
+                "daemon is unavailable; local runsc alone is not sufficient",
+                purple=True,
+            )
+            add(
+                "Sandbox image",
+                "architecture, entrypoint, version, digest",
+                "SKIPPED",
+                "daemon is unavailable; image presence cannot be verified",
+                purple=True,
+            )
 
     table = Table(title="kryonsec doctor")
     table.add_column("Check")
     table.add_column("Needed for")
-    table.add_column("Result")
-    for name, purpose, ok, msg in checks:
-        # ASCII markers, not ✔/✘: doctor must render in ANY console,
-        # including legacy cp1252 ones (it's the tool you run when
-        # things are already broken)
-        if ok is None:
-            mark = "[yellow]SKIP[/yellow]"
-        else:
-            mark = "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
+    table.add_column("Result / detected state / next safe action")
+    for name, purpose, status, msg in checks:
+        colours = {
+            "PASS": "green",
+            "FAIL": "red",
+            "WARNING": "yellow",
+            "SKIPPED": "yellow",
+        }
+        mark = f"[{colours.get(status, 'white')}]{status}[/{colours.get(status, 'white')}]"
         table.add_row(name, purpose, f"{mark} {msg}")
     console.print(table)
 
-    # exit code reflects the profile this machine can actually run, not
-    # "every optional check passed": an Ollama-only Copilot user (fully
-    # supported, wizard-configured) must not get exit 1
-    copilot_ok = storage_ok and any_llm
-    # skipped rows count as "not available here", not "failed"
-    purple_ok = all(ok is True for _, _, ok, _ in checks)
+    copilot_ok = bool(storage_ok and selected_llm_ok and config_ok is not False)
+    purple_ok = bool(purple_names) and all(status == "PASS" for status in purple_names)
 
     from rich.panel import Panel
 
-    if purple_ok:
+    if purple_ok and copilot_ok:
         console.print(Panel(
-            "[green]PASS — Profile 1 (Copilot) and Profile 2 (Purple Team) "
-            "are both ready.[/green]",
+            "[green]PASS — Copilot and the verified Purple Team runtime are ready.[/green]",
             border_style="green",
         ))
     elif copilot_ok:
         console.print(Panel(
-            "[green]PASS — Profile 1 (Copilot) is fully working on this machine.[/green]\n"
-            "[yellow]Profile 2 (Purple Team) also needs Linux + Docker + gVisor "
-            "+ a PostgreSQL DATABASE_URL + a membership and a connected machine "
-            "(see the Membership row above).[/yellow]",
+            "[green]PASS — Profile 1 (Copilot) is usable.[/green]\n"
+            "[yellow]Purple Team is not ready. Review every FAIL/WARNING/SKIPPED "
+            "row; it requires Linux, the selected Docker daemon, registered "
+            "gVisor, a compatible sandbox image, and membership.[/yellow]",
             title="What works here",
             border_style="green",
         ))
     else:
         console.print(Panel(
-            "[red]FAIL — Profile 1 (Copilot) is NOT usable: storage and at "
-            "least one LLM provider must pass (see above).[/red]\n"
-            "[yellow]Profile 2 (Purple Team) also needs Linux + Docker + gVisor "
-            "+ a PostgreSQL DATABASE_URL + a membership and a connected machine "
-            "(see the Membership row above).[/yellow]",
+            "[red]FAIL — Profile 1 (Copilot) is not usable: storage and the "
+            "selected LLM provider must pass.[/red]\n"
+            "[yellow]Purple Team is independently gated and will not fall back "
+            "to an unisolated runtime.[/yellow]",
             title="What works here",
             border_style="red",
         ))
+    if strict:
+        return 0 if copilot_ok and purple_ok else 1
     return 0 if copilot_ok else 1

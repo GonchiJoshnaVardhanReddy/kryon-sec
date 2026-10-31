@@ -14,7 +14,9 @@ def _fake_checks(monkeypatch):
 def test_doctor_non_linux_renders_skip_not_fail(monkeypatch, tmp_path, capsys):
     _fake_checks(monkeypatch)
     monkeypatch.setattr(doctor.sys, "platform", "win32")
-    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.provider = "ollama"
+    rc = doctor.run_doctor(cfg)
     out = capsys.readouterr().out
     assert rc == 0  # copilot profile works
     assert "SKIP" in out
@@ -26,7 +28,9 @@ def test_doctor_linux_missing_docker_still_fail(monkeypatch, tmp_path, capsys):
     _fake_checks(monkeypatch)
     monkeypatch.setattr(doctor.sys, "platform", "linux")
     monkeypatch.setattr(doctor, "_check_docker", lambda: (False, "docker CLI not found"))
-    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.provider = "ollama"
+    rc = doctor.run_doctor(cfg)
     out = capsys.readouterr().out
     assert rc == 0  # copilot still fine
     assert "FAIL" in out  # a real gap on Linux stays a red FAIL
@@ -65,7 +69,9 @@ def test_doctor_bedrock_alone_is_enough_for_copilot(monkeypatch, tmp_path, capsy
     monkeypatch.setattr(doctor, "_check_openai", lambda c: (False, "no key"))
     monkeypatch.setattr(doctor, "_check_bedrock", lambda c: (True, "OK"))
     monkeypatch.setattr(doctor.sys, "platform", "win32")
-    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.provider = "bedrock"
+    rc = doctor.run_doctor(cfg)
     out = capsys.readouterr().out
     assert rc == 0
     assert "FAIL — Profile 1" not in out

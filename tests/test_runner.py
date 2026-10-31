@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from kryonsec.config import KryonsecConfig
+from kryonsec.purple import runtime_checks
 from kryonsec.purple.zonea import PassiveResult
 from kryonsec.purple.runner import sandbox_available, start_engagement
 
@@ -27,9 +28,24 @@ def _fake_recon(domain):
 )
 def test_sandbox_available_failure_paths(runtimes, image_present, expected_reason):
     with patch("kryonsec.purple.runner.platform.system", return_value="Linux"):
-        with patch("kryonsec.purple.runtime_checks.docker_runtimes", return_value=runtimes):
-            with patch("kryonsec.purple.runtime_checks.image_present", return_value=image_present):
-                ok, reason = sandbox_available()
+        with patch(
+            "kryonsec.purple.runtime_checks.docker_server_ok",
+            return_value=(runtimes is not None, "OK" if runtimes is not None else "daemon not reachable"),
+        ):
+            with patch(
+                "kryonsec.purple.runtime_checks.docker_context_info",
+                return_value=runtime_checks.DockerContextInfo(name="default", endpoint="default local endpoint"),
+            ):
+                with patch(
+                    "kryonsec.purple.runtime_checks.docker_info",
+                    return_value=runtime_checks.DockerInfo(architecture="amd64"),
+                ):
+                    with patch(
+                        "kryonsec.purple.runtime_checks.validate_image",
+                        return_value=(runtime_checks.ImageCheck("PASS", "ok") if image_present else runtime_checks.ImageCheck("FAIL", "sandbox image not found")),
+                    ):
+                        with patch("kryonsec.purple.runtime_checks.docker_runtimes", return_value=runtimes):
+                            ok, reason = sandbox_available()
     assert not ok
     assert expected_reason in reason
 
@@ -37,11 +53,26 @@ def test_sandbox_available_failure_paths(runtimes, image_present, expected_reaso
 def test_sandbox_available_ok_when_image_present():
     with patch("kryonsec.purple.runner.platform.system", return_value="Linux"):
         with patch(
-            "kryonsec.purple.runtime_checks.docker_runtimes",
-            return_value="io.containerd.runc.v2,runc,runsc",
+            "kryonsec.purple.runtime_checks.docker_server_ok",
+            return_value=(True, "OK"),
         ):
-            with patch("kryonsec.purple.runtime_checks.image_present", return_value=True):
-                ok, reason = sandbox_available()
+            with patch(
+                "kryonsec.purple.runtime_checks.docker_context_info",
+                return_value=runtime_checks.DockerContextInfo(name="default", endpoint="default local endpoint"),
+            ):
+                with patch(
+                    "kryonsec.purple.runtime_checks.docker_info",
+                    return_value=runtime_checks.DockerInfo(architecture="amd64"),
+                ):
+                    with patch(
+                        "kryonsec.purple.runtime_checks.validate_image",
+                        return_value=runtime_checks.ImageCheck("PASS", "ok"),
+                    ):
+                        with patch(
+                            "kryonsec.purple.runtime_checks.docker_runtimes",
+                            return_value="io.containerd.runc.v2,runc,runsc",
+                        ):
+                            ok, reason = sandbox_available()
     assert ok, reason
     assert reason == "ok"
 

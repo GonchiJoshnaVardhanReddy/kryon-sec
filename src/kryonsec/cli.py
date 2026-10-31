@@ -1119,7 +1119,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"kryonsec {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("doctor", help="run preflight checks (storage, LLMs, Purple Team prerequisites)")
+    doctor = sub.add_parser(
+        "doctor",
+        help="run read-only preflight checks (use --deep for a harmless runtime smoke test)",
+    )
+    doctor.add_argument(
+        "--deep", action="store_true",
+        help="create and remove a network-disabled runsc smoke-test container",
+    )
+    doctor.add_argument(
+        "--strict", action="store_true",
+        help="exit non-zero unless Copilot and the verified Purple runtime are ready",
+    )
 
     sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
 
@@ -1180,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from .doctor import run_doctor
 
-        return run_doctor(cfg)
+        return run_doctor(cfg, deep=args.deep, strict=args.strict)
 
     if args.command == "purple":
         return _wait_for_memory_browser(_run_purple(
