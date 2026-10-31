@@ -7,7 +7,10 @@ never look like an outage either.
 """
 
 import json
+import socket
+import ssl
 import urllib.request
+from urllib import error as urllib_error
 
 import pytest
 
@@ -96,6 +99,104 @@ def test_a_non_200_from_the_endpoint_is_none(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     assert license._http_get_json("https://example.invalid/verify") is None
+
+
+def test_a_post_http_error_is_classified_as_http_not_network(monkeypatch):
+    """The login start is a POST, and a 405 from it was being reported as a
+    network failure. It must carry the HTTP status, not the connect advice."""
+    def fail(req, timeout=None):
+        raise urllib_error.HTTPError(
+            "https://example.invalid/api/beta/device/start",
+            405, "Method Not Allowed", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+    assert license.http_post_json(
+        "https://example.invalid/api/beta/device/start",
+        {"device_id": "0" * 32},
+    ) is None
+    classified = license.last_http_error()
+    assert classified is not None
+    assert classified.kind == license.HTTP_FAILURE
+    assert "HTTP 405" in classified.message
+
+
+@pytest.mark.parametrize(
+    ("failure", "kind", "text"),
+    [
+        (
+            urllib_error.HTTPError(
+                "https://example.invalid/verify", 503, "Unavailable", {}, None),
+            license.HTTP_FAILURE,
+            "HTTP 503",
+        ),
+        (
+            urllib_error.URLError(socket.gaierror(-2, "Name or service not known")),
+            license.DNS_FAILURE,
+            "DNS lookup failed",
+        ),
+        (
+            urllib_error.URLError(ssl.SSLError("certificate verify failed")),
+            license.TLS_FAILURE,
+            "TLS connection",
+        ),
+        (
+            urllib_error.URLError(TimeoutError("timed out")),
+            license.TIMEOUT_FAILURE,
+            "timed out",
+        ),
+    ],
+)
+def test_http_failures_are_classified_without_transport_details(
+    monkeypatch, failure, kind, text
+):
+    def fail(req, timeout=None):
+        raise failure
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+    assert license._http_get_json("https://example.invalid/verify") is None
+    classified = license.last_http_error()
+    assert classified is not None
+    assert classified.kind == kind
+    assert text in classified.message
+    assert "example.invalid" in classified.message
+    assert "KRYO-" not in classified.message
+
+
+def test_malformed_response_is_classified(monkeypatch):
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _FakeResponse(b"not json"),
+    )
+
+    assert license._http_get_json("https://example.invalid/verify") is None
+    classified = license.last_http_error()
+    assert classified is not None
+    assert classified.kind == license.MALFORMED_FAILURE
+    assert "malformed JSON" in classified.message
+
+
+def test_verify_explains_the_transport_failure(tmp_path, monkeypatch):
+    def fail(req, timeout=None):
+        raise urllib_error.URLError(socket.gaierror(-2, "Name or service not known"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+    result = license.verify(_Cfg(GOOD_KEY, home=tmp_path))
+    assert result.status == license.INVALID
+    assert "DNS lookup failed" in result.message
+
+
+def test_verify_treats_an_unexpected_license_shape_as_malformed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(license, "_http_get_json", lambda *a, **k: {})
+
+    result = license.verify(_Cfg(GOOD_KEY, home=tmp_path))
+    assert result.status == license.INVALID
+    assert "unexpected license response" in result.message
 
 
 # ---- the key must not travel in the URL ------------------------------------

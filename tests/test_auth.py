@@ -175,6 +175,63 @@ def test_login_says_so_when_the_site_cannot_be_reached(cfg, monkeypatch):
     assert auth.token(cfg) == ""
 
 
+def test_login_asks_the_documented_start_route_with_machine_fields_only(cfg, monkeypatch):
+    """`POST /api/beta/device/start` takes {device_id, os, arch, version}; the
+    poll then carries only the device_code. No credential goes to either."""
+    calls = []
+
+    def fake(url, payload, **kwargs):
+        calls.append((url, payload, kwargs))
+        if len(calls) == 1:
+            return {"code": "AB12-CD34", "device_code": "d" * 64,
+                    "url": "https://kryonsec.in/beta/device?code=AB12-CD34"}
+        return {"status": "approved", "token": TOKEN, "email": "beta@example.com"}
+
+    monkeypatch.setattr(license, "http_post_json", fake)
+
+    assert auth.login(cfg, open_browser=False) == 0
+
+    start_url, start_payload, start_kwargs = calls[0]
+    assert start_url == auth.LOGIN_START_URL
+    assert set(start_payload) == {"device_id", "os", "arch", "version"}
+    assert start_kwargs.get("token", "") == ""
+    assert calls[1][0] == auth.LOGIN_POLL_URL
+    assert calls[1][1] == {"device_code": "d" * 64}
+
+
+def test_login_names_an_http_error_as_a_server_problem(cfg, monkeypatch, capsys):
+    """A 405 from the start route means the deployment is wrong or missing.
+    Appending "check your connection" sent the operator looking in the wrong
+    place; the status must be named and not blamed on the network."""
+    from urllib import error as urllib_error
+
+    def fail(req, timeout=None):
+        raise urllib_error.HTTPError(
+            auth.LOGIN_START_URL, 405, "Method Not Allowed", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+    assert auth.login(cfg, open_browser=False) == 1
+    out = capsys.readouterr().out
+    assert "HTTP 405" in out
+    assert "not a connection problem" in out
+    assert "Check your connection" not in out
+    assert auth.token(cfg) == ""
+
+
+def test_login_names_a_dns_failure(cfg, monkeypatch, capsys):
+    import socket
+    from urllib import error as urllib_error
+
+    def fail(req, timeout=None):
+        raise urllib_error.URLError(socket.gaierror(-2, "Name or service not known"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+    assert auth.login(cfg, open_browser=False) == 1
+    assert "DNS lookup failed" in capsys.readouterr().out
+
+
 def test_a_denial_reports_the_server_reason_when_there_is_one(cfg, monkeypatch, capsys):
     """`denied` covers two different events: the person clicked no, and the
     access behind the approval was withdrawn in the minutes since. The route

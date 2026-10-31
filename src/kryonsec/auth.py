@@ -187,12 +187,27 @@ def login(cfg: Any, *, open_browser: bool = True) -> int:
         )
         return 1
 
+    lic.clear_http_error()
     started = lic.http_post_json(LOGIN_START_URL, _machine_payload(cfg))
     if started is None:
-        console.print(
-            "[red]Could not reach kryonsec.in.[/red] Signing in needs the "
-            "network once. Check your connection and try again."
-        )
+        failure = lic.last_http_error()
+        if failure:
+            hint = (
+                "The site answered, so this is not a connection problem. "
+                "Try again later."
+                if failure.kind in (lic.HTTP_FAILURE, lic.MALFORMED_FAILURE)
+                else "Signing in needs the network once. Check your connection "
+                     "and try again."
+            )
+            console.print(
+                f"[red]Could not complete sign-in: {failure.message}.[/red] "
+                f"{hint}"
+            )
+        else:
+            console.print(
+                "[red]Could not reach kryonsec.in.[/red] Signing in needs the "
+                "network once. Check your connection and try again."
+            )
         return 1
 
     error = str(started.get("error") or "")
@@ -229,10 +244,13 @@ def login(cfg: Any, *, open_browser: bool = True) -> int:
     console.print("[dim]waiting for you to approve it in the browser…[/dim]")
 
     deadline = time.monotonic() + POLL_TIMEOUT_S
+    last_failure = None
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL_S)
+        lic.clear_http_error()
         answer = lic.http_post_json(LOGIN_POLL_URL, {"device_code": device_code})
         if answer is None:
+            last_failure = lic.last_http_error() or last_failure
             continue  # a dropped poll is not a verdict; the deadline is
 
         status = str(answer.get("status") or "")
@@ -263,9 +281,13 @@ def login(cfg: Any, *, open_browser: bool = True) -> int:
             return 1
         # Any other status is not something to guess at: keep waiting.
 
+    detail = (
+        f" Last request failed: {last_failure.message}."
+        if last_failure else ""
+    )
     console.print(
-        "\n[yellow]Timed out waiting for the browser.[/yellow] "
-        "Nothing was changed — run `kryonsec login` again."
+        "\n[yellow]Timed out waiting for the browser.[/yellow]"
+        f"{detail} Nothing was changed — run `kryonsec login` again."
     )
     return 1
 
@@ -318,7 +340,9 @@ def logout(cfg: Any) -> int:
         console.print("[dim]This machine is not signed in.[/dim]")
         return 0
 
+    lic.clear_http_error()
     answer = lic.http_post_json(LOGOUT_URL, {}, token=raw)
+    failure = lic.last_http_error()
     forget(cfg)
 
     # Clear the registered email too, but only the one field: `load_state`
@@ -328,11 +352,18 @@ def logout(cfg: Any) -> int:
         lic.save_state(cfg, state)
 
     if answer is None:
-        console.print(
-            "[yellow]Signed out on this machine, but kryonsec.in could not be "
-            "reached to revoke the token.[/yellow] It will keep working until "
-            "it expires unless you revoke it from your dashboard."
-        )
+        if failure:
+            console.print(
+                f"[yellow]Signed out on this machine, but {failure.message}."
+                "[/yellow] It will keep working until it expires unless you "
+                "revoke it from your dashboard."
+            )
+        else:
+            console.print(
+                "[yellow]Signed out on this machine, but kryonsec.in could not "
+                "be reached to revoke the token.[/yellow] It will keep working "
+                "until it expires unless you revoke it from your dashboard."
+            )
         return 0
 
     console.print("[green]Signed out.[/green] The token has been revoked.")

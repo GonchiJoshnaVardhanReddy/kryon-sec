@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,6 +101,41 @@ NOT_CONFIGURED = "not_configured"
 
 class LicenseError(Exception):
     """Purple Team blocked by license status. `result` carries the details."""
+
+
+@dataclass(frozen=True)
+class HttpFailure:
+    """A safe, user-facing classification of a failed site request.
+
+    The raw exception is deliberately not retained: it can contain a full URL,
+    proxy details, or a credential supplied by a caller.  The CLI needs to tell
+    DNS, TLS, timeout, HTTP, and malformed-response failures apart, but it does
+    not need to print transport internals.
+    """
+
+    kind: str
+    message: str
+
+
+HTTP_FAILURE = "http"
+DNS_FAILURE = "dns"
+TLS_FAILURE = "tls"
+TIMEOUT_FAILURE = "timeout"
+MALFORMED_FAILURE = "malformed_response"
+NETWORK_FAILURE = "network"
+
+_LAST_HTTP_FAILURE: ContextVar[HttpFailure | None] = ContextVar(
+    "kryonsec_last_http_failure", default=None)
+
+
+def clear_http_error() -> None:
+    """Forget the previous request's failure before a new request starts."""
+    _LAST_HTTP_FAILURE.set(None)
+
+
+def last_http_error() -> HttpFailure | None:
+    """Return the current request's safe failure, if it had one."""
+    return _LAST_HTTP_FAILURE.get()
 
 
 @dataclass
@@ -183,12 +219,62 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
+def _endpoint_host(url: str) -> str:
+    import urllib.parse
+
+    try:
+        return urllib.parse.urlsplit(url).hostname or "the license server"
+    except ValueError:
+        return "the license server"
+
+
+def _record_http_failure(kind: str, message: str) -> None:
+    _LAST_HTTP_FAILURE.set(HttpFailure(kind, message))
+
+
+def _classify_http_exception(exc: Exception, url: str) -> HttpFailure:
+    """Turn urllib/socket exceptions into stable, non-sensitive diagnostics."""
+    import socket
+    import ssl
+
+    host = _endpoint_host(url)
+    candidates: list[object] = [exc]
+    reason = getattr(exc, "reason", None)
+    if reason is not None:
+        candidates.append(reason)
+    if exc.__cause__ is not None:
+        candidates.append(exc.__cause__)
+    if exc.__context__ is not None:
+        candidates.append(exc.__context__)
+
+    text = " ".join(str(item).lower() for item in candidates if item)
+    if any(isinstance(item, (TimeoutError, socket.timeout)) for item in candidates):
+        return HttpFailure(TIMEOUT_FAILURE, f"request to {host} timed out")
+    if "timed out" in text or "timeout" in text:
+        return HttpFailure(TIMEOUT_FAILURE, f"request to {host} timed out")
+    if any(isinstance(item, ssl.SSLError) for item in candidates):
+        return HttpFailure(TLS_FAILURE, f"TLS connection to {host} failed")
+    if any(isinstance(item, socket.gaierror) for item in candidates):
+        return HttpFailure(DNS_FAILURE, f"DNS lookup failed for {host}")
+    if any(term in text for term in (
+        "getaddrinfo",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+    )):
+        return HttpFailure(DNS_FAILURE, f"DNS lookup failed for {host}")
+    if any(term in text for term in ("ssl", "tls", "certificate verify failed")):
+        return HttpFailure(TLS_FAILURE, f"TLS connection to {host} failed")
+    return HttpFailure(NETWORK_FAILURE, f"could not connect to {host}")
+
+
 def _http_json(
     url: str, payload: dict | None = None, *, key: str = "", token: str = ""
 ) -> dict | None:
     """GET url, or POST `payload` to it as JSON. Returns the parsed JSON
     object, or None on any failure — the caller decides whether that means
-    grace, a refusal, or "the network is down".
+    grace, a refusal, or "the network is down".  `last_http_error()` carries a
+    safe classification for the caller that needs to explain the failure.
     (Seam for tests: monkeypatch this.)
 
     Sends whichever credentials it is given. The verify endpoint checks the
@@ -197,8 +283,10 @@ def _http_json(
     decides, and it is the same precedence this file uses when it decides
     whether anything is configured at all.
     """
+    import urllib.error
     import urllib.request
 
+    clear_http_error()
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if key:
@@ -220,10 +308,37 @@ def _http_json(
     try:
         with urllib.request.urlopen(req, timeout=VERIFY_TIMEOUT_S) as r:
             if r.status != 200:
+                _record_http_failure(
+                    HTTP_FAILURE,
+                    f"{_endpoint_host(url)} returned HTTP {r.status}",
+                )
                 return None
-            body = json.loads(r.read().decode("utf-8"))
-            return body if isinstance(body, dict) else None
-    except Exception:
+            try:
+                body = json.loads(r.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                _record_http_failure(
+                    MALFORMED_FAILURE,
+                    f"{_endpoint_host(url)} returned malformed JSON",
+                )
+                return None
+            if not isinstance(body, dict):
+                _record_http_failure(
+                    MALFORMED_FAILURE,
+                    f"{_endpoint_host(url)} returned an unexpected JSON value",
+                )
+                return None
+            return body
+    except Exception as exc:
+        # HTTPError is raised by urllib for a non-2xx response instead of
+        # reaching the status check above.
+        if isinstance(exc, urllib.error.HTTPError):
+            _record_http_failure(
+                HTTP_FAILURE,
+                f"{_endpoint_host(url)} returned HTTP {exc.code}",
+            )
+            return None
+        failure = _classify_http_exception(exc, url)
+        _LAST_HTTP_FAILURE.set(failure)
         return None
 
 
@@ -270,14 +385,18 @@ def _credential_id(key: str, token: str) -> str:
     return hashlib.sha256((key or token).encode("utf-8")).hexdigest()[:16]
 
 
-def _from_state_grace(state: dict, now: datetime) -> VerifyResult:
+def _from_state_grace(
+    state: dict, now: datetime, failure: HttpFailure | None = None
+) -> VerifyResult:
     """Network is down (or the API misbehaved): decide from saved state."""
+    detail = f" (last attempt: {failure.message})" if failure else ""
     last_success = _parse_ts(state.get("last_success"))
     if last_success is None:
         return VerifyResult(
             INVALID,
             message="license could not be verified online and was never "
-                    "verified on this machine — go online once to activate")
+                    "verified on this machine — go online once to activate"
+                    f"{detail}")
     days = _days_between(now, last_success)
     if days < 0:
         # last_success in the future = clock rollback = tampering
@@ -290,11 +409,12 @@ def _from_state_grace(state: dict, now: datetime) -> VerifyResult:
             GRACE,
             expires=state.get("expires", ""),
             days_left=GRACE_DAYS - days,
-            message=f"offline — {GRACE_DAYS - days} day(s) of grace left")
+            message=f"offline — {GRACE_DAYS - days} day(s) of grace left"
+                    f"{detail}")
     return VerifyResult(
         EXPIRED,
         message=f"license not verified for {days} days (limit {GRACE_DAYS}) "
-                "— go online to re-verify")
+                f"— go online to re-verify{detail}")
 
 
 # ---- the entry point ---------------------------------------------------------
@@ -383,13 +503,14 @@ def verify(cfg: Any) -> VerifyResult:
         "arch": platform.machine(),
         "version": __version__,
     }
+    clear_http_error()
     data = _http_get_json(
         f"{VERIFY_URL}?{urllib.parse.urlencode(params)}", key=key, token=token)
     if data is None:
         # unreachable/broken endpoint: grace decides; last_success is
         # never overwritten by a failure, so a dead webhook cannot lock
         # out a member who verified recently
-        return _from_state_grace(state, now)
+        return _from_state_grace(state, now, last_http_error())
 
     if data.get("valid") is True:
         expires = str(data.get("expires", ""))
@@ -411,6 +532,14 @@ def verify(cfg: Any) -> VerifyResult:
             except ValueError:
                 pass
         return VerifyResult(VALID, expires=expires, days_left=days_left)
+
+    if not isinstance(data.get("valid"), bool):
+        failure = HttpFailure(
+            MALFORMED_FAILURE,
+            f"{_endpoint_host(VERIFY_URL)} returned an unexpected license response",
+        )
+        _LAST_HTTP_FAILURE.set(failure)
+        return _from_state_grace(state, now, failure)
 
     # the API answered "not valid": record the check (so the daily cache
     # doesn't hammer a revoked key) but keep last_success untouched —
