@@ -1,35 +1,91 @@
 #!/usr/bin/env bash
 # Kryonsec installer (WSL / Linux / macOS).
 #
-#   curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
+#   curl -fsSL https://kryonsec.in/install.sh -o install.sh
+#   KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash install.sh --profile=auto
 #
 # Beta accounts do not use a key. Sign in at the site and its dashboard prints
 # the command with KRYONSEC_DOWNLOAD_URL set to a one-time link:
 #
-#   curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_DOWNLOAD_URL='https://kryonsec.in/api/beta/download?t=dl_...' bash
+#   curl -fsSL https://kryonsec.in/install.sh -o install.sh
+#   KRYONSEC_DOWNLOAD_URL='https://kryonsec.in/api/beta/download?t=dl_...' bash install.sh
 #
 # Kryonsec is commercial, closed-source software: there is no public repository
 # to clone. The release below is a built wheel, and the membership key is what
 # unlocks it, so this script does nothing useful without one.
 #
 # What it does:
-#   1. installs missing prerequisites (curl) on apt systems
+#   1. checks prerequisites and stops with a repair command when a required
+#      download tool is missing (it does not silently change the host)
 #   2. checks for Python 3.11+
 #   3. creates ~/.kryonsec/venv
 #   4. fetches the kryonsec release from kryonsec.in using your key, and
 #      saves the key so Purple Team can use it later — or, for a beta account,
 #      fetches the one-time link the dashboard gave you and saves no key
 #   5. adds ~/.kryonsec/venv/bin to PATH (in .bashrc, idempotent)
-#   6. on Linux with sudo: installs Docker + gVisor (runsc) if missing,
-#      then fetches the Zone B sandbox image from ghcr.io.
-#      On WSL2 talking to Docker Desktop it installs a daemon inside the
-#      distro and moves the CLI onto it, because Docker Desktop's daemon
-#      cannot host gVisor at all.
-#   7. offers to install Ollama + llama3.1 when no LLM is configured
+#   6. on the approved Purple profile: validates the selected Docker context,
+#      asks before packages/group/service/daemon changes, and fetches a
+#      release-matched digest-pinned sandbox image. It never switches contexts.
+#   7. offers instructions for the optional Ollama provider; it does not run an
+#      unverified third-party install script
 #   8. runs `kryonsec setup` (the wizard: LLM, tools, MCP)
 #   9. runs `kryonsec doctor` so the final state is visible, and prints
 #      the exact command to run when PATH isn't active in this shell yet
 set -euo pipefail
+
+# The installer has two deliberately separate modes:
+#
+#   --dry-run / KRYONSEC_DRY_RUN=1
+#       inspect the local state and print intended actions without downloading,
+#       installing packages, editing config, changing PATH, or restarting a
+#       service;
+#   --profile copilot|purple|auto
+#       copilot never attempts host changes; purple requires the isolated Zone B
+#       path; auto installs Copilot and asks before attempting optional Purple
+#       prerequisites on Linux.
+#
+# A privileged action is never inferred from the fact that this script is being
+# run.  confirm_system_change() below requires a visible answer on the real
+# terminal, or the explicit KRYONSEC_ASSUME_YES=1 opt-in for automation.
+DRY_RUN="${KRYONSEC_DRY_RUN:-0}"
+PROFILE="${KRYONSEC_PROFILE:-auto}"
+REPAIR="${KRYONSEC_REPAIR:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --repair) REPAIR=1 ;;
+        --profile=*) PROFILE="${arg#--profile=}" ;;
+        --profile)
+            printf 'error: use --profile=copilot, --profile=purple, or --profile=auto\n' >&2
+            exit 2
+            ;;
+        --yes) KRYONSEC_ASSUME_YES=1 ;;
+        --help|-h)
+            cat <<'USAGE'
+Kryonsec installer
+
+  --profile=auto       Install Copilot and ask before optional Purple setup
+  --profile=copilot    Install Copilot only; never change Docker or services
+  --profile=purple     Require Linux + Docker + gVisor + the release image
+  --dry-run            Report local state and intended actions only
+  --repair             Allow recovery of an incomplete installer-owned venv
+  --yes                Explicitly approve prompted system changes (review first)
+
+Environment equivalents: KRYONSEC_PROFILE, KRYONSEC_DRY_RUN,
+KRYONSEC_REPAIR, KRYONSEC_ASSUME_YES=1.
+USAGE
+            exit 0
+            ;;
+        *)
+            printf "error: unknown installer option '%s' (use --help)\n" "$arg" >&2
+            exit 2
+            ;;
+    esac
+done
+case "$PROFILE" in
+    auto|copilot|purple) ;;
+    *) say "error: invalid profile '$PROFILE'" >&2; exit 2 ;;
+esac
 
 SITE="${KRYONSEC_SITE:-https://kryonsec.in}"
 DOWNLOAD_URL="$SITE/api/download"
@@ -41,6 +97,34 @@ VENV="$KRYONSEC_HOME/venv"
 
 say() { printf '\033[36m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+confirm_system_change() {
+    local description="$1" answer
+    if [ "$DRY_RUN" = "1" ]; then
+        say "DRY RUN: would $description"
+        return 1
+    fi
+    if [ "${KRYONSEC_ASSUME_YES:-0}" = "1" ]; then
+        say "approved by KRYONSEC_ASSUME_YES=1: $description"
+        return 0
+    fi
+    if [ ! -r /dev/tty ]; then
+        say "not applying system change without a terminal: $description"
+        say "review it, then re-run with --yes or KRYONSEC_ASSUME_YES=1"
+        return 1
+    fi
+    printf '\033[33m==>\033[0m This will %s. Continue? [y/N] ' "$description" >/dev/tty
+    answer=""
+    read -r answer < /dev/tty || answer="n"
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *) say "skipped: $description"; return 1 ;;
+    esac
+}
+
+if [ "$DRY_RUN" = "1" ]; then
+    say "read-only dry run enabled — no downloads, writes, package changes, or service actions"
+fi
 
 if [ "$(id -u)" -eq 0 ]; then
     say "WARNING: running as root — kryonsec installs to /root/.kryonsec and"
@@ -56,11 +140,15 @@ have_sudo() { [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; }
 maybe_sudo() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
 apt_install() {
-    # install the named packages if we can; never fatal — the caller decides
+    # Install the named packages only after the caller has obtained consent.
+    # A failed update is reported, not hidden; the caller decides whether a
+    # package install can safely continue with the existing package lists.
     is_apt && have_sudo || return 1
-    maybe_sudo apt-get update -qq >/dev/null 2>&1 || true
+    if ! maybe_sudo apt-get update -qq; then
+        say "WARNING: apt-get update reported errors; package sources need attention"
+    fi
     # shellcheck disable=SC2086  # $* is a deliberate word-split package list
-    maybe_sudo apt-get install -y -qq $* >/dev/null 2>&1
+    maybe_sudo apt-get install -y -qq $*
 }
 
 # A configured-but-unfetchable apt source does not only fail itself: apt
@@ -75,8 +163,9 @@ apt_install() {
 # was the actual problem. Removing the bad line is the only way out, since
 # the user cannot install docker.io by hand either while it is there.
 #
-# Only a malformed one is removed: the documented line is recognized and
-# left alone, so a user who added it correctly keeps it.
+# Detection is read-only.  The old installer removed this file at startup,
+# which could delete an administrator's repository configuration without
+# consent.  Repair is now an explicit, backed-up action below.
 purge_broken_apt_sources() {
     # $1 is a test seam: the default is the only path that matters in
     # production, and the tests need to point it at a temp file.
@@ -85,28 +174,38 @@ purge_broken_apt_sources() {
     if grep -q 'gvisor/releases release' "$f" 2>/dev/null; then
         return 0   # the documented line — leave it alone
     fi
-    say "removing a malformed gVisor apt source left by an earlier run"
-    # Never fatal. This runs at startup under `set -e`: a Copilot-only user
-    # with no sudo must not have the installer die on a line about apt
-    # sources they never wanted in the first place.
-    maybe_sudo rm -f "$f" ||
-        say "         could not remove it — apt may keep reporting errors"
-    return 0
+    say "WARNING: a malformed gVisor apt source is present at $f"
+    say "         it can prevent apt from installing unrelated packages"
+    return 1
 }
-purge_broken_apt_sources
+
+if ! purge_broken_apt_sources; then
+    if [ "$REPAIR" = "1" ] && confirm_system_change \
+        "back up $HOME's affected apt source and disable $HOME's malformed gVisor source"; then
+        APT_SOURCE="/etc/apt/sources.list.d/gvisor.list"
+        APT_BACKUP="${APT_SOURCE}.kryonsec.$(date +%Y%m%d%H%M%S).bak"
+        maybe_sudo cp -p "$APT_SOURCE" "$APT_BACKUP" ||
+            die "could not back up $APT_SOURCE; nothing was changed"
+        maybe_sudo mv "$APT_SOURCE" "${APT_SOURCE}.disabled" ||
+            die "could not disable $APT_SOURCE; restore from $APT_BACKUP if needed"
+        say "apt source backed up at $APT_BACKUP and disabled"
+    else
+        say "repair skipped; Copilot can still install if no package action is needed"
+    fi
+fi
 
 MISSING=""
 for tool in curl; do
     command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
 if [ -n "$MISSING" ]; then
-    say "missing prerequisites:$MISSING — installing"
+    say "missing prerequisites:$MISSING"
     # shellcheck disable=SC2086
-    if apt_install $MISSING ca-certificates; then
+    if confirm_system_change "install the required download prerequisites:$MISSING ca-certificates" \
+        && apt_install $MISSING ca-certificates; then
         say "prerequisites installed"
     else
-        say "WARNING: could not install$MISSING — the installer may not complete"
-        say "         install them manually and re-run"
+        die "cannot continue without:$MISSING — install them manually and re-run"
     fi
 fi
 
@@ -136,16 +235,74 @@ if "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/d
 fi
 
 # ---- 2. venv ---------------------------------------------------------------
-say "creating virtualenv at $VENV"
-if ! "$PY" -m venv "$VENV" 2>/dev/null; then
-    # Debian/Ubuntu split ensurepip into python3-venv — install it and retry
-    # rather than leaving a half-built venv behind
-    say "virtualenv failed — installing python3-venv"
-    rm -rf "$VENV"
-    apt_install python3-venv python3-pip || true
-    if ! "$PY" -m venv "$VENV" 2>/dev/null; then
-        die "could not create a virtualenv — install python3-venv / python3-pip and re-run"
+mkdir -p "$KRYONSEC_HOME"
+if [ -x "$VENV/bin/python" ]; then
+    if ! "$VENV/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        if [ "$REPAIR" = "1" ] && confirm_system_change \
+            "move the incompatible Kryonsec virtualenv aside for repair"; then
+            backup="$VENV.backup.$(date +%Y%m%d%H%M%S)"
+            mv "$VENV" "$backup" || die "could not preserve the incompatible virtualenv at $backup"
+            say "old virtualenv preserved at $backup"
+        else
+            die "$VENV exists but its Python is incompatible; re-run with --repair after reviewing the backup plan"
+        fi
+    else
+        say "existing compatible virtualenv is ready: $VENV"
     fi
+elif [ -e "$VENV" ]; then
+    if [ "$REPAIR" = "1" ] && confirm_system_change \
+        "move the incomplete Kryonsec virtualenv aside for repair"; then
+        backup="$VENV.backup.$(date +%Y%m%d%H%M%S)"
+        mv "$VENV" "$backup" || die "could not preserve the incomplete virtualenv at $backup"
+        say "old virtualenv preserved at $backup"
+    else
+        die "$VENV exists but is incomplete; re-run with --repair after reviewing the backup plan"
+    fi
+fi
+
+if [ ! -x "$VENV/bin/python" ]; then
+    [ "$DRY_RUN" = "1" ] && {
+        say "DRY RUN: would create a virtualenv at $VENV"
+    } || {
+        say "creating virtualenv at $VENV"
+        # Create at the final path: venv scripts embed their interpreter path,
+        # so a venv built elsewhere and moved here keeps a dead shebang.
+        if ! "$PY" -m venv "$VENV" 2>/dev/null; then
+            # Debian/Ubuntu split ensurepip into python3-venv.  This is a
+            # privileged package action and requires a separate approval.
+            if confirm_system_change "install Python venv support (python3-venv and python3-pip)" \
+                && apt_install python3-venv python3-pip; then
+                :
+            else
+                # The checks above guarantee $VENV held no working venv; this
+                # only removes the half-created one from this attempt.
+                rm -rf "$VENV"
+                die "could not create a virtualenv — install python3-venv / python3-pip and re-run"
+            fi
+            "$PY" -m venv "$VENV" || {
+                rm -rf "$VENV"
+                die "could not create a virtualenv after installing venv support"
+            }
+        fi
+    }
+fi
+
+# A dry run stops before any network or package operation.  It is deliberately
+# useful even when the machine has no membership key: the operator can inspect
+# the interpreter, existing venv, config path, and intended profile first.
+if [ "$DRY_RUN" = "1" ]; then
+    if [ -f "$KRYONSEC_HOME/config.toml" ]; then
+        say "existing configuration detected: $KRYONSEC_HOME/config.toml (will be preserved)"
+    else
+        say "no configuration detected: setup will be required after installation"
+    fi
+    say "would fetch and verify a Kryonsec wheel into $VENV"
+    case "$PROFILE" in
+        copilot) say "would not inspect or modify Docker/gVisor (Copilot profile)" ;;
+        purple) say "would validate Linux, the selected Docker daemon, gVisor, and the release image" ;;
+        auto) say "would ask before attempting optional Linux Docker/gVisor/image setup" ;;
+    esac
+    exit 0
 fi
 
 # ---- 3. install -------------------------------------------------------------
@@ -157,9 +314,112 @@ fi
 # is the escape hatch for air-gapped machines, and it is how support hands
 # someone a build without going through the site.
 WHEEL=""
+
+wheel_hash() {
+    local file="$1" sums
+    sums="$(sha256sum "$file" 2>/dev/null || shasum -a 256 "$file" 2>/dev/null || true)"
+    printf '%s' "${sums%% *}"
+}
+
+verify_wheel_hash() {
+    local file="$1" headers="${2:-}" expected actual
+    expected="${KRYONSEC_WHEEL_SHA256:-}"
+    if [ -z "$expected" ] && [ -n "$headers" ]; then
+        expected="$(awk 'tolower($1) == "x-kryonsec-wheel-sha256:" {print $2}' "$headers" | tail -n 1 | tr -d '\r')"
+    fi
+    actual="$(wheel_hash "$file")"
+    if [ -z "$actual" ]; then
+        die "could not calculate the wheel SHA-256; install sha256sum or shasum and re-run"
+    fi
+    if [ -n "$expected" ]; then
+        expected="$(printf '%s' "$expected" | sed 's/^sha256://' | tr '[:upper:]' '[:lower:]')"
+        if [ "$actual" != "$expected" ]; then
+            die "wheel SHA-256 does not match the release metadata; the artifact was not installed"
+        fi
+        say "wheel verified (SHA-256 $actual)"
+    elif [ -n "$headers" ]; then
+        die "release did not provide wheel verification metadata; the artifact was not installed"
+    else
+        say "local wheel override supplied without release metadata; use KRYONSEC_WHEEL_SHA256 to verify it"
+    fi
+}
+
+download_wheel() {
+    local out="$1" url="$2" key="${3:-}" headers status_file error_file code error
+    headers="$(mktemp)"
+    status_file="$(mktemp)"
+    error_file="$(mktemp)"
+    if [ -n "$key" ]; then
+        if ! curl -fsSL --connect-timeout 20 --max-time 600 \
+            -D "$headers" -H "X-Kryonsec-Key: $key" -o "$out" \
+            -w '%{http_code}' "$url" >"$status_file" 2>"$error_file"; then
+            code="$(cat "$status_file" 2>/dev/null || true)"
+            rm -f "$headers" "$status_file" "$error_file" "$out"
+            case "$code" in
+                400|401|403) die "download refused (HTTP $code): check the membership key" ;;
+                5*) die "download service failed (HTTP $code); retry later or contact support" ;;
+                *) die "could not download the release (DNS, TLS, network, or timeout); check connectivity and retry" ;;
+            esac
+        fi
+    else
+        if ! curl -fsSL --connect-timeout 20 --max-time 600 \
+            -D "$headers" -o "$out" -w '%{http_code}' "$url" \
+            >"$status_file" 2>"$error_file"; then
+            code="$(cat "$status_file" 2>/dev/null || true)"
+            rm -f "$headers" "$status_file" "$error_file" "$out"
+            case "$code" in
+                400|401|403) die "download link was refused or has expired (HTTP $code); request a fresh link" ;;
+                5*) die "download service failed (HTTP $code); retry later or contact support" ;;
+                *) die "could not download the release (DNS, TLS, network, or timeout); check connectivity and retry" ;;
+            esac
+        fi
+    fi
+    code="$(cat "$status_file")"
+    if [ "$code" != "200" ]; then
+        rm -f "$headers" "$status_file" "$error_file" "$out"
+        case "$code" in
+            400|401|403) die "download refused (HTTP $code); check the key or request a fresh link" ;;
+            5*) die "download service failed (HTTP $code); retry later or contact support" ;;
+            *) die "unexpected download response (HTTP ${code:-unknown}); the wheel was not installed" ;;
+        esac
+    fi
+    verify_wheel_hash "$out" "$headers"
+    rm -f "$headers" "$status_file" "$error_file"
+}
+
+wheel_version() {
+    "$PY" - "$1" <<'PY'
+import sys
+import zipfile
+
+wheel = sys.argv[1]
+with zipfile.ZipFile(wheel) as archive:
+    metadata = next(
+        name for name in archive.namelist()
+        if name.endswith('.dist-info/METADATA')
+    )
+    for line in archive.read(metadata).decode('utf-8', 'replace').splitlines():
+        if line.lower().startswith('version:'):
+            print(line.split(':', 1)[1].strip())
+            break
+    else:
+        raise SystemExit('wheel has no Version metadata')
+PY
+}
+
 if [ -n "${KRYONSEC_WHEEL:-}" ]; then
-    say "installing from KRYONSEC_WHEEL override"
-    WHEEL="$KRYONSEC_WHEEL"
+    if [ -f "$KRYONSEC_WHEEL" ]; then
+        say "installing from local KRYONSEC_WHEEL override"
+        WHEEL="$KRYONSEC_WHEEL"
+        verify_wheel_hash "$WHEEL"
+    elif [[ "$KRYONSEC_WHEEL" == http://* || "$KRYONSEC_WHEEL" == https://* ]]; then
+        TMP_DIR="$(mktemp -d)"
+        WHEEL="$TMP_DIR/kryonsec.whl"
+        say "fetching the wheel from KRYONSEC_WHEEL"
+        download_wheel "$WHEEL" "$KRYONSEC_WHEEL"
+    else
+        die "KRYONSEC_WHEEL is neither a readable .whl file nor an HTTP(S) URL"
+    fi
 elif [ -n "${KRYONSEC_DOWNLOAD_URL:-}" ]; then
     # The beta path, and the only reason it needs a branch of its own: pip
     # decides a wheel's name from the URL's last path segment and refuses a
@@ -173,11 +433,7 @@ elif [ -n "${KRYONSEC_DOWNLOAD_URL:-}" ]; then
     TMP_DIR="$(mktemp -d)"
     WHEEL="$TMP_DIR/kryonsec.whl"
     say "fetching the kryonsec release"
-    if ! curl -fsSL --max-time 600 -o "$WHEEL" "$KRYONSEC_DOWNLOAD_URL"; then
-        rm -rf "$TMP_DIR"
-        die "could not download kryonsec — that link was refused, has expired, or $SITE is unreachable.
-         Reload your dashboard at $SITE/dashboard for a fresh one."
-    fi
+    download_wheel "$WHEEL" "$KRYONSEC_DOWNLOAD_URL"
 else
     if [ -z "$KEY" ]; then
         die "a membership key is required. Re-run with:
@@ -187,23 +443,26 @@ else
     TMP_DIR="$(mktemp -d)"
     WHEEL="$TMP_DIR/kryonsec.whl"
     say "fetching the kryonsec release"
-    # -f makes the site's rejection a failure rather than saving an error page
-    # as a "wheel", which pip would then report as a corrupt archive.
-    if ! curl -fsSL --max-time 600 -o "$WHEEL" \
-        "$DOWNLOAD_URL?key=$KEY&os=linux"; then
-        rm -rf "$TMP_DIR"
-        die "could not download kryonsec — the key was rejected, or $SITE is unreachable.
-         Check the key, or request access again at $SITE"
-    fi
+    # The key is a header, not a query parameter.  The URL is intentionally
+    # key-free so proxy/CDN/access logs cannot capture the membership secret.
+    download_wheel "$WHEEL" "$DOWNLOAD_URL?os=linux" "$KEY"
 fi
 
-# Deliberately NOT --quiet: a tree this size takes minutes and pip prints
-# nothing while it resolves and downloads, so a silent install reads as a
-# hung one — which is exactly how it gets reported. The output is the
-# reassurance that it is still working.
-say "installing kryonsec (this pulls litellm, mcp, rich, … — takes a few minutes)"
-"$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install "$WHEEL"
+INSTALLED_VERSION="$("$VENV/bin/python" -c \
+    'import importlib.metadata as m; print(m.version("kryonsec"))' 2>/dev/null || true)"
+WHEEL_VERSION="$(wheel_version "$WHEEL" 2>/dev/null || true)"
+if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" = "$WHEEL_VERSION" ] && [ "${KRYONSEC_FORCE_UPGRADE:-0}" != "1" ]; then
+    say "kryonsec $INSTALLED_VERSION is already installed; skipping package replacement"
+else
+    [ -n "$WHEEL_VERSION" ] || die "downloaded artifact is not a readable Kryonsec wheel"
+    if [ -n "$INSTALLED_VERSION" ]; then
+        say "upgrading Kryonsec $INSTALLED_VERSION to $WHEEL_VERSION"
+    else
+        say "installing Kryonsec $WHEEL_VERSION (dependency resolution may take a few minutes)"
+    fi
+    "$VENV/bin/pip" install --upgrade pip
+    "$VENV/bin/pip" install --upgrade "$WHEEL"
+fi
 "$VENV/bin/kryonsec" --version || die "installation failed"
 
 # Remember the key. It gated the download, and Purple Team will ask for it
@@ -214,16 +473,21 @@ say "installing kryonsec (this pulls litellm, mcp, rich, … — takes a few min
 if [ -n "$KEY" ]; then
     if "$VENV/bin/python" - "$KEY" <<'PY'
 import sys
-from kryonsec.config import load_config
-cfg = load_config()
-cfg.license_key = sys.argv[1].strip()
-cfg.save()
+from pathlib import Path
+from kryonsec.config import config_path, read_config, update_config_sections
+
+key = sys.argv[1].strip()
+path = config_path()
+data = read_config(path)
+if str(data.get("license", {}).get("key") or "") == key:
+    print("already present")
+else:
+    update_config_sections(path, {"license": {"key": key}})
 PY
     then
-        say "membership key saved"
+        say "membership key preserved in config (never printed)"
     else
-        say "WARNING: could not save the membership key"
-        say "         add it later under [license] in $KRYONSEC_HOME/config.toml"
+        die "existing configuration could not be updated safely; it was not overwritten. Repair $KRYONSEC_HOME/config.toml and re-run"
     fi
 fi
 
@@ -234,7 +498,7 @@ fi
 # script already manages, needs no extra `curl | sh` from a third party, and
 # goes away with the venv. Skipped when uv is already available; never fatal,
 # because nothing in either mode depends on it.
-if ! command -v uvx >/dev/null 2>&1; then
+if ! command -v uvx >/dev/null 2>&1 && [ ! -x "$VENV/bin/uvx" ]; then
     if "$VENV/bin/pip" install --quiet uv; then
         say "installed uv (provides uvx, for the 'fetch' MCP server)"
     else
@@ -250,12 +514,20 @@ SHELL_RC="$HOME/.bashrc"
 case "${SHELL:-}" in
     *zsh) SHELL_RC="$HOME/.zshrc" ;;
 esac
-MARKER='# kryonsec'
-if ! grep -q "$MARKER" "$SHELL_RC" 2>/dev/null; then
-    printf '\n%s\nexport PATH="%s:$PATH"\n' "$MARKER" "$VENV/bin" >> "$SHELL_RC"
-    say "added $VENV/bin to PATH in $SHELL_RC"
+PATH_BEGIN='# kryonsec PATH BEGIN (managed)'
+PATH_END='# kryonsec PATH END (managed)'
+if grep -qF "$PATH_BEGIN" "$SHELL_RC" 2>/dev/null; then
+    path_tmp="$(mktemp)"
+    awk -v begin="$PATH_BEGIN" -v end="$PATH_END" -v bin="$VENV/bin" '
+        $0 == begin { print begin; print "export PATH=\"" bin ":$PATH\""; inside=1; next }
+        $0 == end { print end; inside=0; next }
+        !inside { print }
+    ' "$SHELL_RC" > "$path_tmp" && mv "$path_tmp" "$SHELL_RC"
+    say "updated the installer-managed PATH block in $SHELL_RC"
 else
-    say "PATH already set up in $SHELL_RC"
+    printf '\n%s\nexport PATH="%s:$PATH"\n%s\n' \
+        "$PATH_BEGIN" "$VENV/bin" "$PATH_END" >> "$SHELL_RC"
+    say "added the installer-managed PATH block to $SHELL_RC"
 fi
 # when this script is piped into bash, $SHELL is the caller's shell — fish
 # users get nothing from the block above, so tell them what to run
@@ -277,43 +549,40 @@ export PATH="$VENV/bin:$PATH"
 
 # maybe_sudo / have_sudo / is_apt are defined in section 0.
 
-# run docker as root when the current user can't talk to the daemon yet
-# (fresh install: the docker group only applies after the next login)
+# Never probe a different daemon as root.  Kryonsec runs as the current user,
+# so a successful `sudo docker info` would be a false positive and could hide
+# the permission problem the installed application will hit later.
 dkr() {
-    if docker info >/dev/null 2>&1; then
-        docker "$@"
-    else
-        maybe_sudo docker "$@"
-    fi
+    docker "$@"
 }
 
 install_docker() {
     say "installing Docker (apt)"
-    # A failing `apt-get update` must not abort this. apt still installs from
-    # the package lists it already has, and bailing here is precisely how a
-    # gVisor repo problem became a "Docker could not be installed" problem.
-    maybe_sudo apt-get update -qq ||
-        say "WARNING: apt-get update reported errors — trying the install anyway"
-    # distro package: works on every apt system (incl. Kali and Ubuntu
-    # releases the docker.com repo hasn't caught up with) and is plenty
-    # for a gVisor sandbox host
-    maybe_sudo apt-get install -y -qq docker.io || return 1
-    # The socket is root-owned, so without this the daemon answers root and
-    # nobody else — the installer's own probes fall back to sudo and look
-    # fine, while `kryonsec` (which runs as the user) gets "permission
-    # denied" the first time it reaches for Docker. Membership only takes
-    # effect at the next login, so say so rather than pretending.
+    apt_install docker.io || return 1
+    # The socket is root-owned on a normal Engine install. Group membership is
+    # a separate, visible system change and only applies after re-login.
     if [ "$(id -u)" -ne 0 ]; then
         if ! id -nG 2>/dev/null | grep -qw docker; then
-            maybe_sudo usermod -aG docker "$(id -un)" >/dev/null 2>&1 &&
+            if confirm_system_change "add $(id -un) to the docker group (log out and back in afterward)"; then
+                maybe_sudo usermod -aG docker "$(id -un)" || return 1
                 say "added $(id -un) to the docker group — log out and back in for it to apply"
+            else
+                say "Docker installed, but this user still needs Docker socket permission"
+            fi
         fi
     fi
-    # start the daemon — systemd where available (WSL needs it on), the
-    # sysv script as a fallback
-    maybe_sudo systemctl enable --now docker 2>/dev/null ||
-        maybe_sudo service docker start 2>/dev/null || true
-    sleep 2
+    if confirm_system_change "enable and start the Docker service (this can interrupt Docker workloads)"; then
+        if command -v systemctl >/dev/null 2>&1; then
+            maybe_sudo systemctl enable --now docker || return 1
+        elif command -v service >/dev/null 2>&1; then
+            maybe_sudo service docker start || return 1
+        else
+            say "no supported service manager found; start Docker manually"
+        fi
+        sleep 2
+    else
+        say "Docker service was not started by Kryonsec"
+    fi
 }
 
 # Download gVisor's runsc package from the release bucket, verified against
@@ -392,12 +661,40 @@ fetch_runsc() {
     return 0
 }
 
+backup_system_file() {
+    local source="$1" backup
+    [ -f "$source" ] || return 0
+    backup="${source}.kryonsec.$(date +%Y%m%d%H%M%S).bak"
+    maybe_sudo cp -p "$source" "$backup" || return 1
+    printf '%s' "$backup"
+}
+
+valid_json_file() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    "$PY" - "$file" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    json.load(handle)
+PY
+}
+
 install_gvisor() {
+    if ! confirm_system_change \
+        "install gVisor, edit Docker's runtime configuration, and prepare a Docker restart"; then
+        return 1
+    fi
     say "installing gVisor (runsc)"
-    maybe_sudo apt-get install -y -qq gnupg >/dev/null 2>&1
+    if ! apt_install gnupg; then
+        say "gVisor prerequisite installation failed"
+        return 1
+    fi
     maybe_sudo mkdir -p /usr/share/keyrings
 
     local gvisor_list=/etc/apt/sources.list.d/gvisor.list
+    local gvisor_backup docker_backup
+    gvisor_backup="$(backup_system_file "$gvisor_list" || true)"
     # The deb line is `deb [opts] URI SUITE COMPONENT`. It used to be written
     # with `/release` glued onto the URI and the architecture appended as a
     # second component, so apt went looking for
@@ -412,11 +709,6 @@ install_gvisor() {
         maybe_sudo apt-get install -y -qq runsc; then
         : # apt path worked
     else
-        # Drop the repo line BEFORE falling back, on every path out of here.
-        # It used to be removed only after a successful binary install, so a
-        # failed download left a broken source behind — poisoning the next
-        # run's `apt-get update`, and therefore its Docker install, forever.
-        maybe_sudo rm -f "$gvisor_list"
         say "apt repo unavailable — installing runsc from gVisor's own package"
         fetch_runsc /tmp/runsc.deb || return 1
         # dpkg rather than install(1): this is gVisor's own .deb, so it brings
@@ -426,10 +718,41 @@ install_gvisor() {
         maybe_sudo dpkg -i /tmp/runsc.deb >/dev/null || return 1
         rm -f /tmp/runsc.deb
     fi
-    # registers runsc in /etc/docker/daemon.json and restarts the daemon
-    maybe_sudo runsc install
-    maybe_sudo systemctl restart docker 2>/dev/null ||
-        maybe_sudo service docker restart 2>/dev/null || true
+    # `runsc install` edits daemon.json.  Preserve the previous file and refuse
+    # to restart Docker if the resulting JSON is invalid.  A failed validation
+    # restores the exact previous file instead of leaving Docker unable to
+    # start.  The restart is separately approved because it interrupts running
+    # containers.
+    docker_backup="$(backup_system_file /etc/docker/daemon.json || true)"
+    if ! maybe_sudo runsc install; then
+        [ -n "$docker_backup" ] && maybe_sudo cp -p "$docker_backup" /etc/docker/daemon.json || true
+        say "runsc could not register with Docker; the previous daemon configuration was preserved"
+        return 1
+    fi
+    if ! valid_json_file /etc/docker/daemon.json; then
+        say "gVisor produced invalid Docker daemon JSON; restoring the previous configuration"
+        if [ -n "$docker_backup" ]; then
+            maybe_sudo cp -p "$docker_backup" /etc/docker/daemon.json ||
+                say "WARNING: restore failed — recover manually from $docker_backup"
+        else
+            maybe_sudo rm -f /etc/docker/daemon.json ||
+                say "WARNING: could not remove the invalid new daemon configuration"
+        fi
+        return 1
+    fi
+    say "Docker daemon configuration validated"
+    if ! confirm_system_change "restart Docker so the registered runsc runtime takes effect"; then
+        say "Docker was not restarted; runsc will not be usable until an approved restart"
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        maybe_sudo systemctl restart docker || return 1
+    elif command -v service >/dev/null 2>&1; then
+        maybe_sudo service docker restart || return 1
+    else
+        say "no supported service manager found; restart Docker manually"
+        return 1
+    fi
     sleep 2
 }
 
@@ -439,90 +762,65 @@ runsc_registered() {
         grep -qw runsc
 }
 
-if [ "$(uname -s)" = "Linux" ] && have_sudo && is_apt; then
-    # Docker Desktop's daemon lives outside the distro, so no runtime
-    # installed in here can ever reach it. Detect that FIRST: the CLI exists
-    # and answers, so every "is Docker installed?" test below passes, the
-    # gVisor install then writes a daemon.json for a daemon nothing is
-    # talking to, and the whole thing reports success while Purple Team
-    # still cannot start.
-    DOCKER_OS=""
-    if command -v docker >/dev/null 2>&1; then
-        DOCKER_OS="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
-        [ -n "$DOCKER_OS" ] || DOCKER_OS="$(maybe_sudo docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
+PURPLE_REQUESTED=0
+if [ "$PROFILE" = "purple" ]; then
+    PURPLE_REQUESTED=1
+elif [ "$PROFILE" = "auto" ] && [ "$(uname -s)" = "Linux" ]; then
+    if confirm_system_change \
+        "attempt the optional Purple Team setup (Docker, gVisor, and a release sandbox image)"; then
+        PURPLE_REQUESTED=1
+    else
+        say "Purple Team setup declined; installing Copilot only"
     fi
+fi
+
+if [ "$PURPLE_REQUESTED" = "1" ]; then
+    [ "$(uname -s)" = "Linux" ] || die "Purple Team requires Linux or WSL2; use install.ps1 for Windows Copilot"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if is_apt && have_sudo && confirm_system_change \
+            "install Docker Engine from the distribution package"; then
+            install_docker || die "Docker installation failed; inspect the package-manager error and re-run"
+        else
+            die "Docker CLI is missing. Install Docker Engine in this Linux environment, then re-run; Docker Desktop is not silently substituted"
+        fi
+    fi
+
+    if ! dkr info >/dev/null 2>&1; then
+        die "Docker CLI is installed but the selected daemon is not reachable by this user; check the Docker context, DOCKER_HOST, service state, and socket permissions, then re-run"
+    fi
+
+    DOCKER_CONTEXT_NAME="$(dkr context show 2>/dev/null || true)"
+    DOCKER_CONTEXTS="$(dkr context ls --format '{{.Name}}' 2>/dev/null || true)"
+    if [ -n "${DOCKER_HOST:-}" ]; then
+        say "Docker selection: DOCKER_HOST is set; Kryonsec will validate that endpoint and will not override it"
+    fi
+    say "Docker selection: context ${DOCKER_CONTEXT_NAME:-unknown}; available contexts: ${DOCKER_CONTEXTS//$'\n'/, }"
+    CONTEXT_COUNT="$(printf '%s\n' "$DOCKER_CONTEXTS" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "${CONTEXT_COUNT:-0}" -gt 1 ] && [ -z "${DOCKER_CONTEXT:-}" ] && [ -z "${DOCKER_HOST:-}" ]; then
+        die "multiple Docker contexts are available and none was explicitly selected. Choose one yourself (for example export DOCKER_CONTEXT=<name>) and re-run; Kryonsec will not switch contexts"
+    fi
+
+    DOCKER_OS="$(dkr info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
     case "$DOCKER_OS" in
         *"Docker Desktop"*)
-            say "docker is currently Docker Desktop's, which cannot host gVisor"
-            say "         its daemon runs outside this distro. Installing a"
-            say "         Docker daemon in here and pointing the CLI at it."
-            install_docker ||
-                say "WARNING: Docker install failed — Purple Team needs it"
-            # Docker Desktop leaves currentContext set to "desktop-linux" in
-            # ~/.docker/config.json, so the new daemon on the default socket
-            # is invisible to the CLI until this switch — every probe below
-            # would still be reading Docker Desktop. Client-side only (it
-            # edits that config file; no daemon involved), and deliberately
-            # NOT under sudo, which would write root's config instead of the
-            # user's and change nothing for them.
-            docker context use default >/dev/null 2>&1 ||
-                say "         run this yourself: docker context use default"
-            if ! dkr info >/dev/null 2>&1; then
-                say "WARNING: the distro's docker daemon is not up yet — start it with"
-                say "         sudo service docker start   (or enable systemd in /etc/wsl.conf)"
-            fi
-            # The switch is not permanent: Docker Desktop re-creates and
-            # re-selects its own context on every launch, and DOCKER_HOST
-            # overrides the context outright. Without saying so, this fix
-            # holds until the next reboot and then silently reverts.
-            if dkr info --format '{{.OperatingSystem}}' 2>/dev/null | grep -q "Docker Desktop"; then
-                say "WARNING: the CLI is still pointed at Docker Desktop. Two things put"
-                say "         it back — DOCKER_HOST in your shell, and Docker Desktop"
-                say "         itself, which re-selects its context on every launch. Turn"
-                say "         off WSL integration for this distro (Settings > Resources >"
-                say "         WSL Integration), or: unset DOCKER_HOST && docker context use default"
-            fi
+            die "the selected daemon is Docker Desktop, which cannot load a runsc runtime installed inside WSL. Select a native Linux Docker Engine context you administer; Kryonsec will not switch contexts or alter Docker Desktop"
             ;;
     esac
 
-    if ! command -v docker >/dev/null 2>&1; then
-        install_docker ||
-            say "WARNING: Docker install failed — Copilot works fine; Purple Team needs it"
-    elif ! docker info >/dev/null 2>&1 && ! maybe_sudo docker info >/dev/null 2>&1; then
-        # docker is installed but the daemon is down — try to start it
-        maybe_sudo systemctl enable --now docker 2>/dev/null ||
-            maybe_sudo service docker start 2>/dev/null || true
-        sleep 2
-    fi
-    if dkr info >/dev/null 2>&1 && ! runsc_registered; then
-        install_gvisor || true
-        # Verify, do not assume. `runsc install` restarts "the daemon" — but
-        # which daemon depends on how this host runs Docker, and on WSL2 the
-        # CLI may be talking to one this script cannot touch at all.
-        if ! runsc_registered; then
-            # Still Docker Desktop after the switch above means the CLI could
-            # not be moved off it (a Desktop restart can put it back). Nothing
-            # run in here can add a runtime to that daemon, so name the real
-            # problem rather than printing a retry that cannot help.
-            DOCKER_OS="$(dkr info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
-            case "$DOCKER_OS" in
-                *"Docker Desktop"*)
-                    say "WARNING: still talking to Docker Desktop's daemon, which cannot"
-                    say "         load a runtime from inside WSL. Give the distro its own:"
-                    say "           sudo apt-get install -y docker.io"
-                    say "           docker context use default"
-                    say "           sudo service docker start"
-                    say "         then re-run this installer to add gVisor"
-                    ;;
-                *)
-                    say "WARNING: gVisor install did not register runsc — Purple Team needs it"
-                    say "         retry with: sudo runsc install && sudo systemctl restart docker"
-                    ;;
-            esac
+    if ! runsc_registered; then
+        if is_apt && have_sudo && [ -z "${DOCKER_HOST:-}" ]; then
+            if install_gvisor; then
+                :
+            else
+                die "gVisor could not be installed or registered; the selected Docker daemon was not changed after a validation failure"
+            fi
         else
-            say "gVisor (runsc) registered with Docker"
+            die "runsc is not registered with the selected Docker daemon. Install and register gVisor on that daemon host, then re-run; a local binary is not enough"
         fi
     fi
+    runsc_registered || die "gVisor installation did not register runsc with the selected Docker daemon; no runc fallback is allowed"
+    say "gVisor (runsc) is registered with the selected Docker daemon"
 fi
 
 # Registry image published by .github/workflows/sandbox-image.yml on every
@@ -539,14 +837,9 @@ SANDBOX_REGISTRY_IMAGE="ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox"
 INSTALLED_VERSION="$("$VENV/bin/python" -c \
     'import importlib.metadata as m; print(m.version("kryonsec"))' 2>/dev/null || true)"
 
-# Image refs to try, in order, one per line.
-#
-# KRYONSEC_SANDBOX_IMAGE wins and is the ONLY ref tried: it may carry a
-# @sha256: digest, and quietly pulling some other image would defeat the pin
-# the operator asked for. Otherwise: the image for the version we installed
-# (so image and code match), then :latest, which the publish workflow always
-# maintains — that fallback is what keeps installs fast when a tag's image was
-# never published.
+# Image refs to try.  KRYONSEC_SANDBOX_IMAGE wins and is the ONLY ref tried;
+# otherwise the exact image tag for the installed release is used.  There is no
+# latest fallback: release code and a mismatched sandbox are not equivalent.
 sandbox_image_refs() {
     if [ -n "${KRYONSEC_SANDBOX_IMAGE:-}" ]; then
         printf '%s\n' "$KRYONSEC_SANDBOX_IMAGE"
@@ -555,7 +848,6 @@ sandbox_image_refs() {
     if [ -n "$INSTALLED_VERSION" ]; then
         printf '%s:v%s\n' "$SANDBOX_REGISTRY_IMAGE" "$INSTALLED_VERSION"
     fi
-    printf '%s:latest\n' "$SANDBOX_REGISTRY_IMAGE"
     return 0
 }
 
@@ -565,17 +857,17 @@ PULLED_IMAGE_REF=""
 
 pull_sandbox_image() {
     if [ -n "${KRYONSEC_REGISTRY_TOKEN:-}" ]; then
-        # private-repo path; public pulls need no login
+        # private-repo path; public pulls need no login.  A failed login is a
+        # real authentication failure, not a reason to attempt an anonymous
+        # pull and report a misleading "image missing" message.
         printf '%s' "$KRYONSEC_REGISTRY_TOKEN" |
             dkr login ghcr.io -u "${KRYONSEC_REGISTRY_USER:-kryonsec}" \
-                --password-stdin >/dev/null 2>&1 || true
+                --password-stdin >/dev/null 2>&1 || return 2
     fi
     # for-loop, NOT `... | while read`: a pipeline runs the body in a subshell
     # and the `return 0` below would never reach this function
     for REF in $(sandbox_image_refs); do
         if dkr pull "$REF"; then
-            # config/doctor/runner expect the local name kryonsec/sandbox:latest
-            dkr tag "$REF" kryonsec/sandbox:latest || return 1
             PULLED_IMAGE_REF="$REF"
             return 0
         fi
@@ -584,33 +876,52 @@ pull_sandbox_image() {
     return 1
 }
 
-if [ -n "${KRYONSEC_SKIP_SANDBOX:-}" ]; then
-    say "KRYONSEC_SKIP_SANDBOX set — skipping the sandbox image"
-    # no pipeline here: `sandbox_image_refs | head -1` would let pipefail turn
-    # head's early exit into a SIGPIPE failure and `set -e` would abort
-    _later_ref="${KRYONSEC_SANDBOX_IMAGE:-${SANDBOX_REGISTRY_IMAGE}:latest}"
-    say "get it later with: docker pull $_later_ref && docker tag $_later_ref kryonsec/sandbox:latest"
-elif dkr info >/dev/null 2>&1; then
-    if dkr image inspect kryonsec/sandbox:latest >/dev/null 2>&1; then
-        say "sandbox image already present"
-    else
-        say "fetching the Zone B sandbox image..."
-        if pull_sandbox_image; then
-            say "sandbox image pulled: $PULLED_IMAGE_REF"
-        else
-            # No local-build fallback any more: it needed the repository
-            # sources, which are private. Say what to actually do instead of
-            # dropping into a build that cannot fetch anything.
-            say "WARNING: could not pull the sandbox image — Purple Team will not start."
-            say "         Copilot mode is unaffected. Retry manually with:"
-            say "           docker pull ${SANDBOX_REGISTRY_IMAGE}:latest"
-            say "           docker tag ${SANDBOX_REGISTRY_IMAGE}:latest kryonsec/sandbox:latest"
-            say "         If the image has been made private, set KRYONSEC_REGISTRY_TOKEN"
-            say "         and KRYONSEC_REGISTRY_USER, then re-run this installer."
-        fi
+if [ "$PURPLE_REQUESTED" = "1" ]; then
+    if [ -n "${KRYONSEC_SKIP_SANDBOX:-}" ]; then
+        die "KRYONSEC_SKIP_SANDBOX was set, but the selected profile requires Purple Team. Run a Copilot install or remove the skip flag"
     fi
-else
-    say "docker not available — skipped the sandbox image (Copilot works fine; Purple Team needs it)"
+    IMAGE_REF="${KRYONSEC_SANDBOX_IMAGE:-}"
+    if [ -z "$IMAGE_REF" ]; then
+        IMAGE_REF="$(sandbox_image_refs | head -n 1)"
+    fi
+    [ -n "$IMAGE_REF" ] || die "no release-matched sandbox image reference is available"
+    if ! dkr image inspect "$IMAGE_REF" >/dev/null 2>&1; then
+        say "fetching the Zone B sandbox image $IMAGE_REF"
+        pull_rc=0
+        pull_sandbox_image || pull_rc=$?
+        if [ "$pull_rc" -ne 0 ]; then
+            case "$pull_rc" in
+                2) die "sandbox registry authentication failed; check KRYONSEC_REGISTRY_TOKEN and KRYONSEC_REGISTRY_USER" ;;
+                *) die "sandbox image pull failed (registry, DNS, TLS, or network); retry after checking access to GHCR" ;;
+            esac
+        fi
+        IMAGE_REF="$PULLED_IMAGE_REF"
+        say "sandbox image pulled: $IMAGE_REF"
+    else
+        say "sandbox image already present: $IMAGE_REF"
+    fi
+
+    IMAGE_DIGEST="$(dkr image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+    case "$IMAGE_DIGEST" in
+        *@sha256:*) ;;
+        *) die "sandbox image has no registry digest; a tag or local image is not accepted for Purple Team" ;;
+    esac
+    # Persist only the resolved digest.  Existing config is parsed and updated
+    # atomically; malformed config is never replaced by installer defaults.
+    if ! "$VENV/bin/python" - "$IMAGE_DIGEST" <<'PY'
+import sys
+from kryonsec.config import config_path, read_config, update_config_sections
+
+digest = sys.argv[1]
+path = config_path()
+data = read_config(path)
+if str(data.get("sandbox", {}).get("image") or "") != digest:
+    update_config_sections(path, {"sandbox": {"image": digest}})
+PY
+    then
+        die "could not save the verified sandbox digest without overwriting configuration"
+    fi
+    say "sandbox image pinned to verified digest (reference withheld from logs)"
 fi
 
 # ---- 6. LLM preflight -------------------------------------------------------
@@ -623,38 +934,13 @@ ollama_up() {
 }
 
 install_ollama() {
-    say "installing Ollama (local LLM — nothing leaves your machine)"
-    # Ollama's installer unpacks a .tar.zst and exits before installing
-    # anything when zstd is absent. Minimal images — a bare WSL2 Ubuntu, a
-    # slim container, a fresh server install — do not ship it, and the
-    # failure arrives as "Ollama install failed", which reads as a dead end
-    # and sends the user to pick OpenAI instead of running one apt command.
-    # Satisfy the dependency here, and name the command when we cannot.
-    if ! command -v zstd >/dev/null 2>&1; then
-        say "installing zstd (Ollama's installer needs it to unpack its archive)"
-        apt_install zstd || true
-        if ! command -v zstd >/dev/null 2>&1; then
-            say "WARNING: zstd is missing and could not be installed automatically"
-            say "         install it, then re-run this installer:"
-            say "           Debian/Ubuntu:  sudo apt-get install -y zstd"
-            say "           Fedora/RHEL:    sudo dnf install -y zstd"
-            say "           Arch:           sudo pacman -S zstd"
-        fi
-    fi
-    curl -fsSL https://ollama.com/install.sh | sh || return 1
-    # start it: systemd unit when present, detached background server otherwise
-    if ! (systemctl is-active --quiet ollama 2>/dev/null ||
-          maybe_sudo systemctl enable --now ollama 2>/dev/null); then
-        nohup ollama serve >/dev/null 2>&1 &
-    fi
-    # cold start can take a few seconds before /api/tags answers
-    for _ in $(seq 1 15); do
-        ollama_up && break
-        sleep 1
-    done
-    ollama_up || return 1
-    say "pulling llama3.1 (~5 GB download — the local model)"
-    ollama pull llama3.1 || return 1
+    # Do not execute an unpinned third-party install script from a product
+    # installer.  Ollama is optional; the user can install it from its
+    # official instructions and then re-run setup without changing Kryonsec.
+    say "Ollama was not installed automatically (optional provider; external installer is not verified by Kryonsec)"
+    say "         install it from https://ollama.com/download/linux, start it,"
+    say "         pull a model (for example: ollama pull llama3.1), then run `kryonsec setup`"
+    return 1
 }
 
 if ollama_up; then
@@ -664,12 +950,12 @@ elif [ -n "${OPENAI_API_KEY:-}" ]; then
 else
     # curl|bash consumes stdin, so the answer must come from the terminal.
     # No terminal (CI) → read fails → skip (the wizard still offers OpenAI).
-    printf '\033[36m==>\033[0m No LLM configured yet. Install Ollama + llama3.1 locally (~5 GB)? [Y/n] '
+    printf '\033[36m==>\033[0m No LLM configured yet. Show the optional Ollama setup instructions? [Y/n] '
     REPLY=""
     read -r REPLY < /dev/tty 2>/dev/null || REPLY="n"
     case "$REPLY" in
         n*|N*)
-            say "skipped — pick OpenAI in the wizard (have your API key ready)"
+            say "skipped — pick OpenAI or another configured provider in the wizard"
             ;;
         *)
             install_ollama ||
@@ -685,18 +971,37 @@ fi
 # doctor and the closing message ever ran. Give it the real terminal.
 if [ -r /dev/tty ]; then
     say "starting setup wizard"
-    "$VENV/bin/kryonsec" setup < /dev/tty ||
-        say "setup wizard did not finish — run 'kryonsec setup' when you're ready"
+    SETUP_RC=0
+    "$VENV/bin/kryonsec" setup < /dev/tty || SETUP_RC=$?
+    if [ "$SETUP_RC" -ne 0 ]; then
+        say "setup wizard did not finish — configuration was not claimed as complete; run 'kryonsec setup' when you're ready"
+    fi
 else
+    SETUP_RC=2
     say "no terminal available — skipping the setup wizard"
     say "run 'kryonsec setup' in a terminal to configure your LLM"
 fi
 
 # ---- 8. verify + next steps --------------------------------------------------
-# show the final state — doctor's exit code never fails the installer
-# (it only says whether Copilot has storage + an LLM; the table above is
-# the actual information the user needs)
-"$VENV/bin/kryonsec" doctor || true
+# Show the final state.  A strict Purple profile is successful only when the
+# actual selected daemon, registered runtime, digest-pinned image, and deep
+# lifecycle smoke test all pass.  No runc fallback is treated as equivalent.
+DOCTOR_ARGS=(doctor)
+if [ "$PURPLE_REQUESTED" = "1" ]; then
+    DOCTOR_ARGS+=(--deep --strict)
+fi
+DOCTOR_RC=0
+"$VENV/bin/kryonsec" "${DOCTOR_ARGS[@]}" || DOCTOR_RC=$?
+
+if [ "$PURPLE_REQUESTED" = "1" ] && [ "$DOCTOR_RC" -ne 0 ]; then
+    die "installation did not complete the requested Purple Team profile. Copilot may be installed, but Purple Team is not ready; fix the FAIL/WARNING/SKIPPED rows above and re-run"
+fi
+if [ "$SETUP_RC" -ne 0 ] || [ ! -f "$KRYONSEC_HOME/config.toml" ] || \
+   { [ "$PURPLE_REQUESTED" = "0" ] && [ "$DOCTOR_RC" -ne 0 ]; }; then
+    say "Kryonsec is installed, but first-run configuration is still pending"
+else
+    say "Kryonsec Copilot is installed and configured"
+fi
 
 if command -v kryonsec >/dev/null 2>&1; then
     say "done — run: kryonsec"
