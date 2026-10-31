@@ -30,10 +30,12 @@ Cloudflare.
 The file is `kryonsec-landing/functions/api/download.js`, and Pages picks up
 `functions/` automatically — there is nothing to configure for routing.
 
-`install.sh` and `install.ps1` both call it like this:
+The current installers send the membership key in a header. The old query form
+remains accepted for compatibility with older clients:
 
 ```
-GET https://kryonsec.in/api/download?key=KRYO-XXXX-XXXX-XXXX&os=linux
+GET https://kryonsec.in/api/download?os=linux
+X-Kryonsec-Key: KRYO-XXXX-XXXX-XXXX
 ```
 
 | Result | Meaning |
@@ -50,6 +52,8 @@ Two things matter about the contract:
 - **A rejection must not be a `200`.** The installers use `curl -f` /
   `Invoke-WebRequest`, which treat a non-OK status as the failure. Returning
   `200` with an error page saves that page as `kryonsec.whl`.
+- **A successful response must include `X-Kryonsec-Wheel-SHA256`.** Both
+  installers compare the local artifact with this value before invoking pip.
 
 ### Setting it up (about 10 minutes, once)
 
@@ -81,12 +85,14 @@ Two things matter about the contract:
 
    ```bash
    # your real key: expect the wheel to download
-   curl -fL -o /tmp/k.wl "https://kryonsec.in/api/download?key=KRYO-AB2C-DE3F-GH4J"
-   file /tmp/k.wl    # expect: Zip archive data
+    curl -fL -H 'X-Kryonsec-Key: KRYO-AB2C-DE3F-GH4J' \
+      -o /tmp/k.whl "https://kryonsec.in/api/download?os=linux"
+    file /tmp/k.whl    # expect: Zip archive data
 
    # a key that is not on the list: expect 403
    curl -s -o /dev/null -w "%{http_code}\n" \
-     "https://kryonsec.in/api/download?key=KRYO-3333-3333-3333"
+      "https://kryonsec.in/api/download?os=linux" \
+      -H 'X-Kryonsec-Key: KRYO-3333-3333-3333'
    ```
 
 ### Adding or removing a member
@@ -106,15 +112,18 @@ change per release.
 
 ```bash
 # 1. bump the version in pyproject.toml, then commit it
-git commit -am "release: v1.3.3"
+git commit -am "release: vX.Y.Z"
 
 # 2. tag — this triggers release-wheel.yml and sandbox-image.yml
-git tag v1.3.3
+git tag vX.Y.Z
 git push origin main --tags
 ```
 
-After the wheel job goes green, the new version is live: the endpoint reads
-`/releases/latest`, so there is nothing else to do.
+Wait for both the test workflow and the wheel/image workflows. The sandbox job
+must publish the same release version and its summary must record a digest.
+Before announcing the release, run a clean supported Linux/WSL2 installation
+with `kryonsec doctor --deep --strict`; the endpoint reads `/releases/latest`
+only after those checks are green.
 
 ### The installers are copied into the landing repo
 
@@ -125,7 +134,18 @@ installer only reaches members once it is copied over:
 
 ```bash
 cp kryonsec/install.sh kryonsec/install.ps1 ../kryonsec-landing/
+cd ../kryonsec-landing && node --test "tests/*.test.mjs"
 ```
+
+The landing suite includes `tests/install-script.test.mjs`, which checks the
+served `install.ps1` for embedded credentials, the browser-approval flow, and
+fail-closed hash verification. The installer's behavior is covered here by
+`py -3.13 -m pytest tests/test_install_ps1.py`.
+
+The Windows installer depends on two live routes: `/api/beta/device/start` and
+`/api/beta/device/poll` with `purpose: "download"`. Deploy the site first, then
+copy the installer; an installer published against a site without those routes
+falls back to the membership-key prompt instead of approving in the browser.
 
 ## Testing an install without the endpoint
 
@@ -135,20 +155,21 @@ the site:
 
 ```bash
 curl -fsSL https://kryonsec.in/install.sh | \
-  KRYONSEC_WHEEL="$(pwd)/dist/kryonsec-1.3.3-py3-none-any.whl" bash
+  KRYONSEC_WHEEL="$(pwd)/dist/kryonsec-X.Y.Z-py3-none-any.whl" bash
 ```
 
 ```powershell
-$env:KRYONSEC_WHEEL = "C:\build\kryonsec-1.3.3-py3-none-any.whl"
+$env:KRYONSEC_WHEEL = "C:\build\kryonsec-X.Y.Z-py3-none-any.whl"
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 ## What members are told
 
-Whatever you put in the early-access email. The command is:
+Whatever you put in the early-access email. Review the script first, then run:
 
 ```bash
-curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
+curl -fsSL https://kryonsec.in/install.sh -o install.sh
+KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash install.sh --profile=auto
 ```
 
 `KRYONSEC_LICENSE_KEY` works too — it is the name the app itself reads. The

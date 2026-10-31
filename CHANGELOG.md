@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.3.8 — reliable installation and runtime validation
+
+The release now fails closed when the required Purple Team runtime is not ready,
+while keeping Copilot installation independent of Docker and gVisor.
+
+- **Installers are repeatable.** Linux and Windows installers support dry runs,
+  repair paths, explicit approval for host changes, wheel-hash verification, and
+  preserved configuration.
+- **Purple readiness is strict.** Docker context and daemon mismatches, missing
+  `runsc`, mutable or mismatched images, and unsafe fallback runtimes are
+  reported before execution. `kryonsec doctor --deep --strict` includes the
+  network-disabled smoke test.
+- **Site failures are explained safely.** Login, connection, logout, and license
+  checks distinguish HTTP, DNS, TLS, timeout, and malformed-response failures
+  without printing credentials or transport internals.
+
+Test suite: **1747 passed, 4 skipped** (1751 collected across 55 test files).
+
 ## v1.3.7 — a crash the licence cache could reach
 
 One fix. Test suite: **1676 tests green**.

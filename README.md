@@ -10,9 +10,9 @@ A single-user CLI security platform with two modes: an AI copilot you can talk t
 and a deterministic purple-team engine that finds, tests and proves.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.2-8e44ad)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.8-8e44ad)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-red)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-864%20passing-brightgreen)](#development)
+[![Tests](https://img.shields.io/badge/tests-1747%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)
 
 [Install](#install) · [Copilot mode](#mode-a--general-copilot) · [Purple Team mode](#mode-b--purple-team) · [AWS Bedrock](#aws-bedrock) · [OpenAI-compatible endpoints](#openai-compatible-endpoints) · [Safety design](#safety-design) · [Repository structure](#repository-structure)
@@ -490,8 +490,10 @@ machine that has no business seeing it.
 | PostgreSQL | optional (SQLite fallback) | optional (SQLite fallback) |
 
 `kryonsec doctor` checks all of this and refuses to start Purple Team if anything is missing.
-On apt-based Linux (Ubuntu/Debian/Kali) with sudo, the one-line installer sets up Docker and
-gVisor for you, and fetches the sandbox image from a registry as a fast `docker pull`.
+The supported Purple release path is Linux x86-64 (native Linux or WSL2 with a native
+Linux Docker Engine). Docker Desktop's selected daemon cannot host a `runsc` runtime.
+The installer never switches contexts or changes Docker's default runtime. See
+[`docs/INSTALLATION.md`](docs/INSTALLATION.md) for the full support matrix.
 
 ---
 
@@ -501,15 +503,27 @@ Kryonsec is commercial, closed-source software. There is no public repository
 and no public download: the release is a built wheel, and a membership key is
 what unlocks it. [Request access](https://kryonsec.in) to get one.
 
-### One command (WSL / Linux / macOS)
+### Linux or WSL2
 
 ```bash
-curl -fsSL https://kryonsec.in/install.sh | KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash
+curl -fsSL https://kryonsec.in/install.sh -o install.sh
+KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash install.sh --profile=auto
 ```
 
-The installer:
+The installer first installs the Copilot environment. Its `auto` profile asks before
+attempting the optional Purple Team host changes; `copilot` never touches Docker, and
+`purple` fails unless the strict isolated path is ready:
 
-1. Installs missing prerequisites (`curl`) on apt systems
+```bash
+bash install.sh --dry-run --profile=auto
+bash install.sh --profile=copilot   # no Docker/service changes
+bash install.sh --profile=auto      # ask before optional Purple setup
+bash install.sh --profile=purple    # require Purple and deep preflight
+```
+
+It then:
+
+1. Checks for required download tools (`curl`) and stops with a repair command if they are missing
 2. Checks for Python 3.11+ (tries `python3.13`, `python3.12`, `python3.11`, then a bare
    `python3` — and warns if the only one present is a very new 3.14, where pip may have to
    compile dependencies from source and the install looks stalled)
@@ -517,54 +531,62 @@ The installer:
 4. Downloads the release from `kryonsec.in` with your key, and saves that key to
    `~/.kryonsec/config.toml` so Purple Team never asks for it again
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
-6. **On Linux (apt + sudo): auto-installs Docker and gVisor (`runsc`) if missing.** On WSL2
-   with **Docker Desktop** it also installs a Docker daemon *inside* the distro and moves the
-   CLI onto it, because Docker Desktop's daemon runs outside the distro and can never be
-   given a gVisor runtime.
-7. **Fetches the Zone B sandbox image** when Docker is available — a `docker pull` from
-   `ghcr.io`, tagged `kryonsec/sandbox:latest`, which is what `doctor` and the runner look
-   for. If the image can't be pulled, Purple Team won't start; Copilot is unaffected, and the
-   installer prints the exact pull command to retry.
-8. Runs `kryonsec setup` — the first-run wizard
-9. Runs `kryonsec doctor` so the final state is visible
+6. On the approved Purple profile, validates the selected Docker context and daemon,
+   installs/registers gVisor only after consent, backs up and validates Docker JSON before
+   any approved restart, and never uses root Docker probes.
+7. Pulls the image for the installed release, verifies its SHA/digest and metadata, and
+   stores the resolved digest. A mutable `latest` tag is not a Purple runtime fallback.
+8. Runs `kryonsec setup` — the first-run wizard.
+9. Runs `kryonsec doctor`; `--deep --strict` is used for a requested Purple profile.
 
-To skip the sandbox image entirely and do it later:
+To install Copilot only and prepare Purple later:
 
 ```bash
-curl -fsSL https://kryonsec.in/install.sh | \
-  KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX KRYONSEC_SKIP_SANDBOX=1 bash
-# later:
-docker pull ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest
-docker tag ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox:latest kryonsec/sandbox:latest
+KRYONSEC_KEY=KRYO-XXXX-XXXX-XXXX bash install.sh --profile=copilot
+# later, after choosing and configuring the Linux daemon:
+bash install.sh --profile=purple
 ```
 
 Installer environment variables:
 
 | Variable | Effect |
 |---|---|
-| `KRYONSEC_KEY` | Your membership key. Required — it unlocks the download. |
+| `KRYONSEC_KEY` | Your membership key. Unlocks the download without browser approval. |
 | `KRYONSEC_LICENSE_KEY` | The same key, under the name the app itself reads |
+| `KRYONSEC_DOWNLOAD_URL` | A one-time download link prepared by the site (the Unix dashboard command) |
 | `KRYONSEC_WHEEL` | Install a specific wheel instead of downloading — a path or URL. For air-gapped machines and support hand-offs. |
 | `KRYONSEC_SITE` | Base URL to download from (default `https://kryonsec.in`) |
 | `KRYONSEC_SANDBOX_IMAGE` | Override the image ref the installer pulls; may carry a `@sha256:<digest>` |
 | `KRYONSEC_REGISTRY_TOKEN` | GHCR token — only needed if the sandbox image is private (`read:packages`) |
 | `KRYONSEC_REGISTRY_USER` | Username for that token (default `kryonsec`) |
 | `KRYONSEC_SKIP_SANDBOX=1` | Skip the image fetch entirely |
+| `KRYONSEC_PROFILE` | `auto`, `copilot`, or `purple` |
+| `KRYONSEC_DRY_RUN=1` | Read-only installer plan |
+| `KRYONSEC_REPAIR=1` | Preserve and repair an incomplete installer-owned venv |
+| `KRYONSEC_WHEEL_SHA256` | Expected SHA-256 for a local wheel override |
 | `KRYONSEC_HOME` | Install location (default `~/.kryonsec`) |
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://kryonsec.in/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+irm https://kryonsec.in/install.ps1 -OutFile "$env:TEMP\kryonsec-install.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\kryonsec-install.ps1"
 ```
 
-Download it first, read it if you like, then run it — it asks for your key. `-ExecutionPolicy
-Bypass` applies to that one process only; a freshly downloaded script is blocked outright
-under the Windows client default policy.
+That command is short and carries no credential. For a beta account, the
+installer shows an approval link, opens it in the browser, and waits for a
+signed-in, entitled member to approve the machine. Approval yields a fresh,
+single-use download link, and the wheel's SHA-256 is checked before anything
+is installed.
+
+A membership key still works without browser approval: set `KRYONSEC_KEY`
+(or `KRYONSEC_LICENSE_KEY`) before running the second line. `-DryRun` prints
+the plan; `-Repair` preserves an incomplete virtualenv before replacing it.
+`-ExecutionPolicy Bypass` applies to that one process only; a freshly
+downloaded script is blocked outright under the Windows client default policy.
 
 Windows gets Copilot mode only. Purple Team is gated behind a runtime check and must never
-run on the Windows host. Use WSL2 for Mode B.
+run on the Windows host. Use WSL2 with a native Linux Docker Engine for Mode B.
 
 ### From source (development)
 
@@ -606,6 +628,8 @@ your API key. Environment variables still override the file for power users and 
 ```bash
 kryonsec                  # start the chat
 kryonsec doctor           # preflight checks
+kryonsec doctor --deep    # harmless network-disabled runsc smoke test
+kryonsec doctor --deep --strict  # require the full Purple runtime
 kryonsec setup            # re-run the wizard
 kryonsec memory           # browse saved engagement memory (read-only)
 ```
@@ -1145,7 +1169,7 @@ want to use.
 | MCP | **mcp** SDK | Copilot is a real MCP client, stdio transport |
 | Sandbox | **Docker + gVisor (`runsc`)** | A hostile tool in a hostile-target engagement needs a real isolation boundary |
 | Sandbox base | **Kali Linux** | The tool inventory in the expansion doc is Kali-shaped |
-| Tests | **pytest** | 1020 tests across 41 files |
+| Tests | **pytest** | 1747 passed, 4 skipped across 55 files |
 
 Why gVisor specifically: the sandbox runs tools that are *supposed* to be dangerous, against
 targets I don't control. A container alone shares the host kernel. `runsc` puts a user-space
@@ -1222,7 +1246,7 @@ kryonsec/
 │   ├── migrations/                   # schema migrations
 │   └── templates/                    # Jinja2: system_prompt, hypothesize,
 │                                     #   blue_team, report
-└── tests/                            # 41 files, 1020 tests
+└── tests/                            # 55 files, 1751 collected tests
 ```
 
 ---
@@ -1238,7 +1262,7 @@ pytest
 - LLM calls go through **LiteLLM only** (`litellm.completion`)
 - Database access through a thin repository layer (`kryonsec/storage/`)
 - Prompts and reports are **Jinja2 templates** in `kryonsec/templates/`
-- **Every safety layer has at least one unit test** — 1020 tests across 41 files, covering the
+- **Every safety layer has at least one unit test** — 1747 passed, 4 skipped across 55 files, covering the
   audit chain, allowlist, secrets redaction, orchestrator transitions, compaction, sandbox,
   enrichment, scanners, report validation, the CVSS calculator, TUI, wizard, and more
 
