@@ -278,6 +278,34 @@ def test_purple_gate_needs_a_connected_machine(tmp_path, monkeypatch):
     assert license.ensure_purple_allowed(cfg).status == license.VALID
 
 
+def test_a_server_vouched_identity_connects_the_machine(tmp_path, monkeypatch):
+    """A beta key answers with a `member` identity, and that satisfies the
+    gate. The gate still demands an identity — it no longer insists that the
+    identity arrived through a browser claim.
+    """
+    monkeypatch.setattr(
+        license, "_http_get_json",
+        lambda *a, **k: {"valid": True, "member": "beta@kryonsec.in"})
+    cfg = _Cfg(GOOD_KEY, home=tmp_path)
+
+    assert license.ensure_purple_allowed(cfg).status == license.VALID
+    assert license.member_email(cfg) == "beta@kryonsec.in"
+
+
+def test_an_address_from_a_real_claim_is_not_replaced(tmp_path, monkeypatch):
+    """A member who claimed this machine in a browser is the attribution the
+    admin view exists to see. A later beta identity must not downgrade it.
+    """
+    monkeypatch.setattr(
+        license, "_http_get_json",
+        lambda *a, **k: {"valid": True, "member": "beta@kryonsec.in"})
+    cfg = _Cfg(GOOD_KEY, home=tmp_path)
+    license.save_state(cfg, {"member_email": "person@example.com"})
+
+    assert license.ensure_purple_allowed(cfg).status == license.VALID
+    assert license.member_email(cfg) == "person@example.com"
+
+
 def test_purple_gate_still_refuses_a_bad_key_on_a_connected_machine(tmp_path):
     """Connecting is not a way in. Without a key the gate refuses before it
     ever looks at the machine."""

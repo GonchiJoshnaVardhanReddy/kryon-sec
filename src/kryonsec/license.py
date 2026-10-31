@@ -514,17 +514,26 @@ def verify(cfg: Any) -> VerifyResult:
 
     if data.get("valid") is True:
         expires = str(data.get("expires", ""))
-        # Re-read before writing: `device_id()` may have minted an id into the
-        # file after the `state` above was loaded, and save_state replaces the
-        # whole document — writing the stale copy dropped it, so the admin view
-        # saw a brand-new machine id every single day.
-        _remember(cfg, {
+        updates = {
             "last_check": now.isoformat(),
             "last_success": now.isoformat(),
             "cached_status": VALID,
             "cached_for": credential_id,
             "expires": expires,
-        })
+        }
+        # A beta key carries no browser claim, so the endpoint names the
+        # identity instead. Only adopted when this machine holds no address
+        # yet: a member who claimed it in a browser is the attribution the
+        # admin view exists to see, and a shared beta identity must not
+        # quietly replace it on the next check-in.
+        member = str(data.get("member") or "").strip()
+        if member and not str(state.get("member_email") or "").strip():
+            updates["member_email"] = member
+        # Re-read before writing: `device_id()` may have minted an id into the
+        # file after the `state` above was loaded, and save_state replaces the
+        # whole document — writing the stale copy dropped it, so the admin view
+        # saw a brand-new machine id every single day.
+        _remember(cfg, updates)
         days_left = None
         if expires:
             try:
