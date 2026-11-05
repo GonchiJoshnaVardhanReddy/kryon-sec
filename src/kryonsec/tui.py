@@ -23,11 +23,16 @@ def set_mode(
     notice: list[str],
     cfg: KryonsecConfig,
     new_mode: str,
+    *,
+    busy: bool = False,
 ) -> bool:
     """Switch the active mode holder. Refuses (and says why in the
     notice line) when purple mode is requested but the sandbox is not
     available. Returns True when the mode actually changed."""
     if new_mode == mode[0]:
+        return False
+    if busy:
+        notice[0] = "cannot switch modes while an operation is active — wait for a safe boundary"
         return False
     if new_mode == "purple":
         from .purple.runner import sandbox_available
@@ -67,6 +72,8 @@ def build_key_bindings(
     notice: list[str],
     cfg: KryonsecConfig,
     on_change: Any | None = None,
+    on_palette: Any | None = None,
+    busy: Any | None = None,
 ) -> Any:
     """Shift+Tab toggles copilot <-> purple without losing what's
     already typed (the buffer is untouched; only the prompt repaints).
@@ -79,9 +86,25 @@ def build_key_bindings(
     @kb.add("s-tab")
     def _toggle(event: Any) -> None:
         target = "purple" if mode[0] == "copilot" else "copilot"
-        if set_mode(mode, notice, cfg, target) and on_change:
+        active = bool(busy()) if callable(busy) else False
+        if set_mode(mode, notice, cfg, target, busy=active) and on_change:
             on_change(mode[0])
         event.app.invalidate()  # repaint with the new indicator now
+
+    @kb.add("c-p")
+    def _palette(event: Any) -> None:
+        """Open the shell command palette when the terminal supports it.
+
+        The callback owns presentation and may use prompt_toolkit's
+        ``run_in_terminal`` bridge.  With no callback this remains a harmless
+        status hint, which keeps this helper useful in small callers and
+        preserves the non-TTY fallback.
+        """
+        if on_palette is not None:
+            on_palette(event)
+        else:
+            notice[0] = "command palette: type /help for commands"
+            event.app.invalidate()
 
     return kb
 
@@ -91,6 +114,8 @@ def make_prompt_session(
     notice: list[str],
     cfg: KryonsecConfig,
     on_change: Any | None = None,
+    on_palette: Any | None = None,
+    busy: Any | None = None,
 ) -> Any | None:
     """The PromptSession driving chat input: history file, Shift+Tab
     bindings, and the mode-aware prompt. Returns None if prompt_toolkit
@@ -108,7 +133,10 @@ def make_prompt_session(
     cfg.home.mkdir(parents=True, exist_ok=True)
     return PromptSession(
         history=FileHistory(str(cfg.home / "chat_history")),
-        key_bindings=build_key_bindings(mode, notice, cfg, on_change=on_change),
+        key_bindings=build_key_bindings(
+            mode, notice, cfg, on_change=on_change, on_palette=on_palette,
+            busy=busy,
+        ),
         message=lambda: prompt_message(mode, notice),
         enable_history_search=True,  # Ctrl+R / up-arrow prefix search
     )

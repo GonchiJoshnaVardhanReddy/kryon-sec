@@ -53,6 +53,14 @@ def test_set_mode_noop_when_same(tmp_path):
     assert mode[0] == "copilot"
 
 
+def test_set_mode_refuses_while_an_operation_is_active(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    mode, notice = _holders()
+    assert set_mode(mode, notice, cfg, "purple", busy=True) is False
+    assert mode[0] == "copilot"
+    assert "active" in notice[0]
+
+
 def test_prompt_message_shows_mode_indicator():
     mode, notice = (["copilot"], [""])
     fragments = prompt_message(mode, notice)
@@ -93,6 +101,13 @@ def test_shift_tab_binding_toggles_mode(tmp_path):
                side_effect=AssertionError("must not be called")):
         handler(FakeEvent())
     assert mode[0] == "copilot"
+
+
+def test_command_palette_binding_is_available(tmp_path):
+    cfg = KryonsecConfig(home=tmp_path)
+    mode, notice = _holders()
+    kb = build_key_bindings(mode, notice, cfg)
+    assert kb.get_bindings_for_keys(("c-p",))
 
 
 def test_prompt_session_skipped_without_tty(tmp_path):

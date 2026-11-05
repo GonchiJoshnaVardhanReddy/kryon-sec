@@ -94,6 +94,9 @@ def _approval_panel(index: int, total: int, hypothesis: dict,
         facts.add_row("Evidence", rationale)
 
     body = Group(
+        Text("GATE 2 · HUMAN_REVIEW · active testing only", style="bold yellow"),
+        Text("This decision does not authorize post-exploitation.", style="dim"),
+        Text(""),
         Text(str(p.get("title", hypothesis.get("label", ""))), style="bold"),
         Text(""),
         facts,

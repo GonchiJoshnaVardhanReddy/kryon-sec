@@ -39,6 +39,8 @@ from rich.table import Table
 from rich.text import Text
 
 from .orchestrator import STATES
+from ..ui.events import BackendEventAdapter, UIEventBus
+from ..ui.theme import resolve_theme, terminal_capabilities
 
 # ---- vocabulary ---------------------------------------------------------
 
@@ -402,6 +404,7 @@ class PurpleUI:
         graph: Any = None,
         clock=time.monotonic,
         utf8: bool | None = None,
+        sandbox_status: str = "not checked",
     ) -> None:
         self.console = console
         self.target = target
@@ -410,6 +413,17 @@ class PurpleUI:
         # just showing no counts.
         self.graph = graph
         self._clock = clock
+        self.theme = resolve_theme(
+            truecolor=terminal_capabilities(getattr(console, "file", None)).get(
+                "truecolor", False
+            )
+        )
+        self.events = UIEventBus()
+        self.event_adapter = BackendEventAdapter(self.events)
+        self.sandbox_status = sandbox_status
+        self.outcome: str | None = None
+        self.halt_reason: str | None = None
+        self.report_path: str | None = None
         self.glyphs = GLYPHS_UTF8 if _utf8_ok(console, utf8) else GLYPHS_ASCII
         self.frame = _Frame(console, self.glyphs is GLYPHS_UTF8)
         self.started_at = clock()
@@ -491,6 +505,7 @@ class PurpleUI:
             if self.current_state not in self.completed_states:
                 self.completed_states.append(self.current_state)
         self.current_state = state
+        self.event_adapter.state_started(state)
 
         if state == "HUMAN_REVIEW":
             self.pause()
@@ -504,6 +519,26 @@ class PurpleUI:
             self._state_line(state)
             return
         self.resume()
+        self._refresh()
+
+    def on_state_complete(self, state: str) -> None:
+        """Observe a quiescent state boundary without influencing the loop."""
+        if state in STATES and state not in self.completed_states:
+            self.completed_states.append(state)
+        self.event_adapter.state_completed(state)
+        self._refresh()
+
+    def finish(
+        self,
+        outcome: str,
+        *,
+        halt_reason: str | None = None,
+        report_path: str | None = None,
+    ) -> None:
+        """Record an operator-facing terminal outcome for the live workspace."""
+        self.outcome = outcome
+        self.halt_reason = halt_reason
+        self.report_path = report_path
         self._refresh()
 
     def _state_line(self, state: str) -> None:
@@ -522,6 +557,7 @@ class PurpleUI:
         mysterious failure elsewhere. Every field is read with a default.
         """
         try:
+            self.events.publish("audit", data=entry)
             self._handle_audit(entry)
         except Exception:  # pragma: no cover - never fail a run over paint
             pass
@@ -639,6 +675,7 @@ class PurpleUI:
         if not text:
             return
         self.notices.append(text)
+        self.event_adapter.notice(text)
         self._refresh()
 
     def on_log(self, record: logging.LogRecord) -> None:
@@ -702,21 +739,31 @@ class PurpleUI:
             Text(""),
             self._counters(),
             Text(""),
+            self._findings_panel(),
+            Text(""),
             self._progress(),
+            Text(""),
+            self._footer(),
         )
 
     def _header(self) -> Panel:
         elapsed = _clock(self._clock() - self.started_at)
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=STYLE_PENDING, justify="right")
+        table.add_column(style=self.theme.muted, justify="right")
         table.add_column()
         table.add_row("Target", f"[bold]{self.target}[/bold]")
         table.add_row("Engagement", self.engagement_id)
         table.add_row("Elapsed", elapsed)
+        table.add_row("Sandbox", self.sandbox_status)
+        table.add_row("Stage", f"{self.stage_number() or 0} / {len(STATES)}")
         dot = self.glyphs["dot"]
-        status = (f"[bold cyan]{dot} RUNNING[/bold cyan]"
-                  if self._live is not None
-                  else f"[dim]{dot} STOPPED[/dim]")
+        if self.outcome:
+            outcome_style = self.theme.success if self.outcome == "completed" else self.theme.warning
+            status = f"[bold {outcome_style}]{dot} {self.outcome.upper()}[/bold {outcome_style}]"
+        else:
+            status = (f"[bold {self.theme.running}]{dot} RUNNING[/bold {self.theme.running}]"
+                      if self._live is not None
+                      else f"[dim]{dot} STOPPED[/dim]")
         return self.frame.panel(
             table, title="[bold magenta]KRYONSEC PURPLE TEAM[/bold magenta]",
             subtitle=status, border_style=STYLE_PURPLE,
@@ -743,7 +790,7 @@ class PurpleUI:
                 parts.append(f"[{STYLE_PENDING}]{mark} {label}[/{STYLE_PENDING}]")
         return self.frame.panel(
             Text.from_markup("\n".join(parts)),
-            title="[bold]ENGAGEMENT PIPELINE[/bold]",
+            title="[bold]WORKFLOW TIMELINE[/bold] [dim](ENGAGEMENT PIPELINE)[/dim]",
             border_style="dim",
         )
 
@@ -898,6 +945,59 @@ class PurpleUI:
         return self.frame.panel(
             Group(*body), title="[bold]RESULTS[/bold]", border_style="dim",
         )
+
+    def _findings_panel(self) -> Panel:
+        """Show evidence standing without promoting hypotheses to findings."""
+        counts = self.counts()
+        verified = 0
+        possible = 0
+        evidence = 0
+        rows: list[tuple[str, str, str]] = []
+        try:
+            findings = self.graph.by_type("finding") if self.graph is not None else []
+            verified = sum(1 for node in findings if node.get("properties", {}).get("verified"))
+            possible = max(0, len(findings) - verified)
+            if self.graph is not None:
+                evidence = len(self.graph.by_type("post_exploit_evidence"))
+            for node in findings[-4:]:
+                props = node.get("properties", {}) or {}
+                standing = "verified" if props.get("verified") else "possible / unverified"
+                rows.append((str(node.get("label", "finding")), standing, str(props.get("severity", "—"))))
+        except Exception:  # pragma: no cover - defensive render boundary
+            rows = []
+
+        table = Table(box=None, expand=True, padding=(0, 2), show_header=True,
+                      header_style=self.theme.muted)
+        table.add_column("Standing", no_wrap=True)
+        table.add_column("Finding", ratio=2, overflow="ellipsis")
+        table.add_column("Severity", no_wrap=True)
+        if rows:
+            for label, standing, severity in rows:
+                style = self.theme.success if standing == "verified" else self.theme.warning
+                table.add_row(Text(standing, style=style), Text(label), Text(severity, style=self.theme.muted))
+        else:
+            table.add_row(Text("—", style=self.theme.muted), Text("No findings recorded yet", style=self.theme.muted), Text("—", style=self.theme.muted))
+
+        summary = Table.grid(padding=(0, 3))
+        summary.add_column(style=self.theme.muted, justify="right")
+        summary.add_column()
+        summary.add_row("Verified", str(verified))
+        summary.add_row("Possible", str(possible))
+        summary.add_row("Evidence nodes", str(evidence))
+        summary.add_row("Assets", str(counts["subdomains"] + counts["endpoints"]))
+        body = Group(summary, Text(""), table)
+        if self.halt_reason:
+            body = Group(body, Text(""), Text(f"Halt reason: {self.halt_reason}", style=self.theme.warning))
+        return self.frame.panel(body, title="[bold]FINDINGS & EVIDENCE[/bold]", border_style=self.theme.border)
+
+    def _footer(self) -> Text:
+        text = Text()
+        text.append("  ", style="dim")
+        text.append("Ctrl+C", style=f"bold {self.theme.warning}")
+        text.append(" stop safely  ·  ", style="dim")
+        text.append("audit chain", style=f"bold {self.theme.info}")
+        text.append(" active  ·  approvals remain explicit", style="dim")
+        return text
 
     def _progress(self) -> Text:
         """Stage progress, never a bare percentage.

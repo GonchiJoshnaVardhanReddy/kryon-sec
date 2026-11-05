@@ -168,6 +168,8 @@ def start_engagement(
     progress: "Callable[[str], None] | None" = None,
     status_factory: "Callable[[str], object] | None" = None,
     code_folder: str | None = None,
+    human_reviewer: "Callable[[list[dict]], set[str]] | None" = None,
+    post_exploit_approver: "Callable[[str], bool] | None" = None,
 ) -> tuple[PurpleOrchestrator, AuditLog, "object"]:
     """Wire up an engagement. Returns (orchestrator, audit, graph).
 
@@ -265,7 +267,11 @@ def start_engagement(
         if state == "HUMAN_REVIEW":
             from .human_review import HumanReviewSubagent
 
-            sub = HumanReviewSubagent(graph=graph, audit=audit)
+            sub = HumanReviewSubagent(
+                graph=graph,
+                audit=audit,
+                reviewer=human_reviewer,
+            )
             return sub.run
 
         if state == "BLUE_TEAM":
@@ -315,6 +321,7 @@ def start_engagement(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
                 progress=progress,
+                post_exploit_approver=post_exploit_approver,
             )
             return sub.run
 
