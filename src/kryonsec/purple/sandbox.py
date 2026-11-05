@@ -26,6 +26,40 @@ log = logging.getLogger(__name__)
 # Match the entrypoint's internal tool timeout (300s) + a small margin.
 DEFAULT_TIMEOUT_S = 330
 
+# Mode-B execution invariant (hard, permanent): every tool launch must be
+# gVisor-isolated. These are the docker-run flags that make a spawn
+# containerized execution rather than host-equivalent execution; `spawn`
+# refuses to launch if any of them is missing from the built argv, so a
+# future refactor of `_docker_argv` cannot silently drop isolation.
+# (flag, required-next-token, "" for a bare flag)
+_REQUIRED_ISOLATION_FLAGS: tuple[tuple[str, str, str], ...] = (
+    ("--runtime", "runsc", "gVisor (runsc) runtime"),
+    ("--user", "kryonsec-runner", "non-root user"),
+    ("--read-only", "", "read-only root filesystem"),
+    ("--memory", "2g", "memory limit"),
+    ("--cpus", "2", "CPU limit"),
+    ("--pids-limit", "100", "process limit"),
+)
+
+
+def missing_isolation_flags(docker_argv: list[str]) -> list[str]:
+    """The isolation requirements the launch argv fails to carry.
+
+    Pure check over the exact docker argv that would be executed. A bare
+    flag only requires presence; a paired flag requires its token to
+    follow with the required value.
+    """
+    missing: list[str] = []
+    for flag, expected, meaning in _REQUIRED_ISOLATION_FLAGS:
+        if flag not in docker_argv:
+            missing.append(f"{flag} ({meaning})")
+        elif expected and (
+            len(docker_argv) <= docker_argv.index(flag) + 1
+            or docker_argv[docker_argv.index(flag) + 1] != expected
+        ):
+            missing.append(f"{flag}={expected} ({meaning})")
+    return missing
+
 
 @dataclass
 class SpawnResult:
@@ -198,6 +232,20 @@ class KaliSandbox:
         docker_argv = self._docker_argv(tool_argv)
         container_name = docker_argv[docker_argv.index("--name") + 1]
         log.info("sandbox spawn: %s", " ".join(docker_argv[:6]) + " …")
+
+        # Mode-B execution invariant: refuse to launch when the isolation
+        # flags are missing. Fail closed with a diagnostic — a spawn that
+        # would run unisolated on the Docker daemon is not "a worse sandbox",
+        # it is host-equivalent execution and must never happen instead of a
+        # sandboxed one. Audited by every caller as a failed spawn.
+        missing = missing_isolation_flags(docker_argv)
+        if missing:
+            error = (
+                "sandbox isolation invariant broken — refusing to launch "
+                f"{tool_argv[0]!r}: missing {', '.join(missing)}"
+            )
+            log.error(error)
+            return SpawnResult(ok=False, exit_code=-1, stdout="", error=error)
 
         try:
             proc = self._run(

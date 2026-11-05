@@ -140,7 +140,7 @@ def run_code_scanners(
     renders as scanner evidence. A failing scanner is an audited skip —
     the LLM phase runs regardless. Returns the number of scanners that
     actually ran."""
-    from .allowlist import ToolAllowlist
+    from .allowlist import AllowlistViolation, ToolAllowlist
 
     allow = allowlist or ToolAllowlist()
     plan = list(BLUE_TEAM_SCAN_PLAN)
@@ -152,7 +152,7 @@ def run_code_scanners(
         try:
             allow.validate(argv[0], argv)
             allow.check_blocklist(argv)
-        except Exception as e:
+        except AllowlistViolation as e:
             audit.write({
                 "event": "scanner_rejected_by_allowlist",
                 "tool": tool,
