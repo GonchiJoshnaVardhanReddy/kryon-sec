@@ -709,12 +709,28 @@ def post_exploit_view(graph: EngagementGraph) -> dict:
 
 def report_limitations(graph: EngagementGraph, audit: AuditLog) -> list[str]:
     """Execution and verification limitations, derived from records —
-    including the standing sandbox-egress gap (never claimed resolved)."""
-    limitations = [
-        "Network egress from the execution sandbox is not restricted to the "
-        "target scope at the network layer (default docker bridge); target "
-        "scope is enforced by command-line validation only.",
-    ]
+    including the egress state actually observed in the audit chain
+    (never claimed resolved without the boundary events to prove it)."""
+    # Phase 1E: the network-layer egress state is READ from the audit
+    # chain, not asserted. Without `egress_policy_established` in this
+    # engagement's chain the old default-bridge wording stays.
+    established = any(
+        entry.get("event") == "egress_policy_established"
+        for entry in read_audit_events(audit))
+    if established:
+        limitations = [
+            "Network egress from the execution sandbox was restricted by a "
+            "host-layer allow-only firewall (DOCKER-USER chain) at the time "
+            "of execution; DNS queries to the pinned resolvers could still "
+            "carry exfiltration in query names — the boundary does not "
+            "inspect DNS payloads.",
+        ]
+    else:
+        limitations = [
+            "Network egress from the execution sandbox is not restricted to "
+            "the target scope at the network layer (default docker bridge); "
+            "target scope is enforced by command-line validation only.",
+        ]
     from .capability import CAPABILITY_PARSERS
     if CAPABILITY_PARSERS == {}:
         limitations.append(

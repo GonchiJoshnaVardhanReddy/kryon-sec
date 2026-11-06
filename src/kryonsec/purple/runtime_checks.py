@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
@@ -29,6 +30,65 @@ SANDBOX_REQUIRED_FILES = (
     "/opt/kryonsec/probe.py",
     "/opt/kryonsec/openapi_probe.py",
 )
+
+
+def egress_firewall_ok() -> tuple[bool, str]:
+    """Phase 1E preflight: can the host program the Zone B network
+    boundary? Checks that iptables AND ip6tables are installed and that
+    the DOCKER-USER chain is readable through a NON-interactive sudo
+    (directly as root) — the runner's EgressGate needs exactly this
+    before it will allow any Zone B tool to run.
+
+    Returns (ok, detail). Never attempts to modify the firewall.
+    """
+    if not sys.platform.startswith("linux"):
+        return False, (
+            "egress firewall checks apply to Linux; Purple Team (Zone B) "
+            "is unavailable on this host"
+        )
+    sudo = shutil.which("sudo")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        prefix: list[str] = []
+    elif sudo:
+        prefix = ["sudo", "-n"]
+    else:
+        return False, (
+            "no sudo binary: the runner cannot program the Zone B egress "
+            "firewall non-interactively (fail closed)"
+        )
+    problems = []
+    for cmd in ("iptables", "ip6tables"):
+        binary = shutil.which(cmd)
+        if not prefix and not binary:
+            problems.append(f"{cmd} not installed")
+            continue
+        try:
+            proc = subprocess.run(
+                (prefix + [cmd, "-S", "DOCKER-USER"]),
+                capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            problems.append(f"{cmd} via sudo -n probe failed: {e}")
+            continue
+        if proc.returncode == 0:
+            continue
+        stderr = (proc.stderr or "").strip()
+        if prefix and ("a password is required" in stderr.lower()
+                       or "incorrect password" in stderr.lower()):
+            problems.append(
+                f"sudo -n {cmd}: password cache required — run "
+                "`sudo -v` first (non-interactive root is needed to "
+                "program the Zone B egress firewall)")
+        else:
+            problems.append(
+                f"{cmd}: DOCKER-USER chain unreadable ({stderr[:120] or 'exit ' + str(proc.returncode)})")
+    if problems:
+        return False, "; ".join(problems)
+    detail_name = "root" if not prefix else "sudo -n"
+    return True, (
+        f"iptables and ip6tables DOCKER-USER chains readable ({detail_name}); "
+        "the egress boundary can be programmed at engagement start"
+    )
 
 
 @dataclass(frozen=True)

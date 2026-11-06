@@ -61,6 +61,72 @@ def missing_isolation_flags(docker_argv: list[str]) -> list[str]:
     return missing
 
 
+# Networks that would defeat the egress boundary outright — rejected
+# REGARDLESS of network_name checks. Hard-coded: no config can re-enable
+# them while an egress policy is set.
+_FORBIDDEN_NETWORKS = ("bridge", "host", "none")
+
+
+def missing_egress_flags(
+    docker_argv: list[str], policy, image: str | None = None,
+) -> list[str]:
+    """The egress requirements the launch argv fails/defrauds to carry.
+
+    Only meaningful when an EgressPolicy is set (every Zone B spawn now
+    has one): the argv must run on THIS engagement's dedicated network
+    (exact name), with DNS pinned to EXACTLY the policy's resolver set,
+    and must never carry a forbidden network (bridge/host/none). Pure —
+    argv cannot talk its way past this. Only tokens BEFORE the image
+    position are docker flags (tool argv continues after it); a tool
+    argument spelled "--dns" after the image is not a docker flag and
+    cannot redirect the container's DNS anyway (the host firewall
+    enforces the resolver scope regardless).
+    """
+    problems: list[str] = []
+    docker_section = docker_argv
+    if image is not None and image in docker_argv:
+        docker_section = docker_argv[:docker_argv.index(image)]
+    networks = []
+    i = 0
+    while i < len(docker_section):
+        if docker_section[i] == "--network":
+            if i + 1 < len(docker_section):
+                networks.append(docker_section[i + 1])
+            else:
+                networks.append("<unterminated>")
+            i += 2
+            continue
+        i += 1
+    net = networks[0] if networks else None
+    if net is None:
+        problems.append(
+            f"--network {policy.network_name} — the engagement "
+            "egress boundary")
+    else:
+        if net.lower() in _FORBIDDEN_NETWORKS:
+            problems.append(
+                f"--network {net} is forbidden under an egress policy")
+        elif net != policy.network_name:
+            problems.append(
+                f"--network {net} != engagement network {policy.network_name}")
+    dns = []
+    i = 0
+    while i < len(docker_section):
+        if docker_section[i] == "--dns":
+            if i + 1 < len(docker_section):
+                dns.append(docker_section[i + 1])
+            else:
+                dns.append("<unterminated>")
+            i += 2
+            continue
+        i += 1
+    expected_dns = sorted(str(r) for r in policy.dns_resolvers)
+    if sorted(dns) != expected_dns:
+        problems.append(
+            f"--dns {dns or '(none)'} != pinned resolvers {expected_dns}")
+    return problems
+
+
 @dataclass
 class SpawnResult:
     ok: bool                 # did the spawn itself work (docker + parse)
@@ -90,9 +156,17 @@ class KaliSandbox:
         timeout_s: int = DEFAULT_TIMEOUT_S,
         code_dir: str | None = None,
         evidence_dir: str | None = None,
+        egress_policy=None,
+        egress_gate=None,
     ):
         self.cfg = cfg
         self.image = cfg.sandbox_image
+        # Phase 1E: the engagement's egress boundary. When set, EVERY
+        # spawn runs on the dedicated engagement bridge network with DNS
+        # pinned to the policy resolvers, and the gate is re-verified
+        # before each launch (fail closed — see spawn()).
+        self.egress_policy = egress_policy
+        self.egress_gate = egress_gate
         # Blue-team code scanning (Phase 5): an ABSOLUTE host path, mounted
         # READ-ONLY at the fixed /code inside the container. The path comes
         # from the CLI (--code), never the LLM; a relative path is refused
@@ -198,10 +272,17 @@ class KaliSandbox:
         # /code stay read-only, so a tool can only write here.
         if getattr(self, "evidence_dir", None):
             argv += ["-v", f"{self.evidence_dir}:/evidence:rw"]
-        # NOTE: full spec adds network_mode=container:kryonsec-proxy for
-        # target-scope-only egress (§8.2). The proxy does not exist yet —
-        # containers use the default bridge. Recorded in the audit chain
-        # by the EXPLOIT subagent until the proxy lands.
+        # Zone B network egress (Phase 1E): when the engagement has an
+        # egress policy, every spawn runs on the DEDICATED engagement
+        # bridge (never the default bridge), with DNS pinned to the
+        # policy's resolver set. The host DOCKER-USER firewall (built by
+        # EgressGate) filters every packet leaving that bridge; `spawn`
+        # re-verifies the boundary before each launch and refuses to run
+        # when it is missing or drifted.
+        if getattr(self, "egress_policy", None) is not None:
+            argv += ["--network", self.egress_policy.network_name]
+            for resolver in self.egress_policy.dns_resolvers:
+                argv += ["--dns", str(resolver)]
         argv += [self.image]
         argv += list(tool_argv)
         return argv
@@ -246,6 +327,31 @@ class KaliSandbox:
             )
             log.error(error)
             return SpawnResult(ok=False, exit_code=-1, stdout="", error=error)
+
+        # Egress invariant (Phase 1E): when this engagement carries an
+        # egress policy, the launch argv must run on the dedicated
+        # engagement network with the pinned resolvers, and the boundary
+        # must STILL be live — re-verified here, fail closed. A spawn
+        # without a verified boundary would be default-bridge execution
+        # and must never happen instead of a bounded one. Audited by
+        # every caller as a failed spawn.
+        if getattr(self, "egress_policy", None) is not None:
+            egress_problems = missing_egress_flags(
+                docker_argv, self.egress_policy, image=self.image)
+            if not egress_problems and self.egress_gate is not None:
+                ok, reason = self.egress_gate.verify(self.egress_policy)
+                if not ok:
+                    egress_problems.append(
+                        f"egress boundary not verified: {reason}")
+            if egress_problems:
+                error = (
+                    "sandbox egress invariant broken — refusing to launch "
+                    f"{tool_argv[0]!r}: "
+                    + "; ".join(egress_problems)
+                )
+                log.error(error)
+                return SpawnResult(
+                    ok=False, exit_code=-1, stdout="", error=error)
 
         try:
             proc = self._run(

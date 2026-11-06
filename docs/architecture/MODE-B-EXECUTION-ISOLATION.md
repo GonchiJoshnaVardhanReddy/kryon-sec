@@ -88,22 +88,46 @@ misrepresents the containment and violates this invariant. Any future
 MCP-to-Mode-B integration must come through the Layer-2 allowlist, the
 sandbox boundary, and a dedicated approval gate.
 
-## 5. Network egress — what is and is NOT enforced (honest limits)
+## 5. Network egress — enforced at the host layer (Phase 1E)
 
 - **Enforced:** Zone A egress allowlist at the HTTP layer, including redirect
   hops (`zonea.py:92–133`); Docker-level resource isolation; the `runsc` guest
-  isolation for all tool execution.
-- **NOT enforced:** Zone B containers run on the Docker **default bridge**. The
-  spec §8.2 traffic-shaping proxy that would constrain tool egress to
-  target scope does not exist yet. **Container isolation does NOT provide
-  destination-scope enforcement**: a sandboxed tool can currently reach any
-  network destination the Docker daemon's network allows. Target scope in
-  EXPLOIT is enforced by argv construction (`compose_url`) and by the
-  allowlist — i.e. by what we choose to launch, not by where the container can
-  connect. This known gap is documented in `sandbox.py:167–170` and recorded
-  per-run in the audit chain (`exploit.py:311–316`). The runtime smoke test
-  runs `--network none`, but that is preflight only. Do not cite gVisor as an
-  egress control until the proxy lands.
+  isolation for all tool execution; and since Phase 1E a **host-layer allow-only
+  egress boundary for every Zone B tool container**:
+  - Each engagement builds a DEDICATED Docker bridge network
+    (`kryonsec-egress-<id8>`, explicit bridge iface `ksb<id8>`,
+    inter-container communication disabled) — never the default bridge.
+  - The Docker host's `DOCKER-USER` chain receives a per-engagement chain
+    (`KRYONSEC-EGRESS-<id8>`) for BOTH embodiments (`iptables` and
+    `ip6tables`), matching only that bridge in/out: allow ESTABLISHED,RELATED;
+    DNS (udp/tcp 53) only to the pinned resolver set; allow only the
+    engagement's authorized destinations; absolute DROP.
+  - `spawn()` re-verifies the boundary before every launch and hard-rejects
+    `--network bridge|host|none`, a wrong network, or wrong DNS pinning —
+    approved tool argv cannot override the egress policy.
+  - **Fail closed:** policy build (`build_policy`) raises on empty/dangerous
+    scope (loopback, link-local incl. cloud metadata 169.254.169.254,
+    multicast, unspec are stripped even if operator-listed); establishment
+    failure, post-program verification drift, or a spawn-time verification
+    failure halts Zone B with an audited reason (`egress_policy_failed` /
+    `zone_b_blocked`) — never default-bridge execution.
+  - **Audit:** `egress_policy_established` (with the policy summary),
+    `egress_policy_failed`, and per-run spawns only after verification;
+    teardown at engagement end removes ONLY this engagement's chain, jumps
+    and network.
+  - Why this works with gVisor: once a packet leaves the sandbox container
+    across the veth onto the host it is ordinary host-netns traffic filtered
+    by the host's netfilter — independent of the guest runtime. gVisor's
+    netstack does not implement netfilter (no in-container iptables), and
+    netns-sharing topologies (`network_mode: container:` / `service:`) are
+    the recorded WSL2/gVisor incompatibility; both approaches are avoided.
+- **Honest residuals:** the L3 boundary pins the DNS resolver set but cannot
+  inspect DNS payloads (a tool could park exfiltration data in query names
+  sent to the allowed resolvers); an authorized destination whose DNS record
+  rotates after policy creation resolves to an unallowlisted address and is
+  dropped (fail-closed) until the operator widens scope or starts a new
+  engagement. The runtime smoke test runs `--network none`, which is
+  preflight only and unrelated to this boundary.
 
 ## 6. Fail-closed paths (checked)
 
@@ -115,4 +139,7 @@ sandbox boundary, and a dedicated approval gate.
 | docker CLI crash / KeyboardInterrupt / SystemExit | container killed before re-raise or reporting; never left running |
 | Allowlist refusal | audited rejection, nothing spawned, counted as skipped |
 | Spawn isolation flags missing | **spawn refused outright, launcher never invoked** (new guard) |
+| Egress boundary cannot be established or verify drifts | **Zone B blocked** (`egress_policy_failed`, then `zone_b_blocked` in each state); no default-bridge fallback |
+| Spawn argv tampered off the engagement network / DNS pinning | **spawn refused outright** (`missing_egress_flags`) |
+| Engagement ends (any outcome) | egress chain/jumps/network removed (only ours); fail-safe leftover = default-deny |
 | Orchestrator budget exhaustion | deterministic `budget_exhausted` halt |

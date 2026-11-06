@@ -81,7 +81,7 @@ def test_purple_subprocess_use_is_sandbox_and_runtime_checks_only():
     the host. Any new ``subprocess`` import under purple/ must be added
     here consciously — and the first question must be: is this tool
     execution? Then it belongs in the sandbox instead."""
-    allowed = {"sandbox.py", "runtime_checks.py"}
+    allowed = {"sandbox.py", "runtime_checks.py", "egress.py"}
     offenders = [
         str(p.relative_to(PURPLE))
         for p in _iter_python(PURPLE)
@@ -92,9 +92,10 @@ def test_purple_subprocess_use_is_sandbox_and_runtime_checks_only():
     assert offenders == [], (
         "purple modules may not open host processes directly; tool "
         "execution goes through KaliSandbox.spawn, docker management "
-        "through sandbox.py/runtime_checks.py"
+        "through sandbox.py/runtime_checks.py, the network-egress "
+        "boundary through egress.py"
     )
-    # and the two known docker-management surfaces stay covered by this test
+    # and the three known docker/firewall-management surfaces stay covered
     scanned = {str(p.relative_to(PURPLE)) for p in _iter_python(PURPLE)}
     assert allowed <= scanned
 

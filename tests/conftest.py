@@ -35,3 +35,63 @@ def _member(request, monkeypatch):
         lambda cfg: license.VerifyResult(status=license.VALID, message="test member"),
     )
 
+
+@pytest.fixture(autouse=True)
+def _egress_boundary(request, monkeypatch):
+    """The Zone B network-egress boundary is stood up and verified with the
+    host's docker daemon and firewall — real work the test suite cannot do
+    (and must not do). This fixture gives every runner-driven test a
+    working boundary WITHOUT touching the host: `build_policy` returns a
+    real EgressPolicy built from literal addresses (no DNS), and
+    `EgressGate` is replaced by a recording fake whose establish/verify
+    succeed.
+
+    test_egress.py keeps the REAL classes for its gate-level tests via
+    its own import-time bindings, and tests that need a failing boundary
+    patch the module attributes themselves. The integration test file is
+    skipped here because it must use the REAL boundary against a real
+    daemon.
+    """
+    if Path(str(request.node.fspath)).name == "test_egress_integration.py":
+        return
+    import ipaddress
+
+    from kryonsec.purple import egress
+
+    def _fake_build_policy(cfg, engagement_id, target, resolver=None):
+        resolvers = tuple(
+            ipaddress.ip_address(r) for r in cfg.zone_b_dns_resolvers)
+        return egress.EgressPolicy(
+            engagement_id=engagement_id,
+            target=target,
+            network_name="kryonsec-egress-test0",
+            bridge_name="ksbtest000",
+            chain_name="KRYONSEC-EGRESS-test",
+            subnet=ipaddress.ip_network(cfg.zone_b_subnet, strict=False),
+            v4_allowed=(ipaddress.ip_network("203.0.113.0/24"),),
+            v6_allowed=(),
+            dns_resolvers=resolvers,
+        )
+
+    class _FakeGate:
+        def __init__(self, run_fn=None):
+            self.run_fn = run_fn
+            self.establish_calls: list = []
+            self.verify_calls: list = []
+            self.release_calls: list = []
+
+        def establish(self, policy):
+            self.establish_calls.append(policy.engagement_id)
+            return True, "ok"
+
+        def verify(self, policy):
+            self.verify_calls.append(policy.engagement_id)
+            return True, "ok"
+
+        def release(self, policy):
+            self.release_calls.append(policy.engagement_id)
+            return True, "ok"
+
+    monkeypatch.setattr(egress, "build_policy", _fake_build_policy)
+    monkeypatch.setattr(egress, "EgressGate", _FakeGate)
+
