@@ -275,10 +275,11 @@ class KaliSandbox:
         # Zone B network egress (Phase 1E): when the engagement has an
         # egress policy, every spawn runs on the DEDICATED engagement
         # bridge (never the default bridge), with DNS pinned to the
-        # policy's resolver set. The host DOCKER-USER firewall (built by
-        # EgressGate) filters every packet leaving that bridge; `spawn`
-        # re-verifies the boundary before each launch and refuses to run
-        # when it is missing or drifted.
+        # policy's resolver set. The host firewall (built by EgressGate:
+        # DOCKER-USER for forwarded traffic, INPUT for host-local
+        # delivery since Phase 1E.1) filters every packet from that
+        # bridge; `spawn` re-verifies the boundary before each launch
+        # and refuses to run when it is missing or drifted.
         if getattr(self, "egress_policy", None) is not None:
             argv += ["--network", self.egress_policy.network_name]
             for resolver in self.egress_policy.dns_resolvers:

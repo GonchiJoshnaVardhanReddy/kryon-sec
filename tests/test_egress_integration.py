@@ -16,23 +16,34 @@ Safety/authorization:
   machine already reaches; no scanning, no exploitation.
 
 Run explicitly:  KRYONSEC_EGRESS_INTEGRATION=1  on a Linux host with
-Docker + gVisor + non-interactive sudo for iptables. Skipped silently
-in the regular suite — this is the expected default on dev machines;
-an unexercised boundary must never be reported as production-verified.
+Docker + gVisor + programming privileges for iptables/ip6tables (run
+under a non-interactive-root-capable sudo, e.g. `sudo -E
+env KRYONSEC_EGRESS_INTEGRATION=1 .venv/bin/python -m pytest ...`, since
+the egress gate programs the host firewall the same way a live engagement
+does). Skipped silently in the regular suite — this is the expected
+default on dev machines; an unexercised boundary must never be reported
+as production-verified.
 """
 
 from __future__ import annotations
 
+import http.server
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
+import urllib.request
 
 import pytest
 
 from kryonsec.config import KryonsecConfig
 from kryonsec.purple.egress import (  # real bindings (import time)
     EgressGate,
+    _fw_prefix,
+    _input_jump_argv,
     build_policy,
     release_active,
 )
@@ -84,18 +95,28 @@ def test_establish_programs_a_real_firewall_and_release_removes_it():
             ["docker", "network", "inspect", policy.network_name],
             capture_output=True, text=True, timeout=30)
         assert inspect.returncode == 0, inspect.stderr
-        assert "com.docker.network.bridge.enable_icc=false" in inspect.stdout
-        # 2) the rules exist in the REAL kernel, both families: the
-        # default-deny DROP plus the exact authorized /32
-        allowed_v4 = [str(n) for n in policy.v4_allowed]
-        for cmd in ("iptables", "ip6tables"):
+        netinfo = json.loads(inspect.stdout)[0]
+        assert netinfo["Options"].get(
+            "com.docker.network.bridge.enable_icc") == "false"
+        # 2) the rules exist in the REAL kernel: default-deny DROP, the
+        # family's authorized destinations, and the INPUT jump that
+        # guards host-LOCAL delivery
+        for cmd, allowed in (("iptables", policy.v4_allowed),
+                             ("ip6tables", policy.v6_allowed)):
             dump = subprocess.run(
                 prefix + [cmd, "-S", policy.chain_name],
                 capture_output=True, text=True, timeout=30)
             assert dump.returncode == 0, (cmd, dump.stderr)
             assert "-j DROP" in dump.stdout
-            for net in allowed_v4:
+            for net in [str(n) for n in allowed]:
                 assert f"-d {net}" in dump.stdout
+            indump = subprocess.run(
+                prefix + [cmd, "-S", "INPUT"],
+                capture_output=True, text=True, timeout=30)
+            assert indump.returncode == 0, (cmd, indump.stderr)
+            # -S prints "-A INPUT -i <bridge> -j <chain>" — no insert pos
+            jump_body = " ".join(_input_jump_argv(policy)[3:])
+            assert jump_body in indump.stdout, indump.stdout
     finally:
         gate.release(policy)
         # teardown removed everything of ours
@@ -105,6 +126,11 @@ def test_establish_programs_a_real_firewall_and_release_removes_it():
                 capture_output=True, text=True, timeout=30)
             assert dump.returncode != 0, (
                 f"{cmd} chain survived teardown: {dump.stdout}")
+            indump = subprocess.run(
+                prefix + [cmd, "-S", "INPUT"],
+                capture_output=True, text=True, timeout=30)
+            assert " ".join(_input_jump_argv(policy)[3:]) not in indump.stdout, \
+                f"{cmd} INPUT jump survived teardown"
         inspect = subprocess.run(
             ["docker", "network", "inspect", policy.network_name],
             capture_output=True, text=True, timeout=30)
@@ -135,13 +161,17 @@ def test_sandbox_packets_are_scoped_to_the_engineering_boundary():
 
         sb = KaliSandbox(cfg=cfg, egress_policy=policy, egress_gate=gate)
 
-        # ALLOWED: HTTPS to the Cloudflare resolver endpoint
+        # ALLOWED: HTTPS to the Cloudflare resolver endpoint. The exact
+        # status is 1.1.1.1's business (it answers 200; live checks show
+        # 301 = redirect to one.one.one.one); what the boundary test
+        # proves is that the connection COMPLETED.
         allowed = sb.spawn(
-            ["curl", "--max-time", "15", "-o", "/dev/null",
+            ["curl", "-s", "--max-time", "15", "-o", "/dev/null",
              "-w", "%{http_code}", "https://1.1.1.1/"])
         assert allowed.ok, allowed.error
         assert allowed.exit_code == 0, allowed.stdout
-        assert allowed.stdout.strip() == "200", allowed.stdout
+        assert allowed.stdout.strip() in ("200", "301", "302"), \
+            allowed.stdout
 
         # BLOCKED: another public resolver is NOT in the allowlist —
         # curl must time out (exit 28), i.e. the packets were dropped,
@@ -200,3 +230,142 @@ def test_dns_outside_pinned_resolvers_is_blocked():
     finally:
         gate.release(policy)
         release_active("eng-integ-dns0")
+
+
+def _chain_drop_counter(prefix: list[str], chain_name: str) -> int:
+    """Total packets hitting the DROP rules of our REAL chain — the
+    unforgeable evidence that out-of-policy packets were received and
+    dropped (not merely unreachable for some other reason)."""
+    dump = subprocess.run(
+        prefix + ["iptables", "-v", "-n", "-L", chain_name, "-x"],
+        capture_output=True, text=True, timeout=30)
+    assert dump.returncode == 0, dump.stderr
+    total = 0
+    for line in dump.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[2] == "DROP":
+            total += int(fields[0])
+    return total
+
+
+def _host_primary_ip() -> str:
+    """The host's own IPv4 on its default interface — WITHOUT sending
+    any packet (UDP connect only picks the route/socket address)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("203.0.113.1", 80))  # TEST-NET-3: unroutable target
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+class _IntegrationHandler(http.server.BaseHTTPRequestHandler):
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        body = b"kryonsec-egress-integration-endpoint"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # keep the test output clean
+        pass
+
+
+@_env_gated
+def test_container_to_host_local_traffic_is_blocked():
+    """The Phase 1E.1 bypass case, proven on a REAL kernel: traffic from
+    the sandbox to the bridge GATEWAY IP and to the host's OWN IP is
+    routed to the host's INPUT chain and never traverses
+    FORWARD/DOCKER-USER. With the INPUT jump programmed, both endpoints
+    must be dropped (curl exit 28) even though the host really listens
+    there — and the chain's DROP counter must climb, proving the drops
+    were made BY OUR RULES and not by an unreachable listener.
+    Endpoints are disposable local listeners only."""
+    _skip_unless_host_can_program_fw()
+    prefix = _sudo_prefix()
+
+    # environment fingerprint (recorded, not decisive): which firewall
+    # backend this boundary was genuinely exercised against
+    ver = subprocess.run(["iptables", "--version"], capture_output=True,
+                         text=True, timeout=30)
+    backend = (ver.stdout or "").strip()
+    print(f"\nfirewall backend: {backend}")
+
+    cfg = KryonsecConfig()
+    cfg.zone_b_allowed_cidrs = ["203.0.113.0/24"]
+    cfg.zone_b_dns_resolvers = ["1.1.1.1"]
+    policy = build_policy(
+        cfg, "eng-integ-local0", "203.0.113.10",
+        resolver=lambda h: [(2, 1, 6, "", ("203.0.113.10", 0))])
+    gate = EgressGate()
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _IntegrationHandler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        ok, reason = gate.establish(policy)
+        assert ok, f"boundary establishment failed: {reason}"
+        assert gate.verify(policy) == (True, "ok")
+
+        # the REAL gateway IP of OUR engagement network
+        gw = subprocess.run(
+            ["docker", "network", "inspect", "-f",
+             "{{(index .IPAM.Config 0).Gateway}}", policy.network_name],
+            capture_output=True, text=True, timeout=30)
+        assert gw.returncode == 0, gw.stderr
+        gateway = gw.stdout.strip()
+        assert gateway == str(policy.subnet.network_address + 1)
+        host_ip = _host_primary_ip()
+
+        # positive listener control: the endpoint itself really serves
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/", timeout=5) as resp:
+            assert resp.status == 200
+
+        before = _chain_drop_counter(prefix, policy.chain_name)
+
+        sb = KaliSandbox(cfg=cfg, egress_policy=policy, egress_gate=gate)
+
+        # 1) container -> bridge gateway IP (the Docker host) — INPUT path
+        to_gateway = sb.spawn(
+            ["curl", "--connect-timeout", "6", "--max-time", "8", "-o",
+             "/dev/null", "-sS", f"http://{gateway}:{port}/"])
+        assert to_gateway.exit_code == 28, (
+            f"the sandbox reached a host-local endpoint THROUGH the "
+            f"boundary (gateway {gateway}:{port}, exit "
+            f"{to_gateway.exit_code}) — the INPUT path is not filtered")
+
+        # 2) container -> the host's own IP (host services / proxies)
+        to_host = sb.spawn(
+            ["curl", "--connect-timeout", "6", "--max-time", "8", "-o",
+             "/dev/null", "-sS", f"http://{host_ip}:{port}/"])
+        assert to_host.exit_code == 28, (
+            f"the sandbox reached the host's own service THROUGH the "
+            f"boundary (host {host_ip}:{port}, exit "
+            f"{to_host.exit_code}) — the INPUT path is not filtered")
+
+        # packet-level evidence: our chain witnessed and dropped them
+        after = _chain_drop_counter(prefix, policy.chain_name)
+        assert after >= before + 2, (
+            f"DROP counter did not climb ({before} -> {after}): the "
+            "refusals were NOT produced by the egress chain — investigate")
+
+        # the listener still works host-side after all of this
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/", timeout=5) as resp:
+            assert resp.status == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        gate.release(policy)
+        release_active("eng-integ-local0")
+        # the INPUT jump must be gone: no lasting restriction on the host
+        for cmd in ("iptables", "ip6tables"):
+            dump = subprocess.run(
+                prefix + [cmd, "-S", "INPUT"],
+                capture_output=True, text=True, timeout=30)
+            assert " ".join(_input_jump_argv(policy)[3:]) not in dump.stdout, \
+                f"{cmd} INPUT jump survived teardown"

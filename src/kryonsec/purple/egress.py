@@ -15,7 +15,10 @@ destinations. The enforcement is at the host network layer:
   in-container iptables was never an option, and netns-sharing
   topologies such as ``network_mode=container:...`` are the recorded
   WSL2/gVisor incompatibility — not repeated here);
-- scoped: rules match ONLY the engagement bridge in/out, so unrelated
+- scoped: rules match ONLY the engagement bridge in/out (FORWARD via the
+  host's DOCKER-USER chain, and host-LOCAL delivery via the INPUT chain —
+  the gateway IP and any service the host listens on would otherwise be
+  reachable without ever traversing DOCKER-USER), so unrelated
   containers and host traffic pass untouched;
 - always default-deny: no allow rule means the packet is dropped; DNS
   egress is permitted only to the configured resolver set; and the
@@ -311,10 +314,31 @@ def _jump_argv(policy: EgressPolicy, direction_flag: str) -> list[str]:
     ]
 
 
+def _input_jump_argv(policy: EgressPolicy) -> list[str]:
+    """Host-LOCAL deliverability (INPUT) is a separate netfilter reach:
+    a packet to the bridge gateway IP or any other host-owned address
+    (host services, published ports behind a host proxy) is routed to
+    the host's INPUT chain and NEVER traverses FORWARD/DOCKER-USER.
+    Without this jump a container could reach whatever the host listens
+    on. Scoped exactly like the others: only OUR bridge interface.
+    """
+    return [
+        "-I", "INPUT", "1",
+        "-i", policy.bridge_name, "-j", policy.chain_name,
+    ]
+
+
 def _jump_remove_argv(jump: list[str]) -> list[str]:
+    """The delete is the rule-SPEC of the insert, WITHOUT the numeric
+    insert position: real iptables refuses a mixed `-D CHAIN 1 -i ...`
+    form ('Bad rule'), and the release path is best-effort, so the
+    failure was silent — a genuine-kernel defect caught by the Phase
+    1E.1 integration run (jumps survived teardown on both built-ins).
+    Only the spec-only form actually deletes."""
     out = list(jump)
-    out[out.index("-I")] = "-D"
-    return out
+    out[0] = "-D"
+    i = next(k for k, t in enumerate(out) if t in ("-i", "-o"))
+    return [out[0], out[1]] + out[i:]
 
 
 def _chain_rules(policy: EgressPolicy, cmd: str) -> "list[list[str]]":
@@ -364,7 +388,7 @@ def _rule_body(argv: list[str]) -> str:
     '-A <chain>' prefix. Works for our argv forms too, whether the rule
     starts with -A or is a DOCKER-USER jump (whose numeric insert
     position the dumps never carry)."""
-    if argv[1] == "DOCKER-USER":
+    if argv[1] in ("DOCKER-USER", "INPUT"):
         i = next(k for k, t in enumerate(argv) if t in ("-i", "-o"))
         return " ".join(argv[i:])
     return " ".join(argv[2:])
@@ -379,10 +403,55 @@ def _dumped_body(line: str) -> str:
 
 
 def _has_rule(dump: str, argv: list[str]) -> bool:
-    """Whether a ruleset dump contains this exact rule — full body
-    match: presence is verified, never assumed."""
-    body = _rule_body(argv)
-    return any(_dumped_body(l) == body for l in dump.splitlines())
+    """Whether a ruleset dump contains this rule — presence verified,
+    never assumed. The comparison is SEMANTIC, not textual: a real
+    nf_tables backend prints rules normalised (ctstate members in
+    canonical order, implicit masks spelled out, implicit match
+    modules added, match options reordered) so a literal string match
+    always fails on a real host while the rule is actually there."""
+    want = _rule_canon(_rule_body(argv).split())
+    if not want:
+        return False
+    for line in dump.splitlines():
+        got = _rule_canon(_dumped_body(line).split())
+        if got and got == want:
+            return True
+    return False
+
+
+def _rule_canon(tokens: "list[str]") -> "frozenset[str]":
+    """One rule's option tokens, normalised to an order-insensitive,
+    mask/module-agnostic form of (flag, value) pairs.
+
+    - `--ctstate A,B` -> members sorted (nft canon order is arbitrary)
+    - bare `-d/-s` addresses get their implicit /32 or /128
+    - a redundant `-m X` right beside `-p X` is dropped (nft prints it)
+    Pairs compare as an unordered set: rule sameness is its option
+    set, not the print order."""
+    if not tokens:
+        return frozenset()
+    # the -p value, so we can drop the redundant -m p value nft prints
+    p_val = None
+    for k, t in enumerate(tokens):
+        if t == "-p" and k + 1 < len(tokens):
+            p_val = tokens[k + 1]
+    canon: list = []
+    k = 0
+    while k < len(tokens):
+        t = tokens[k]
+        val = tokens[k + 1] if k + 1 < len(tokens) else ""
+        if t in ("--ctstate",):
+            canon.append(f"{t} {','.join(sorted(val.split(',')))}")
+            k += 2
+            continue
+        if t in ("-d", "-s") and "/" not in val:
+            val += "/32" if "." in val else "/128"
+        if t == "-m" and val and val == p_val:
+            k += 2
+            continue
+        canon.append(f"{t} {val}")
+        k += 2
+    return frozenset(canon)
 
 
 class EgressGate:
@@ -481,10 +550,12 @@ class EgressGate:
         """
         argv = _fw_prefix()
         ok, out = self._fw(argv + [cmd, "-S", policy.chain_name])
-        # remove OUR jumps first: deleting (-X) a chain that DOCKER-USER
-        # still references would fail on a real host
-        for jump in (_jump_argv(policy, "-i"), _jump_argv(policy, "-o")):
-            self._fw(argv + [cmd] + _jump_remove_argv(jump))
+        # remove OUR jumps first, from BOTH built-ins (INPUT and
+        # DOCKER-USER): deleting (-X) a chain that is still referenced
+        # would fail on a real host
+        for base in (_jump_argv(policy, "-i"), _jump_argv(policy, "-o"),
+                     _input_jump_argv(policy)):
+            self._delete_jump(cmd, argv, base)
         if ok:
             # recreate cleanly — the chain exists but its content may be
             # from an earlier run with a different policy
@@ -493,10 +564,15 @@ class EgressGate:
         ok_n, err_n = self._fw(argv + [cmd, "-N", policy.chain_name])
         if not ok_n and "already exists" not in err_n:
             return False, f"cannot create chain {policy.chain_name}: {err_n}"
-        for jump in (_jump_argv(policy, "-i"), _jump_argv(policy, "-o")):
+        for jump in (
+                _input_jump_argv(policy),
+                _jump_argv(policy, "-i"),
+                _jump_argv(policy, "-o"),
+        ):
             ok_j, err = self._fw(argv + [cmd] + jump)
             if not ok_j:
-                return False, f"DOCKER-USER jump failed: {err.strip()[:200]}"
+                return False, (
+                    f"{jump[1]} jump failed: {err.strip()[:200]}")
         for rule in _chain_rules(policy, cmd):
             ok_r, err = self._fw(argv + [cmd] + rule)
             if not ok_r:
@@ -505,11 +581,28 @@ class EgressGate:
                     f"{err.strip()[:200]}")
         return True, "ok"
 
+    def _delete_jump(
+            self, cmd: str, argv: list[str], jump: list[str],
+    ) -> "tuple[bool, str]":
+        """A real `-D` deletes only the FIRST matching rule; a jump can
+        exist twice (e.g. a previous release whose deletion form was
+        silently refused). Delete, re-check via `-S`, repeat — bounded;
+        reporting (gone, why) so release can surface a stubborn jump."""
+        builtin = jump[1]
+        for _ in range(4):
+            self._fw(argv + [cmd] + _jump_remove_argv(jump))
+            ok_s, out = self._fw(argv + [cmd, "-S", builtin])
+            if not ok_s or not _has_rule(out, jump):
+                return True, "ok"
+        return False, (
+            f"{cmd} {builtin} jump still present after delete: "
+            f"{_rule_body(jump)}")
+
     def verify(self, policy: EgressPolicy) -> "tuple[bool, str]":
         """The post-state must reproduce the policy: network present at
         the policy subnet, our chain ends in an absolute DROP, every
-        allow/DNS rule present, both DOCKER-USER jumps in place — in
-        BOTH families. Any drift fails the boundary."""
+        allow/DNS rule present, both DOCKER-USER jumps AND the INPUT
+        jump in place — in BOTH families. Any drift fails the boundary."""
         ok, reason = self._network_subnet_matches(policy)
         if not ok:
             return False, reason
@@ -530,20 +623,30 @@ class EgressGate:
                     return False, (
                         f"{cmd} DOCKER-USER missing jump: "
                         f"{_rule_body(jump)}")
+            ok_i, out = self._fw(argv + [cmd, "-S", "INPUT"])
+            if not ok_i:
+                return False, f"{cmd} INPUT chain unreadable"
+            if not _has_rule(out, _input_jump_argv(policy)):
+                return False, (
+                    f"{cmd} INPUT missing jump: "
+                    f"{_rule_body(_input_jump_argv(policy))}")
         return True, "ok"
 
     def release(self, policy: EgressPolicy) -> "tuple[bool, str]":
         """Best-effort teardown of OUR rules + network; idempotent.
 
-        Removes only our exact chain and our two DOCKER-USER jumps, then
-        the network. Other chains, other networks and host rules are
-        untouched.
+        Removes only our exact chain, our DOCKER-USER jumps and our INPUT
+        jump, then the network. Other chains, other networks and host
+        rules are untouched.
         """
         problems: list[str] = []
         for cmd in ("iptables", "ip6tables"):
             argv = _fw_prefix()
-            for jump in (_jump_argv(policy, "-i"), _jump_argv(policy, "-o")):
-                self._fw(argv + [cmd] + _jump_remove_argv(jump))
+            for jump in (_jump_argv(policy, "-i"), _jump_argv(policy, "-o"),
+                         _input_jump_argv(policy)):
+                gone, why = self._delete_jump(cmd, argv, jump)
+                if not gone:
+                    problems.append(why)
             self._fw(argv + [cmd, "-F", policy.chain_name])
             self._fw(argv + [cmd, "-X", policy.chain_name])
         ok, _, err = self._docker([

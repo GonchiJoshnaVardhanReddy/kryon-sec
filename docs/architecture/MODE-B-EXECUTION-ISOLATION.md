@@ -101,7 +101,12 @@ sandbox boundary, and a dedicated approval gate.
     (`KRYONSEC-EGRESS-<id8>`) for BOTH embodiments (`iptables` and
     `ip6tables`), matching only that bridge in/out: allow ESTABLISHED,RELATED;
     DNS (udp/tcp 53) only to the pinned resolver set; allow only the
-    engagement's authorized destinations; absolute DROP.
+    engagement's authorized destinations; absolute DROP. **Phase 1E.1:** the
+    same chain is ALSO jumped from the host's `INPUT` chain (`-i` the
+    engagement bridge only) — traffic to the gateway IP or any host-owned
+    address is routed to INPUT and would otherwise never traverse
+    DOCKER-USER (container → host services / published ports / host proxy
+    bypass).
   - `spawn()` re-verifies the boundary before every launch and hard-rejects
     `--network bridge|host|none`, a wrong network, or wrong DNS pinning —
     approved tool argv cannot override the egress policy.
@@ -113,8 +118,8 @@ sandbox boundary, and a dedicated approval gate.
     `zone_b_blocked`) — never default-bridge execution.
   - **Audit:** `egress_policy_established` (with the policy summary),
     `egress_policy_failed`, and per-run spawns only after verification;
-    teardown at engagement end removes ONLY this engagement's chain, jumps
-    and network.
+    teardown at engagement end removes ONLY this engagement's chain, its
+    three jumps per family (INPUT + 2 DOCKER-USER) and network.
   - Why this works with gVisor: once a packet leaves the sandbox container
     across the veth onto the host it is ordinary host-netns traffic filtered
     by the host's netfilter — independent of the guest runtime. gVisor's

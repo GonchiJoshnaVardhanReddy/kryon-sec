@@ -26,6 +26,10 @@ from kryonsec.purple.egress import (  # real bindings (import time)
     EgressGate,
     _chain_rules,
     _fw_prefix,
+    _has_rule,
+    _input_jump_argv,
+    _jump_argv,
+    _jump_remove_argv,
     build_policy,
     network_create_argv,
     register_active,
@@ -61,28 +65,35 @@ class ScriptedHost:
         self.net_create_error = None
         # per-family iptables state: {"iptables": {...}, "ip6tables": {...}}
         self.fw = {
-            fam: {"existing": set(), "rules": {}, "jumps": []}
+            fam: {"existing": set(), "rules": {},
+                  "jumps": {"DOCKER-USER": [], "INPUT": []}}
             for fam in ("iptables", "ip6tables")
         }
         self.record = []
 
     # -- state helpers for tests --------------------------------------------
 
-    @property
-    def chains(self):
-        """The iptables (v4) chain rules map — the common case."""
-        return self._fw_state("iptables").get("rules")
-
     def _fw_state(self, fam):
         return self.fw[fam]
 
     def all_jumps(self) -> list[str]:
-        return self._fw_state("iptables")["jumps"] + \
-            self._fw_state("ip6tables")["jumps"]
+        out = []
+        for st in self.fw.values():
+            for jumps in st["jumps"].values():
+                out.extend(jumps)
+        return out
 
     def clear_jumps(self) -> None:
         for st in self.fw.values():
-            st["jumps"] = []
+            for name in st["jumps"]:
+                st["jumps"][name] = []
+
+    def clear_builtin_jumps(self, builtin: str) -> None:
+        for st in self.fw.values():
+            st["jumps"][builtin] = []
+
+    def input_jumps(self, fam: str) -> list[str]:
+        return self.fw[fam]["jumps"]["INPUT"]
 
     def remove_rule(self, fam: str, chain: str, body: str) -> None:
         st = self.fw[fam]
@@ -142,8 +153,8 @@ class ScriptedHost:
         st = self._fw_state(fam)
         if op == "-S":
             name = tokens[2]
-            if name == "DOCKER-USER":
-                lines = [f"-A DOCKER-USER {j}" for j in st["jumps"]]
+            if name in ("DOCKER-USER", "INPUT"):
+                lines = [f"-A {name} {j}" for j in st["jumps"].get(name, [])]
                 return self._done(0, "\n".join(lines), "")
             if name not in st["existing"]:
                 return self._done(1, "", f"Chain '{name}' does not exist")
@@ -158,11 +169,12 @@ class ScriptedHost:
             return self._done(0, "", "")
         if op in ("-A", "-I"):
             name, body_tok = tokens[2], tokens[3:]
-            if name == "DOCKER-USER":
+            if name in ("DOCKER-USER", "INPUT"):
                 # jump install: keep the direction-flagged body, like -S prints
                 i = next(k for k, t in enumerate(body_tok)
                          if t in ("-i", "-o"))
-                st["jumps"].append(" ".join(body_tok[i:]))
+                st["jumps"].setdefault(name, []).append(
+                    " ".join(body_tok[i:]))
                 return self._done(0, "", "")
             if name not in st["existing"]:
                 return self._done(1, "", f"Chain '{name}' does not exist")
@@ -179,11 +191,14 @@ class ScriptedHost:
             return self._done(0, "", "")
         if op == "-D":
             name, body_tok = tokens[2], tokens[3:]
-            if name == "DOCKER-USER":
+            if name in ("DOCKER-USER", "INPUT"):
                 i = next(k for k, t in enumerate(body_tok)
                          if t in ("-i", "-o"))
                 body = " ".join(body_tok[i:])
-                st["jumps"] = [j for j in st["jumps"] if j != body]
+                jumps = st["jumps"].get(name, [])
+                if body in jumps:
+                    # real iptables deletes only the FIRST match
+                    jumps.remove(body)
                 return self._done(0, "", "")
             return self._done(1, "", f"unexpected -D on {name}")
         return self._done(1, "", f"unexpected fw op {tokens}")
@@ -349,7 +364,8 @@ def test_gate_establish_happy_path():
     assert host.network_exists
     for fam in ("iptables", "ip6tables"):
         assert p.chain_name in host.fw[fam]["existing"]
-    assert len(host.all_jumps()) == 4  # 2 directions x 2 families
+        assert len(host.input_jumps(fam)) == 1
+    assert len(host.all_jumps()) == 6  # 3 builtins x 2 families
 
 
 def test_gate_establish_is_idempotent():
@@ -400,13 +416,13 @@ def test_gate_establish_rolls_back_when_family_programming_fails():
     original = host._fw
 
     def broken_add(tokens):
-        if tokens[1] in ("-A", "-I") and tokens[2] == "DOCKER-USER":
+        if tokens[1] in ("-A", "-I") and tokens[2] == "INPUT":
             return host._done(1, "", "iptables: rule refused by host")
         return original(tokens)
 
     host._fw = broken_add
     ok, reason = EgressGate(run_fn=host).establish(p)
-    assert not ok and "DOCKER-USER jump failed" in reason
+    assert not ok and "INPUT jump failed" in reason
     # rolled back: the network is gone again
     assert not host.network_exists
 
@@ -434,6 +450,94 @@ def test_gate_verify_fails_on_missing_jump():
     assert not ok and "DOCKER-USER missing jump" in reason
 
 
+NFT_DEDUMP = (
+    "-A CHAIN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n"
+    "-A CHAIN -d 1.1.1.1/32 -p udp -m udp --dport 53 -j ACCEPT\n"
+    "-A CHAIN -d 203.0.113.10/32 -j ACCEPT\n"
+    "-A CHAIN -j DROP\n"
+)
+
+
+def test_has_rule_matches_nft_normalized_dump():
+    """REAL nft dump text (captured live on nf_tables backend): rule
+    presence is semantic — orders and masks and implicit -m differ —
+    while the same rule written via our argv must still be FOUND."""
+    # these exact argv bodies were programmed before the real dump:
+    assert _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-m", "conntrack",
+                                  "--ctstate", "ESTABLISHED,RELATED",
+                                  "-j", "ACCEPT"])
+    assert _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-p", "udp",
+                                  "--dport", "53", "-d", "1.1.1.1",
+                                  "-j", "ACCEPT"])
+    assert _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-d", "203.0.113.10",
+                                  "-j", "ACCEPT"])
+    assert _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-j", "DROP"])
+    # and a DIFFERENT rule must not certify the chain
+    assert not _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-p", "udp",
+                                      "--dport", "53", "-d", "8.8.8.8",
+                                      "-j", "ACCEPT"])
+    assert not _has_rule(NFT_DEDUMP, ["-A", "CHAIN", "-j", "ACCEPT"])
+
+
+def test_input_jump_argv_is_exact_and_scoped():
+    p = make_policy()
+    jump = _input_jump_argv(p)
+    assert jump == ["-I", "INPUT", "1", "-i", p.bridge_name,
+                    "-j", p.chain_name]
+    # the removal is the rule-spec ONLY: real iptables refuses the
+    # mixed `-D INPUT 1 -i ...` form and silently leaves the rule
+    assert _jump_remove_argv(jump) == ["-D", "INPUT", "-i",
+                                       p.bridge_name, "-j", p.chain_name]
+
+
+def test_jump_remove_argv_drops_position_for_docker_user():
+    """Same spec-only delete rule for the DOCKER-USER jumps — the
+    genuine-kernel run caught stale jumps there too (Phase 1E's
+    position+spec form never deleted anything)."""
+    p = make_policy()
+    jump = _jump_argv(p, "-i")
+    assert jump[:3] == ["-I", "DOCKER-USER", "1"]
+    assert _jump_remove_argv(jump) == ["-D", "DOCKER-USER", "-i",
+                                       p.bridge_name, "-j", p.chain_name]
+
+
+def test_gate_release_removes_duplicate_jumps():
+    """Real `-D` removes only the FIRST match: a duplicate jump left by
+    an older broken release must not survive the release. The removal
+    loops delete-and-recheck until `-S` shows the jump gone."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    gate = EgressGate(run_fn=host)
+    ok, reason = gate.establish(p)
+    assert ok, reason
+    # simulate an old leftover: the v4 INPUT jump exists TWICE
+    body = host.fw["iptables"]["jumps"]["INPUT"][0]
+    host.fw["iptables"]["jumps"]["INPUT"].append(body)
+    ok, reason = gate.release(p)
+    assert ok, reason
+    for st in host.fw.values():
+        for jumps in st["jumps"].values():
+            assert not jumps
+    assert not host.network_exists
+
+
+def test_gate_verify_fails_on_missing_input_jump():
+    """The host-local deliverability path (INPUT) is part of the
+    boundary: without it, container -> host services / gateway IP would
+    bypass the DOCKER-USER filter. Per-family INPUT drift (while the
+    DOCKER-USER jumps are present) must fail the boundary."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    gate = EgressGate(run_fn=host)
+    ok, reason = gate.establish(p)
+    assert ok, reason
+    # family-scoped drift: ip6tables loses its INPUT jump while its
+    # DOCKER-USER jumps stay — only the INPUT check can catch this
+    host.fw["ip6tables"]["jumps"]["INPUT"] = []
+    ok, reason = gate.verify(p)
+    assert not ok and "ip6tables INPUT missing jump" in reason
+
+
 def test_gate_release_is_scoped_to_our_rules_only():
     p = make_policy()
     host = ScriptedHost(p)
@@ -447,6 +551,10 @@ def test_gate_release_is_scoped_to_our_rules_only():
     flushed = {t[2] for t in host.fw_ops("-F")}
     deleted = {t[2] for t in host.fw_ops("-X")}
     assert flushed == deleted == {p.chain_name}
+    # the removals are our jumps only: INPUT + DOCKER-USER, our chain
+    d_ops = host.fw_ops("-D")
+    assert {t[2] for t in d_ops} == {"INPUT", "DOCKER-USER"}
+    assert all(p.chain_name in " ".join(t[3:]) for t in d_ops)
     rmed = [a for a in host.record if a[:3] == ["docker", "network", "rm"]]
     assert rmed == [["docker", "network", "rm", p.network_name]]
     assert not host.network_exists
