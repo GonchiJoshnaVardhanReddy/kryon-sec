@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 PROBE_TIMEOUT_S = 10
+# Container LIFECYCLE calls (create/start/rm) are not probes: a `runsc`
+# cold start of the full sandbox image on WSL2 took longer than the probe
+# timeout, which made a WORKING runtime report "timed out or could not
+# start" in `doctor --deep`. The lifecycle timeout must tolerate a cold
+# start without weakening any check (a hung start still fails cleanly).
+SMOKE_TIMEOUT_S = 120
 
 # Release images are accepted only after the installer resolves them to a
 # registry digest.  Keeping the repository name here avoids several callers
@@ -134,13 +140,16 @@ class ImageCheck:
     info: ImageInfo | None = None
 
 
-def _run_docker(args: list[str]) -> subprocess.CompletedProcess:
-    """Run one read-only Docker CLI query with a bounded timeout."""
+def _run_docker(
+        args: list[str], timeout: "int | float" = PROBE_TIMEOUT_S,
+) -> subprocess.CompletedProcess:
+    """Run one read-only Docker CLI query with a bounded timeout
+    (lifecycle callers may extend it — see SMOKE_TIMEOUT_S)."""
     return subprocess.run(
         ["docker", *args],
         capture_output=True,
         text=True,
-        timeout=PROBE_TIMEOUT_S,
+        timeout=timeout,
     )
 
 
@@ -436,7 +445,11 @@ def runtime_smoke_test(image: str) -> tuple[bool, str]:
     list a runtime that is registered but unusable, and an image can have the
     right metadata while a required file is missing.  The command is harmless:
     it has no network, a read-only root, tight limits, and only asks the image's
-    entrypoint to run a small Python file-existence check.
+    entrypoint to run a small Python file-existence check.  Lifecycle calls
+    (create/start/rm) get the cold-start-tolerant SMOKE_TIMEOUT_S — a WSL2
+    first start of the full image can exceed the fast probe timeout (caught
+    genuinely in the Phase 1E.1 pre-flight) — while read-only queries stay
+    bounded by PROBE_TIMEOUT_S.
     """
     if not shutil.which("docker"):
         return False, "docker CLI not found"
@@ -456,7 +469,7 @@ def runtime_smoke_test(image: str) -> tuple[bool, str]:
     ]
     created = False
     try:
-        proc = _run_docker(create_args)
+        proc = _run_docker(create_args, timeout=SMOKE_TIMEOUT_S)
         if proc.returncode != 0:
             return False, _safe_docker_failure(proc)
         created = True
@@ -465,7 +478,8 @@ def runtime_smoke_test(image: str) -> tuple[bool, str]:
         ])
         if inspected.returncode != 0 or (inspected.stdout or "").strip() != "runsc":
             return False, "Docker did not record runsc as the container runtime"
-        started = _run_docker(["start", "--attach", name])
+        started = _run_docker(["start", "--attach", name],
+                              timeout=SMOKE_TIMEOUT_S)
         if started.returncode != 0:
             detail = (started.stderr or started.stdout or "").strip()[:300]
             return False, (
@@ -478,7 +492,7 @@ def runtime_smoke_test(image: str) -> tuple[bool, str]:
     finally:
         if created:
             try:
-                _run_docker(["rm", "--force", name])
+                _run_docker(["rm", "--force", name], timeout=SMOKE_TIMEOUT_S)
             except (OSError, subprocess.TimeoutExpired):
                 pass
 

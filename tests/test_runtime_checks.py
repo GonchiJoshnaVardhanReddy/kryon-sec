@@ -9,6 +9,7 @@ genuinely missing gVisor install, because the fix is completely different.
 """
 
 from kryonsec.purple import runtime_checks
+from kryonsec.purple.runtime_checks import PROBE_TIMEOUT_S, SMOKE_TIMEOUT_S
 
 
 def _fake_docker_info(monkeypatch, os_string, runtimes="runc"):
@@ -241,8 +242,8 @@ def test_validate_image_accepts_matching_digest_and_release(monkeypatch):
 def test_runtime_smoke_uses_runsc_entrypoint_and_cleans_up(monkeypatch):
     calls = []
 
-    def fake(args):
-        calls.append(args)
+    def fake(args, timeout=PROBE_TIMEOUT_S):
+        calls.append((args, timeout))
         if args[0] == "create":
             return type("Result", (), {"returncode": 0, "stdout": "name", "stderr": ""})()
         if args[0] == "inspect":
@@ -257,8 +258,43 @@ def test_runtime_smoke_uses_runsc_entrypoint_and_cleans_up(monkeypatch):
     monkeypatch.setattr(runtime_checks, "_run_docker", fake)
     ok, detail = runtime_checks.runtime_smoke_test("image@sha256:abc")
     assert ok, detail
-    create = calls[0]
+    create, _create_timeout = calls[0]
     assert "--runtime" in create and create[create.index("--runtime") + 1] == "runsc"
     assert "--network" in create and create[create.index("--network") + 1] == "none"
     assert create[create.index("--entrypoint") + 1] == "/entrypoint.sh"
-    assert calls[-1][0:2] == ["rm", "--force"]
+    assert calls[-1][0][:2] == ["rm", "--force"]
+
+
+def test_runtime_smoke_gives_start_a_cold_start_timeout(monkeypatch):
+    """Genuine 1E.1 pre-flight catch on WSL2: the FIRST `runsc` start of
+    the 9.35 GB sandbox image exceeded the 10 s probe timeout, so
+    doctor --deep reported 'timed out or could not start' although the
+    identical command passes by hand (~6 s warm, cold slower). The
+    probe must give container LIFECYCLE calls (create/start/rm) a wide
+    cold-start-tolerant timeout — read-only queries keep probe speed —
+    without weakening any runtime check."""
+    calls = []
+
+    def fake(args, timeout=PROBE_TIMEOUT_S):
+        calls.append((args, timeout))
+        if args[0] == "create":
+            return type("Result", (), {"returncode": 0, "stdout": "name", "stderr": ""})()
+        if args[0] == "inspect":
+            return type("Result", (), {"returncode": 0, "stdout": "runsc\n", "stderr": ""})()
+        if args[0] == "start":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[0] == "rm":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(runtime_checks.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runtime_checks, "_run_docker", fake)
+    ok, detail = runtime_checks.runtime_smoke_test("image@sha256:abc")
+    assert ok, detail
+    timeouts = {args[0]: t for (args, t) in calls}
+    assert timeouts["create"] == SMOKE_TIMEOUT_S
+    assert timeouts["start"] == SMOKE_TIMEOUT_S
+    assert timeouts["rm"] == SMOKE_TIMEOUT_S
+    # read-only queries stay on the fast probe timeout
+    assert timeouts["inspect"] == PROBE_TIMEOUT_S
+    assert SMOKE_TIMEOUT_S > PROBE_TIMEOUT_S
