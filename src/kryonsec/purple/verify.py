@@ -7,8 +7,13 @@ findings this is the classic boolean check: fetch the URL with
 injected boolean as SQL, the two responses differ.
 
 A finding is marked "verified" only when this independent method agrees.
-If it does not, the finding keeps its "confirmed" status but is marked
-verification_failed — honest evidence either way, audited.
+Phase 1C: every verify_attempt record now carries a derived status —
+verified / disagreed / inconclusive / not_run — derived from its own
+execution evidence (views.verification_status; the read-time derivation
+stays authoritative). A blocked check (scope refusal, missing probe
+parameter, failed spawn) keeps its actual blocking reason and is never
+described as disproven or safe. The finding is linked to its check by a
+verified_by lineage edge between node ids.
 """
 
 from __future__ import annotations
@@ -17,12 +22,19 @@ import logging
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from ..config import KryonsecConfig
+from . import lineage
 from .allowlist import AllowlistViolation, ToolAllowlist
 from .audit import AuditLog
 from .exploit import compose_url
 from .orchestrator import SubagentResult
 from .recon_passive import EngagementGraph
 from .sandbox import KaliSandbox
+from .views import (
+    VERIFICATION_DISAGREED,
+    VERIFICATION_INCONCLUSIVE,
+    VERIFICATION_NOT_RUN,
+    VERIFICATION_VERIFIED,
+)
 
 log = logging.getLogger(__name__)
 
@@ -133,7 +145,8 @@ class VerifySubagent:
             self.graph.add_node(
                 node_type="verify_attempt",
                 label=finding_id,
-                properties={"verified": False, "method": "n/a",
+                properties={"status": VERIFICATION_NOT_RUN,
+                            "verified": False, "method": "n/a",
                             "reason": "asset outside engagement scope"},
             )
             return 0
@@ -153,7 +166,8 @@ class VerifySubagent:
             self.graph.add_node(
                 node_type="verify_attempt",
                 label=finding_id,
-                properties={"verified": False, "method": "n/a",
+                properties={"status": VERIFICATION_NOT_RUN,
+                            "verified": False, "method": "n/a",
                             "reason": "no numeric query parameter",
                             "secondary_evidence": secondary},
             )
@@ -172,7 +186,8 @@ class VerifySubagent:
             self.graph.add_node(
                 node_type="verify_attempt",
                 label=finding_id,
-                properties={"verified": False, "method": "curl boolean",
+                properties={"status": VERIFICATION_NOT_RUN,
+                            "verified": False, "method": "curl boolean",
                             "reason": "probe run failed"},
             )
             return 0
@@ -188,30 +203,64 @@ class VerifySubagent:
         # hold — every genuine boolean-SQLi finding would "fail"
         # verification (v1.1.1 regression)
         base_out = self._curl(url)
-        if base_out is not None:
+        baseline_used = base_out is not None
+        if baseline_used:
             responses_differ = (
                 true_out != false_out
                 and true_out == base_out
                 and false_out != base_out
             )
+            # the baseline method ran its full course: agreement or a real
+            # contradiction — both are conclusions an independent test made
+            status = (VERIFICATION_VERIFIED if responses_differ
+                      else VERIFICATION_DISAGREED)
         else:
             # no baseline possible — fall back to plain difference, but
-            # only when the difference is substantial (not nonce churn)
+            # only when the difference is substantial (not nonce churn).
+            # Non-substantial without a baseline is the classic "ran but
+            # cannot establish either conclusion": noise could explain it.
             responses_differ = abs(len(true_out) - len(false_out)) > max(
                 32, int(0.02 * max(len(true_out), len(false_out)))
             )
+            status = (VERIFICATION_VERIFIED if responses_differ
+                      else VERIFICATION_INCONCLUSIVE)
 
-        self.graph.add_node(
+        attempt_node = self.graph.add_node(
             node_type="verify_attempt",
             label=finding_id,
             properties={
                 "verified": responses_differ,
+                # producer convenience (read-time derivation is
+                # authoritative — views.verification_status re-derives
+                # from the execution fields below):
+                "status": status,
                 "method": "curl boolean probe",
                 "true_len": len(true_out),
                 "false_len": len(false_out),
-                "baseline_len": len(base_out) if base_out is not None else None,
+                "baseline_len": len(base_out) if baseline_used else None,
             },
         )
+        # Phase 1C lineage: finding --verified_by--> its independent check,
+        # by node ids. A refused link is audited — the refusal reason is
+        # the record, not a missing edge on the graph.
+        finding_node = next(
+            (n for n in self.graph.by_type("finding")
+             if n["label"] == finding_id), None)
+        if finding_node is not None:
+            refused: list[str] = []
+            lineage.link(
+                self.graph, "verified_by", finding_node, attempt_node,
+                provenance={"agent": "VERIFY", "source_type": "tool"},
+                properties={"finding_id": finding_id},
+                on_refuse=refused.append,
+            )
+            if refused:
+                self.audit.write({
+                    "event": "lineage_refused",
+                    "relationship": "verified_by",
+                    "finding_id": finding_id,
+                    "reason": refused[0],
+                })
         if responses_differ:
             # the finding node gains independent confirmation
             for n in self.graph.by_type("finding"):

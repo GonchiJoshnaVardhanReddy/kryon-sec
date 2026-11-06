@@ -342,8 +342,12 @@ def test_a_failed_verification_is_not_reported_as_agreement(tmp_path):
                    {"verified": False, "reason": "probe run failed"})
     report = render_report(graph, _audit(tmp_path), "e-a13")
 
-    assert "did not agree or could not run — treat this finding with care" in report
+    # Phase 1C: a blocked check reads as exactly that — the second check
+    # never ran, so the finding is unverified, never disproven or safe.
+    assert "second check never ran" in report
+    assert "treat this finding with care" in report
     assert "Double-checked: **yes" not in report
+    assert "unverified, not disproven" in report
 
 
 def test_no_node_label_refers_to_a_merged_away_hypothesis(tmp_path):

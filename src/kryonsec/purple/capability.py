@@ -67,7 +67,19 @@ class CapabilityRecord(BaseModel):
     target_host: str
     #: finding node label the attempt confirmed ("" when unconfirmed-but-run)
     finding_id: str = ""
+    #: Gate 3 lifecycle (approval decision) — written only by the gate:
+    #: claimed -> approved | rejected. Phase 1C: the model no longer
+    #: conflates approval with independent verification; a record whose
+    #: status is ``verified`` here is legacy shape and reads as
+    #: not-approved (fail closed).
     status: Literal["claimed", "verified", "approved", "rejected"]
+    #: Phase 1C — INDEPENDENT verification of the claimed shell evidence
+    #: itself. Written only by a capability-verification routine (none
+    #: exists yet — the registry is empty, so nothing may ever set it),
+    #: NEVER by Gate 3 and never implicitly. Eligibility for
+    #: post-exploitation requires ``status == "approved"`` AND
+    #: ``verification == "verified"``; approval alone is never enough.
+    verification: Literal["not_run", "verified"] = "not_run"
     #: bounded, secret-redacted supporting evidence
     evidence: str
     #: machine-produced, never LLM-authored
@@ -102,11 +114,14 @@ def build_record(
     finding_id: str = "",
     evidence: str,
     status: str = "claimed",
+    verification: str = "not_run",
 ) -> "CapabilityRecord | None":
     """Build + validate a record — a wrong field means None, never a
     half-valid record (fail closed). Anything claiming a capability the
     schema does not know, an unknown status, or empty source fields is
-    refused here."""
+    refused here. ``verification`` defaults to ``not_run`` and only a
+    capability-verification routine may pass ``verified`` — no Gate 3
+    decision can set it."""
     try:
         record = CapabilityRecord(
             capability=capability,  # type: ignore[arg-type]
@@ -117,6 +132,7 @@ def build_record(
             target_host=target_host,
             finding_id=finding_id,
             status=status,  # type: ignore[arg-type]
+            verification=verification,  # type: ignore[arg-type]
             evidence=evidence,
         )
     except ValidationError:

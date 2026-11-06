@@ -414,6 +414,7 @@ def approved_record(**overrides):
         "attempt_id": "attempt-1", "attempt_label": "H1:sqlmap",
         "hypothesis_id": "H1", "target_host": "target-corp.com",
         "finding_id": "H1", "status": "approved",
+        "verification": "verified",  # Phase 1C: eligible ⇔ both
         "evidence": "os-shell session established",
         "recorded_by": "EXPLOIT_PROGRAM",
     }
@@ -489,6 +490,49 @@ def test_post_exploit_refuses_out_of_scope_capability_hosts(tmp_path):
     assert refused and "scope" in refused[0]["reason"]
 
 
+def test_approval_without_independent_verification_fails_closed(tmp_path):
+    """Phase 1C: Gate 3 approval of a claimed capability must never make
+    it executable — the record's independent verification is still
+    not_run, so the state fails closed."""
+    graph = EngagementGraph(engagement_id="e-pe")
+    _add_record(graph)  # status approved
+    sandbox = PostSandbox([])
+    graph.by_type("capability")[0]["properties"]["verification"] = "not_run"
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit_pe_gate.jsonl")
+    sub = PostExploitSubagent(cfg=cfg, graph=graph, audit=audit,
+                              target="target-corp.com", sandbox=sandbox)
+    result = sub.run()
+
+    assert result.status == "failed"
+    assert sandbox.spawned == []      # nothing ran: approval ≠ eligibility
+    refused = [e for e in _events(audit)
+               if e["event"] == "post_exploit_capability_refused"]
+    assert refused and "independently verified" in refused[0]["reason"]
+
+
+def test_verification_without_approval_fails_closed(tmp_path):
+    """The inverse leg of Phase 1C eligibility: independently verified
+    evidence but no human approval (status claimed) -> refused."""
+    graph = EngagementGraph(engagement_id="e-pe")
+    graph.add_node(
+        "capability", "capability:H1:sqlmap", approved_record(
+            status="claimed", verification="verified"),
+        provenance={"agent": "EXPLOIT", "source_type": "tool"})
+    sandbox = PostSandbox([])
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit_pe_ver.jsonl")
+    sub = PostExploitSubagent(cfg=cfg, graph=graph, audit=audit,
+                              target="target-corp.com", sandbox=sandbox)
+    result = sub.run()
+
+    assert result.status == "failed"
+    assert sandbox.spawned == []
+    refused = [e for e in _events(audit)
+               if e["event"] == "post_exploit_capability_refused"]
+    assert refused and refused[0]["reason"] == "capability record is not approved"
+
+
 def test_host_in_scope_matches_target_and_subdomains_only():
     assert host_in_scope("target-corp.com", "target-corp.com")
     assert host_in_scope("webmail.target-corp.com", "target-corp.com")
@@ -520,6 +564,14 @@ def test_end_to_end_transition_via_fake_sandbox(tmp_path, monkeypatch):
 
     # the orchestrator routes only on the reported, approved evidence
     assert next_state("EXPLOIT", exploit_result) == "POST_EXPLOIT"
+
+    # Phase 1C: approval alone is never eligibility. The claimed evidence
+    # must ALSO be independently verified before anything runs. No
+    # capability-verification routine exists yet, so this step stands in
+    # for that future verifier: the gate never touched this field.
+    node = exploit_graph.by_type("capability")[0]
+    assert node["properties"]["verification"] == "not_run"
+    node["properties"]["verification"] = "verified"
 
     pe_sandbox = PostSandbox([])
     pe_sub, pe_audit = _post_exploit(

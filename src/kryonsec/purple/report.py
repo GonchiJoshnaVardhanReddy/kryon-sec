@@ -33,9 +33,16 @@ from .hypothesize import (
 # below that testing happened is read from these, not from a node's
 # existence.
 from .views import (
+    ATTEMPT_CONFIRMED,
+    ATTEMPT_NOT_RUN,
+    ATTEMPT_UNRECORDED,
     OUTCOMES_RUN,
     attempt_outcome,
     hypothesis_engine_view,
+    verification_status,
+    VERIFICATION_INCONCLUSIVE,
+    VERIFICATION_NOTES,
+    VERIFICATION_NOT_RUN,
 )
 from .orchestrator import SubagentResult
 from .recon_passive import EngagementGraph
@@ -517,6 +524,21 @@ def build_timeline(audit: AuditLog) -> list[dict]:
     (timestamp, event, detail). The chain's hash order (not the wall
     clock) remains the ordering guarantee; ts is presentation only."""
     milestones = []
+    for entry in read_audit_events(audit):
+        event = entry.get("event", "")
+        ts = str(entry.get("ts", ""))
+        if event in ("engagement_created", "state_enter", "report_written"):
+            detail = (entry.get("state") or entry.get("target")
+                      or entry.get("engagement_id") or "")
+            milestones.append(
+                {"ts": ts, "event": event, "detail": detail})
+    return milestones[:100]  # bounded
+
+
+def read_audit_events(audit: AuditLog) -> list[dict]:
+    """Every parseable audit entry, in chain order. Corrupt lines are
+    skipped (verify() reports corruption; the report renders anyway)."""
+    events: list[dict] = []
     try:
         with open(audit.path, encoding="utf-8") as f:
             for line in f:
@@ -524,20 +546,349 @@ def build_timeline(audit: AuditLog) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    entry = json.loads(line)
+                    events.append(json.loads(line))
                 except ValueError:
-                    continue  # verify() reports corruption; render anyway
-                event = entry.get("event", "")
-                ts = str(entry.get("ts", ""))
-                if event in ("engagement_created", "state_enter",
-                             "report_written"):
-                    detail = (entry.get("state") or entry.get("target")
-                              or entry.get("engagement_id") or "")
-                    milestones.append(
-                        {"ts": ts, "event": event, "detail": detail})
+                    continue
     except OSError:
         return []
-    return milestones[:100]  # bounded
+    return events
+
+
+# ---- Phase 1C: coverage, post-exploit honesty, limitations ------------------
+
+MAX_COVERAGE_ITEMS = 50
+REPORT_JSON_SCHEMA_VERSION = "1.0"
+
+
+def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
+    """What the engagement actually covered — from execution and
+    verification records only.
+
+    Machine-observed activity (tool runs that really started) is read
+    side by side with what the model claimed, and every bucket can be
+    empty: absent from a list is **unassessed**, never "checked clean".
+    """
+    from .views import exploit_status
+
+    hypotheses = graph.by_type("hypothesis")
+    attempts = graph.by_type("exploit_attempt")
+    finding_labels = {f["label"] for f in graph.by_type("finding")}
+    attempts_by_hyp: dict[str, list] = {}
+    for a in attempts:
+        attempts_by_hyp.setdefault(str(a["label"]).split(":", 1)[0],
+                                   []).append(a)
+
+    tested_surfaces: list[str] = []
+    confirmed: list[str] = []
+    tested_unconfirmed: list[str] = []
+    unassessed: list[str] = []
+    unclear: list[str] = []
+    blocked: list[dict] = []
+    for h in hypotheses:
+        label = h["label"]
+        runs = attempts_by_hyp.get(label, [])
+        outcomes = [attempt_outcome(a) for a in runs]
+        if any(o in OUTCOMES_RUN for o in outcomes):
+            asset = str((h.get("properties") or {}).get("target_asset")
+                        or "").strip()
+            if asset:
+                tested_surfaces.append(asset)
+            if (exploit_status(label, graph) == ATTEMPT_CONFIRMED
+                    and label in finding_labels):
+                confirmed.append(label)
+            else:
+                tested_unconfirmed.append(label)
+        elif runs:
+            for a in runs:
+                if attempt_outcome(a) == ATTEMPT_NOT_RUN:
+                    blocked.append({
+                        "item": a["label"],
+                        "reason": normalize_evidence(
+                            a["properties"].get("error_excerpt", ""), 160),
+                    })
+                else:
+                    unclear.append(a["label"])
+        else:
+            unassessed.append(label)
+
+    verify_unresolved = [
+        n["label"] for n in graph.by_type("verify_attempt")
+        if verification_status(n) == VERIFICATION_INCONCLUSIVE
+    ]
+
+    events = read_audit_events(audit)
+    out_of_scope = sum(
+        1 for e in events
+        if e.get("event") == "exploit_scope_refused"
+        or (e.get("event") == "verify_skipped"
+            and "scope" in str(e.get("reason", ""))))
+    never_started = sum(
+        1 for a in attempts if attempt_outcome(a) == ATTEMPT_NOT_RUN)
+
+    return {
+        "tested_surfaces": sorted(set(tested_surfaces))[:MAX_COVERAGE_ITEMS],
+        "confirmed_findings": sorted(confirmed)[:MAX_COVERAGE_ITEMS],
+        "tested_unconfirmed": sorted(tested_unconfirmed)[:MAX_COVERAGE_ITEMS],
+        "unresolved": sorted(set(unclear + verify_unresolved))[:MAX_COVERAGE_ITEMS],
+        "skipped_or_blocked": blocked[:MAX_COVERAGE_ITEMS],
+        "out_of_scope_refused": out_of_scope,
+        "unassessed": sorted(unassessed)[:MAX_COVERAGE_ITEMS],
+        # model claims vs machine-observed activity, side by side
+        "model_claims": len(hypotheses),
+        "machine_observed_runs": sum(
+            1 for a in attempts if attempt_outcome(a) in OUTCOMES_RUN),
+        "tool_runs_never_started": never_started,
+    }
+
+
+def post_exploit_view(graph: EngagementGraph) -> dict:
+    """The report's post-exploitation view. It may claim post-exploit
+    activity only when genuine authorized records exist — an APPROVED
+    capability record that is ALSO independently verified, plus evidence
+    nodes the phase produced. An empty parser registry means no
+    capability can ever be claimed, so this is dormant by construction.
+    """
+    from .capability import CapabilityRecord
+
+    records = []
+    for node in graph.by_type("capability"):
+        try:
+            records.append(CapabilityRecord.model_validate(node["properties"]))
+        except Exception:
+            continue  # malformed record: the honest line is "nothing genuine"
+    if not records:
+        return {
+            "authorized": False,
+            "note": ("No post-exploitation was performed: no shell/session "
+                     "capability was ever claimed (no tool in the inventory "
+                     "provides independently verifiable capability evidence)."),
+        }
+    if not any(r.status == "approved" and r.verification == "verified"
+               for r in records):
+        return {
+            "authorized": False,
+            "note": ("A capability record exists, but it was never both "
+                     "independently verified and human-approved — "
+                     "post-exploitation never ran."),
+        }
+    evidence_nodes = graph.by_type("post_exploit_evidence")
+    if not evidence_nodes:
+        return {
+            "authorized": False,
+            "note": ("Capability evidence was verified and approved, but the "
+                     "post-exploitation phase never ran."),
+        }
+    primary = next(
+        (r for r in records
+         if r.status == "approved" and r.verification == "verified"))
+    evidence = []
+    for n in evidence_nodes[:MAX_COVERAGE_ITEMS]:
+        entry = {
+            "tool": n["label"],
+            "ok": bool(n["properties"].get("ok")),
+            "stdout_chars": int(n["properties"].get("stdout_chars") or 0),
+        }
+        if "summary" in n["properties"]:
+            entry["summary"] = redact_secrets(
+                normalize_evidence(json.dumps(n["properties"]["summary"]),
+                                   max_chars=800))
+        elif "excerpt" in n["properties"]:
+            entry["excerpt"] = redact_secrets(
+                normalize_evidence(str(n["properties"]["excerpt"]),
+                                   max_chars=400))
+        evidence.append(entry)
+    return {
+        "authorized": True,
+        "capability": primary.capability,
+        "tool": primary.tool,
+        "target_host": primary.target_host,
+        "records": len(records),
+        "evidence": evidence,
+    }
+
+
+def report_limitations(graph: EngagementGraph, audit: AuditLog) -> list[str]:
+    """Execution and verification limitations, derived from records —
+    including the standing sandbox-egress gap (never claimed resolved)."""
+    limitations = [
+        "Network egress from the execution sandbox is not restricted to the "
+        "target scope at the network layer (default docker bridge); target "
+        "scope is enforced by command-line validation only.",
+    ]
+    from .capability import CAPABILITY_PARSERS
+    if CAPABILITY_PARSERS == {}:
+        limitations.append(
+            "The capability parser registry is empty: no shell/session "
+            "capability can be claimed, and post-exploitation stays dormant.")
+    coverage = coverage_summary(graph, audit)
+    never_started = coverage["tool_runs_never_started"]
+    if never_started:
+        limitations.append(
+            f"{never_started} exploit tool run(s) never started (sandbox or "
+            "allowlist refusal): nothing was checked by them.")
+    blocked_checks = sum(
+        1 for n in graph.by_type("verify_attempt")
+        if verification_status(n) == VERIFICATION_NOT_RUN)
+    if blocked_checks:
+        limitations.append(
+            f"{blocked_checks} independent verification check(s) never ran; "
+            "those findings are unverified, not disproven.")
+    return limitations[:10]
+
+
+# ---- Phase 1C: machine-readable report.json ---------------------------------
+
+def build_report_json(
+    graph: EngagementGraph,
+    audit: AuditLog,
+    engagement_id: str,
+    completed_states: list[str] | None = None,
+    halt_reason: str | None = None,
+) -> str:
+    """The deterministic machine-readable export, one document for the
+    same graph + audit chain (no wall-clock data, sorted keys, no
+    whitespace). Every free-text field is bounded and secret-redacted;
+    post-exploitation content appears only from genuine authorized
+    records; failures of any single section must not produce a broken
+    document — a malformed section is omitted and the more general
+    values stand."""
+    from .views import exploit_status
+
+    attempts = graph.by_type("exploit_attempt")
+    attempt_by_label = {a["label"]: a for a in attempts}
+    rows = []
+
+    def attempt_row(a: dict) -> dict:
+        props = a.get("properties") or {}
+        argv = [str(x) for x in (props.get("argv") or [])]
+        return {
+            "id": a["id"],
+            "label": a["label"],
+            "tool": str(props.get("tool", "")),
+            "outcome": attempt_outcome(a),
+            "exit_code": props.get("exit_code"),
+            "argv": [redact_secrets(a_[:120]) for a_ in argv[:64]],
+            "output_excerpt": redact_secrets(
+                normalize_evidence(str(props.get("output_excerpt", "")),
+                                   max_chars=300)),
+            "not_run_reason": redact_secrets(
+                normalize_evidence(str(props.get("error_excerpt", "")),
+                                   max_chars=160)),
+            "retried_https": bool(props.get("retried_https")),
+        }
+
+    summary_counts = {"verified": 0, "disagreed": 0, "inconclusive": 0,
+                      "not_run": 0}
+    findings = []
+    for h in graph.by_type("hypothesis"):
+        props = h.get("properties") or {}
+        view = hypothesis_engine_view(h, graph)
+        status = view["verification_status"]
+        summary_counts[status] = summary_counts.get(status, 0) + 1
+        # provenance: stable node ids via the lineage registry
+        tested_by = sorted(
+            (graph.get_node(e["target_node_id"]) or {}).get("label", "")
+            for e in graph.find_edges("tested_by", source=h["id"]))
+        finding = next((n for n in graph.by_type("finding")
+                        if n["label"] == h["label"]), None)
+        verified_by = []
+        if finding is not None:
+            verified_by = sorted(
+                (graph.get_node(e["target_node_id"]) or {}).get("label", "")
+                for e in graph.find_edges("verified_by", source=finding["id"]))
+        verify_reasons = [
+            {
+                "attempt": n["label"], "status": verification_status(n),
+                "reason": (redact_secrets(normalize_evidence(
+                    str((n.get("properties") or {}).get("reason", "")),
+                    160))),
+            }
+            for n in graph.by_type("verify_attempt")
+            if n["label"] == h["label"]
+        ]
+        score = cvss_base_score(str(props.get("cvss_vector", "")))
+        if score is None:
+            score = (props.get("enrichment") or {}).get("cvss_score")
+        findings.append({
+            "id": h["label"],
+            "title": redact_secrets(normalize_line(
+                props.get("title"), 300) or ""),
+            "target_asset": str(props.get("target_asset", "")),
+            "tools": [str(t) for t in (props.get("tools") or [])][:16],
+            "approval": "approved" if props.get("approved") else "not_approved",
+            "confirmed_by_tool": bool(h["label"] in
+                                      {f["label"] for f
+                                       in graph.by_type("finding")}),
+            "cvss": {
+                "vector": str(props.get("cvss_vector", "")),
+                "score": score,
+                "qualitative": cvss_severity(score),
+            },
+            "verification": {
+                "status": status,
+                "note": VERIFICATION_NOTES[status],
+                "block_reasons": verify_reasons,
+            },
+            "provenance": {
+                "hypothesis_id": h["id"],
+                "exploit_attempts": tested_by,
+                "verified_by": verified_by,
+            },
+        })
+
+    verify_attempts = []
+    for n in graph.by_type("verify_attempt"):
+        props = n.get("properties") or {}
+        verify_attempts.append({
+            "id": n["id"],
+            "label": n["label"],
+            "status": verification_status(n),
+            "method": str(props.get("method", "")),
+            "verified": bool(props.get("verified")),
+            "reason": redact_secrets(normalize_evidence(
+                str(props.get("reason", "")), 160)),
+        })
+
+    attempts_out = [attempt_row(a) for a in attempts[:200]]
+    coverage = coverage_summary(graph, audit)
+
+    payload = {
+        "schema_version": REPORT_JSON_SCHEMA_VERSION,
+        "engagement_id": engagement_id,
+        "target": graph.by_type("target")[0]["label"]
+        if graph.by_type("target") else "",
+        "summary": {
+            "findings": len(findings),
+            "verification_statuses": summary_counts,
+            "model_claims": coverage["model_claims"],
+            "machine_observed_runs": coverage["machine_observed_runs"],
+            "post_exploit_authorized":
+                post_exploit_view(graph)["authorized"],
+        },
+        "coverage": coverage,
+        "findings": findings,
+        "exploit_attempts": attempts_out,
+        "verification_attempts": verify_attempts,
+        "post_exploit": post_exploit_view(graph),
+        "limitations": report_limitations(graph, audit),
+        "completed_states": list(completed_states or []),
+        "halt_reason": halt_reason or "",
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      default=str)
+
+
+def write_report_json(payload: str, path: Path) -> None:
+    """Atomic write: the .tmp file is created, fully written, fsynced
+    and then renamed over the destination — a crash mid-write can leave
+    a .tmp behind, never a truncated report.json."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        import os as _os
+        _os.fsync(f.fileno())
+    tmp.replace(path)
 
 
 def remediation_reference(label: object, graph: EngagementGraph) -> dict:
@@ -726,6 +1077,11 @@ def render_report(
         scanners=scanners,
         sbom_summary=sbom_summary,
         timeline=build_timeline(audit),
+        # Phase 1C: coverage from actual records, honest post-exploit view,
+        # derived limitations (incl. the standing egress gap)
+        coverage=coverage_summary(graph, audit),
+        post_exploit=post_exploit_view(graph),
+        limitations=report_limitations(graph, audit),
         remediations=[
             # .get defaults: BLUE_TEAM nodes written before Phase 6 (and
             # test fixtures) lack cwe/owasp/attack/owasp_api — StrictUndefined
@@ -905,6 +1261,29 @@ class ReportSubagent:
             })
             log.warning("report render failed: %s", e)
             return SubagentResult(status="failed")
+
+        # Phase 1C: the machine-readable export, written atomically. Its
+        # own failure never takes down the markdown deliverable — it is
+        # audited instead and the markdown stands alone.
+        json_path = report_path.parent / "report.json"
+        try:
+            json_payload = build_report_json(
+                self.graph, self.audit, self.engagement_id,
+                completed_states=getattr(self, "completed_states", None),
+                halt_reason=getattr(self, "halt_reason", None),
+            )
+            write_report_json(json_payload, json_path)
+            self.audit.write({
+                "event": "report_json_written",
+                "path": str(json_path),
+                "chars": len(json_payload),
+            })
+        except Exception as e:
+            self.audit.write({
+                "event": "report_json_failed",
+                "reason": str(e)[:300],
+            })
+            log.warning("report.json failed: %s", e)
 
         # append report_written BEFORE reading head_hash, so the anchor
         # printed in the report matches the chain's FINAL head — a

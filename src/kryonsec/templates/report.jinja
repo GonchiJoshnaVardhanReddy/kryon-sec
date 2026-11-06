@@ -137,7 +137,7 @@ information and guessed what might be wrong. Nothing below is confirmed
 - Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
 {% if exploit_ran or h.exploit_status != 'none' %}- Tested: {{ "yes" if h.tested | default(false) else "no" }}{% if h.exploit_status in ('not-run', 'unrecorded') %} — {{ h.exploit_note }}{% endif %}{% endif %}
 {% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
-{% if h.verified | default(false) %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.confirmed | default(false) %}- Double-checked: the second check ran but did not agree or could not run — treat this finding with care{% endif %}
+{% if h.confirmed | default(false) %}{% if h.verification_status == 'verified' %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.verification_status == 'disagreed' %}- Double-checked: **a second tool re-tested it and did NOT agree** — treat this finding with care{% elif h.verification_status == 'inconclusive' %}- Double-checked: the second check ran but could not establish either conclusion — treat this finding with care{% else %}- Double-checked: the second check never ran — treat this finding with care (unverified, not disproven){% endif %}{% endif %}
 {% if h.cvss_vector %}- Severity guess (CVSS vector): {{ h.cvss_vector }}
 {% if h.cvss_score is not none %}  (calculated base score: {{ h.cvss_score }} — {{ h.cvss_qual }})
 {% else %}  (score could not be calculated)
@@ -187,6 +187,50 @@ No code scanners ran (no --code folder was provided, or the sandbox was unavaila
 
 {% else %}
 No fix advice was generated.
+{% endfor %}
+
+## Post-exploitation status
+
+{% if post_exploit.authorized %}
+A shell/session capability on {{ post_exploit.target_host }} (**{{ post_exploit.capability }}**, via {{ post_exploit.tool }}) was
+independently verified **and** separately approved by a human. The
+evidence collection below ran inside the sandbox (process, filesystem,
+network, secret discovery — nothing destructive):
+
+{% for e in post_exploit.evidence %}- {{ e.tool }} ({{ "ran" if e.ok else "failed" }}){% if e.summary %}: `{{ e.summary }}`{% elif e.excerpt %}: `{{ e.excerpt }}`{% endif %}
+{% endfor %}
+{% else %}
+{{ post_exploit.note }} No post-exploitation happened in this engagement.
+{% endif %}
+
+## Coverage of what was tested
+
+This summary is built from the audit log and the evidence graph — not
+from the assistant's statements. An item absent from a list here is
+**unassessed**, never "checked and clean".
+
+{% if coverage.tested_surfaces %}
+- Areas actually tested: {{ coverage.tested_surfaces | join(" | ") }}
+{% else %}
+- Areas actually tested: **none** — no tool ran against this target.
+{% endif %}
+- Issue items the model proposed: {{ coverage.model_claims }} — tool runs really
+  started for {{ coverage.machine_observed_runs }} of them.
+- Confirmed by a test tool: {{ coverage.confirmed_findings | length }}{% if coverage.confirmed_findings %} ({{ coverage.confirmed_findings | join(", ") }}){% endif %}
+- Tested but not confirmed: {{ coverage.tested_unconfirmed | length }}{% if coverage.tested_unconfirmed %} ({{ coverage.tested_unconfirmed | join(", ") }}){% endif %}
+- Unresolved results (ran with no conclusion either way): {{ coverage.unresolved | length }}{% if coverage.unresolved %} ({{ coverage.unresolved | join(", ") }}){% endif %}
+- Test steps that could not run: {{ coverage.skipped_or_blocked | length }}
+{% for b in coverage.skipped_or_blocked %}  - {{ b.item }} — could not start: {{ b.reason or "(no reason recorded)" }}
+{% endfor %}{%- if coverage.out_of_scope_refused %}- Out-of-scope work refused outright: {{ coverage.out_of_scope_refused }} step(s)
+{% endif %}{%- if coverage.unassessed %}- Suggested but never attempted: {{ coverage.unassessed | length }} ({{ coverage.unassessed | join(", ") }})
+{% endif %}{%- if coverage.tool_runs_never_started %}- Tool runs that never started: {{ coverage.tool_runs_never_started }} — those steps checked nothing.
+{% endif %}
+
+## Limitations
+
+Nothing below is a claim of completeness — these are the recorded gaps.
+
+{% for l in limitations %}- {{ l }}
 {% endfor %}
 
 ## Proof this report is genuine
