@@ -40,11 +40,16 @@ MARKER = "KRYONSEC-CAP-PROBE-OK"
 
 def _sqlmap_contract():
     """The hypothetical future producer's verification contract: one
-    static, bounded probe whose stdout must contain the exact marker."""
+    static, bounded probe whose stdout must contain the exact marker —
+    and whose argv REFERENCES the engagement target (Phase 2A binding:
+    a marker-only probe that never touches the target cannot demonstrate
+    an on-target capability)."""
     return VerificationContract(
         producer="sqlmap",
         method="sandbox_marker_probe",
-        probe_argv=("python3", "-c", f"print('{MARKER}')"),
+        probe_argv=("python3", "-c",
+                    f"probe target-corp.com; if unreachable, no"
+                    f" print('{MARKER}')"),
         expect_marker=MARKER,
     )
 
@@ -232,6 +237,8 @@ def test_contract_registration_rejects_bad_shapes():
         VerificationContract("tool", "m", ("{target_host}",), MARKER),
         VerificationContract("tool", "m", ("ok",), ""),            # no marker
         VerificationContract("tool", "m", ("ok",), "m" * 65),      # oversize
+        VerificationContract(
+            "tool", "m", ("ok",), "m", capability=""),             # no class
     ]
     for contract in bad:
         with pytest.raises(ValueError):
@@ -463,6 +470,67 @@ def test_out_of_scope_host_is_refused(tmp_path, sqlmap_contract):
     assert result.status == "refused"
     assert "scope" in " ".join(result.reasons)
     assert sandbox.spawned == []
+
+
+# ---- contract binding (Phase 2A hardening of Phase 1D) ------------------------
+
+def test_marker_only_probe_without_target_binding_is_refused(
+        tmp_path, sqlmap_contract, monkeypatch):
+    """Phase 2A: a registered contract whose probe argv never references
+    the engagement target cannot verify anything — the marker alone is
+    not independent evidence of an on-target capability."""
+    from kryonsec.purple.capability_verify import VerificationContract, \
+        register_contract
+    _sqlmap_parser(monkeypatch)
+    marker_only = VerificationContract(
+        producer="sqlmap", method="sandbox_marker_probe",
+        probe_argv=("python3", "-c", f"print('{MARKER}')"),
+        expect_marker=MARKER)
+    register_contract(marker_only)   # registration passes...
+    try:
+        graph = _graph()
+        _attempt(graph)
+        record_node = _record(graph)
+        sandbox = SwitchingSandbox(PROBE_OK)
+        verifier, audit = _verifier(tmp_path, graph, sandbox)
+        result = verifier.verify(*_records(graph)[0])
+        assert result.status == "refused"
+        assert "not bound to the engagement target" in " ".join(
+            result.reasons)
+        assert sandbox.spawned == []     # never executed
+        assert "capability_verified" not in _event_names(audit)
+        assert graph.by_type("capability")[0]["properties"] \
+            ["verification"] == "not_run"
+    finally:
+        capability_verify.CAPABILITY_VERIFICATION_CONTRACTS.clear()
+
+
+def test_contract_capability_class_binding_mismatch(tmp_path,
+                                                    sqlmap_contract):
+    """Phase 2A: the contract names the one capability class it verifies;
+    a record claiming a different class is refused (contradictory)."""
+    graph = _graph()
+    _attempt(graph)
+    record_node = _record(graph)
+    record_node["properties"]["capability"] = "shell"  # schema-Literal only
+    # no cross-class record shape exists under the published schema —
+    # the binding contract is enforced at the record-vs-contract level:
+    # simulate a contract bound to a different class than the record.
+    from kryonsec.purple.capability_verify import VerificationContract, \
+        register_contract
+    register_contract(VerificationContract(
+        producer="sqlmap", method="m",
+        probe_argv=("python3", "-c", "probe target-corp.com"),
+        expect_marker=MARKER, capability="fs-read"))
+    try:
+        sandbox = SwitchingSandbox(PROBE_OK)
+        verifier, _ = _verifier(tmp_path, graph, sandbox)
+        result = verifier.verify(*_records(graph)[0])
+        assert result.status == "refused"
+        assert "fs-read" in " ".join(result.reasons)
+        assert "contradictory" in " ".join(result.reasons)
+    finally:
+        capability_verify.CAPABILITY_VERIFICATION_CONTRACTS.clear()
 
 
 # ---- the Layer-2 gate guards the verification probe ---------------------------

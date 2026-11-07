@@ -185,7 +185,8 @@ def _startup_failure(conn: _ServerConnection) -> str:
 class _ServerConnection:
     """One live stdio server: its background loop, stop event, entries."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "") -> None:
+        self.name = name
         self.loop: Any = None            # the asyncio loop (anyio backend)
         self.stop_event: Any = None      # asyncio.Event set by close()
         self.ready = threading.Event()   # set once tools are listed (or the session ended)
@@ -299,6 +300,18 @@ class McpToolbox:
         self.on_notice = on_notice  # user-visible notices (CLI console)
         self._lock = threading.Lock()
         self._closing = False
+        # Presentation-only status.  The UI reads this snapshot; it never
+        # uses it to decide whether a tool may run.
+        self._server_status: dict[str, dict[str, Any]] = {
+            str(server.get("name", "?")): {
+                "name": str(server.get("name", "?")),
+                "status": "starting",
+                "detail": "connecting",
+                "tools": 0,
+            }
+            for server in self.cfg.mcp_servers
+            if server.get("enabled", True)
+        }
 
     def _notice(self, message: str) -> None:
         """Slow/dead servers must be VISIBLE, not just a log line."""
@@ -332,6 +345,13 @@ class McpToolbox:
                 # log at info: the user already sees the notice below —
                 # a log.warning here made every failure print TWICE
                 log.info("MCP server %r failed to start: %s", name, e)
+                with self._lock:
+                    self._server_status[str(name)] = {
+                        "name": str(name),
+                        "status": "disconnected",
+                        "detail": str(e)[:160],
+                        "tools": 0,
+                    }
                 self._notice(f"MCP server {name!r} failed to start: {e}")
                 continue
             with self._lock:
@@ -343,6 +363,16 @@ class McpToolbox:
             if torn_down:
                 return dict(self.tools)  # plain copy: the lock is released
             self._merge(conn.entry)
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "connected" if conn.entry else "starting",
+                    "detail": (
+                        f"{len(conn.entry)} tool(s) available"
+                        if conn.entry else "server is still starting"
+                    ),
+                    "tools": len(conn.entry),
+                }
             if slow:
                 self._notice(
                     f"MCP server {name!r} is still starting — its tools "
@@ -367,14 +397,35 @@ class McpToolbox:
         servers used to appear next message — this restores that without
         the per-turn process leak)."""
         if not conn.ready.wait(timeout=LATE_BOOT_TIMEOUT_S):
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "disconnected",
+                    "detail": "startup timed out",
+                    "tools": 0,
+                }
             self._notice(
                 f"MCP server {name!r} never became ready — dropped for this session")
             return
         if conn.entry:
             self._merge(conn.entry)
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "connected",
+                    "detail": f"{len(conn.entry)} tool(s) available",
+                    "tools": len(conn.entry),
+                }
             self._notice(
                 f"MCP server {name!r} ready — {len(conn.entry)} tool(s) now available")
         else:
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "disconnected",
+                    "detail": "server exited before listing tools",
+                    "tools": 0,
+                }
             self._notice(
                 f"MCP server {name!r} exited before listing any tools")
 
@@ -424,7 +475,7 @@ class McpToolbox:
         except OSError:
             pass
 
-        conn = _ServerConnection()
+        conn = _ServerConnection(str(server.get("name", "?")))
         # daemon thread, never joined — a local is enough (M6: a self._thread
         # attribute here was clobbered per server and read by nobody)
         thread = threading.Thread(
@@ -463,13 +514,28 @@ class McpToolbox:
             conn.close()
         self.connections.clear()
 
+    def statuses(self) -> list[dict[str, Any]]:
+        """Return actual configured-server connection states for the UI.
+
+        This is deliberately a snapshot.  The terminal may display it, but no
+        execution path consults it for authorization or tool selection.
+        """
+        with self._lock:
+            return [dict(value) for value in self._server_status.values()]
+
 
 def _tool_name(tool: Any) -> str:
     return getattr(tool, "name", "tool")
 
 
 def _schema(tool: Any) -> dict:
-    schema = getattr(tool, "inputSchema", None) or {}
+    # mcp 1.x named the field inputSchema; 2.x renamed it input_schema —
+    # accept both so a version bump cannot silently empty every
+    # parameter schema (a tool then validates against "no parameters"
+    # and every call with arguments is refused).
+    raw = getattr(tool, "input_schema", None) or \
+        getattr(tool, "inputSchema", None) or {}
+    schema = raw if isinstance(raw, dict) else {}
     props = schema.get("properties", {})
     required = list(schema.get("required", []))
     return {

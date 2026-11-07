@@ -74,6 +74,12 @@ class VerificationContract:
     evidence, independent of the claimed evidence string. Contracts are
     reviewed configuration (never runtime/LLM input) and are fully
     static: no templating, no environmental interpolation.
+
+    Binding requirements (fail closed at verify time): the probe argv
+    MUST reference the claimed target — a marker-only probe that never
+    touches the engagement target cannot demonstrate an ON-TARGET
+    capability and is refused — and the contract names the one
+    ``capability`` class it may verify, which must equal the record's.
     """
 
     producer: str
@@ -81,6 +87,9 @@ class VerificationContract:
     method: str
     probe_argv: "tuple[str, ...]"
     expect_marker: str
+    #: the capability class this contract may verify (kept narrow:
+    #: a shell contract must not verify a file-read record)
+    capability: str = "shell"
 
     def probe_args(self) -> "tuple[str, ...]":
         """The exact argv for the probe — a static contract argv."""
@@ -110,6 +119,8 @@ def register_contract(contract: "VerificationContract") -> None:
             len(contract.expect_marker) > MAX_MARKER_CHARS:
         raise ValueError(
             f"expect_marker must be 1..{MAX_MARKER_CHARS} chars")
+    if not (contract.capability or "").strip():
+        raise ValueError("verification contract needs a capability class")
     CAPABILITY_VERIFICATION_CONTRACTS[contract.producer] = contract
 
 
@@ -258,6 +269,29 @@ class CapabilityVerifier:
         if not capability.host_in_scope(record.target_host, self.target):
             return verdict("refused",
                            "capability host is outside engagement scope")
+
+        # Probe binding (fail closed): the probe's static argv MUST
+        # reference the engagement target. A marker-only probe that
+        # never touches the target cannot demonstrate an ON-TARGET
+        # capability — coupling target and capability is what makes the
+        # independent check meaningful.
+        if not any(self.target in token or record.target_host in token
+                   for token in contract.probe_argv):
+            return verdict(
+                "refused",
+                "verification contract probe is not bound to the "
+                "engagement target — a marker-only probe is not "
+                "independent evidence of an on-target capability",
+                method=contract.method)
+        # Capability binding: the contract names the capability class it
+        # may verify and it must be exactly the claimed one.
+        if str(contract.capability or "").strip() != record.capability:
+            return verdict(
+                "refused",
+                f"verification contract binds capability "
+                f"{contract.capability!r}, not {record.capability!r} "
+                "(contradictory)",
+                method=contract.method)
 
         # The one allowed probe, exactly as contracted, through the
         # Mode B sandbox (gVisor; the egress policy is re-verified per
