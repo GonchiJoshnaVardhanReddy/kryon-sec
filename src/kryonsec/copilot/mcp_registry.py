@@ -25,6 +25,11 @@ Each configured server row may carry flat keys:
     call_timeout_s     1..120 cap  (default 120)
     max_output_chars   result bound (default/ceiling: config limits)
     max_concurrent_calls  1..8 cap (default 2)
+    path_roots         optional operator-approved resource scope
+                       (absolute roots; used with path_arguments)
+    path_arguments     which argument NAMES carry filesystem paths —
+                       enforced by explicit naming + canonical
+                       resolution, never by generic key guessing
 
 * An UNKNOWN tool (not in ``allow_tools``) is never callable — the
   default trust is ``disabled``, so a freshly connected server exposes
@@ -68,6 +73,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -126,6 +132,14 @@ class McpExecutionPolicy:
     call_timeout_s: float = TOOL_CALL_TIMEOUT_S
     max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS
     max_concurrent_calls: int = 2
+    #: operator-approved resource scope: absolute roots; a filesystem
+    #: argument resolving outside them is refused BEFORE dispatch
+    #: (defense in depth — the provider enforces its own canonical
+    #: boundary too; neither alone is trusted)
+    path_roots: "tuple[str, ...]" = ()
+    #: the policy names EXACTLY which arguments are paths (never a
+    #: generic key-name guess)
+    path_arguments: "frozenset[str]" = frozenset()
 
     def allows(self, tool_name: str) -> bool:
         """Unknown tools default to disabled: only an explicitly chosen
@@ -166,6 +180,33 @@ class McpExecutionPolicy:
         """Parse + validate one config.toml [[mcp.servers]] row. Unknown
         keys are tolerated (forward compatibility), except a row claiming
         SANDBOX properties — refused, fail loud."""
+        allow = row.get("allow_tools", []) or []
+        if isinstance(allow, str):
+            allow = [allow]
+        if not isinstance(allow, (list, tuple, set, frozenset)):
+            raise McpPolicyError("allow_tools must be a list of tool names")
+        wild = "*" in allow
+        names = frozenset(
+            str(t).strip() for t in allow if str(t).strip() and t != "*")
+        # resource scope (Phase 2B.1)
+        raw_roots = row.get("path_roots", []) or []
+        if isinstance(raw_roots, str):
+            raw_roots = [raw_roots]
+        if not isinstance(raw_roots, (list, tuple)):
+            raise McpPolicyError("path_roots must be a list of roots")
+        roots = tuple(
+            os.path.expanduser(str(r)) for r in raw_roots if str(r).strip())
+        raw_path_args = row.get("path_arguments", []) or []
+        if isinstance(raw_path_args, str):
+            raw_path_args = [raw_path_args]
+        if not isinstance(raw_path_args, (list, tuple, set, frozenset)):
+            raise McpPolicyError("path_arguments must be a list")
+        path_args = frozenset(
+            str(a).strip() for a in raw_path_args if str(a).strip())
+        if path_args and not roots:
+            raise McpPolicyError(
+                "path_arguments requires path_roots — destination "
+                "arguments may not be enforced by name alone")
         if "sandboxed" in row:
             raise McpPolicyError(
                 "MCP server policy cannot claim 'sandboxed': a remote MCP "
@@ -180,14 +221,6 @@ class McpExecutionPolicy:
         if sandbox_claim:
             raise McpPolicyError(
                 "MCP server policy cannot claim 'sandboxed' (see above)")
-        allow = row.get("allow_tools", []) or []
-        if isinstance(allow, str):
-            allow = [allow]
-        if not isinstance(allow, (list, tuple, set, frozenset)):
-            raise McpPolicyError("allow_tools must be a list of tool names")
-        wild = "*" in allow
-        names = frozenset(
-            str(t).strip() for t in allow if str(t).strip() and t != "*")
         return cls(
             trust=str(row.get("trust", "disabled")),
             allow_tools=names,
@@ -198,6 +231,8 @@ class McpExecutionPolicy:
                                            DEFAULT_MAX_OUTPUT_CHARS)),
             max_concurrent_calls=int(_positive(
                 row, "max_concurrent_calls", 2)),
+            path_roots=roots,
+            path_arguments=path_args,
         )
 
 
@@ -544,6 +579,11 @@ class McpRegistry:
                                  sorted(policy.allow_tools)),
             "call_timeout_s": policy.call_timeout_s,
             "max_concurrent_calls": policy.max_concurrent_calls,
+            # the operator-approved resource scope (when configured):
+            # where filesystem arguments may resolve (relative inside
+            # these roots; absolute/symlink-resolved containment)
+            "path_scope": (sorted(policy.path_roots)
+                           if policy.path_roots else []),
             "tools": tools,
         }, indent=1)
 
@@ -621,11 +661,17 @@ class McpRegistry:
             return f"error: invalid arguments for {tool!r}: {invalid}"
         # argument validation and destination/path policy stay
         # SEPARATE: above the tool schema proves the shape; below the
-        # side-effect guard rejects unsafe destinations
+        # side-effect guards reject unsafe destinations — this second
+        # guard is POLICY-CONFIGURED (path_arguments/path_roots), so
+        # enforcement never depends on generic argument-key guessing
         unsafe = _destination_guard(arguments)
         if unsafe:
             self.audit_refused(connection, tool, unsafe)
             return f"error: {unsafe}"
+        violation = _path_scope_violation(policy, arguments)
+        if violation:
+            self.audit_refused(connection, tool, violation)
+            return f"error: {violation}"
 
         guard = self._semaphores.get(connection)
         if guard is None:            # connection added at runtime — no cap
@@ -951,6 +997,75 @@ def _destination_guard(arguments: dict) -> str:
         if "\x00" in str(value):
             return f"path argument {key!r} contains a NUL byte — refused"
     return ""
+
+
+def _path_scope_violation(policy: McpExecutionPolicy,
+                          arguments: dict) -> str:
+    """The POLICY-CONFIGURED resource scope check (Phase 2B.1).
+
+    Enforced per-connections by EXPLICIT configuration — the row names
+    exactly which argument values are filesystem paths
+    (``path_arguments``) and the operator-approved roots
+    (``path_roots``) — never by generic argument-key guessing. For
+    every configured path argument that is present:
+
+    - NUL bytes and ".." traversal are refused outright;
+    - "~" home expansion is refused (the operator names the roots);
+    - ABSOLUTE values are canonicalized (realpath semantics: every
+      symlink, intermediate or final, is resolved) and must land
+      inside ONE approved root — a symlink escaping the root is a
+      refusal, not a leak;
+    - RELATIVE values are resolved canonically by the PROVIDER against
+      its same roots, with identical refusal rules — the registry
+      cannot canonicalize a relative path it cannot locate, and the
+      provider-side check is itself independent and auditable.
+
+    Schema-valid-but-out-of-scope calls are refused BEFORE dispatch;
+    the provider repeats the check canonically as its own boundary.
+    """
+    if not policy.path_arguments:
+        return ""
+    for name in sorted(policy.path_arguments):
+        if name not in arguments:
+            continue
+        value = arguments[name]
+        if not isinstance(value, str) or not value.strip():
+            return (f"argument {name!r} must be a non-empty path "
+                    "string")
+        text = value.strip()
+        if "\x00" in text:
+            return f"path argument {name!r} contains a NUL byte — refused"
+        segments = text.replace("\\", "/").split("/")
+        if any(segment == ".." for segment in segments):
+            return (f"path argument {name!r} contains '..' traversal — "
+                    "refused")
+        if text.startswith("~"):
+            return (f"path argument {name!r} uses home expansion — "
+                    "the operator names the approved scope; '~' is "
+                    "refused")
+        candidate = os.path.expanduser(text)
+        if os.path.isabs(candidate):
+            try:
+                real = os.path.realpath(os.path.abspath(candidate))
+            except (OSError, ValueError):
+                return f"path argument {name!r} cannot be canonicalized"
+            for root in policy.path_roots:
+                if _within(real, os.path.realpath(
+                        os.path.abspath(os.path.expanduser(root)))):
+                    break
+            else:
+                return (f"path argument {name!r} resolves outside the "
+                        "approved resource scope")
+    return ""
+
+
+def _within(real: str, root: str) -> bool:
+    """Symlink-aware containment of a canonical path in a canonical
+    root (never a lexical prefix check)."""
+    try:
+        return os.path.commonpath([real, root]) == root
+    except (ValueError, OSError):
+        return False
 
 
 # ---- the five LLM-facing schemas (fixed, small, boring) -----------------
