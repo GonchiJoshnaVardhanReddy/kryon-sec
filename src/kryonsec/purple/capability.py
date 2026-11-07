@@ -74,11 +74,13 @@ class CapabilityRecord(BaseModel):
     #: not-approved (fail closed).
     status: Literal["claimed", "verified", "approved", "rejected"]
     #: Phase 1C — INDEPENDENT verification of the claimed shell evidence
-    #: itself. Written only by a capability-verification routine (none
-    #: exists yet — the registry is empty, so nothing may ever set it),
-    #: NEVER by Gate 3 and never implicitly. Eligibility for
-    #: post-exploitation requires ``status == "approved"`` AND
-    #: ``verification == "verified"``; approval alone is never enough.
+    #: itself. Written ONLY by the Phase 1D verifier
+    #: (:mod:`capability_verify`) when the record's producer has a
+    #: registered verification contract AND the contract's bounded probe
+    #: reproduces its marker inside the Mode B sandbox — never by Gate 3
+    #: and never implicitly. Eligibility for post-exploitation requires
+    #: ``status == "approved"`` AND ``verification == "verified"``;
+    #: approval alone is never enough.
     verification: Literal["not_run", "verified"] = "not_run"
     #: bounded, secret-redacted supporting evidence
     evidence: str
@@ -119,9 +121,9 @@ def build_record(
     """Build + validate a record — a wrong field means None, never a
     half-valid record (fail closed). Anything claiming a capability the
     schema does not know, an unknown status, or empty source fields is
-    refused here. ``verification`` defaults to ``not_run`` and only a
-    capability-verification routine may pass ``verified`` — no Gate 3
-    decision can set it."""
+    refused here. ``verification`` defaults to ``not_run`` and only the
+    Phase 1D verifier may pass ``verified`` — no Gate 3 decision can set
+    it."""
     try:
         record = CapabilityRecord(
             capability=capability,  # type: ignore[arg-type]
