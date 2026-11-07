@@ -328,17 +328,49 @@ class McpToolbox:
         with self._lock:
             return dict(self.tools)
 
-    def connect_all(self) -> dict[str, tuple[dict, Any]]:
-        """Start every enabled server; returns the tool entries known at
+    def connect_all(
+        self,
+        allow_start: "Callable[[dict], str] | None" = None,
+    ) -> dict[str, tuple[dict, Any]]:
+        """Start AUTHORIZED servers only; returns the tool entries known at
         connect time (late booters merge into snapshot() afterwards).
         Failures are logged, noticed, and skipped. Safe to call on a
-        daemon thread — close() can interrupt it between servers."""
+        daemon thread — close() can interrupt it between servers.
+
+        Startup is a policy checkpoint, not plumbing: starting a stdio
+        server means launching a local program. ``allow_start`` is called
+        with the raw server row BEFORE anything spawns — "" permits
+        startup, a non-empty refusal reason blocks it and is shown in
+        the connection status. When no authorizer is wired (stray
+        callers), the BUILT-IN conservative gate applies
+        (:func:`_startup_refusal`): only rows that explicitly authorize
+        execution (trust 'ask'/'allow' with at least one tool allowance)
+        may start — unknown/disabled connections never execute
+        host-side programs.
+        """
+        if allow_start is None:
+            allow_start = _startup_refusal
         servers = [s for s in self.cfg.mcp_servers if s.get("enabled", True)]
         for server in servers:
             torn_down = False
             if self._closing:
                 return self.snapshot()
             name = server.get("name", "?")
+            refusal = str(allow_start(server) or "")
+            if refusal:
+                # policy refusal BEFORE any process exists: the connection
+                # stays visible (status 'blocked') but never runs anything
+                detail = refusal[:160]
+                with self._lock:
+                    self._server_status[str(name)] = {
+                        "name": str(name),
+                        "status": "blocked",
+                        "detail": detail,
+                        "tools": 0,
+                    }
+                self._notice(
+                    f"MCP server {name!r} not started: {detail}")
+                continue
             try:
                 conn, slow = self._connect_one(server)
             except Exception as e:
@@ -522,6 +554,32 @@ class McpToolbox:
         """
         with self._lock:
             return [dict(value) for value in self._server_status.values()]
+
+
+def _startup_refusal(row: dict) -> str:
+    """The built-in startup gate: "" = start permitted; otherwise the
+    reason the row may not start a process.
+
+    Startup rule (conservative, matches the registry's policy): a
+    connection only launches its program when it EXPLICITLY authorizes
+    execution — trust 'ask' or 'allow' AND at least one tool allowance
+    (``allow_tools``, where ``["*"]`` counts). A row without a policy,
+    with trust 'disabled', or with nothing allowed never starts a
+    host-side program, even though its status remains visible.
+    """
+    trust = str(row.get("trust", "disabled"))
+    allow = row.get("allow_tools", [])
+    names = [
+        str(t).strip() for t in allow if isinstance(allow, (list, tuple, set))
+        and str(t).strip() and t != "*"]
+    wildcard = isinstance(allow, (list, tuple, set, frozenset)) and "*" in allow
+    if trust not in ("ask", "allow"):
+        return ("no explicit startup authorization (trust must be 'ask' "
+                "or 'allow') — server not started")
+    if not names and not wildcard:
+        return ("no allow_tools entry — starting requires explicitly "
+                "authorized tools")
+    return ""
 
 
 def _tool_name(tool: Any) -> str:

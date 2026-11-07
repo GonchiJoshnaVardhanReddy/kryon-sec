@@ -32,13 +32,26 @@ Each configured server row may carry flat keys:
 * ``ask`` calls must pass a human approval callback; with none wired the
   call is refused, so silence never grants consent (same rule as the
   file tools and the Gate-3 approver).
-* Arguments are validated against the tool's own schema (required keys,
-  declared types, and unknown-key rejection) before dispatch.
+* Arguments are validated against the tool's own JSON schema with the
+  maintainance ``jsonschema`` library: nested objects, arrays, enums,
+  patterns, numeric/bounded constraints and additionalProperties all
+  hold; schema validity is NOT authorization — tool, destination,
+  path and side-effect policies stay separate (an explicit
+  least-privilege guard also rejects argument keys the tool did not
+  declare, and path-like arguments containing traversal ("..") or
+  NUL bytes are refused outright).
+* A server's PROCESS only starts under explicit connection-level
+  authorization (trust 'ask'/'allow' with tool allowances) — an
+  unknown or disabled connection never executes host-side programs;
+  it stays visible in discovery as status "blocked".
 * Results are secret-redacted, size-bounded, and treated as UNTRUSTED
   data — never instructions; they are never parsed for control flow,
   never executed, and never written raw to the audit log.
 * Concurrency is capped per connection; overflows are refused (not
-  queued) and audited.
+  queued) and audited. Repeatedly timed-out (hung) operations cannot
+  accumulate without bound: past 2× the connection's concurrency cap
+  of still-running abandoned workers, new calls are refused until the
+  hung work drains.
 
 Mode A / Mode B boundary (unbroken in this phase): this registry is
 host-side Mode A code mode — Kryonsec runs ON the host here. It must
@@ -124,6 +137,15 @@ class McpExecutionPolicy:
     def needs_approval(self) -> bool:
         return self.trust == "ask"
 
+    def startup_authorized(self) -> bool:
+        """Connection-level STARTUP authorization: launching this
+        connection's server process means executing a local program, so
+        it requires an explicit trust mode AND an explicit allowance —
+        unknown or disabled connections never start programs."""
+        if self.trust not in ("ask", "allow"):
+            return False
+        return self.allow_all_tools or bool(self.allow_tools)
+
     def __post_init__(self) -> None:
         if self.trust not in TRUST_MODES:
             raise McpPolicyError(
@@ -187,13 +209,45 @@ def _positive(row: dict, key: str, default: float) -> float:
     return value
 
 
+def _counter():
+    """A thread-safe monotonically increasing id source (hung tokens)."""
+    import itertools
+
+    lock = threading.Lock()
+    state = itertools.count()
+
+    def nxt() -> int:
+        with lock:
+            return next(state)
+
+    return nxt
+
+
 @dataclass
 class McpApprovalRequest:
-    """What the human is shown when a policy says ask."""
+    """What the human is shown when a policy says ask.
+
+    Everything string-valued here is redacted and bounded by the
+    registry BEFORE the approval UI sees it — previews of argument
+    values (never secret-shaped material), the tool's declared
+    description (origin), and, when identifiable, the file path or
+    destination the call would touch.
+    """
     connection: str
     tool: str
     argument_keys: "list[str]"
     trust_reason: str = ""
+    #: bounded, redacted preview of argument VALUES (keys only would
+    #: not show WHERE a path argument points)
+    arguments_preview: "dict[str, str]" = None  # type: ignore[assignment]
+    #: identified destination/path/resource, or None
+    resource: "str | None" = None
+    #: the tool's own (redacted, bounded) description — origin context
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        if self.arguments_preview is None:
+            self.arguments_preview = {}
 
 
 Approver = Callable[[McpApprovalRequest], bool]
@@ -201,22 +255,34 @@ Approver = Callable[[McpApprovalRequest], bool]
 
 def terminal_mcp_approver() -> Approver:
     """A terminal approval gate for ``trust == "ask"`` connections:
-    shows connection, tool, and argument KEYS (never values — arguments
-    may carry secrets), and approves nothing when stdin is not a live
-    terminal (silence is never consent)."""
+    shows tool identity and origin (external MCP server + its declared
+    description), the requested operation, a bounded redacted argument
+    preview, and any identified destination/path — never secret values
+    — and approves nothing when stdin is not a live terminal (silence
+    is never consent)."""
     import sys
 
     def approve(request: McpApprovalRequest) -> bool:
         try:
             if not sys.stdin.isatty():
                 return False
+            operation = (f"call tool {request.tool!r} on connection "
+                         f"{request.connection!r}")
             print(
                 f"\n=== MCP tool approval ===\n"
-                f"connection: {request.connection}\n"
-                f"tool:       {request.tool}\n"
-                f"arguments:  {', '.join(request.argument_keys) or '(nothing)'}"
-                f"\n[trust='ask'] approve this call? [y/N] ",
-                end="")
+                f"origin:     MCP server {request.connection!r} "
+                f"(external stdio server)\n"
+                f"operation:  {operation}\n"
+                + (f"tool doc:   {request.description[:160]}\n"
+                   if request.description else "")
+                + (f"touches:    {request.resource}\n"
+                   if request.resource else "")
+                + f"arguments:  "
+                + (", ".join(request.argument_keys) or "(nothing)")
+                + "\n")
+            for key, text in sorted(request.arguments_preview.items()):
+                print(f"  {key}: {text}")
+            print("[trust='ask'] approve this call? [y/N] ", end="")
             sys.stdout.flush()
             answer = sys.stdin.readline().strip().lower()
             return answer in ("y", "yes")
@@ -266,6 +332,15 @@ class McpRegistry:
         # missing rows (server configured before its policy import) fail
         # closed via _policy()'s default below — never auto-trusted
         self._lock = threading.Lock()
+        # hung-worker accounting (Phase 2A.1): dispatch runs on a small
+        # independent worker thread; a timed-out call ABANDONS that
+        # thread (it keeps working to the toolbox's own cap). Abandoned
+        # workers are tracked; when too many are still running, the
+        # connection is overloaded with hung work and new calls are
+        # refused until they drain — bounded work, unbounded never.
+        self._hung_lock = threading.Lock()
+        self._hung_workers: "set[int]" = set()
+        self._worker_ids = _counter()
         # the five executors, keyed exactly as the LLM-facing schemas:
         # execute_tool(**args) unpacks the schema's argument NAMES as
         # keyword parameters — they must match forever.
@@ -282,6 +357,32 @@ class McpRegistry:
     def policy_for(self, connection: str) -> McpExecutionPolicy:
         """The policy for one connection, or the fail-closed default."""
         return self._policies.get(connection) or McpExecutionPolicy()
+
+    def startup_allowance(self) -> "Callable[[dict], str]":
+        """The connection-level startup gate for ``McpToolbox
+        .connect_all``: "" permits a server row's process to start; a
+        refusal reason blocks it — and the refusal is AUDITED here, so
+        every blocked startup leaves evidence. Unknown or disabled
+        connections never execute host-side programs."""
+        def allow_start(row: dict) -> str:
+            name = str(row.get("name", "?"))
+            policy = self._policies.get(name)
+            if policy is None:
+                reason = ("no execution policy — servers only start "
+                          "under an explicitly authorized policy")
+            elif not policy.startup_authorized():
+                reason = (f"trust={policy.trust!r} with no tool "
+                          "allowance — server not started")
+            else:
+                return ""
+            self.audit_safe({
+                "event": "mcp_connection_not_started",
+                "connection": name,
+                "reason": redact(reason[:MAX_AUDIT_REASON_CHARS])[0],
+            })
+            return reason
+
+        return allow_start
 
     def _connection_entry(self, connection: str, tool: str):
         """(executor, schema, tool_label) for an allowed dispatch target,
@@ -470,11 +571,20 @@ class McpRegistry:
             return f"error: {reason}"
         (schema, executor) = entry
 
+        args_now = arguments if isinstance(arguments, dict) else {}
         if policy.needs_approval():
+            fn = schema.get("function", {})
             request = McpApprovalRequest(
                 connection=connection,
                 tool=tool,
-                argument_keys=sorted(arguments or {}),
+                argument_keys=sorted(args_now),
+                trust_reason=(
+                    f"connection {connection!r} is an external MCP "
+                    "server configured with trust='ask'"),
+                description=redact(str(fn.get("description", ""))
+                                   [:MAX_HIT_DESCRIPTION_CHARS])[0],
+                arguments_preview=self._redacted_preview(args_now),
+                resource=self._resource_of(args_now),
             )
             if self.approver is None:
                 why = ("connection trust is 'ask' but no approval gate is "
@@ -509,6 +619,13 @@ class McpRegistry:
             self.audit_refused(connection, tool, f"invalid arguments: "
                                f"{invalid[:MAX_AUDIT_REASON_CHARS]}")
             return f"error: invalid arguments for {tool!r}: {invalid}"
+        # argument validation and destination/path policy stay
+        # SEPARATE: above the tool schema proves the shape; below the
+        # side-effect guard rejects unsafe destinations
+        unsafe = _destination_guard(arguments)
+        if unsafe:
+            self.audit_refused(connection, tool, unsafe)
+            return f"error: {unsafe}"
 
         guard = self._semaphores.get(connection)
         if guard is None:            # connection added at runtime — no cap
@@ -527,26 +644,86 @@ class McpRegistry:
                 return (f"error: MCP connection {connection!r} is at its "
                         f"concurrency cap of {policy.max_concurrent_calls} "
                         "call(s)")
+            # hung-server protection (Phase 2A.1): abandoned timed-out
+            # workers still running must not accumulate without bound
+            hung_cap = policy.max_concurrent_calls * 2
+            with self._hung_lock:
+                hung = len(self._hung_workers)
+            if hung >= hung_cap:
+                why = (f"{hung} timed-out operation(s) still running on "
+                       f"{connection!r} — hung-server protection cap "
+                       f"({hung_cap}) reached; refusing until the hung "
+                       "work drains")
+                self.audit_refused(connection, tool, why)
+                return f"error: MCP connection {connection!r} has too " \
+                       "many timed-out operations still running — " \
+                       "try again later"
             return self._run_bounded(connection, tool, policy, executor,
                                      arguments)
         finally:
             if acquired:
                 guard.release()
 
+    # -- argument preview + destination guard (Phase 2A.1) -----------------
+
+    _RESOURCE_KEYS = frozenset({
+        "path", "file", "filepath", "filename", "dir", "directory",
+        "destination", "dest", "target", "resource", "location",
+        "url", "uri", "source", "output", "output_path", "root",
+    })
+
+    @staticmethod
+    def _redacted_preview(arguments: dict) -> "dict[str, str]":
+        """Bounded, redacted argument preview for the approval UI: values
+        are shown (a keys-only preview hides where a path argument
+        points) but secrets are redacted first and each value is
+        bounded. Keys only, max 12 entries."""
+        preview: "dict[str, str]" = {}
+        for key in sorted(arguments, key=str)[:12]:
+            try:
+                text = redact(str(arguments[key]))[0]
+            except Exception:
+                text = "<unprintable>"
+            if len(text) > 120:
+                text = text[:120] + "…"
+            preview[str(key)] = text
+        return preview
+
+    @classmethod
+    def _resource_of(cls, arguments: dict) -> "str | None":
+        """The first argument that names a destination/path/resource —
+        redacted and bounded for the approval display."""
+        for key in sorted(arguments, key=str):
+            if str(key).casefold() in cls._RESOURCE_KEYS:
+                try:
+                    text = redact(str(arguments[key]))[0]
+                except Exception:
+                    text = "<unprintable>"
+                return f"{text[:200]}"
+        return None
+
     def _run_bounded(self, connection, tool, policy, executor,
                      arguments) -> str:
         """The dispatch itself: an independent worker thread so the
         policy timeout is enforced even above the toolbox's own cap; the
-        result is redacted ONCE at this boundary."""
+        result is redacted ONCE at this boundary. A timed-out worker is
+        ABANDONED (tracked, still bounded by the toolbox cap) — the
+        hung bookkeeping (``_worker_finished``) keeps repeated hangs
+        from piling up."""
+        token = self._worker_ids()
         pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(executor, **arguments)
+        future = pool.submit(
+            self._guarded_run, token, executor, arguments)
         try:
             try:
                 raw = future.result(timeout=policy.call_timeout_s)
             except FutureTimeout:
-                future.cancel()
-                self.audit_failed(connection, tool,
-                                  f"timed out after {policy.call_timeout_s}s")
+                self._worker_abandoned(token)
+                self.audit_failed(
+                    connection, tool,
+                    f"timed out after {policy.call_timeout_s}s "
+                    "(operation abandoned; bounded by the connection's "
+                    "own call cap)")
                 return (f"error: MCP tool {tool!r} on {connection!r} timed "
                         f"out after {policy.call_timeout_s}s")
             except Exception as e:
@@ -570,6 +747,23 @@ class McpRegistry:
         })
         # UNTRUSTED boundary marker: the LLM must read this as data
         return result + UNTRUSTED_MARKER
+
+    def _guarded_run(self, token: int, executor, arguments):
+        """Run one dispatch; when it eventually lands — success, error,
+        or long after its caller timed out — the hung bookkeeping is
+        closed so abandoned workers cannot accumulate invisibly."""
+        try:
+            return executor(**arguments)
+        finally:
+            self._worker_finished(token)
+
+    def _worker_finished(self, token: int) -> None:
+        with self._hung_lock:
+            self._hung_workers.discard(token)
+
+    def _worker_abandoned(self, token: int) -> None:
+        with self._hung_lock:
+            self._hung_workers.add(token)
 
     # -- audit (fail-safe: audit problems never break discovery) ----------
 
@@ -619,31 +813,143 @@ class McpRegistry:
 
 
 def validate_arguments(parameters: dict, arguments: dict) -> str:
-    """Schema-validate `arguments` against the tool's declared
-    parameters. Deterministic and fail-closed: required present, declared
-    types hold, unknown keys rejected. Returns "" or a short reason.
+    """Schema-validate `arguments` against the tool's declared JSON
+    schema (Phase 2A.1: full validation via ``jsonschema`` — nested
+    objects, arrays, enums, patterns, numeric and bounded constraints,
+    additionalProperties).
+
+    Deterministic and fail-closed:
+    - a tool without a usable object parameter schema is refused;
+    - oversize/pathological schemas and arguments are refused BEFORE
+      validation (a schema comes from an UNTRUSTED server — bounded
+      size/depth/pattern lengths keep validation from being an attack
+      surface, e.g. regex blowup);
+    - argument keys the tool did not declare are ALWAYS refused, even
+      when the schema would allow them: schema validity is not
+      authorization, and least-privilege argument selection stays
+      explicit.
+
+    Returns "" when valid, otherwise a short refusal reason.
     """
-    if not isinstance(parameters, dict):
+    if not isinstance(parameters, dict) or not parameters:
         return "tool declared no usable parameter schema"
     properties = parameters.get("properties")
     if not isinstance(properties, dict):
         return "tool declared no usable parameter schema"
-    required = list(parameters.get("required", []))
-    missing = [r for r in required if r not in arguments or
-               arguments[r] is None]
-    if missing:
-        return f"missing required argument(s): {missing}"
+
+    # size bounds BEFORE any validation work
+    try:
+        args_json = json.dumps(arguments, default=str)
+        schema_json = json.dumps(parameters, default=str)
+    except (TypeError, ValueError) as e:
+        return f"arguments not serializable for validation: {e}"
+    if len(args_json) > _MAX_ARGUMENT_BYTES:
+        return (f"arguments too large ({len(args_json)} bytes > "
+                f"{_MAX_ARGUMENT_BYTES})")
+    if len(schema_json) > _MAX_SCHEMA_CHARS:
+        return "tool declares an oversize parameter schema — refused"
+    try:
+        depth = _schema_depth(parameters)
+    except RecursionError:
+        return "tool declares a schema nested too deeply — refused"
+    if depth > _MAX_SCHEMA_DEPTH:
+        return "tool declares a schema nested too deeply — refused"
+    if _oversize_patterns(parameters):
+        return "tool declares over-long regex patterns — refused"
+
+    # least-privilege: keys the tool did not declare never pass, even
+    # when the (untrusted) schema explicitly permits them
     unknown = [k for k in arguments if k not in properties]
     if unknown:
         return f"unexpected argument(s): {unknown}"
-    type_map = {"string": str, "number": (int, float), "integer": int,
-                "boolean": bool, "array": list, "object": dict}
+
+    import jsonschema
+    from jsonschema.exceptions import SchemaError
+
+    try:
+        validator = jsonschema.Draft202012Validator(parameters)
+        errors = sorted(validator.iter_errors(arguments),
+                        key=lambda e: (len(e.absolute_path),
+                                       str(list(e.absolute_path))))
+    except SchemaError:
+        return "tool declares an invalid JSON schema — refused"
+    except RecursionError:
+        return "argument validation failed (deeply nested values) — refused"
+    except Exception as e:
+        return f"argument validation failed ({type(e).__name__}) — refused"
+
+    if errors:
+        parts = []
+        for e in errors[:3]:
+            where = ".".join(str(p) for p in e.absolute_path)
+            where = f"arguments.{where}" if where else "arguments"
+            if e.validator == "required":
+                missing = ", ".join(sorted(map(str, e.validator_value))) \
+                    if isinstance(e.validator_value, (list, tuple)) else "?"
+                parts.append(f"{where}: "
+                             f"missing required argument(s): {missing}")
+            elif e.validator == "type":
+                parts.append(f"{where}: must be {e.validator_value} "
+                             f"(got a different type)")
+            else:
+                parts.append(f"{where}: {e.message}")
+        return "; ".join(parts)[:240]
+    return ""
+
+
+_MAX_ARGUMENT_BYTES = 65_536
+_MAX_SCHEMA_CHARS = 100_000
+_MAX_SCHEMA_DEPTH = 16
+_MAX_PATTERN_CHARS = 256
+
+
+def _schema_depth(node: Any, seen: frozenset = frozenset()) -> int:
+    """Depth of a (possibly cyclic) schema structure, iteratively."""
+    if not isinstance(node, (dict, list)):
+        return 0
+    if isinstance(node, list):
+        return 1 + max((_schema_depth(item, seen) for item in node),
+                       default=0)
+    if id(node) in seen:            # cyclic schema — treat as unsafe later
+        return _MAX_SCHEMA_DEPTH + 1
+    return 1 + max((_schema_depth(value, seen | {id(node)})
+                    for value in node.values()), default=0)
+
+
+def _oversize_patterns(node: Any, depth: int = 0) -> bool:
+    """True when any 'pattern'/'propertyNames' regex is long enough to
+    matter as a ReDoS vector (untrusted schema)."""
+    if depth > _MAX_SCHEMA_DEPTH or not isinstance(node, (dict, list)):
+        return False
+    if isinstance(node, list):
+        return any(_oversize_patterns(item, depth + 1) for item in node)
+    for key, value in node.items():
+        if key in ("pattern", "propertyNames") and \
+                isinstance(value, str) and len(value) > _MAX_PATTERN_CHARS:
+            return True
+        if _oversize_patterns(value, depth + 1):
+            return True
+    return False
+
+
+def _destination_guard(arguments: dict) -> str:
+    """Side-effect safety INDEPENDENT of the tool schema: path- and
+    destination-like argument values must not traverse out ("..") or
+    smuggle NUL bytes. Absolute paths stay legal (a filesystem MCP
+    server legitimately needs them); the tool's own trust policy
+    remains the real authorization — this is the safety net, not the
+    policy."""
     for key, value in arguments.items():
-        declared = (properties.get(key) or {}).get("type")
-        expected = type_map.get(declared)
-        if expected is not None and not isinstance(value, expected):
-            return (f"argument {key!r} must be {declared} "
-                    f"(got {type(value).__name__})")
+        if str(key).casefold() not in McpRegistry._RESOURCE_KEYS:
+            continue
+        if not isinstance(value, str):
+            continue
+        segments = str(value).replace("\\", "/").split("/")
+        if any(segment == ".." for segment in segments):
+            return (f"path argument {key!r} contains '..' traversal — "
+                    "refused")
+        if "\x00" in str(value):
+            return f"path argument {key!r} contains a NUL byte — refused"
     return ""
 
 

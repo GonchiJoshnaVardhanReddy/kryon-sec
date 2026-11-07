@@ -272,8 +272,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
             mcp_registry = McpRegistry(
                 cfg, mcp_toolbox, approver=terminal_mcp_approver())
+            # Phase 2A.1: the startup gate is connection-level policy —
+            # a server's PROCESS only launches when its row explicitly
+            # authorizes execution; blocked rows stay visible but never
+            # start (and their block is audited).
             threading.Thread(
-                target=mcp_toolbox.connect_all, name="mcp-connect", daemon=True,
+                target=mcp_toolbox.connect_all,
+                kwargs={"allow_start": mcp_registry.startup_allowance()},
+                name="mcp-connect", daemon=True,
             ).start()
         except Exception as e:
             err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
