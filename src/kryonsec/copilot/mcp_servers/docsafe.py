@@ -305,6 +305,35 @@ def _display(real: Path, roots: "list[Path]") -> str:
     return real.name
 
 
+def smoke() -> "tuple[bool, str]":
+    """A small, non-invasive provider smoke (operator tooling, docs:
+    docs/MCP-DOCSAFE.md). Builds the server against a throwaway temp
+    root and exercises the canonical path boundary: one allowed read,
+    one traversal refusal and one outside-scope refusal. NO process
+    spawn, NO network, NO environment reads — it never touches real
+    operator roots, only its own temp directory. Returns (ok, note)."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="kryonsec-docsafe-") as d:
+            root = Path(d) / "smoke_root"
+            root.mkdir()
+            (root / "ok.txt").write_text("docsafe smoke", encoding="utf-8")
+            roots = [root]
+            assert _resolve(roots, "ok.txt").name == "ok.txt"
+            for refused in ("../outside", str(d)):
+                try:
+                    _resolve(roots, refused)
+                    return False, f"smoke failed: accepted {refused!r}"
+                except ScopeViolation:
+                    pass
+            return True, (
+                "docsafe boundary smoke OK (path resolution honored, "
+                "traversal and outside-scope refusals hold)")
+    except Exception as e:   # smoke: always honest, never noisy
+        return False, f"docsafe smoke failed: {e}"
+
+
 def main() -> None:
     """Entry point: python -m kryonsec.copilot.mcp_servers.docsafe
     ROOT [ROOT ...] — stdio only, no network, no environment reads."""

@@ -304,12 +304,17 @@ class KaliSandbox:
         except Exception as e:  # never let cleanup mask the timeout report
             log.warning("could not kill sandbox container %s: %s", name, e)
 
-    def spawn(self, tool_argv: list[str]) -> SpawnResult:
+    def spawn(self, tool_argv: list[str],
+              timeout_s: "int | None" = None) -> SpawnResult:
         """Run one tool in the sandbox; parse the entrypoint's JSON payload.
 
         tool_argv[0] is the tool name (must be allowlisted — the host-side
         ToolAllowlist check happens BEFORE this is called; the image's
         entrypoint re-checks it as defense-in-depth).
+
+        ``timeout_s`` (Phase 2B.2): an optional per-call bound for vetted
+        adapters — it may only TIGHTEN the sandbox's own ceiling; the
+        resource caps and every isolation/egress invariant are unchanged.
         """
         docker_argv = self._docker_argv(tool_argv)
         container_name = docker_argv[docker_argv.index("--name") + 1]
@@ -355,11 +360,15 @@ class KaliSandbox:
                     ok=False, exit_code=-1, stdout="", error=error)
 
         try:
+            if timeout_s is None:
+                timeout = self.timeout_s
+            else:
+                timeout = max(1, min(int(timeout_s), self.timeout_s))
             proc = self._run(
                 docker_argv,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_s,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             # killing the docker CLI leaves the container running on the
@@ -367,7 +376,7 @@ class KaliSandbox:
             self._kill_container(container_name)
             return SpawnResult(
                 ok=False, exit_code=-1, stdout="",
-                error=f"tool exceeded {self.timeout_s}s sandbox timeout",
+                error=f"tool exceeded {timeout}s sandbox timeout",
             )
         except Exception as e:
             return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e))
