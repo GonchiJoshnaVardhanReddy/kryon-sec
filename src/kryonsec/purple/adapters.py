@@ -463,7 +463,24 @@ def _fill_template(template: tuple[str, ...],
                 f"template argument {arg!r} still carries an unfilled "
                 "placeholder — preparation is all-or-nothing")
         args.append(arg)
+    _no_option_shaped_values(template, variables)
     return args
+
+
+def _no_option_shaped_values(template: "tuple[str, ...]",
+                             variables: dict[str, str]) -> None:
+    """Option-injection guard (Phase 2B.4): a caller-provided value that
+    BEGINS with '-' is indistinguishable from a CLI option to every
+    getopts-style tool (e.g. a searchsploit term '-u' would run its
+    network UPDATE command). No legit value does: urls/hosts/ports all
+    start with a name character, and the {term} charset regex alone
+    would still admit '-u foo'. Refuse the render — argv slots are
+    either literals or values, never options."""
+    for name, value in variables.items():
+        if value.startswith("-"):
+            raise AdapterError(
+                f"variable {name} value {value[:40]!r} begins with '-' — "
+                "option-shaped caller input is refused (option injection)")
 
 
 def prepare_adapter_run(

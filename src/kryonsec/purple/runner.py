@@ -305,12 +305,18 @@ def start_engagement(
         if state == "HYPOTHESIZE":
             from .hypothesize import HypothesizeSubagent
 
+            from .adapter_searchsploit import production_registry
+
             # the sandbox (when present) powers ExploitDB searchsploit
             # enrichment; without it enrichment runs API-only and skips
-            # searchsploit with an audited notice
+            # searchsploit with an audited notice. The vetted
+            # searchsploit-term adapter (2B.4) replaces the legacy
+            # text-table lookup when registered (its refusal path degrades
+            # to the same audited skip; never a host fallback).
             sub = HypothesizeSubagent(
                 cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
                 sandbox=sandbox,
+                adapter_registry=production_registry(),
             )
             return sub.run
 
