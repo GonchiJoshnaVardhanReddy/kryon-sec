@@ -17,6 +17,10 @@ ALLOWED_TOOLS=(
     "subfinder" "amass" "assetfinder"
     # active recon
     "nmap" "naabu" "httpx" "rustscan" "whatweb" "katana" "hakrawler"
+    # ProjectDiscovery httpx under its REAL Kali binary name (the plain
+    # `httpx` command does not exist in this image — debian/rules installs
+    # it ONLY as httpx-toolkit); used by the httpx-probe adapter (2B.3)
+    "httpx-toolkit"
     "feroxbuster" "sslscan" "testssl.sh" "dnsx"
     # active recon (Phase 8): screenshots, DNS brute-force, API discovery
     "gowitness" "massdns" "/opt/kryonsec/openapi_probe.py"

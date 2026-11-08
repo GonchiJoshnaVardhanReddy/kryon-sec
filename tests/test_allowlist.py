@@ -300,6 +300,7 @@ _TOOL_SOURCE: dict[str, str] = {
     "nmap": "nmap",
     "naabu": "naabu",
     "httpx": "httpx-toolkit",
+    "httpx-toolkit": "httpx-toolkit",
     "rustscan": "rustscan",
     "whatweb": "whatweb",
     "katana": "katana",

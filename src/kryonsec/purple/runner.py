@@ -353,10 +353,15 @@ def start_engagement(
 
         if state == "RECON_ACTIVE" and sandbox is not None:
             from .recon_active import ReconActiveSubagent
+            from .adapter_httpx import production_registry
 
             sub = ReconActiveSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
+                # Phase 2B.3: the ONE vetted production adapter registry
+                # (httpx-probe). Injected explicitly; unknown adapters
+                # inside remain refused/disabled.
+                adapter_registry=production_registry(),
             )
             return sub.run
 

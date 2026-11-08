@@ -629,7 +629,8 @@ def execute_adapter(
     graph: "EngagementGraph | None" = None,
     hypothesis_id: str = "",
     approvals_granted: "frozenset[str] | set[str] | None" = None,
-) -> AdapterRunRecord:
+    full_output: bool = False,
+) -> "AdapterRunRecord | tuple[AdapterRunRecord, str]":
     """Run one prepared adapter request through the sandbox.
 
     Refusals are audited and returned as a failed record (never raised
@@ -638,6 +639,12 @@ def execute_adapter(
     - a required approval gate was not granted;
     - a target-touching adapter has no egress policy on the sandbox;
     - the sandbox object is incapable of spawning (no host fallback).
+
+    ``full_output`` (Phase 2B.3) additionally returns the run's stdout,
+    bounded by the adapter's own output bound (the record's excerpt
+    stays bounded exactly as before). Callers that need to PARSE the
+    output (e.g. the httpx-probe JSONL reader) request it; untrusted
+    data, same rules.
     """
     denied_reasons: list[str] = []
     try:
@@ -675,7 +682,7 @@ def execute_adapter(
             "reason": reason,
         })
         log.warning("adapter %s refused: %s", adapter.adapter_id, reason)
-        return AdapterRunRecord(
+        record = AdapterRunRecord(
             adapter_id=adapter.adapter_id,
             request_id=prepared.request_id,
             tool=prepared.tool,
@@ -687,6 +694,7 @@ def execute_adapter(
             error_excerpt=reason[:_EXCERPT_CHARS],
             evidence_kind=adapter.evidence_kind,
         )
+        return (record, "") if full_output else record
 
     # hypothesis gate (Gate 2) must be REAL when the adapter demands it:
     # the referenced hypothesis must exist on the graph AND be approved
@@ -706,7 +714,7 @@ def execute_adapter(
                 "request_id": prepared.request_id,
                 "reason": reason,
             })
-            return AdapterRunRecord(
+            record = AdapterRunRecord(
                 adapter_id=adapter.adapter_id,
                 request_id=prepared.request_id,
                 tool=prepared.tool,
@@ -718,6 +726,7 @@ def execute_adapter(
                 error_excerpt=reason[:_EXCERPT_CHARS],
                 evidence_kind=adapter.evidence_kind,
             )
+            return (record, "") if full_output else record
 
     audit.write({
         "event": "adapter_spawn",
@@ -793,6 +802,14 @@ def execute_adapter(
                 "adapter_id": adapter.adapter_id,
                 "request_id": prepared.request_id,
             })
+    # the FULL (adapter-bound, still untrusted) stdout for parsing
+    # callers — re-read through the SAME redaction as the excerpt caller
+    # would apply downstream (here raw-but-bounded; excerpts carry their
+    # own redaction)
+    if full_output:
+        bounded = (result.stdout or "")[:adapter.output_bound_chars]
+        redacted, _ = redact(bounded)
+        return record, redacted
     return record
 
 
