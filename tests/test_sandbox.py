@@ -1,6 +1,7 @@
 """Tests for the Kali sandbox spawn (spec §8.5)."""
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -264,3 +265,50 @@ def test_normal_exception_does_not_kill(tmp_path, monkeypatch):
     assert result.ok is False
     assert "docker not found" in result.error
     assert killed == []
+
+
+# ---- image source covers the production adapter executables (2B.5.1) -------
+
+def test_image_source_covers_production_adapters():
+    """Every production Mode B adapter's executable must be both built into
+    the sandbox image source and entrypoint-allowlisted in it.
+
+    WHY (Phase 2B.5.1): the released v1.3.8 image predates the 2B.3
+    entrypoint change, so its ``httpx-toolkit`` binary sat behind a
+    stale allowlist and every httpx-probe spawn got
+    ``tool_not_in_allowlist`` (exit 125). The repo source was already
+    right — nothing in CI verified THE IMAGE BUILD DESCRIPTION carries
+    what the adapters can't live without. The generic
+    test_entrypoint_allowlist_in_sync couples the HOST allowlist to the
+    entrypoint; this test additionally couples the adapters (the
+    consumers) to both source files by name, so the next image rebuild
+    cannot ship an adapter-blocking image.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    entrypoint = (repo / "containers" / "sandbox" / "entrypoint.sh"
+                  ).read_text(encoding="utf-8")
+    dockerfile = (repo / "containers" / "sandbox" / "Dockerfile.kali"
+                  ).read_text(encoding="utf-8")
+
+    # entrypoint: every adapter executable allowlisted by its exact
+    # quoted name (the entrypoint matches whole tokens, not substrings)
+    for tool in ("httpx-toolkit", "whatweb", "searchsploit"):
+        assert f'"{tool}"' in entrypoint, (
+            f"{tool} missing from containers/sandbox/entrypoint.sh "
+            "ALLOWED_TOOLS — adapter spawns would all be rejected "
+            "with tool_not_in_allowlist")
+
+    # build source: every adapter executable has a concrete install
+    # statement (apt tool list; searchsploit ships with the exploitdb
+    # package — the Dockerfile tokens below are the same eyeball-level
+    # evidence test_allowlist.py already relies on for install-ness)
+    build_tokens = {
+        "httpx-toolkit": "httpx-toolkit" in dockerfile,
+        "whatweb": "whatweb" in dockerfile,
+        "searchsploit": "exploitdb" in dockerfile,
+    }
+    missing = [t for t, ok in build_tokens.items() if not ok]
+    assert not missing, (
+        f"containers/sandbox/Dockerfile.kali does not build: {missing}"
+        " — a rebuilt image would lack the adapter executables")
+
