@@ -21,6 +21,10 @@ design.
 """
 
 import ast
+import json
+import os
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -261,7 +265,8 @@ def test_spawn_refuses_to_launch_without_isolation(
     weakened = _strip_flag(real_argv, flag, expected)
 
     sb = _sandbox(tmp_path, run_fn)
-    monkeypatch.setattr(sb, "_docker_argv", lambda tool_argv: weakened)
+    monkeypatch.setattr(sb, "_docker_argv",
+                        lambda tool_argv, network_mode=None: weakened)
     result = sb.spawn(["nmap", "t.example"])
 
     assert launched == [], "a tool must never launch unisolated"
@@ -396,3 +401,313 @@ def test_no_browser_automation_reaches_mode_b():
         text = _module_text(path).lower()
         for bad in ("playwright", "selenium", "puppeteer"):
             assert bad not in text, f"{path.name} references {bad}"
+
+
+# ---- network-none adapter isolation (Phase 2B.4.1) --------------------------
+#
+# INVARIANT: a tool whose contract declares network="none" (e.g. the
+# searchsploit-term adapter) must be PROVABLY disconnected. A missing
+# egress policy used to mean the Docker DEFAULT bridge (full NAT
+# connectivity) — that silent fallback is now impossible: none-runs
+# launch with --network none and the invariant is verified on the exact
+# launch argv, fail closed.
+
+from kryonsec.purple.adapters import (
+    AdapterRegistry,
+    ModeBToolAdapter,
+    execute_adapter,
+    prepare_adapter_run,
+    spawn_supports_network_mode,
+)
+from kryonsec.purple.audit import AuditLog
+from kryonsec.purple.recon_passive import EngagementGraph
+from kryonsec.purple.sandbox import (
+    SpawnResult,
+    missing_network_none_flags,
+)
+
+
+class _FakePolicy:
+    """Duck-typed egress policy for _docker_argv (network_name +
+    dns_resolvers is all it reads)."""
+
+    network_name = "eng-net-abc"
+    dns_resolvers = ["10.9.9.9"]
+
+
+class _GenSandbox:
+    """A spawn double that ACCEPTS network_mode (the contract a real
+    KaliSandbox now exposes) and records what it received."""
+
+    def __init__(self, result=None, *, egress_policy=None):
+        self._result = result or SpawnResult(
+            ok=True, exit_code=0, stdout='{"exit_code": 0, "stdout": "ok"}')
+        self.spawned = []
+        self.network_modes = []
+        self.egress_policy = egress_policy
+
+    def spawn(self, argv, timeout_s=None, network_mode=None):
+        self.spawned.append(list(argv))
+        self.network_modes.append(network_mode)
+        return self._result
+
+
+class _OldSansbox:
+    """A legacy double whose spawn does NOT know network_mode — the
+    shape that cannot prove a run would be disconnected."""
+
+    def __init__(self, result=None):
+        self._result = result or SpawnResult(
+            ok=True, exit_code=0, stdout="ok")
+        self.spawned = []
+
+    def spawn(self, argv, timeout_s=None):
+        self.spawned.append(list(argv))
+        return self._result
+
+
+def _audit(tmp_path):
+    return AuditLog(Path(tmp_path) / "audit.jsonl")
+
+
+def _reg_none_adapter():
+    reg = AdapterRegistry()
+    reg.register(ModeBToolAdapter(
+        adapter_id="local-only-probe",
+        title="local database probe",
+        purpose="A network-none local lookup used by the tests.",
+        category="recon",
+        stages=("HYPOTHESIZE",),
+        executable="searchsploit",
+        command_template=("-j", "-t", "{term}"),
+        target_kind="term",
+        max_seconds=60,
+        output_bound_chars=4096,
+        approvals=(),
+        network="none",
+        risk="informational",
+        evidence_kind="json_report",
+    ))
+    return reg
+
+
+def test_default_bridge_fallback_never_happens_for_none_adapters(tmp_path):
+    """The executor hands NONE adapters to the sandbox with
+    network_mode='none' — the launch is a verifiable disconnect, not a
+    silent default-bridge fallthrough."""
+    reg = _reg_none_adapter()
+    sbx = _GenSandbox()
+    audit = _audit(tmp_path)
+    prep = prepare_adapter_run(
+        reg, "local-only-probe", target="t.example",
+        params={"term": "openssl"}, request_id="requestid0001")
+    record = execute_adapter(reg, prep, sandbox=sbx, audit=audit)
+    assert sbx.network_modes == ["none"]
+    assert bool(record.executed)
+    # the REAL docker argv builder for none mode carries the flag even
+    # when NO egress policy exists (the old silent-default-bridge case)
+    from kryonsec.config import KryonsecConfig
+
+    real = KaliSandbox(
+        cfg=KryonsecConfig(home=tmp_path),
+        run_fn=lambda argv, **kw: Completed(stdout=COMPLETED_PAYLOAD),
+        seccomp_profile=tmp_path / "nope.json")
+    argv = real._docker_argv(["searchsploit", "-j", "-t", "x"],
+                             network_mode="none")
+    assert argv[argv.index("--network") + 1] == "none"
+    assert argv.index("--network") < argv.index(real.image)
+    assert "--dns" not in argv[:argv.index(real.image)]
+
+
+def test_none_adapter_stays_disconnected_on_an_egressed_sandbox(tmp_path):
+    """Network Policy mismatch: an egress policy on the sandbox exists
+    for CONTEXT-tier tools — it must NOT turn a none-adapter into an
+    engagement-network run. The none contract wins and is checked."""
+    reg = _reg_none_adapter()
+    sbx = _GenSandbox(egress_policy=_FakePolicy())
+    prep = prepare_adapter_run(
+        reg, "local-only-probe", target="t.example",
+        params={"term": "openssl"}, request_id="requestid0001")
+    record = execute_adapter(reg, prep, sandbox=sbx, audit=_audit(tmp_path))
+    assert record.executed
+    assert sbx.network_modes == ["none"]   # NOT the engagement network
+    # sandbox side: a none-mode launch never carries the engagement
+    # network or DNS overrides even when a policy is attached
+    from kryonsec.config import KryonsecConfig
+
+    real = KaliSandbox(
+        cfg=KryonsecConfig(home=tmp_path),
+        run_fn=lambda argv, **kw: Completed(stdout=COMPLETED_PAYLOAD),
+        seccomp_profile=tmp_path / "nope.json")
+    real.egress_policy = _FakePolicy()
+    real.egress_gate = None
+    argv = real._docker_argv(["searchsploit", "-j", "-t", "x"],
+                             network_mode="none")
+    networks = [argv[i + 1] for i, a in enumerate(argv)
+                if a == "--network" and i + 1 < argv.index(real.image)]
+    assert networks == ["none"]
+    assert "eng-net-abc" not in argv
+    from kryonsec.purple.sandbox import missing_isolation_flags
+
+    assert missing_isolation_flags(argv) == []
+    assert missing_network_none_flags(argv, image=real.image) == []
+
+
+def test_isolation_flag_tampering_still_fails_closed(tmp_path):
+    """If a regression strips the --network none pair from the launch
+    argv, the invariant catches it and the docker run NEVER executes."""
+    launched = []
+
+    def run_fn(argv, **kw):
+        launched.append(list(argv))
+        return Completed(stdout=COMPLETED_PAYLOAD)
+
+    from kryonsec.config import KryonsecConfig
+
+    real = KaliSandbox(
+        cfg=KryonsecConfig(home=tmp_path), run_fn=run_fn,
+        seccomp_profile=tmp_path / "nope.json")
+    good = real._docker_argv(["searchsploit", "-j", "-t", "x"],
+                             network_mode="none")
+    tampered = _strip_flag(good, "--network", "none")
+    real._docker_argv = lambda tool_argv, network_mode=None: tampered
+    result = real.spawn(["searchsploit", "-j", "-t", "x"],
+                        network_mode="none")
+    assert launched == [], "a disconnected run must never launch disconnected-adjacent"
+    assert result.ok is False
+    assert "network-none invariant" in result.error
+    # same for an argv that smuggles a SECOND --network back in
+    smuggled = good[:good.index(real.image)] + ["--network", "bridge"] \
+        + good[good.index(real.image):]
+    real._docker_argv = lambda tool_argv, network_mode=None: smuggled
+    result2 = real.spawn(["searchsploit", "-j", "-t", "x"],
+                         network_mode="none")
+    assert launched == []
+    assert result2.ok is False and "network" in result2.error
+
+
+def test_missing_sandbox_refuses_none_adapter(tmp_path):
+    """No sandbox object at all: the adapter is audited-refused and
+    nothing runs — host-side execution is never a fallback."""
+    reg = _reg_none_adapter()
+    audit = _audit(tmp_path)
+    prep = prepare_adapter_run(
+        reg, "local-only-probe", target="t.example",
+        params={"term": "openssl"}, request_id="requestid0001")
+    record = execute_adapter(reg, prep, sandbox=None, audit=audit)
+    assert record.executed is False and record.outcome == "refused"
+    assert "no sandbox" in record.error_excerpt
+    events = [json.loads(line) for line in open(audit.path,
+                                                encoding="utf-8")
+              if line.strip()]
+    assert events[-1]["event"] == "adapter_refused"
+
+
+def test_fail_closed_when_sandbox_cannot_prove_disconnection(tmp_path):
+    """A sandbox whose spawn() lacks network_mode CANNOT prove the run
+    would be disconnected — the executor refuses the run, it never
+    launches unproven on the default bridge."""
+    reg = _reg_none_adapter()
+    old = _OldSansbox()
+    audit = _audit(tmp_path)
+    prep = prepare_adapter_run(
+        reg, "local-only-probe", target="t.example",
+        params={"term": "openssl"}, request_id="requestid0001")
+    record = execute_adapter(reg, prep, sandbox=old, audit=audit)
+    assert record.executed is False and record.outcome == "refused"
+    assert old.spawned == []      # never handed to the old double
+    assert "network_mode" in record.error_excerpt
+    assert "default-bridge" in record.error_excerpt
+    assert not spawn_supports_network_mode(old)
+
+
+def test_network_none_isolation_invariant_pure_function():
+    from kryonsec.config import KryonsecConfig
+
+    real = KaliSandbox(
+        cfg=KryonsecConfig(home=Path("nothing")),
+        run_fn=lambda argv, **kw: Completed(),
+        seccomp_profile=None)
+    good = real._docker_argv(["searchsploit", "-j"], network_mode="none")
+    assert missing_network_none_flags(good) == []
+    for wrong in (_strip_flag(good, "--network", "none"),
+                  good + ["--dns", "1.1.1.1"]):
+        assert missing_network_none_flags(wrong) != []
+
+
+def _none_net_it_readiness():
+    """Real Docker + runsc + pinned image + an operator lab endpoint."""
+    lab = os.environ.get("KRYONSEC_NONE_NET_LAB_URL", "").strip()
+    if not lab.lower().startswith(("http://", "https://")):
+        return False, "KRYONSEC_NONE_NET_LAB_URL must be an http(s) lab URL"
+    if not sys.platform.startswith("linux"):
+        return False, "Mode B needs Linux"
+    if shutil.which("docker") is None:
+        return False, "docker CLI missing"
+    if os.environ.get("KRYONSEC_NONE_NET_IT") != "1":
+        return False, "KRYONSEC_NONE_NET_IT=1 not set"
+    from kryonsec.purple import runtime_checks as rc
+
+    ok, reason = rc.docker_server_ok()
+    if not ok:
+        return False, f"docker daemon: {reason}"
+    if not rc.runsc_registered():
+        return False, "runsc runtime not registered"
+    from kryonsec.config import KryonsecConfig
+
+    image = KryonsecConfig().sandbox_image
+    if "@sha256:" not in image:
+        return False, ("sandbox image is not digest-pinned in this "
+                       "environment (rule 7) — set KRYONSEC_SANDBOX_IMAGE")
+    if not rc.image_present(image):
+        return False, f"pinned sandbox image absent: {image}"
+    return True, ""
+
+
+def test_real_network_none_blocks_lab_packets_it(tmp_path):
+    """GENUINE isolation IT (opt-in): the real gVisor sandbox runs
+    `curl` against the operator's LOCAL lab endpoint twice — once with
+    default networking (the positive control; the lab must be
+    REACHABLE), once with network_mode='none'. The none run MUST fail
+    to reach the lab: same command, same lab, only the verified
+    --network none isolation differs. Skipped silently otherwise.
+
+        KRYONSEC_NONE_NET_IT=1 KRYONSEC_NONE_NET_LAB_URL=http://<your-lab> \
+            .venv/bin/python -m pytest tests/test_mode_b_isolation.py
+    """
+    ok, reason = _none_net_it_readiness()
+    if not ok:
+        pytest.skip(f"opt-in IT not armed: {reason}")
+
+    from kryonsec.config import KryonsecConfig
+
+    lab = os.environ["KRYONSEC_NONE_NET_LAB_URL"].strip()
+    sbx = KaliSandbox(
+        cfg=KryonsecConfig(),
+        seccomp_profile=None,
+    )
+    probe = ["curl", "-m", "6", "-sS", "-o", "/dev/null", lab]
+    control = sbx.spawn(probe)
+    if control.exit_code != 0 or not control.ok:
+        pytest.skip(
+            f"lab endpoint {lab} not reachable even with default "
+            f"networking (curl exit {control.exit_code}) — operator "
+            "environment, not an isolation answer")
+    # the none run: identical command, only the isolation flag differs
+    argv = sbx._docker_argv(probe, network_mode="none")
+    assert argv[argv.index("--network") + 1] == "none"
+    assert argv.index("--network") < argv.index(sbx.image)
+    disconnected = sbx.spawn(probe, network_mode="none")
+    assert disconnected.exit_code != 0, (
+        "network-none run reached the lab — the isolation flag did not "
+        "take effect on this image/runtime")
+    # audit trail of the proof (the file stays local to the repo)
+    audit = AuditLog(tmp_path / "none_net_it.jsonl")
+    audit.write({
+        "event": "network_none_block_it",
+        "lab": lab,
+        "control_exit": control.exit_code,
+        "none_exit": disconnected.exit_code,
+    })
+    ok2, reason2 = audit.verify()
+    assert ok2, reason2

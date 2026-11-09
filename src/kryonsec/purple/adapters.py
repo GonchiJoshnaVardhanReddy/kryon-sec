@@ -632,6 +632,27 @@ def _find_hypothesis(graph: EngagementGraph,
     return None
 
 
+def spawn_supports_network_mode(sandbox) -> bool:
+    """Does this sandbox's spawn() implement the network_mode isolation
+    capability (Phase 2B.4.1)?
+
+    Introspection only — the REAL enforcement lives inside
+    KaliSandbox.spawn's verified ``--network none`` invariant. A sandbox
+    without the capability answers False, and network-none adapters are
+    REFUSED on it: it cannot prove the run would not land on the
+    Docker-default bridge.
+    """
+    if not callable(getattr(sandbox, "spawn", None)):
+        return False
+    import inspect
+
+    try:
+        return "network_mode" in inspect.signature(
+            sandbox.spawn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _excerpt(text: str, bound: int) -> str:
     redacted, _ = redact((text or "")[:bound])
     return redacted
@@ -686,6 +707,17 @@ def execute_adapter(
         denied_reasons.append(
             "no egress policy on the sandbox — target-touching adapter "
             "refused (the spawn invariant would refuse anyway)")
+    if adapter.network == "none" and \
+            not spawn_supports_network_mode(sandbox):
+        # Phase 2B.4.1: a disconnected run must be PROVABLY disconnected.
+        # A sandbox that cannot request --network none would launch the
+        # adapter on the Docker default bridge (full NAT connectivity) —
+        # the unproven-network fallback is refused, never substituted.
+        denied_reasons.append(
+            "sandbox.spawn() does not implement network_mode isolation "
+            "(--network none) — a network-'none' adapter cannot be "
+            "proven disconnected (default-bridge fallback is never a "
+            "substitute)")
     if sandbox is None or not callable(getattr(sandbox, "spawn", None)):
         denied_reasons.append(
             "no sandbox with spawn() — host-side or in-process execution "
@@ -755,7 +787,9 @@ def execute_adapter(
     })
 
     result = sandbox.spawn(list(prepared.argv),
-                           timeout_s=adapter.max_seconds)
+                           timeout_s=adapter.max_seconds,
+                           **({"network_mode": "none"}
+                              if adapter.network == "none" else {}))
 
     error_excerpt = _excerpt(result.error or "", _EXCERPT_CHARS)
     audit.write({

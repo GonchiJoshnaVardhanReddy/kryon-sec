@@ -67,6 +67,44 @@ def missing_isolation_flags(docker_argv: list[str]) -> list[str]:
 _FORBIDDEN_NETWORKS = ("bridge", "host", "none")
 
 
+def missing_network_none_flags(
+    docker_argv: list[str], image: str | None = None,
+) -> list[str]:
+    """The requirements a NETWORK-DISCONNECTED run fails to carry
+    (Phase 2B.4.1).
+
+    A run whose contract declares network "none" (e.g. the searchsploit
+    adapter) must be provably disconnected: the docker section carries
+    EXACTLY one ``--network none`` pair, never another network mode
+    alongside it, and never a ``--dns`` override (meaningless on a
+    loopback-only interface — and a sign someone pasted egress plumbing
+    into a disconnected run). Pure — argv cannot talk its way past this.
+    Only tokens BEFORE the image position are docker flags.
+    """
+    problems: list[str] = []
+    section = docker_argv
+    if image is not None and image in docker_argv:
+        section = docker_argv[:docker_argv.index(image)]
+    networks: list[str] = []
+    i = 0
+    while i < len(section):
+        if section[i] == "--network":
+            if i + 1 < len(section):
+                networks.append(section[i + 1])
+            else:
+                problems.append("--network flag with no value")
+        elif section[i] == "--dns":
+            problems.append(
+                "--dns override on a network-none run (loopback-only "
+                "interface has no resolvers)")
+        i += 1
+    if networks != ["none"]:
+        problems.append(
+            "network-none run must carry exactly ['--network', 'none'] "
+            f"(got {networks})")
+    return problems
+
+
 def missing_egress_flags(
     docker_argv: list[str], policy, image: str | None = None,
 ) -> list[str]:
@@ -247,8 +285,18 @@ class KaliSandbox:
             clone.evidence_dir = evidence_dir
         return clone
 
-    def _docker_argv(self, tool_argv: list[str]) -> list[str]:
-        """Build the docker run argv. Tool argv as container args (spec §8.5)."""
+    def _docker_argv(self, tool_argv: list[str],
+                     network_mode: "str | None" = None) -> list[str]:
+        """Build the docker run argv. Tool argv as container args (spec §8.5).
+
+        ``network_mode`` (Phase 2B.4.1): "none" builds a NETWORK-
+        DISCONNECTED container (``--network none``) — the verified
+        fail-closed isolation for tools whose contract declares network
+        "none" (e.g. the searchsploit-term adapter's local database
+        read). "none" beats everything else: a present egress policy
+        does NOT put the run on the engagement network, because the
+        tool's own contract says it must not touch the network at all.
+        """
         argv = [
             "docker", "run", "--rm",
             "--name", self._container_name(),
@@ -272,15 +320,22 @@ class KaliSandbox:
         # /code stay read-only, so a tool can only write here.
         if getattr(self, "evidence_dir", None):
             argv += ["-v", f"{self.evidence_dir}:/evidence:rw"]
-        # Zone B network egress (Phase 1E): when the engagement has an
-        # egress policy, every spawn runs on the DEDICATED engagement
-        # bridge (never the default bridge), with DNS pinned to the
-        # policy's resolver set. The host firewall (built by EgressGate:
-        # DOCKER-USER for forwarded traffic, INPUT for host-local
-        # delivery since Phase 1E.1) filters every packet from that
-        # bridge; `spawn` re-verifies the boundary before each launch
-        # and refuses to run when it is missing or drifted.
-        if getattr(self, "egress_policy", None) is not None:
+        if network_mode == "none":
+            # network-none isolation (2B.4.1): the tool contract says it
+            # needs NO network — docker gives the container a loopback-
+            # only interface. This must be verifiable later (see spawn's
+            # none-invariant), so it is a real flag pair, never an
+            # omission implying "no egress policy".
+            argv += ["--network", "none"]
+        elif getattr(self, "egress_policy", None) is not None:
+            # Zone B network egress (Phase 1E): when the engagement has an
+            # egress policy, every spawn runs on the DEDICATED engagement
+            # bridge (never the default bridge), with DNS pinned to the
+            # policy's resolver set. The host firewall (built by EgressGate:
+            # DOCKER-USER for forwarded traffic, INPUT for host-local
+            # delivery since Phase 1E.1) filters every packet from that
+            # bridge; `spawn` re-verifies the boundary before each launch
+            # and refuses to run when it is missing or drifted.
             argv += ["--network", self.egress_policy.network_name]
             for resolver in self.egress_policy.dns_resolvers:
                 argv += ["--dns", str(resolver)]
@@ -304,8 +359,8 @@ class KaliSandbox:
         except Exception as e:  # never let cleanup mask the timeout report
             log.warning("could not kill sandbox container %s: %s", name, e)
 
-    def spawn(self, tool_argv: list[str],
-              timeout_s: "int | None" = None) -> SpawnResult:
+    def spawn(self, tool_argv: list[str], timeout_s: "int | None" = None,
+              network_mode: "str | None" = None) -> SpawnResult:
         """Run one tool in the sandbox; parse the entrypoint's JSON payload.
 
         tool_argv[0] is the tool name (must be allowlisted — the host-side
@@ -315,8 +370,16 @@ class KaliSandbox:
         ``timeout_s`` (Phase 2B.2): an optional per-call bound for vetted
         adapters — it may only TIGHTEN the sandbox's own ceiling; the
         resource caps and every isolation/egress invariant are unchanged.
+
+        ``network_mode`` (Phase 2B.4.1): "none" builds a network-
+        disconnected container (``--network none``) for tools whose
+        contract says they touch no network at all. The invariant is
+        verified on the exact launch argv, fail closed: a launch that
+        would silently fall back to the Docker default bridge is not
+        "a weaker none-mode", it is unproven connectivity and must
+        never happen instead of a bounded one.
         """
-        docker_argv = self._docker_argv(tool_argv)
+        docker_argv = self._docker_argv(tool_argv, network_mode=network_mode)
         container_name = docker_argv[docker_argv.index("--name") + 1]
         log.info("sandbox spawn: %s", " ".join(docker_argv[:6]) + " …")
 
@@ -341,7 +404,25 @@ class KaliSandbox:
         # without a verified boundary would be default-bridge execution
         # and must never happen instead of a bounded one. Audited by
         # every caller as a failed spawn.
-        if getattr(self, "egress_policy", None) is not None:
+        #
+        # Network-none invariant (Phase 2B.4.1): when the run declared
+        # network "none", the launch argv must instead carry the
+        # disconnected-network pair. Both are fail closed; a none-run is
+        # NOT the egress path (there is no boundary to verify — the
+        # container has no network beyond loopback at all).
+        if network_mode == "none":
+            none_problems = missing_network_none_flags(
+                docker_argv, image=self.image)
+            if none_problems:
+                error = (
+                    "sandbox network-none invariant broken — refusing to "
+                    f"launch {tool_argv[0]!r}: "
+                    + "; ".join(none_problems)
+                )
+                log.error(error)
+                return SpawnResult(
+                    ok=False, exit_code=-1, stdout="", error=error)
+        elif getattr(self, "egress_policy", None) is not None:
             egress_problems = missing_egress_flags(
                 docker_argv, self.egress_policy, image=self.image)
             if not egress_problems and self.egress_gate is not None:

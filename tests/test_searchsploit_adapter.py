@@ -166,8 +166,10 @@ class FakeSandbox:
         self.timeout_s = timeout_s
         self.image = image
 
-    def spawn(self, argv, timeout_s=None):
+    def spawn(self, argv, timeout_s=None, network_mode=None):
         self.spawned.append((list(argv), timeout_s))
+        self.network_modes = getattr(self, "network_modes", [])
+        self.network_modes.append(network_mode)
         if self._script is not None:
             return self._script(argv)
         return self._result
@@ -451,9 +453,15 @@ def test_no_network_none_standing_and_no_egress(monkeypatch, tmp_path):
     assert adapter.risk == "informational"
     sbx = _searchsploit_sandbox()
     assert sbx.egress_policy is None
-    _graph, audit, _counts = _enrich(monkeypatch, Path(tmp_path), sbx,
-                                     registry=production_registry())
+    graph, audit, _counts = _enrich(monkeypatch, Path(tmp_path), sbx,
+                                    registry=production_registry())
     assert _event_names(audit).count("hypothesize_searchsploit_adapter") == 1
+    # 2B.4.1: the adapter run is requested NETWORK-DISCONNECTED — the
+    # executor carries network_mode="none" on the searchsploit spawn
+    # (the nuclei_meta legacy lookup is engine-side and unaffected)
+    modes = {argv[0]: mode for argv, mode in
+             zip([a for a, _t in sbx.spawned], sbx.network_modes)}
+    assert modes[TOOL_EXECUTABLE] == "none"
 
 
 # ---- 9. missing sandbox and runtime failure -------------------------------------------

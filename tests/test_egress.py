@@ -675,8 +675,8 @@ def test_spawn_refuses_tampered_docker_flags(sandbox_with_boundary):
     sb, policy, _ = sandbox_with_boundary
     original = sb._docker_argv
 
-    def tampered(tool_argv):
-        argv = original(tool_argv)
+    def tampered(tool_argv, network_mode=None):
+        argv = original(tool_argv, network_mode=network_mode)
         at = argv.index("--network")
         argv[at + 1] = "bridge"  # e.g. a corrupted config path
         return argv

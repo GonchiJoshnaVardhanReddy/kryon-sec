@@ -123,8 +123,10 @@ class FakeSandbox:
         self.timeout_s = timeout_s
         self.image = image
 
-    def spawn(self, argv, timeout_s=None):
+    def spawn(self, argv, timeout_s=None, network_mode=None):
         self.spawned.append((argv, timeout_s))
+        self.network_modes = getattr(self, "network_modes", [])
+        self.network_modes.append(network_mode)
         return self._result
 
 
