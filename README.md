@@ -671,8 +671,59 @@ the file, and Approve/Deny. **Deny is the default (Enter = Deny).**
 | `/write <path>` | write text to a file in the workspace |
 | `/workspace` | show the workspace path |
 | `/mode` | switch copilot ⇄ purple mode — or press **Shift+Tab** |
+| `/theme <name>` | saves a theme preference for other Kryonsec surfaces (the workspace always uses the mode-driven monochrome palette) |
 | `/help` | command reference |
 | `/quit` (`exit`, `quit`, `q`) | leave — session is persisted |
+
+### Terminal workspace and shortcuts
+
+The interactive terminal is one persistent full-screen workspace. The top bar
+shows real saved session or engagement tabs, the centre holds the conversation
+or engagement dashboard, the right sidebar shows live context, provider/model,
+MCP status, runtime, and (in Mode B) the eight security agents, and the
+composer stays anchored at the bottom. On terminals narrower than 100 columns
+the sidebar collapses so the workspace keeps its space. In Mode B the sidebar
+is driven by real runtime state — Docker and sandbox availability come from
+the same checks the engagement gates use (shown as `unknown` before they run),
+the agents panel follows live events, and a dedicated Tool · Command section
+shows the active tool with its actual argv (redacted, never constructed by the
+UI). The Mode B centre shows a 10-state workflow timeline with stage
+durations, a timestamped live activity stream, and a current-operation block
+for the running agent.
+
+| Shortcut | Action |
+|---|---|
+| **Enter / Shift+Enter** | send / insert a newline |
+| **Shift+Tab** | switch Copilot/Purple when the existing sandbox and license checks allow it |
+| **Ctrl+P** | open the command palette (also: Rename session, Close session, Open Kryonsec Memory) |
+| **Ctrl+N** | create a real new session or engagement |
+| **Ctrl+Left / Ctrl+Right** | move between stored tabs |
+| **Ctrl+R** | rename the active Copilot session (prepopulated dialog; Esc cancels) |
+| **Ctrl+W** | close the active tab (refused while an operation or approval is pending; stored history is kept) |
+| **Ctrl+Q** | leave (sessions are saved) |
+| **Ctrl+C** | stop the active operation at a safe boundary, or leave when idle |
+
+The workspace palette is mode-driven: Mode A (Copilot) renders entirely in
+black, white, and gray with state carried by text marks (✓ ○ ! …); Mode B adds
+purple only on the KRYONSEC wordmark. In Mode B the right sidebar also carries
+a focusable **Kryonsec Memory** entry (or `Open Kryonsec Memory` in the
+palette) that launches the existing read-only loopback memory browser on
+demand — it never opens on startup or on a mode switch. The `/theme` command
+still saves a preference for other Kryonsec surfaces, but it cannot change the
+workspace palette.
+
+Closing a tab is never an approval and never cancels backend work: while a
+tool call, sandbox run, or any approval gate is active, tab closing is
+refused. Renaming a Copilot session changes only the display title (persisted
+across restarts); engagement identifiers stay immutable.
+
+Theme choices are presentation-only and are saved separately in
+`~/.kryonsec/ui.json` for the non-workspace surfaces; the full-screen
+workspace itself always uses the mode-driven monochrome palette. Built-ins
+are `kryonsec`, `tokyonight`, and `dracula`; use `/theme` to switch the saved
+preference. Piped, CI, and legacy terminals keep plain output
+without full-screen escape sequences. See `docs/screenshots/` for headless
+captures of the real app.
 
 ### Memory
 
@@ -725,11 +776,13 @@ Or switch inside the chat with `/mode` (or **Shift+Tab**), then type a domain.
 
 > ⚠️ **Only run this against systems you are authorized to test.**
 
-### The operations console
+### The operations workspace
 
-Purple Team used to print raw developer logs — a spinner over a one-line inventory of every
-tool in the state, full tracebacks from public APIs answering 429/403/404, and a final summary
-in plain text. It's now a single live console (v1.3.2).
+Purple Team now uses the same terminal workspace language as Copilot: an
+engagement header, honest workflow timeline, current operation, bounded tool
+activity, findings/evidence standing, and a completion summary. Raw developer
+logs are still kept in the engagement debug log rather than on the operator
+screen.
 
 The console learns everything from two streams that already existed — the orchestrator's state
 callback and the audit chain, via a read-only `add_observer` — so **no subagent knows a UI
@@ -742,7 +795,8 @@ exists**. What you get:
   history; only tools that actually ran appear.
 - **Tracebacks are split, not shown.** One line per warning on the console; the full record,
   `exc_info` intact, goes to `engagements/<id>/debug.log`.
-- **Human review is a proper panel** (`A`/`R`) instead of a bare `y/N` prompt.
+- **Human review is a proper Gate 2 panel** (`A`/`R`) and remains separate from
+  the Gate 3 post-exploitation approval.
 - **Piped and CI runs stay observable** — with no TTY it prints one line per state.
 
 ### The audit chain
@@ -1165,11 +1219,11 @@ want to use.
 | Prompts & reports | **Jinja2** | Prompts are templates in `kryonsec/templates/`, reviewable as files |
 | Storage | **SQLAlchemy 2.0** + **PostgreSQL** | Postgres is the system of record; SQLite is the embedded Copilot fallback |
 | Encryption | **cryptography** | Encrypted secret mappings at rest |
-| CLI / TUI | **prompt_toolkit** + **rich** | Shift+Tab mode toggle, history, and the live console |
+| CLI / TUI | **Textual** + **Rich** | Persistent full-screen workspace; prompt_toolkit still drives setup dialogs |
 | MCP | **mcp** SDK | Copilot is a real MCP client, stdio transport |
 | Sandbox | **Docker + gVisor (`runsc`)** | A hostile tool in a hostile-target engagement needs a real isolation boundary |
 | Sandbox base | **Kali Linux** | The tool inventory in the expansion doc is Kali-shaped |
-| Tests | **pytest** | 1747 passed, 4 skipped across 55 files |
+| Tests | **pytest** | 1798 passed, 22 skipped across 55 files |
 
 Why gVisor specifically: the sandbox runs tools that are *supposed* to be dangerous, against
 targets I don't control. A container alone shares the host kernel. `runsc` puts a user-space
@@ -1203,7 +1257,12 @@ kryonsec/
 │   ├── config.py                     # TOML config (read/write, env overrides)
 │   ├── doctor.py                     # preflight checks + Mode B gate
 │   ├── wizard.py                     # first-run setup wizard
-│   ├── tui.py                        # prompt_toolkit input, Shift+Tab toggle
+│   ├── tui.py                        # mode helpers for the fallback prompt
+│   ├── ui/                           # full-screen workspace + theme + stores
+│   │   ├── app.py                    #   Textual app, tabs, palette, approvals
+│   │   ├── workspace.py              #   backend-agnostic UI controller
+│   │   ├── state.py                  #   agent/state snapshots, approval gates
+│   │   └── runtime.py                #   safe TTY/Textual fallback check
 │   ├── status.py                     # spinner / status line
 │   ├── llm.py                        # LiteLLM routing + the secrets gate
 │   ├── bedrock.py                    # Bedrock region probe + model discovery

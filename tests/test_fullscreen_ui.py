@@ -1,0 +1,1252 @@
+"""Contracts for the persistent Textual terminal workspace.
+
+These tests never start an LLM, Docker, MCP server, or Purple Team tool.  They
+drive the same controller and widgets the interactive CLI uses, with synthetic
+state and a temporary session database.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import sys
+
+import pytest
+from textual.widgets import Static
+
+from kryonsec.config import KryonsecConfig
+from kryonsec.copilot.session import Message
+from kryonsec.storage import reset_engine
+from kryonsec.ui.app import (
+    ApprovalScreen,
+    CommandPalette,
+    KryonsecApp,
+    MemoryEntry,
+    RenameScreen,
+)
+from kryonsec.ui.runtime import interactive_terminal_available
+from kryonsec.ui.session_store import EngagementStore, SessionStore
+from kryonsec.ui.state import (
+    AGENT_LABELS,
+    PURPLE_STATES,
+    SECURITY_AGENT_STATES,
+    ApprovalGate,
+    PurpleWorkspaceState,
+)
+from kryonsec.ui.theme import resolve_theme, workspace_tokens
+from kryonsec.ui.workspace import CopilotActivity, WorkspaceController
+
+pytest.importorskip("textual")
+
+
+@pytest.fixture()
+def workspace(tmp_path):
+    reset_engine()
+    cfg = KryonsecConfig(home=tmp_path / "home", workspace=tmp_path / "workspace")
+    cfg.database_url = f"sqlite:///{tmp_path / 'sessions.db'}"
+    store = SessionStore(cfg)
+    store.ensure_schema()
+    controller = WorkspaceController(
+        cfg,
+        session_store=store,
+        engagement_store=EngagementStore(cfg),
+        system_prompt="test prompt",
+    )
+    yield controller
+    controller.close()
+    reset_engine()
+
+
+def _app(controller: WorkspaceController, *, truecolor: bool = True) -> KryonsecApp:
+    """Build the app with the mode-driven workspace palette, like the CLI."""
+    return KryonsecApp(
+        controller.cfg,
+        controller,
+        theme=workspace_tokens(controller.mode, truecolor=truecolor),
+    )
+
+
+def _hex_channels(value: str) -> tuple[int, int, int] | None:
+    if not value.startswith("#") or len(value) != 7:
+        return None
+    return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16)
+
+
+def _monochrome(value: str) -> bool:
+    channels = _hex_channels(value)
+    return channels is not None and len(set(channels)) == 1
+
+
+PURE_PURPLE = "#a855f7"
+
+
+async def _render_text(widget) -> str:
+    return str(widget.render())
+
+
+def test_session_store_round_trip_drives_real_tabs(workspace):
+    tab = workspace.sessions[0]
+    tab.session.add("user", "Investigate the authentication flow")
+    tab.session.add("assistant", "I will inspect the configured workspace.")
+    record_id = workspace.session_store.save(tab)
+
+    loaded = workspace.session_store.list_tabs()
+    assert record_id
+    assert loaded[0].record_id == record_id
+    assert loaded[0].session.messages[0].content == "Investigate the authentication flow"
+    assert loaded[0].title == "Investigate the authentication flow"
+
+
+def test_top_bar_renders_stored_sessions_and_new_action(workspace):
+    tab = workspace.sessions[0]
+    tab.session.messages = [Message("user", "Review a CVE")]
+    workspace.session_store.save(tab)
+    workspace.sessions = workspace.session_store.list_tabs()
+    workspace.session_index = 0
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            items = list(app.query("#tabstrip > .tab-item, #tabstrip > .tab-action"))
+            labels = [await _render_text(item) for item in items]
+            assert any("Review a CVE" in label for label in labels)
+            assert any("+ New session" in label for label in labels)
+            assert any("active" in item.classes for item in items if "tab-item" in item.classes)
+
+    asyncio.run(scenario())
+
+
+def test_mcp_sidebar_uses_runtime_status_not_configured_defaults(workspace):
+    class FakeMcp:
+        def statuses(self):
+            return [
+                {"name": "GitHub", "status": "connected", "detail": "2 tool(s) available"},
+                {"name": "Filesystem", "status": "disconnected", "detail": "process exited"},
+            ]
+
+    workspace.mcp_toolbox = FakeMcp()
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#sidebar-content"))
+            assert "GitHub" in text and "connected" in text
+            assert "Filesystem" in text and "disconnected" in text
+            # Docker is a runtime field, never conflated with MCP servers.
+            assert "Docker" in text
+            assert "not used by Copilot" in text
+
+    asyncio.run(scenario())
+
+
+def test_purple_sidebar_lists_eight_agents_not_ten_states(workspace):
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = PurpleWorkspaceState(
+        "authorized.example", "eng-1", sandbox_status="ready"
+    )
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#sidebar-content"))
+            assert len(SECURITY_AGENT_STATES) == 8
+            assert "AGENTS · 8" in text
+            for state in SECURITY_AGENT_STATES:
+                assert AGENT_LABELS[state] in text
+            assert "INIT" not in text
+            assert "HUMAN_REVIEW" not in text
+
+    asyncio.run(scenario())
+
+
+def test_purple_centre_shows_target_timeline_and_tools(workspace):
+    workspace.mode_holder[0] = "purple"
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_PASSIVE")
+    view.on_state_complete("RECON_PASSIVE")
+    view.on_state("HYPOTHESIZE")
+    view.on_audit(
+        {
+            "event": "tool_spawn",
+            "tool": "subfinder",
+            "state": "HYPOTHESIZE",
+        }
+    )
+    view.findings = [("Reflected XSS on /search", "verified", "high")]
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#purple-view"))
+            assert "authorized.example" in text
+            assert "WORKFLOW · 10 STATES" in text
+            assert all(state.replace("_", " ") in text for state in PURPLE_STATES)
+            assert "subfinder" in text
+            assert "HYPOTHESIZE" in text
+            assert "Reflected XSS on /search [high]" in text
+            assert "verified [high]" not in text
+
+    asyncio.run(scenario())
+
+
+def test_conversation_renders_markdown_and_inline_tools(workspace):
+    tab = workspace.sessions[0]
+    tab.session.add("user", "Summarise this finding")
+    tab.session.add("assistant", "## Finding\n\nUse **parametrised** queries.")
+    workspace.tools_by_tab[id(tab)] = [
+        CopilotActivity(name="read_file", detail="README.md", status="completed", duration=0.2)
+    ]
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert len(app.query("#message-list UserBlock")) == 1
+            assert len(app.query("#message-list AssistantBlock")) == 1
+            activity = await _render_text(app.query_one("#inline-activity"))
+            assert "read_file" in activity
+            assert "completed" in activity
+
+    asyncio.run(scenario())
+
+
+def test_composer_shows_keyboard_hints_on_wide_terminals(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            hints = await _render_text(app.query_one("#composer-hints"))
+            assert "Enter send" in hints
+            assert "Ctrl+P" in hints
+
+    asyncio.run(scenario())
+
+
+def test_command_palette_opens_and_closes(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert isinstance(app.screen, CommandPalette)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, CommandPalette)
+
+    asyncio.run(scenario())
+
+
+def test_new_session_shortcut_creates_a_real_tab(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = len(workspace.sessions)
+            await pilot.press("ctrl+n")
+            await pilot.pause()
+            await pilot.pause()
+            assert len(workspace.sessions) == before + 1
+            assert len(app.query("#tabstrip > .tab-item, #tabstrip > .tab-action")) == before + 2
+
+    asyncio.run(scenario())
+
+
+def test_sidebar_collapses_below_wide_breakpoint(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#sidebar").display is True
+            await pilot.resize_terminal(80, 30)
+            await pilot.pause()
+            assert app.query_one("#sidebar").display is False
+            await pilot.resize_terminal(120, 40)
+            await pilot.pause()
+            assert app.query_one("#sidebar").display is True
+
+    asyncio.run(scenario())
+
+
+def test_busy_mode_switch_is_blocked_without_calling_sandbox(workspace, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available",
+        lambda image: called.append(image) or (True, "test"),
+    )
+    workspace.busy = True
+    asyncio.run(workspace.switch_mode())
+    assert workspace.mode_holder == ["copilot"]
+    assert "safe boundary" in workspace.notice
+    assert called == []
+
+
+def test_mode_switch_refuses_when_sandbox_is_unavailable(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available",
+        lambda image: (False, "runsc not registered"),
+    )
+    asyncio.run(workspace.switch_mode())
+    assert workspace.mode_holder == ["copilot"]
+    assert "cannot switch to purple" in workspace.notice
+
+
+def test_shift_tab_switches_mode_and_shows_eight_agents(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available",
+        lambda image: (True, "test"),
+    )
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("shift+tab")
+            for _ in range(4):
+                await pilot.pause()
+            assert workspace.mode == "purple"
+            top = await _render_text(app.query_one("#topmode"))
+            assert "MODE B" in top
+            purple = await _render_text(app.query_one("#purple-view"))
+            assert "PURPLE TEAM" in purple
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "AGENTS · 8" in sidebar
+            for state in SECURITY_AGENT_STATES:
+                assert AGENT_LABELS[state] in sidebar
+            assert "INIT" not in sidebar
+            assert "HUMAN_REVIEW" not in sidebar
+
+    asyncio.run(scenario())
+
+
+def test_approval_is_fail_closed_until_explicit_decision(workspace):
+    gate = ApprovalGate(gate="file")
+    workspace._install_approval(gate)
+    workspace.decide_approval(False)
+    assert gate.result is False
+    assert gate.done.is_set()
+    assert workspace.approval is None
+
+    gate = ApprovalGate(gate="file")
+    workspace._install_approval(gate)
+    workspace.decide_approval(True)
+    assert gate.result is True
+    assert gate.done.is_set()
+
+    gate = ApprovalGate(gate="post_exploit")
+    workspace._install_approval(gate)
+    workspace.cancel_approvals()
+    assert gate.result is False
+    assert gate.done.is_set()
+
+
+def test_human_review_approval_advances_one_hypothesis_at_a_time(workspace):
+    gate = ApprovalGate(
+        gate="human_review",
+        hypotheses=[{"label": "a"}, {"label": "b"}],
+    )
+    workspace._install_approval(gate)
+    workspace.decide_approval(True)
+    assert gate.approved == {"a"}
+    assert gate.index == 1
+    assert not gate.done.is_set()
+    workspace.decide_approval(False)
+    assert gate.approved == {"a"}
+    assert gate.done.is_set()
+    assert workspace.approval is None
+
+
+def test_approval_modal_denies_on_escape(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            gate = ApprovalGate(
+                gate="file",
+                hypotheses=[
+                    {
+                        "properties": {
+                            "title": "read outside workspace",
+                            "target_asset": "/etc/passwd",
+                            "rationale": "test",
+                        }
+                    }
+                ],
+            )
+            workspace._install_approval(gate)
+            app._maybe_show_approval()
+            await pilot.pause()
+            assert isinstance(app.screen, ApprovalScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert gate.result is False
+            assert gate.done.is_set()
+            assert workspace.approval is None
+
+    asyncio.run(scenario())
+
+
+def test_approval_modal_enter_denies_even_with_approve_button(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            gate = ApprovalGate(gate="post_exploit", shell_evidence="root shell")
+            workspace._install_approval(gate)
+            app._maybe_show_approval()
+            await pilot.pause()
+            assert isinstance(app.screen, ApprovalScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert gate.result is False
+            assert gate.done.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_approval_modal_explicit_approve_still_works(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            gate = ApprovalGate(gate="file")
+            workspace._install_approval(gate)
+            app._maybe_show_approval()
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert gate.result is True
+            assert gate.done.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_closing_app_denies_pending_approval(workspace):
+    gate = ApprovalGate(gate="file")
+    workspace._install_approval(gate)
+    workspace.close()
+    assert gate.result is False
+    assert gate.done.is_set()
+
+
+def test_stop_request_ends_copilot_turn_at_the_next_round(workspace, monkeypatch):
+    tab = workspace.sessions[0]
+
+    def fake_run_agent(cfg, messages, toolbox, model, on_tool, on_round):
+        on_round()
+        return "this reply must never be stored"
+
+    monkeypatch.setattr("kryonsec.copilot.agent.run_agent", fake_run_agent)
+    monkeypatch.setattr("kryonsec.copilot.agent.build_toolbox", lambda *a, **k: {})
+    workspace.stop_requested = True
+    asyncio.run(workspace._run_agent(tab, "hi"))
+    text = " ".join(message.content for message in workspace.display_messages(tab))
+    assert "cancelled at a safe boundary" in text
+    assert "this reply must never be stored" not in text
+
+
+def test_failed_engagement_exit_is_visible_and_stops_checking(workspace, monkeypatch):
+    monkeypatch.setattr("kryonsec.cli._run_purple", lambda *a, **k: 3)
+    asyncio.run(workspace.start_engagement("authorized.example"))
+    view = workspace.purple_view
+    assert view is not None
+    assert view.outcome == "failed"
+    assert view.halt_reason == "exit_3"
+    assert workspace.engagements[0].status == "failed"
+
+
+def test_non_tty_environment_does_not_claim_full_screen(monkeypatch):
+    # pytest captures stdout, so the conservative check must choose the plain
+    # fallback rather than trying to start a terminal application.
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    assert interactive_terminal_available() is False
+
+
+# ---- mode-driven color system ------------------------------------------
+
+
+def test_mode_a_tokens_are_entirely_monochrome():
+    tokens = workspace_tokens("copilot", truecolor=True)
+    assert tokens.brand == "#ffffff"
+    for name, value in vars(tokens).items():
+        if name in {"brand", "purple", "name", "mode"}:
+            continue  # purple is excluded in Mode A rendering; brand is white
+        if _hex_channels(value) is not None:
+            assert _monochrome(value), f"{name}={value} is not monochrome"
+
+
+def test_mode_b_tokens_use_purple_brand_only():
+    tokens = workspace_tokens("purple", truecolor=True)
+    assert tokens.brand == PURE_PURPLE
+    for name, value in vars(tokens).items():
+        if name == "brand" or _hex_channels(value) is None:
+            continue
+        if name != "purple":  # the purple token stays reserved; nothing renders it
+            assert _monochrome(value), f"{name}={value} is not monochrome"
+    # ANSI fallback stays readable on limited terminals.
+    ansi = workspace_tokens("purple", truecolor=False)
+    assert ansi.brand == "magenta"
+    assert ansi.accent == "white"
+    assert ansi.background == "black"
+
+
+def test_app_starts_with_mode_palette_and_looks_monochrome(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.tokens.brand == "#ffffff"
+            copilot_css = app.CSS
+            assert PURE_PURPLE not in copilot_css
+            assert "#ffffff" in copilot_css
+
+    asyncio.run(scenario())
+
+
+def test_mode_switch_applies_the_other_palette_immediately(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available", lambda image: (True, "test")
+    )
+    monkeypatch.setattr(
+        "kryonsec.ui.app.terminal_capabilities",
+        lambda stream=None: {
+            "tty": True,
+            "truecolor": True,
+            "unicode": True,
+            "dumb": False,
+        },
+    )
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert workspace.mode == "copilot"
+            assert app.tokens.brand == "#ffffff"
+            await pilot.press("shift+tab")
+            for _ in range(5):
+                await pilot.pause()
+            assert workspace.mode == "purple"
+            assert app.tokens.brand == PURE_PURPLE
+            assert app._mode_shown == "purple"
+            topmode = app.query_one("#topmode", Static)
+            assert "MODE B" in await _render_text(topmode)
+
+    asyncio.run(scenario())
+
+
+# ---- session renaming ---------------------------------------------------
+
+
+def test_rename_updates_visible_tab_immediately(workspace):
+    renamed = workspace.rename_session(0, "Recon notes")
+    assert renamed is True
+    assert workspace.sessions[0].title == "Recon notes"
+    assert workspace.sessions[0].session.messages == []
+
+
+def test_rename_rejects_empty_names(workspace):
+    before = workspace.sessions[0].title
+    assert workspace.rename_session(0, "   ") is False
+    assert "cannot be empty" in workspace.notice
+    assert workspace.sessions[0].title == before
+
+
+def test_rename_persists_across_restart(workspace):
+    tab = workspace.sessions[0]
+    tab.session.messages = [Message("user", "Investigate the login service")]
+    workspace.session_store.save(tab)
+    assert workspace.rename_session(0, "Login review") is True
+
+    reloaded = workspace.session_store.list_tabs()
+    titles = [session.title for session in reloaded if session.record_id == tab.record_id]
+    assert titles == ["Login review"]
+
+
+def test_rename_screen_dialog_cancel_preserves_name(workspace):
+    async def scenario():
+        app = _app(workspace)
+        results: list[str | None] = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await app.push_screen(RenameScreen("old title"), lambda value: results.append(value))
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert results == [None]
+            assert workspace.sessions[0].custom_title is None
+
+    asyncio.run(scenario())
+
+
+def test_rename_screen_prepopulates_and_confirms(workspace):
+    async def scenario():
+        app = _app(workspace)
+        results: list[str | None] = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await app.push_screen(RenameScreen("first draft"), lambda value: results.append(value))
+            await pilot.pause()
+            dialog = app.screen
+            assert isinstance(dialog, RenameScreen)
+            assert dialog.query_one("#rename-input").value == "first draft"
+            # empty names are refused inline, then a real name confirms
+            dialog.query_one("#rename-input").value = ""
+            await pilot.press("enter")
+            await pilot.pause()
+            assert results == []
+            error = str(dialog.query_one("#rename-error").render())
+            assert "empty" in error
+            dialog.query_one("#rename-input").value = "final title"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert results == ["final title"]
+
+    asyncio.run(scenario())
+
+
+def test_rename_refused_in_purple_mode(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available", lambda image: (True, "test")
+    )
+    workspace.mode_holder[0] = "purple"
+    assert workspace.rename_session(0, "nope") is False
+    assert "immutable" in workspace.notice
+
+
+# ---- session closing -----------------------------------------------------
+
+
+def _saved_tab(workspace, text: str):
+    tab = workspace.session_store.new_tab()
+    tab.session.messages = [Message("user", text)]
+    tab.record_id = workspace.session_store.save(tab)
+    return tab
+
+
+def test_close_session_preserves_stored_history(workspace):
+    tab = _saved_tab(workspace, "Keep this history forever")
+    workspace.sessions = [tab]
+    workspace.session_index = 0
+
+    workspace.close_tab(0)
+
+    rows = workspace.session_store.list_tabs(limit=10)
+    assert any(row.record_id == tab.record_id for row in rows)
+    assert any(
+        message.content == "Keep this history forever"
+        for row in rows
+        for message in row.session.messages
+    )
+
+
+def test_close_active_tab_selects_another_valid_tab(workspace):
+    first = _saved_tab(workspace, "first")
+    second = _saved_tab(workspace, "second")
+    third = _saved_tab(workspace, "third")
+    workspace.sessions = [first, second, third]
+    workspace.session_index = 2
+
+    workspace.close_tab(2)
+    assert workspace.session_index == 1
+    assert workspace.active_session().record_id == second.record_id
+
+    workspace.close_tab(1)
+    assert workspace.session_index == 0
+    assert workspace.active_session().record_id == first.record_id
+
+
+def test_closing_final_tab_returns_clean_new_session(workspace):
+    tab = _saved_tab(workspace, "only one")
+    workspace.sessions = [tab]
+    workspace.session_index = 0
+
+    workspace.close_tab(0)
+
+    assert len(workspace.sessions) == 1
+    fresh = workspace.sessions[0]
+    assert fresh.record_id is None
+    assert fresh.session.messages == []
+    assert fresh.title == "New session"
+    assert workspace.session_index == 0
+
+
+def test_close_tab_refused_while_operation_is_active(workspace):
+    tab = _saved_tab(workspace, "busy one")
+    workspace.sessions = [tab]
+    workspace.session_index = 0
+    workspace.busy = True
+
+    workspace.close_tab(0)
+    assert len(workspace.sessions) == 1
+    assert "safe boundary" in workspace.notice
+
+
+def test_close_tab_refused_while_approval_is_pending(workspace):
+    tab = _saved_tab(workspace, "gated")
+    workspace.sessions = [tab]
+    workspace.session_index = 0
+    gate = ApprovalGate(gate="file")
+    workspace._install_approval(gate)
+
+    workspace.close_tab(0)
+
+    assert len(workspace.sessions) == 1
+    # Closing must never act as an implicit denial of the security gate.
+    assert workspace.approval is gate
+    assert not gate.done.is_set()
+    assert "approval is pending" in workspace.notice
+
+
+def test_close_engagement_tab_keeps_audit_data(workspace):
+    tab = workspace.session_store.new_tab()
+    workspace.sessions = [tab]
+    workspace.mode_holder[0] = "purple"
+    # engagement tabs come from EngagementStore; close is list-only
+    workspace.engagements = [
+        type(
+            "EngagementStub",
+            (),
+            {
+                "engagement_id": "deadbeef",
+                "target": "authorized.example",
+                "status": "recorded",
+                "last_state": "",
+                "path": None,
+                "started_at": "",
+                "title": "authorized.example",
+            },
+        )()
+    ]
+    workspace.engagement_index = 0
+    workspace.close_tab(0)
+    assert workspace.engagements == []
+    assert workspace.engagement_index is None
+    assert workspace.purple_view is None
+
+
+# ---- palette discoverability -------------------------------------------
+
+
+def test_palette_exposes_rename_and_close_in_mode_a():
+    options = CommandPalette(_make_controller_stub("copilot"))._options
+    ids = [identifier for _, identifier in options]
+    assert "rename" in ids and "close" in ids
+    assert "memory" not in ids
+
+
+def test_palette_lists_a_close_entry_for_every_session():
+    stub = _make_controller_stub("copilot")
+
+    class _Tab:
+        def __init__(self, title: str) -> None:
+            self.title = title
+
+    stub.sessions = [_Tab("Email header triage notes"), _Tab("Recon flow")]
+    options = CommandPalette(stub)._options
+    ids = [identifier for _, identifier in options]
+    labels = [label for label, _ in options]
+    # each stored session gets its own close (and rename) entry
+    assert ids.count("close:1") == 1 and ids.count("close:2") == 1
+    assert "rename:1" in ids and "rename:2" in ids
+    assert any("Close session 1: Email header triage notes" in label for label in labels)
+    assert any("Close session 2: Recon flow" in label for label in labels)
+    # the session list stays grouped before the general commands
+    assert ids.index("close:1") < ids.index("new")
+    assert "memory" not in ids
+
+
+def test_palette_lists_close_entry_for_a_single_session():
+    stub = _make_controller_stub("copilot")
+
+    class _Tab:
+        title = "Only session"
+
+    stub.sessions = [_Tab()]
+    options = CommandPalette(stub)._options
+    ids = [identifier for _, identifier in options]
+    labels = [label for label, _ in options]
+    assert ids.count("close:1") == 1
+    assert any("Close session 1: Only session" in label for label in labels)
+
+
+def test_palette_exposes_memory_in_mode_b():
+    options = CommandPalette(_make_controller_stub("purple"))._options
+    ids = [identifier for _, identifier in options]
+    assert "memory" in ids
+    assert "rename" not in ids and "close" not in ids
+
+
+def _make_controller_stub(mode_value: str):
+    class _Stub:
+        def __init__(self) -> None:
+            self.mode = mode_value
+            self.sessions: list = []
+
+    return _Stub()
+
+
+# ---- Kryonsec Memory shortcut ------------------------------------------
+
+
+def test_memory_entry_visible_only_in_purple(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available", lambda image: (True, "test")
+    )
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            entry = app.query_one("#memory-entry", MemoryEntry)
+            assert entry.display is False
+            await pilot.press("shift+tab")
+            for _ in range(5):
+                await pilot.pause()
+            assert workspace.mode == "purple"
+            assert entry.display is True
+
+    asyncio.run(scenario())
+
+
+def test_memory_activation_uses_the_shared_viewers(monkeypatch, workspace):
+    import webbrowser
+
+    calls = []
+
+    def fake_start(cfg, host="127.0.0.1", port=8899):
+        calls.append("start")
+        return "http://127.0.0.1:9001/"
+
+    fake_open = lambda url, *a, **k: calls.append(("open", url)) or True
+    monkeypatch.setattr("kryonsec.cli._start_memory_browser", fake_start)
+    monkeypatch.setattr("webbrowser.open", fake_open)
+    workspace.mode_holder[0] = "purple"
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_open_memory()
+            for _ in range(8):
+                await await_worker(app)
+                await pilot.pause()
+            joined = workspace.notice
+            assert "http://127.0.0.1:9001/" in joined
+            assert "read-only" in joined
+            assert calls.count("start") == 1
+            assert ("open", "http://127.0.0.1:9001/") in calls
+
+    asyncio.run(scenario())
+
+
+async def await_worker(app: KryonsecApp) -> None:
+    await asyncio.sleep(0.05)
+
+
+def test_memory_failure_is_reported_without_breaking_the_ui(monkeypatch, workspace):
+    import webbrowser
+
+    def failing_start(cfg, host="127.0.0.1", port=8899):
+        return None
+
+    monkeypatch.setattr("kryonsec.cli._start_memory_browser", failing_start)
+    monkeypatch.setattr("webbrowser.open", lambda url, *a, **k: True)
+    workspace.mode_holder[0] = "purple"
+
+    result = asyncio.run(controller_call(workspace))
+    assert result is None
+    assert "could not start" in workspace.notice
+    # the controller is still usable afterwards
+    assert workspace.sessions
+
+
+async def controller_call(workspace: WorkspaceController):
+    return await asyncio.to_thread(workspace.open_memory_browser)
+
+
+def test_memory_never_launches_on_mode_switch_or_startup(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available", lambda image: (True, "test")
+    )
+    launched = []
+
+    def guard(cfg, host="127.0.0.1", port=8899):
+        launched.append("start")
+        return None
+
+    monkeypatch.setattr("kryonsec.cli._start_memory_browser", guard)
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("shift+tab")
+            for _ in range(5):
+                await pilot.pause()
+            assert workspace.mode == "purple"
+
+    asyncio.run(scenario())
+    assert launched == []
+
+
+# ---- Mode B live runtime and activity rendering -------------------------
+#
+# These tests feed the same observation callbacks the real runner/audit
+# observer thread calls; nothing fabricates a "ready" state. The actual
+# docker/sandbox collectors are decided by their real check functions, which
+# are monkeypatched here the same way the mode gate already is.
+
+
+def test_purple_runtime_panel_starts_unknown_and_reflects_real_checks(
+    workspace, monkeypatch
+):
+    assert workspace.runtime_status_summary() == {
+        "docker": "unknown",
+        "docker_detail": "",
+        "sandbox": "unknown",
+        "sandbox_detail": "",
+    }
+    monkeypatch.setattr(
+        "kryonsec.purple.runtime_checks.docker_server_ok",
+        lambda: (False, "docker daemon unreachable"),
+    )
+    monkeypatch.setattr(
+        "kryonsec.purple.runner.sandbox_available",
+        lambda image: (False, "runsc not registered"),
+    )
+    workspace._collect_runtime_status()
+    status = workspace.runtime_status_summary()
+    assert status["docker"] == "unavailable"
+    assert "docker daemon unreachable" in status["docker_detail"]
+    assert status["sandbox"] == "unavailable"
+    assert "runsc not registered" in status["sandbox_detail"]
+
+
+def test_purple_runtime_sidebar_never_shows_fake_ready(workspace):
+    workspace.mode_holder[0] = "purple"
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#sidebar-content"))
+            assert "RUNTIME" in text
+            assert "unknown" in text
+            # nothing is claimed connected or ready before a real check runs
+            assert "connected" not in text
+            assert "ready" not in text.replace("READY", "")
+            assert "on demand" in text
+
+    asyncio.run(scenario())
+
+
+def test_purple_sandbox_status_comes_from_real_audit_events(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1")
+    view.on_audit(
+        {
+            "event": "sandbox_check",
+            "available": False,
+            "reason": "gVisor image mismatch",
+        }
+    )
+    assert view.sandbox_status == "unavailable"
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "unavailable" in sidebar
+            assert "gVisor image mismatch" in sidebar
+
+    asyncio.run(scenario())
+
+
+def test_purple_connections_reflect_the_real_toolbox_state(workspace):
+    class FakeMcp:
+        def statuses(self):
+            return [
+                {"name": "GitHub", "status": "connected", "detail": "2 tool(s)"},
+                {"name": "Filesystem", "status": "disconnected", "detail": "process exited"},
+            ]
+
+    workspace.mcp_toolbox = FakeMcp()
+    workspace.mode_holder[0] = "purple"
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#sidebar-content"))
+            assert "1/2 connected" in text
+            assert "GitHub" in text and "Filesystem" in text
+            # the real per-server state, not a blanket "connected"
+            assert "disconnected" in text
+
+    asyncio.run(scenario())
+
+
+def test_purple_active_agent_updates_from_state_events(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._refresh_sidebar()
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "—\n" in sidebar  # no stage yet
+            # backend observations arrive one at a time, like the real thread
+            view.on_state("RECON_ACTIVE")
+            view.on_audit(
+                {
+                    "event": "tool_spawn",
+                    "tool": "nmap",
+                    "state": "RECON_ACTIVE",
+                    "argv": ["nmap", "-Pn", "-sV", "-p", "80,443", "authorized.example"],
+                }
+            )
+            # a real run posts UiChanged from the observer thread; here the
+            # observation callbacks are driven by hand, so force the repaint
+            app._refresh_sidebar()
+            await pilot.pause()
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "Active recon" in sidebar
+            assert "running" in sidebar
+            assert "nmap" in sidebar
+
+    asyncio.run(scenario())
+
+
+def test_purple_current_operation_shows_real_command_from_audit_argv(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_ACTIVE")
+    view.on_audit(
+        {
+            "event": "tool_spawn",
+            "tool": "nmap",
+            "state": "RECON_ACTIVE",
+            "argv": ["nmap", "-Pn", "-sV", "-p", "80,443", "authorized.example"],
+        }
+    )
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            assert "CURRENT OPERATION" in purple
+            assert "nmap" in purple
+            assert "nmap -Pn -sV -p 80,443 authorized.example" in purple
+            assert "running" in purple
+
+    asyncio.run(scenario())
+
+
+def test_purple_last_completed_tool_is_shown_when_nothing_runs(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_ACTIVE")
+    view.on_audit(
+        {
+            "event": "tool_spawn",
+            "tool": "nmap",
+            "state": "RECON_ACTIVE",
+            "argv": ["nmap", "-Pn", "authorized.example"],
+        }
+    )
+    view.on_audit(
+        {
+            "event": "tool_result",
+            "tool": "nmap",
+            "state": "RECON_ACTIVE",
+            "ok": True,
+            "exit_code": 0,
+            "output_chars": 421,
+        }
+    )
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "completed" in purple
+            assert "421 chars" in purple
+            assert "nmap" in sidebar and "completed" in sidebar
+
+    asyncio.run(scenario())
+
+
+def test_purple_command_display_redacts_secrets_from_argv(workspace):
+    import kryonsec.ui.state as ui_state
+
+    tool, argv = "curl", [
+        "curl",
+        "-H",
+        "Authorization: Bearer abcdef0123456789abcdef0123456789",
+        "https://authorized.example",
+    ]
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_ACTIVE")
+    view.on_audit(
+        {"event": "tool_spawn", "tool": tool, "state": "RECON_ACTIVE", "argv": argv}
+    )
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            assert "abcdef0123456789abcdef0123456789" not in purple
+            assert "SECRET" in purple
+
+    asyncio.run(scenario())
+    # and the shared formatter behaves the same way
+    assert ui_state.display_command(tool, argv).count("«SECRET_") == 1
+
+
+def test_purple_activity_stream_appends_real_events_in_order(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_PASSIVE")
+    view.on_state_complete("RECON_PASSIVE")
+    view.on_state("RECON_ACTIVE")
+    view.on_audit(
+        {
+            "event": "tool_spawn",
+            "tool": "nmap",
+            "state": "RECON_ACTIVE",
+            "argv": ["nmap", "-Pn", "authorized.example"],
+        }
+    )
+    view.on_audit(
+        {
+            "event": "tool_result",
+            "tool": "nmap",
+            "state": "RECON_ACTIVE",
+            "ok": True,
+            "output_chars": 88,
+        }
+    )
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            launched = purple.index("launched nmap")
+            finished = purple.index("finished nmap")
+            assert launched < finished
+            assert "started" in purple
+            assert "stage completed" in purple
+
+    asyncio.run(scenario())
+
+
+def test_purple_findings_and_evidence_update_from_state_changes(workspace):
+    class FakeGraph:
+        def by_type(self, kind):
+            if kind == "finding":
+                return [
+                    {
+                        "label": "Basic auth over HTTP on /admin",
+                        "properties": {"verified": True, "severity": "high"},
+                    }
+                ]
+            return []
+
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.graph = FakeGraph()
+    assert view.snapshot()["counts"]["findings"] == 0
+    view.on_state("VERIFY")
+    view.on_state_complete("VERIFY")
+    snapshot = view.snapshot()
+    assert snapshot["counts"]["findings"] == 1
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            assert "findings 1" in purple
+            assert "verified 1" in purple
+
+    asyncio.run(scenario())
+
+
+def test_purple_statusbar_tracks_running_tool_not_static_tagline(workspace):
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            text = await _render_text(app.query_one("#statusbar"))
+            assert "engine idle" in text
+            assert "deterministic engine" not in text
+            workspace.purple_view = view
+            app._refresh_status()
+            text = await _render_text(app.query_one("#statusbar"))
+            assert "waiting" in text
+            view.on_state("RECON_ACTIVE")
+            view.on_audit(
+                {
+                    "event": "tool_spawn",
+                    "tool": "nmap",
+                    "state": "RECON_ACTIVE",
+                    "argv": ["nmap", "-Pn", "authorized.example"],
+                }
+            )
+            app._refresh_status()
+            await pilot.pause()
+            text = await _render_text(app.query_one("#statusbar"))
+            assert "recon_active" in text
+            assert "nmap" in text
+
+    asyncio.run(scenario())
+
+
+def test_purple_workflow_timeline_shows_stage_durations(workspace):
+    import time as time_module
+
+    view = PurpleWorkspaceState("authorized.example", "eng-1", sandbox_status="ready")
+    view.on_state("RECON_PASSIVE")
+    first = view.state_started["RECON_PASSIVE"]
+    view.state_started["RECON_PASSIVE"] = first - 7.0  # the real clock would drift
+    view.on_state_complete("RECON_PASSIVE")
+    assert round(view.state_duration["RECON_PASSIVE"]) == 7
+    workspace.mode_holder[0] = "purple"
+    workspace.purple_view = view
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            purple = await _render_text(app.query_one("#purple-view"))
+            assert "7s" in purple
+
+    asyncio.run(scenario())

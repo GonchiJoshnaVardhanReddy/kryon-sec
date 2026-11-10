@@ -21,7 +21,6 @@ import time
 log = logging.getLogger(__name__)
 
 from rich.console import Console
-from rich.markdown import Markdown
 
 from . import __version__
 from .config import KryonsecConfig
@@ -44,7 +43,6 @@ _UTF8_OK = _console_supports_utf8()
 ARROW = "→" if _UTF8_OK else "->"
 OK_MARK = "✓" if _UTF8_OK else "+"
 FAIL_MARK = "✗" if _UTF8_OK else "x"
-TREE_BRANCH = "└─" if _UTF8_OK else "`-"
 
 console = Console()
 err_console = Console(stderr=True, style="red")
@@ -149,6 +147,123 @@ def _print_help() -> None:
     console.print()  # breathing room before the next prompt
 
 
+async def _fullscreen_chat_loop(cfg: KryonsecConfig) -> None:
+    """Run the persistent Textual workspace on a real interactive TTY.
+
+    This path deliberately does not call Rich's ``print`` or ``PromptSession``
+    loop.  ``WorkspaceController`` owns backend work and reports observations
+    from worker threads; ``KryonsecApp`` paints a single full-screen terminal
+    surface.  The legacy Rich loop below remains the readable non-TTY fallback
+    used by pipes, CI, and tests.
+    """
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+    from .storage import GeneralUserLtm
+    from .ui.app import KryonsecApp
+    from .ui.session_store import EngagementStore, SessionStore
+    from .ui.workspace import WorkspaceController
+
+    store = SessionStore(cfg)
+    try:
+        initial_sessions = store.list_tabs()
+    except Exception as exc:
+        initial_sessions = []
+        log.warning("fullscreen session history unavailable: %s", exc)
+
+    # Load the same sanitized preference/fact context as the existing chat
+    # loop.  This is prompt construction, not a change to provider behavior.
+    prefs: dict = {"explain_mode": "technical"}
+    user_facts: list[str] = []
+    try:
+        from .storage import get_session as db_session
+
+        with db_session(cfg) as db:
+            for row in (
+                db.query(GeneralUserLtm)
+                .filter(GeneralUserLtm.category == "preference")
+                .order_by(GeneralUserLtm.access_count.desc())
+                .limit(10)
+                .all()
+            ):
+                prefs[row.key] = row.value
+            for row in (
+                db.query(GeneralUserLtm)
+                .filter(GeneralUserLtm.category == "fact")
+                .order_by(GeneralUserLtm.last_accessed.desc())
+                .limit(15)
+                .all()
+            ):
+                fact = row.value if isinstance(row.value, str) else str(row.value)
+                user_facts.append(f"{row.key}: {fact}")
+    except Exception as exc:
+        log.warning("fullscreen LTM context unavailable: %s", exc)
+
+    templates = Path(__file__).parent / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(templates)),
+        undefined=StrictUndefined,
+        autoescape=False,
+    )
+    system_prompt = env.get_template("system_prompt.jinja").render(
+        workspace=str(cfg.workspace),
+        explain_mode=str(prefs.get("explain_mode", "technical")),
+        recent_topics=[],
+        user_facts=user_facts,
+    )
+
+    engagement_store = EngagementStore(cfg)
+    try:
+        initial_engagements = engagement_store.list_tabs()
+    except Exception as exc:
+        initial_engagements = []
+        log.warning("fullscreen engagement history unavailable: %s", exc)
+
+    controller = WorkspaceController(
+        cfg,
+        session_store=store,
+        engagement_store=engagement_store,
+        system_prompt=system_prompt,
+        initial_sessions=initial_sessions,
+        initial_engagements=initial_engagements,
+    )
+    # The workspace palette is mode-driven (Mode A monochrome, Mode B purple
+    # branding only).  Saved theme preferences remain on disk for the other
+    # Kryonsec surfaces but never override the required design here.
+    app = KryonsecApp(cfg, controller)
+
+    mcp_toolbox = None
+    if cfg.mcp_servers:
+        from .copilot.mcp_tools import McpToolbox
+
+        try:
+            mcp_toolbox = McpToolbox(cfg, on_notice=controller.notify)
+            controller.mcp_toolbox = mcp_toolbox
+            threading.Thread(
+                target=mcp_toolbox.connect_all,
+                name="mcp-connect",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            controller.notify(f"MCP unavailable: {type(exc).__name__}: {exc}")
+
+    from .llm import preload_litellm
+
+    preload_litellm()
+    try:
+        await app.run_async()
+    finally:
+        # Save every non-empty tab, not only the selected one.  A tab switch
+        # never discards an unsaved conversation.
+        try:
+            await asyncio.to_thread(store.save_all, controller.sessions)
+        except Exception:
+            log.exception("fullscreen session save failed")
+        if mcp_toolbox is not None:
+            mcp_toolbox.close()
+
+
 def _print_goodbye(cleanup: "Callable[[], None] | None" = None) -> None:
     """Persist, tear down, and say goodbye with the exchange count —
     the user shouldn't wonder whether the session was saved."""
@@ -166,6 +281,14 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
     from .copilot.tools import ApprovalRequest
     from .llm import LlmUnavailable, chat
     from .storage import GeneralUserLtm, get_session as db_session
+    from .ui.components import approval_panel
+    from .ui.theme import resolve_theme, terminal_capabilities
+
+    ui_theme = resolve_theme(
+        truecolor=terminal_capabilities(getattr(console, "file", None)).get(
+            "truecolor", False
+        )
+    )
 
     # create tables on first use — the chat must work out of the box
     try:
@@ -175,26 +298,17 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
         err_console.print(f"[yellow]storage init failed: {e} — session will not be persisted[/yellow]")
 
     def _console_approve(req: ApprovalRequest) -> bool:
-        from rich.panel import Panel
-
         verb = {"read": "Read", "list": "List", "write": "Write"}.get(
             req.action, req.action.capitalize())
-        # req.path is the RESOLVED target (what the decision is about). When
-        # the agent named something else — a workspace symlink pointing out of
-        # the workspace — show both, or the user approves the wrong file.
-        via = ""
-        if req.requested_path:
-            via = (
-                f"\n[yellow]requested as[/yellow] [dim]{req.requested_path}[/dim]"
-                f"\n[yellow]→ really[/yellow] [bold red]{req.path}[/bold red]"
-            )
-        console.print(Panel(
-            f"[bold]{verb} this file?[/bold]\n"
-            f"[cyan]{req.path}[/cyan]"
-            f"{via}\n"
-            f"[dim]why: {req.reason}[/dim]",
-            title="[bold yellow]Approval required[/bold yellow]",
-            border_style="yellow",
+        # The resolved path remains the decision target.  The shared
+        # component shows both names when a symlink or path normalization made
+        # them differ; the decision itself is still deny-by-default below.
+        console.print(approval_panel(
+            action=verb,
+            requested_path=req.requested_path or "",
+            resolved_path=req.path,
+            reason=req.reason,
+            theme=ui_theme,
         ))
         answer = console.input(
             "[bold][A]pprove / [D]eny (Enter = Deny):[/bold] ")
@@ -311,12 +425,23 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
     _notice = [""]  # one-line status shown above the prompt
 
     from .tui import make_prompt_session
+    from .ui.shell import KryonsecShell
+
+    shell = KryonsecShell(cfg, console, _mode, _notice)
+    shell.show_startup()
 
     def _on_mode_change(new_mode: str) -> None:
-        console.clear()  # repaint the banner in the new mode color
-        _print_banner(new_mode)
+        shell.state.mode = new_mode
+        shell.refresh()
 
-    ps = make_prompt_session(_mode, _notice, cfg, on_change=_on_mode_change)
+    ps = make_prompt_session(
+        _mode,
+        _notice,
+        cfg,
+        on_change=_on_mode_change,
+        on_palette=shell.open_palette,
+        busy=lambda: shell.state.active not in {"ready", "idle"},
+    )
 
     try:
         while True:
@@ -336,6 +461,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 continue
 
             cmd = text.lower()
+            shell.record_user(text, active=not cmd.startswith("/"))
             if cmd in ("/quit", "/exit", "exit", "quit", "q"):
                 _print_goodbye(_exit)
                 return
@@ -486,10 +612,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                 # the spinner gives way: the tool may prompt for approval,
                 # which needs the terminal
                 status.hide()
-                arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in (args or {}).items())
-                console.print(f"  [dim]{TREE_BRANCH}[/dim] [cyan]{name}[/cyan][dim]({arg_preview})[/dim]")
+                shell.record_tool(name, args)
 
             def _show_round() -> None:
+                shell.record_round()
                 status.show(f"[cyan]copilot[/cyan] thinking…")
 
             try:
@@ -541,6 +667,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                         "`kryonsec setup` to switch providers.",
                     )
                     console.print(f"[yellow]{hint}[/yellow]")
+                    shell.state.active = "ready"
                     session.messages.pop()  # drop the unanswered user turn
                     continue
                 except Exception as e:
@@ -550,6 +677,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
                     err_console.print(
                         f"[red]chat failed ({type(e).__name__}): {e}[/red]")
                     log.exception("fallback chat failed")
+                    shell.state.active = "ready"
                     session.messages.pop()
                     continue
             finally:
@@ -557,7 +685,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
 
             session.add("assistant", reply)
             _msg_count[0] += 1
-            console.print(Markdown(reply))
+            shell.record_assistant(reply)
             console.print("\n")  # a blank line separates the reply from the prompt
             _remember_facts(cfg, text, reply)  # best-effort LTM (never blocks chat)
     finally:
@@ -704,6 +832,10 @@ def _run_purple(
     code_folder: str | None = None,
     *,
     memory_browser: bool = False,
+    ui: "Any | None" = None,
+    output: bool = True,
+    human_reviewer: "Callable[[list[dict]], set[str]] | None" = None,
+    post_exploit_approver: "Callable[[str], bool] | None" = None,
 ) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
     subcommand and the /mode toggle inside the chat loop.
@@ -729,10 +861,26 @@ def _run_purple(
     )
     from .purple.zonea import validate_target
 
+    def _notice(message: str) -> None:
+        if ui is not None:
+            try:
+                ui.on_notice(message)
+                return
+            except Exception:
+                pass
+        if output:
+            console.print(message)
+
+    def _error(message: str) -> None:
+        if ui is not None and not output:
+            _notice(message)
+        else:
+            err_console.print(message)
+
     try:
         target = validate_target(target_arg)
     except ValueError as e:
-        err_console.print(f"[red]Invalid target:[/red] {e}")
+        _error(f"Invalid target: {e}")
         return 2
 
     # --id is a PATH COMPONENT: it names cfg.home/engagements/<id>/ and is
@@ -743,8 +891,8 @@ def _run_purple(
     # engagement_id so the memory browser validates an id the same way.
     if engagement_id is not None:
         if not is_valid_engagement_id(engagement_id):
-            err_console.print(
-                f"[red]Invalid engagement id:[/red] {engagement_id!r} — "
+            _error(
+                f"Invalid engagement id: {engagement_id!r} — "
                 "use letters, digits, dot, dash or underscore (max 64 chars)"
             )
             return 2
@@ -754,8 +902,7 @@ def _run_purple(
     if code_folder:
         code_path = Path(code_folder).expanduser()
         if not code_path.is_dir():
-            err_console.print(
-                f"[red]--code path is not a folder:[/red] {code_folder}")
+            _error(f"--code path is not a folder: {code_folder}")
             return 2
         code_folder = str(code_path.resolve())
 
@@ -773,17 +920,16 @@ def _run_purple(
     try:
         ensure_purple_allowed(cfg)
     except LicenseError as e:
-        err_console.print(f"[red]Purple Team is not available:[/red] {e}")
-        console.print(
-            "[dim]Copilot mode is free and unaffected — just run `kryonsec`.[/dim]")
+        _error(f"Purple Team is not available: {e}")
+        _notice("Copilot mode is free and unaffected — just run `kryonsec`.")
         return 3
 
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     if not sandbox_ok:
-        console.print(f"[yellow]Sandbox not available:[/yellow] {sandbox_reason}")
-        console.print("[yellow]Engagement will stop after passive recon (Zone A works everywhere).[/yellow]")
+        _notice(f"Sandbox not available: {sandbox_reason}")
+        _notice("Engagement will stop after passive recon (Zone A works everywhere).")
         if code_folder:
-            console.print("[yellow]--code ignored: static scanners need the sandbox.[/yellow]")
+            _notice("--code ignored: static scanners need the sandbox.")
 
     # an explicit --id must survive the run: re-running a named engagement
     # keeps the same audit/report dirs instead of getting a random id
@@ -797,7 +943,19 @@ def _run_purple(
         detach_purple_logging,
     )
 
-    ui = PurpleUI(console, target=target, engagement_id=engagement_id)
+    if ui is None:
+        ui = PurpleUI(
+            console,
+            target=target,
+            engagement_id=engagement_id,
+            sandbox_status="ready" if sandbox_ok else "unavailable",
+        )
+    else:
+        # The fullscreen adapter is created before the worker starts so its
+        # target and runtime status are visible even while INIT is loading.
+        ui.target = target
+        ui.engagement_id = engagement_id
+        ui.sandbox_status = "ready" if sandbox_ok else "unavailable"
     # Precomputed so _progress can tell a state announcement (which the
     # panel already shows) from a subagent's event (which it does not).
     _STATE_ACTION_TEXTS = frozenset(STATE_ACTION.values())
@@ -839,31 +997,51 @@ def _run_purple(
             orch, audit, graph = start_engagement(
                 cfg, engagement_id, target=target, progress=_progress,
                 code_folder=code_folder,
+                human_reviewer=human_reviewer,
+                post_exploit_approver=post_exploit_approver,
             )
             # Two existing hooks, no new plumbing: the orchestrator announces
             # state transitions (before the subagent is built, so HUMAN_REVIEW's
             # prompt owns the terminal first), and the audit chain announces
             # tool activity.
             ui.graph = graph
+            ui.audit = audit
+            ui.orchestrator = orch
             orch.on_state = ui.on_state
             audit.add_observer(ui.on_audit)
+            checkpoint_callback = getattr(orch, "on_state_complete", None)
 
-            console.print(
-                f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
-                f"target={target}")
+            def _on_state_complete(state: str) -> None:
+                ui.on_state_complete(state)
+                if checkpoint_callback is not None:
+                    checkpoint_callback(state)
+
+            orch.on_state_complete = _on_state_complete
+
+            if output:
+                console.print(
+                    f"[magenta]\\[PURPLE]>[/magenta] engagement {engagement_id} "
+                    f"target={target}")
             # Printed here, with the engagement line and before the live
             # panel owns the terminal, so it arrives as one readable line
             # rather than something the panel has to paint around.
             memory_url = _start_memory_browser(cfg) if memory_browser else None
-            if memory_url:
+            if memory_url and output:
                 console.print(
                     f"[magenta]\\[PURPLE]>[/magenta] memory browser "
                     f"[cyan]{memory_url}[/cyan] [dim](read-only, loopback — "
                     "open it in a browser; it fills in as the run goes)[/dim]")
-            console.print()
+            if output:
+                console.print()
             ui.started_at = time.monotonic()
             ui.start()
             completed = orch.run()
+            report_path = cfg.home / "engagements" / engagement_id / "report.md"
+            ui.finish(
+                "halted" if orch.halt_reason else "completed",
+                halt_reason=orch.halt_reason,
+                report_path=str(report_path) if report_path.exists() else None,
+            )
         finally:
             ui.stop()
             detach_purple_logging(log_handler)
@@ -876,10 +1054,10 @@ def _run_purple(
         # recorded before it goes.
         graph_saved = persist_graph(cfg, engagement_id, graph, audit)
         if not graph_saved:
-            err_console.print(
-                "[yellow]graph memory not saved — the engagement itself is "
-                "complete (audit chain, evidence and report are on disk); "
-                "see the debug log[/yellow]")
+            _notice(
+                "graph memory not saved — the engagement itself is complete "
+                "(audit chain, evidence and report are on disk); see the debug log"
+            )
 
         # Read after persist_graph, not before: a crash while saving the
         # graph is a failure of the run, and reading the halt reason earlier
@@ -913,10 +1091,11 @@ def _run_purple(
             exception_type=exception_type,
         )
 
-    _print_purple_summary(
-        cfg, engagement_id, target, completed, orch, audit, graph,
-        debug_log=debug_log, graph_saved=graph_saved,
-    )
+    if output:
+        _print_purple_summary(
+            cfg, engagement_id, target, completed, orch, audit, graph,
+            debug_log=debug_log, graph_saved=graph_saved,
+        )
     return 0
 
 
@@ -946,6 +1125,7 @@ def _print_purple_summary(
 
     findings = graph.by_type("finding")
     verified = [n for n in findings if n["properties"].get("verified")]
+    possible = [n for n in findings if not n["properties"].get("verified")]
     attempts = graph.by_type("exploit_attempt")
     # A14: an attempt node exists for every tool EXPLOIT *tried*, so the node
     # count is not a run count — a sandbox that never started leaves 31 nodes
@@ -972,6 +1152,7 @@ def _print_purple_summary(
         rows.add_row("Completed", f"{len(completed)} / {len(STATES)} stages")
     rows.add_row("Verified findings", f"[red]{len(verified)}[/red]"
                  if verified else "0")
+    rows.add_row("Possible findings", str(len(possible)))
     rows.add_row("Hypotheses", str(len(hypotheses)))
     rows.add_row("Tool executions", str(len(runs)))
     rows.add_row("Evidence artifacts", str(evidence_count))
@@ -988,6 +1169,15 @@ def _print_purple_summary(
     if report_path.exists():
         rows.add_row("", "")
         rows.add_row("Report", _short_path(report_path, cfg.home))
+    try:
+        chain_ok, _chain_error = audit.verify()
+        chain_status = "verified" if chain_ok else "verification failed"
+        rows.add_row(
+            "Audit chain",
+            f"{chain_status} · {audit.head_hash()[:16]}…",
+        )
+    except Exception:
+        rows.add_row("Audit chain", "verification unavailable")
     if debug_log is not None:
         rows.add_row("Debug log", _short_path(debug_log, cfg.home))
 
@@ -1025,6 +1215,10 @@ def _print_purple_summary(
         verdict = f"[green]no testing performed[/green] (engagement stopped before EXPLOIT)"
 
     console.print(verdict)
+    if halted:
+        console.print("[dim]next safe action: resolve the gate above, run `kryonsec doctor`, then start a new engagement[/dim]")
+    else:
+        console.print("[dim]next safe action: review the report and audit fingerprint before sharing results[/dim]")
     console.print(f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]")
 
     if subdomains:
@@ -1299,9 +1493,22 @@ def main(argv: list[str] | None = None) -> int:
 
     _offer_connect(cfg)
 
-    console.print(welcome(cfg))
+    # A supported interactive terminal gets the persistent full-screen
+    # workspace. Pipes, CI, and legacy encodings keep the readable fallback.
+    from .ui.runtime import interactive_terminal_available
+
+    full_screen = interactive_terminal_available()
+    if not full_screen:
+        console.print(welcome(cfg))
     try:
-        asyncio.run(_chat_loop(cfg))
+        if full_screen:
+            # Importing the app stack and the saved sessions can take a few
+            # seconds on a cold or networked disk; say something first so the
+            # terminal is never silently blank.
+            console.print("[dim]starting the Kryonsec workspace…[/dim]")
+            asyncio.run(_fullscreen_chat_loop(cfg))
+        else:
+            asyncio.run(_chat_loop(cfg))
     except (KeyboardInterrupt, asyncio.CancelledError):
         console.print("")  # Ctrl+C during shutdown — exit cleanly
     return 0

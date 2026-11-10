@@ -103,6 +103,17 @@ def test_initial_screen_identifies_the_engagement():
     assert "KRYONSEC PURPLE TEAM" in out
 
 
+def test_engagement_header_shows_sandbox_and_outcome_state():
+    ui = make_ui()
+    ui.sandbox_status = "unavailable"
+    ui.finish("halted", halt_reason="profile2_required")
+    out = render(ui)
+    assert "Sandbox" in out
+    assert "unavailable" in out
+    assert "HALTED" in out
+    assert "profile2_required" in out
+
+
 def test_initial_screen_shows_the_whole_pipeline():
     out = render(make_ui())
     for label in ("INIT", "PASSIVE RECON", "ACTIVE RECON", "HYPOTHESIZE",
