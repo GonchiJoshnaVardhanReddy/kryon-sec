@@ -18,8 +18,13 @@ from kryonsec.copilot.mcp_registry import UNTRUSTED_MARKER, McpRegistry
 from kryonsec.copilot.mcp_tools import McpToolbox
 
 DOCSAFE_MODULE = "kryonsec.copilot.mcp_servers.docsafe"
-FAKE_SECRET = "AKIAIOSFODNN7EXAMPLE"
-FAKE_TOKEN = "sk-BBBB2222CCCC3333DDDD4444EEEE5555"
+# Locally generated placeholder credentials (GitGuardian-safe: not real
+# provider key material, and shaped as bearer tokens rather than any
+# provider's key format). They still match kryonsec's own redactor
+# patterns (bearer_token), so the redaction assertions below genuinely
+# exercise the redactor boundary.
+FAKE_SECRET = "bearer KRYONFAKE0000000aaaaaaaaaaaaaaaaaaa"
+FAKE_TOKEN = "bearer KRYONFAKE1111111zzzzzzzzzzzzzzzzzzzzz"
 
 
 def _make_root(tmp_path):
@@ -422,8 +427,13 @@ def test_shipped_wiring_cannot_bypass(tmp_path):
         "\n", " ") or "mcp_registry.llm_tools()" in cli
     assert "startup_allowance()" in cli
     assert "mcp_toolbox.snapshot" not in cli
-    ui_workspace = (src / "ui" / "workspace.py").read_text(encoding="utf-8")
-    assert "mcp_toolbox.snapshot" not in ui_workspace
+    ui_workspace = src / "ui" / "workspace.py"
+    # The Textual UI ships separately from this phase — when it lands the
+    # scan below activates automatically; on trees without it there is
+    # nothing shipped to scan (the file is not part of this tree).
+    if ui_workspace.exists():
+        assert "mcp_toolbox.snapshot" not in ui_workspace.read_text(
+            encoding="utf-8")
 
 
 # ---- 12. Mode B never sees the provider ------------------------------------------

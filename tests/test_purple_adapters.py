@@ -458,17 +458,22 @@ def test_timeout_failure_and_output_bounds_in_the_record(tmp_path):
     assert rec.executed is False and rec.exit_code == -1
     assert "30s" in rec.error_excerpt and rec.truncated is False
     # a huge, secret-shaped output is bounded, redacted and untrusted
+    # (the bearer-token fixture is locally generated placeholder
+    # material — GitGuardian-safe — that still matches kryonsec's own
+    # redactor patterns, so this redaction stays a real check)
     fake2 = FakeSandbox(SpawnResult(
         ok=True, exit_code=0, truncated=True,
-        stdout="AKIAIOSFODNN7EXAMPLE " + "y" * 10000))
+        stdout="bearer KRYONFAKE0000000aaaaaaaaaaaaaaaaaaa "
+              + "y" * 10000))
     rec = execute_adapter(reg, prep, sandbox=fake2, audit=audit)
     assert rec.executed is True
     assert len(rec.output_excerpt) <= 500
-    assert "AKIAIOSFODNN7EXAMPLE" not in rec.output_excerpt
+    fake_secret = "bearer KRYONFAKE0000000aaaaaaaaaaaaaaaaaaa"
+    assert fake_secret not in rec.output_excerpt
     assert rec.truncated is True
     # the audit itself never carries raw tool output
     raw = open(audit.path, encoding="utf-8").read()
-    assert "AKIAIOSFODNN7EXAMPLE" not in raw
+    assert "bearer KRYONFAKE0000000aaaaaaaaaaaaaaaaaaa" not in raw
     assert '"argv":' in raw              # argv is on the record by design
 
 

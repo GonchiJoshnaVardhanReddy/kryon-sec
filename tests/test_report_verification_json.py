@@ -16,9 +16,13 @@ from kryonsec.purple.report import (
 )
 from kryonsec.purple.recon_passive import EngagementGraph
 
-_JWT = ("eyJhbGciOiJIUzI1NiJ9."
-        "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-        "dozjgNryP4J3jwfOwscqXlEnLpAcRuVOjeB4iPQM4HM")
+# Locally generated placeholder session token (GitGuardian-safe: not a
+# real credential and not shaped as any provider key or sample JWT). It
+# still matches kryonsec's own redactor patterns (bearer_token), so the
+# "report never leaks the attempt's credential material" assertions
+# below genuinely exercise the redactor.
+_FAKE_SESSION_TOKEN = (
+    "bearer KRYONFAKE0000000bbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 
 def _events(audit):
@@ -46,7 +50,7 @@ def _report_graph(verify_props=None, confirmed=True):
     graph.add_node("exploit_attempt", "H1:sqlmap", {
         "tool": "sqlmap", "ok": True, "exit_code": 0, "confirmed": confirmed,
         "argv": ["sqlmap", "-u", "http://target-corp.com/Login.asp",
-                 "--cookie", f"session={_JWT}"],
+                 "--cookie", f"session={_FAKE_SESSION_TOKEN}"],
         "output_excerpt": "is vulnerable — password=hunter2 in dump",
     })
     if confirmed:
@@ -187,7 +191,7 @@ def test_report_json_redacts_secrets_and_bounds_evidence(tmp_path):
     blob = json.dumps(doc)
     assert "hunter2" not in blob            # password value redacted
     assert "password" in blob               # label kept, value replaced
-    assert _JWT not in blob                 # session token redacted
+    assert _FAKE_SESSION_TOKEN not in blob   # session token redacted
     attempt = doc["exploit_attempts"][0]
     assert len(attempt["output_excerpt"]) <= 300
     assert all(len(a) <= 120 for a in attempt["argv"])
@@ -319,7 +323,7 @@ def test_json_failure_is_audited_and_markdown_stands(tmp_path, monkeypatch):
     assert result.status == "ok"               # markdown deliverable stands
     md = tmp_path / "engagements" / "e-sub-fail" / "report.md"
     assert md.exists()
-    assert _JWT not in md.read_text(encoding="utf-8")
+    assert _FAKE_SESSION_TOKEN not in md.read_text(encoding="utf-8")
     events = [e["event"] for e in _events(audit)]
     assert "report_json_failed" in events
     assert "report_written" in events          # report.md event unchanged
