@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import io
 import sys
+from pathlib import Path
 
 import pytest
 from textual.widgets import Static
 
 from kryonsec.config import KryonsecConfig
+from kryonsec.copilot.mcp_registry import REGISTRY_TOOL_KEYS
 from kryonsec.copilot.session import Message
 from kryonsec.storage import reset_engine
 from kryonsec.ui.app import (
@@ -78,6 +80,90 @@ def _monochrome(value: str) -> bool:
 
 
 PURE_PURPLE = "#a855f7"
+
+
+# ---- MCP authorization wiring (regression: no legacy catalog bypass) ---------
+
+class _LegacySnapshotToolbox:
+    """Duck-typed legacy McpToolbox: ``snapshot()`` exposes a server's
+    RAW catalog without any policy. Whatever it may return must never
+    reach the agent toolbox through the workspace controller."""
+
+    def __init__(self) -> None:
+        self.snapshot_called = 0
+
+    def snapshot(self) -> dict:
+        self.snapshot_called += 1
+        return {"raw_catalog_tool": (None, None)}
+
+    def statuses(self) -> list[dict]:
+        return []
+
+
+class _FakeMcpRegistry:
+    """Duck-typed McpRegistry: ``llm_tools()`` exposes ONLY the five
+    policy-controlled discovery operations."""
+
+    def __init__(self) -> None:
+        self.llm_tools_called = 0
+
+    def llm_tools(self) -> dict:
+        self.llm_tools_called += 1
+        return {key: (None, None) for key in REGISTRY_TOOL_KEYS}
+
+
+def test_agent_mcp_extra_registry_only(tmp_path):
+    """With a registry wired, the agent loop entry set is exactly the
+    registry's five operations — even when a legacy toolbox is also
+    present (its snapshot is never consulted)."""
+    reset_engine()
+    cfg = KryonsecConfig(home=tmp_path / "home", workspace=tmp_path / "workspace")
+    cfg.database_url = f"sqlite:///{tmp_path / 'sessions.db'}"
+    store = SessionStore(cfg)
+    store.ensure_schema()
+    legacy = _LegacySnapshotToolbox()
+    registry = _FakeMcpRegistry()
+    controller = WorkspaceController(
+        cfg,
+        session_store=store,
+        engagement_store=EngagementStore(cfg),
+        system_prompt="test prompt",
+        mcp_toolbox=legacy,
+        mcp_registry=registry,
+    )
+    try:
+        extra = controller.agent_mcp_extra()
+        assert set(extra) == set(REGISTRY_TOOL_KEYS)
+        assert registry.llm_tools_called == 1
+        assert legacy.snapshot_called == 0
+    finally:
+        controller.close()
+        reset_engine()
+
+
+def test_agent_mcp_extra_fail_closed_without_registry(tmp_path):
+    """No registry wired -> None. A legacy toolbox present on its own
+    must not turn into a catalog exposure, and its snapshot() stays
+    untouched."""
+    reset_engine()
+    cfg = KryonsecConfig(home=tmp_path / "home2", workspace=tmp_path / "workspace2")
+    cfg.database_url = f"sqlite:///{tmp_path / 'sessions2.db'}"
+    store = SessionStore(cfg)
+    store.ensure_schema()
+    legacy = _LegacySnapshotToolbox()
+    controller = WorkspaceController(
+        cfg,
+        session_store=store,
+        engagement_store=EngagementStore(cfg),
+        system_prompt="test prompt",
+        mcp_toolbox=legacy,
+    )
+    try:
+        assert controller.agent_mcp_extra() is None
+        assert legacy.snapshot_called == 0
+    finally:
+        controller.close()
+        reset_engine()
 
 
 async def _render_text(widget) -> str:
