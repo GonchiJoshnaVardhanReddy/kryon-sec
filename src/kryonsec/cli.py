@@ -240,8 +240,24 @@ async def _fullscreen_chat_loop(cfg: KryonsecConfig) -> None:
         try:
             mcp_toolbox = McpToolbox(cfg, on_notice=controller.notify)
             controller.mcp_toolbox = mcp_toolbox
+            # The workspace reaches MCP exactly like the chat path: the
+            # registry's connection-level startup policy decides which
+            # server PROCESS may start (blocked rows stay visible but
+            # never launch, and their block is audited), and the agent
+            # loop sees ONLY the five discovery operations (see
+            # WorkspaceController.agent_mcp_extra). No raw-catalog
+            # route into the agent toolbox exists.
+            from .copilot.mcp_registry import (
+                McpRegistry,
+                terminal_mcp_approver,
+            )
+
+            mcp_registry = McpRegistry(
+                cfg, mcp_toolbox, approver=terminal_mcp_approver())
+            controller.mcp_registry = mcp_registry
             threading.Thread(
                 target=mcp_toolbox.connect_all,
+                kwargs={"allow_start": mcp_registry.startup_allowance()},
                 name="mcp-connect",
                 daemon=True,
             ).start()

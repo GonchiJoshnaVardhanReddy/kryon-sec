@@ -91,6 +91,7 @@ class WorkspaceController:
         engagement_store: EngagementStore,
         system_prompt: str,
         mcp_toolbox: Any = None,
+        mcp_registry: Any = None,
         initial_sessions: list[SessionTab] | None = None,
         initial_engagements: list[EngagementTab] | None = None,
         on_change: Callable[[str], None] | None = None,
@@ -101,6 +102,7 @@ class WorkspaceController:
         self.engagement_store = engagement_store
         self.system_prompt = system_prompt
         self.mcp_toolbox = mcp_toolbox
+        self.mcp_registry = mcp_registry
         self._on_change = on_change or (lambda reason: None)
         self.sessions: list[SessionTab] = initial_sessions or []
         if not self.sessions:
@@ -464,7 +466,7 @@ class WorkspaceController:
         from ..llm import LlmUnavailable, chat
 
         file_tools = FileTools(self.cfg, approver=self.request_file_approval)
-        extra = self.mcp_toolbox.snapshot() if self.mcp_toolbox is not None else None
+        extra = self.agent_mcp_extra()
         toolbox = await asyncio.to_thread(build_toolbox, self.cfg, file_tools, extra or None)
         self._set_activity(tab, "thinking")
 
@@ -936,6 +938,17 @@ class WorkspaceController:
             self._runtime_checked_at = time.monotonic()
         self._changed("runtime")
         return dict(self.runtime_status)
+
+    def agent_mcp_extra(self) -> "dict | None":
+        """The MCP entries exposed to the agent loop: ONLY the five
+        policy-controlled registry discovery operations. Every real tool
+        execution flows through ``McpRegistry.call_mcp_tool`` — trust
+        policy, allowance, approval gate, schema validation, and audit
+        are enforced at that single choke point. A legacy toolbox's raw
+        catalog snapshot must NEVER feed the agent toolbox: it would
+        expose server tools with no authorization and no audit."""
+        reg = getattr(self, "mcp_registry", None)
+        return reg.llm_tools() if reg is not None else None
 
     def mcp_statuses(self) -> list[dict[str, Any]]:
         box = self.mcp_toolbox
