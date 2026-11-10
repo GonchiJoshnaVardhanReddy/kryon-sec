@@ -142,6 +142,19 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     "katana": ["-u", "{url}", "-d", "{depth}", "-silent"],
     "hakrawler": ["-url", "{url}", "-depth", "{depth}"],
     "feroxbuster": ["-u", "{urlfuzz}", "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"],
+    # ProjectDiscovery httpx under its REAL Kali binary name. Kali's
+    # packaging copies the upstream `httpx` binary to `httpx-toolkit`
+    # ONLY (debian/rules — the plain `httpx` command does not exist in
+    # this image). JSONL output (-json) is the stable machine-readable
+    # contract used by the httpx-probe ADAPTER (Phase 2B.3); -duc keeps
+    # the run offline-deterministic (no update check).
+    # The legacy template name above (`httpx`) stays for the not-yet-
+    # rebuilt images; in THIS image it exit-127s (binary absent) and the
+    # failure is audited — the adapter path replaces it where registered.
+    "httpx-toolkit": [
+        "-u", "{url}", "-silent", "-json", "-status-code", "-title",
+        "-tech-detect", "-no-color", "-duc",
+    ],
     "sslscan": ["--no-failed", "--sleep", "{rate}", "{target}"],
     "testssl.sh": ["--batch", "--severity={low|medium|high|critical}", "--no-color", "{url}"],
     "dnsx": ["-d", "{target}", "-silent"],

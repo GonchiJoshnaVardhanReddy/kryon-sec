@@ -205,8 +205,9 @@ def test_full_loop_through_exploit(tmp_path):
     orig_sb_init = sb_mod.KaliSandbox.__init__
 
     def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None,
-                  sandbox=None):
-        # sandbox=None keeps the fake subagent offline (no searchsploit)
+                  sandbox=None, **kw):
+        # sandbox=None keeps the fake subagent offline (no searchsploit);
+        # **kw absorbs later constructor additions (e.g. adapter_registry)
         orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm, budget=budget,
                       sandbox=None)
 
@@ -450,7 +451,7 @@ def test_engagement_evidence_dir_wiring(tmp_path):
     orig_sb_copy = sb_mod.KaliSandbox.copy_with
 
     def _init_hyp(self, cfg, graph, audit, llm_fn=None, budget=None,
-                  sandbox=None):
+                  sandbox=None, **kw):
         orig_hyp_init(self, cfg, graph, audit, llm_fn=fake_llm, budget=budget,
                       sandbox=None)
 

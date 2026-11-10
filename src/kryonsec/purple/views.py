@@ -49,15 +49,22 @@ __all__ = [
     "MAX_RELATIONSHIP_CHARS",
     "MAX_ROLE_CHARS",
     "OUTCOMES_RUN",
+    "VERIFICATION_DISAGREED",
+    "VERIFICATION_INCONCLUSIVE",
+    "VERIFICATION_NOTES",
+    "VERIFICATION_NOT_RUN",
+    "VERIFICATION_VERIFIED",
     "asset_key",
     "attempt_names",
     "attempt_outcome",
     "exploit_status",
+    "finding_verification_status",
     "hypothesis_engine_view",
     "observed_assets",
     "primary_asset_observed",
     "related_asset_views",
     "relationship_basis",
+    "verification_status",
 ]
 
 
@@ -223,7 +230,8 @@ def relationship_basis(node: dict, graph: EngagementGraph) -> str:
     if isinstance(label, str) and label:
         for attempt in graph.by_type("verify_attempt"):
             if (attempt.get("label") == label
-                    and (attempt.get("properties") or {}).get("verified")):
+                    and verification_status(attempt)
+                    == VERIFICATION_VERIFIED):
                 return BASIS_VALIDATED
         # A14: an attempt node's existence used to be enough to reach this
         # rung, so a sandbox that never started still told the reader "an
@@ -329,6 +337,129 @@ def attempt_names(attempt_label: object, hypothesis_id: str) -> bool:
             or attempt_label.startswith(f"{hypothesis_id}:"))
 
 
+# --- what the independent check (VERIFY) actually established ----------------
+#
+# VERIFY writes one ``verify_attempt`` node per finding it *works* on, and
+# the node records its own execution evidence: whether the probes returned
+# responses (``true_len``/``false_len``), whether a baseline was available
+# (``baseline_len``), the boolean verdict (``verified``) and, when blocked,
+# the actual blocking reason (``reason``). The status is *derived* from
+# those fields — never from a stored label — exactly like the EXPLOIT
+# attempt outcome above.
+
+VERIFICATION_VERIFIED = "verified"          # an independent test agreed
+VERIFICATION_DISAGREED = "disagreed"        # an independent test contradicted
+VERIFICATION_INCONCLUSIVE = "inconclusive"  # ran; cannot establish either
+VERIFICATION_NOT_RUN = "not_run"            # no independent check executed
+
+#: Most informative last — a finding checked by several VERIFY passes
+#: reports the strongest status its records establish.
+_VERIFICATION_ORDER: tuple[str, ...] = (
+    VERIFICATION_NOT_RUN,
+    VERIFICATION_INCONCLUSIVE,
+    VERIFICATION_DISAGREED,
+    VERIFICATION_VERIFIED,
+)
+
+#: What each status means, in the operator's words — "not checked" is
+#: never a verdict about the vulnerability.
+VERIFICATION_NOTES: dict[str, str] = {
+    VERIFICATION_VERIFIED: (
+        "an independent test ran and agreed with the finding"
+    ),
+    VERIFICATION_DISAGREED: (
+        "an independent test ran and did NOT agree with the finding — treat "
+        "it as the first tool's claim, not an established fact"
+    ),
+    VERIFICATION_INCONCLUSIVE: (
+        "the independent test ran but could not establish either conclusion"
+    ),
+    VERIFICATION_NOT_RUN: (
+        "no independent check ran for this finding — it is unverified "
+        "either way, and none of this says the issue is not real"
+    ),
+}
+
+
+def verification_status(node: dict) -> str:
+    """What one ``verify_attempt`` node establishes — derived, not read.
+
+    The derivation reads only the node's execution evidence:
+    ``verified`` (the boolean verdict), whether the probes returned both
+    responses (``true_len``/``false_len``), and whether a baseline was
+    available (``baseline_len``). A node whose probes never returned
+    responses is ``not_run`` — scope refusal, missing parameter, failed
+    spawn — and keeps its blocking ``reason``; it is never described as
+    disproven or safe. A stored ``status`` word, if any producer writes
+    one, is consulted by nothing: it cannot be the basis:
+    - verified=True + probes returned responses -> ``verified``
+    - verified=False + no responses            -> ``not_run`` (blocked)
+    - verified=False + responses, no baseline  -> ``inconclusive``
+    - verified=False + responses + baseline    -> ``disagreed``
+    """
+    properties = node.get("properties") if isinstance(node, dict) else None
+    if not isinstance(properties, dict):
+        return VERIFICATION_NOT_RUN
+    responses = (properties.get("true_len") is not None
+                 and properties.get("false_len") is not None)
+    verdict = properties.get("verified")
+    if verdict is True:
+        # "verified" without the probe responses it is derived from is a
+        # stored word, not execution evidence — a tampered or hand-built
+        # node reads as what its evidence shows: nothing.
+        return VERIFICATION_VERIFIED if responses else VERIFICATION_NOT_RUN
+    if verdict is False:
+        if not responses:
+            return VERIFICATION_NOT_RUN
+        if properties.get("baseline_len") is None:
+            return VERIFICATION_INCONCLUSIVE
+        return VERIFICATION_DISAGREED
+    return VERIFICATION_NOT_RUN
+
+
+def verify_block_reason(node: dict) -> str:
+    """The recorded blocking reason of a verify_attempt that never ran
+    ("" when none was recorded)."""
+    properties = node.get("properties") if isinstance(node, dict) else None
+    if not isinstance(properties, dict):
+        return ""
+    return str(properties.get("reason") or "")
+
+
+def finding_verification_status(finding_id: str, graph: "EngagementGraph") -> str:
+    """The independent-verification standing of one finding (by label).
+
+    The strongest status any of the finding's ``verify_attempt`` records
+    establishes; with no record at all that is ``not_run`` — no
+    independent verification was executed.
+    """
+    statuses = [
+        verification_status(attempt)
+        for attempt in graph.by_type("verify_attempt")
+        if attempt.get("label") == finding_id
+    ]
+    if not statuses:
+        return VERIFICATION_NOT_RUN
+    return max(statuses, key=_VERIFICATION_ORDER.index)
+
+
+def finding_verification_detail(
+        finding_id: str, graph: "EngagementGraph",) -> dict:
+    """The render/print view of one finding's verification standing:
+    derived status, operator note, and — when the check never ran — the
+    actual blocking reason."""
+    status = finding_verification_status(finding_id, graph)
+    reason = ""
+    for attempt in graph.by_type("verify_attempt"):
+        if (attempt.get("label") == finding_id
+                and verification_status(attempt) == VERIFICATION_NOT_RUN):
+            reason = verify_block_reason(attempt)
+            if reason:
+                break
+    note = VERIFICATION_NOTES[status]
+    return {"status": status, "note": note, "block_reason": reason}
+
+
 def exploit_status(hypothesis_id: str, graph: EngagementGraph) -> str:
     """How far EXPLOIT actually got with one hypothesis.
 
@@ -367,6 +498,7 @@ def hypothesis_engine_view(node: dict, graph: EngagementGraph) -> dict:
     """
     status = exploit_status(node.get("label"), graph)
     basis = relationship_basis(node, graph)
+    verification = finding_verification_detail(node.get("label"), graph)
     return {
         "basis": basis,
         "basis_note": BASIS_NOTES[basis],
@@ -376,4 +508,10 @@ def hypothesis_engine_view(node: dict, graph: EngagementGraph) -> dict:
         "confirmed": status == ATTEMPT_CONFIRMED,
         "primary_asset_observed": primary_asset_observed(node, graph),
         "related_assets": related_asset_views(node, graph),
+        # Phase 1C: the independent-verification standing, derived from
+        # the same records on every surface. Additive — existing readers
+        # are untouched.
+        "verification_status": verification["status"],
+        "verification_note": verification["note"],
+        "verification_block_reason": verification["block_reason"],
     }

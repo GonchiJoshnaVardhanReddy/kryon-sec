@@ -25,6 +25,10 @@ import logging
 import re
 
 from ..config import KryonsecConfig
+from .adapter_httpx import parse_httpx_json_lines, record_httpx_evidence
+from .adapter_whatweb import parse_whatweb_lines, record_whatweb_evidence
+from .adapters import AdapterError, AdapterRegistry, \
+    execute_adapter, prepare_adapter_run
 from .allowlist import AllowlistViolation, ToolAllowlist
 from .audit import AuditLog
 from .orchestrator import SubagentResult
@@ -32,6 +36,19 @@ from .recon_passive import EngagementGraph
 from .sandbox import KaliSandbox, SpawnResult
 
 log = logging.getLogger(__name__)
+
+#: the one production adapter id that RECON_ACTIVE selects from an
+#: injected registry (Phase 2B.3). Registration is explicit: when the
+#: registry does not carry it (or no registry is injected), the legacy
+#: fixed-plan httpx entries run exactly as before — DETERMINISTICALLY
+#: one or the other, never both probing the same base.
+HTTPX_ADAPTER_ID = "httpx-probe"
+#: the second production adapter id RECON_ACTIVE selects from the
+#: same injected registry (Phase 2B.5). Same rule: when the registry
+#: does not carry it (or no registry is injected), the legacy
+#: fixed-plan whatweb entry runs exactly as before — DETERMINISTICALLY
+#: one or the other, never both probing the same base.
+WHATWEB_ADAPTER_ID = "whatweb-probe"
 
 # nmap -sV lines look like:
 # "80/tcp   open  http    Microsoft IIS httpd 8.5"
@@ -172,6 +189,7 @@ class ReconActiveSubagent:
         target: str,
         sandbox: KaliSandbox,
         allowlist: ToolAllowlist | None = None,
+        adapter_registry: "AdapterRegistry | None" = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -179,6 +197,11 @@ class ReconActiveSubagent:
         self.target = target
         self.sandbox = sandbox
         self.allowlist = allowlist or ToolAllowlist()
+        # Phase 2B.3: the RECON_ACTIVE adapter registry (explicitly
+        # injected by the runner). None -> the legacy fixed plan runs
+        # unchanged. An injected registry that does not carry the
+        # adapter is equivalent to no registry (unknown = disabled).
+        self.adapter_registry = adapter_registry
 
     # ---- plan construction (deterministic, no LLM input) -----------------
 
@@ -192,19 +215,64 @@ class ReconActiveSubagent:
             ("dnsx", ["dnsx", "-d", self.target, "-silent"]),
         ]
 
-    def _web_plan(self, ports: set[int]) -> list[tuple[str, list[str]]]:
-        """Stage 2: http probes on discovered web ports."""
-        plan: list[tuple[str, list[str]]] = []
+    def _httpx_adapter(self):
+        """The registered httpx-probe adapter, or None (unknown ids are
+        refused everywhere by the registry — refusal here means the
+        legacy path runs, deterministically)."""
+        if self.adapter_registry is None:
+            return None
+        try:
+            return self.adapter_registry.get(HTTPX_ADAPTER_ID)
+        except AdapterError:
+            return None
+
+    def _whatweb_adapter(self):
+        """The registered whatweb-probe adapter (Phase 2B.5), or None —
+        the same explicit-registration rule as the httpx adapter: an
+        injected registry without it means the legacy whatweb plan
+        entry runs, deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        try:
+            return self.adapter_registry.get(WHATWEB_ADAPTER_ID)
+        except AdapterError:
+            return None
+
+    def _web_bases(self, ports: set[int]) -> "list[str]":
+        """The in-scope base URLs stage 2 probes (deterministic order)."""
         web_ports = sorted(p for p in ports if p in WEB_PORTS)
         if not web_ports:
             web_ports = [80]  # nothing recognised — try the default anyway
+        bases: list[str] = []
         for port in web_ports:
             scheme = "https" if port in TLS_PORTS else "http"
-            base = f"{scheme}://{self.target}:{port}/"
-            plan.append(("httpx", ["httpx", "-u", base, "-silent",
-                                   "-status-code", "-title", "-tech-detect"]))
-            plan.append(("whatweb", ["whatweb", "-a", "3", "--no-errors",
-                                     "--color=never", base]))
+            bases.append(f"{scheme}://{self.target}:{port}/")
+        return bases
+
+    def _web_plan(self, ports: set[int],
+                  use_httpx_adapter: bool = False,
+                  use_whatweb_adapter: bool = False
+                  ) -> list[tuple[str, list[str]]]:
+        """Stage 2: http probes on discovered web ports.
+
+        ``use_httpx_adapter`` (Phase 2B.3) and ``use_whatweb_adapter``
+        (Phase 2B.5) omit the corresponding legacy plan entries when
+        the registered adapter probe runs instead — NO duplicate
+        probing of the same check (deterministic either/or). The other
+        probes (katana/feroxbuster/...) are unchanged either way.
+        """
+        plan: list[tuple[str, list[str]]] = []
+        # same filter/order as _web_bases, so (port, base) stay paired
+        web_ports = sorted(p for p in ports if p in WEB_PORTS) or [80]
+        for port, base in zip(web_ports, self._web_bases(ports)):
+            if not use_httpx_adapter:
+                plan.append(("httpx", ["httpx", "-u", base, "-silent",
+                                       "-status-code", "-title",
+                                       "-tech-detect"]))
+            if not use_whatweb_adapter:
+                plan.append(("whatweb", ["whatweb", "-a", "3",
+                                         "--no-errors", "--color=never",
+                                         base]))
             plan.append(("katana", ["katana", "-u", base, "-d", "2", "-silent"]))
             plan.append(("feroxbuster",
                          ["feroxbuster", "-u", base.rstrip("/") + "/FUZZ",
@@ -286,8 +354,29 @@ class ReconActiveSubagent:
                     "resolved_ips": ips,
                 })
 
-        # stage 2 — web probes on what stage 1 found
-        for tool, argv in self._web_plan(open_ports):
+        # the registered httpx adapter (Phase 2B.3) REPLACES the legacy
+        # httpx entries for the same base URLs — one probe per check,
+        # never both. The adapter probe runs FIRST; its web_endpoint
+        # nodes are the same type the legacy parse produced, so
+        # HYPOTHESIZE reads one uniform surface.
+        httpx_adapter = self._httpx_adapter()
+        if httpx_adapter is not None:
+            executed += self._run_httpx_adapter(httpx_adapter,
+                                                self._web_bases(open_ports))
+
+        # the registered whatweb adapter (Phase 2B.5) REPLACES the
+        # legacy whatweb entries — same deterministic either/or as the
+        # httpx rule above: the adapter probe runs against the same
+        # base URLs, the legacy plan entry contributes nothing; the
+        # richer tech_fingerprint nodes carry the adapter provenance.
+        whatweb_adapter = self._whatweb_adapter()
+        if whatweb_adapter is not None:
+            executed += self._run_whatweb_adapter(whatweb_adapter,
+                                                  self._web_bases(open_ports))
+
+        for tool, argv in self._web_plan(
+                open_ports, use_httpx_adapter=httpx_adapter is not None,
+                use_whatweb_adapter=whatweb_adapter is not None):
             result, ran = self._spawn(tool, argv)
             executed += ran if result.ok else 0
             if not result.ok:
@@ -396,6 +485,125 @@ class ReconActiveSubagent:
             "error": "no recon tool ran successfully",
         })
         return SubagentResult(status="failed")
+
+    def _run_httpx_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered httpx-probe adapter against each stage-2
+        base URL.
+
+        Returns 1 per base whose run executed (the same count the
+        legacy httpx plan entries contribute). Preparation refusals
+        (out-of-scope base) and execution refusals (no egress, no
+        sandbox) are AUDITED as ``recon_active_adapter_failure`` and
+        skipped — an adapter refusal never fails the state, exactly
+        like a tool failure. Observations become the SAME
+        ``web_endpoint`` nodes the legacy parse produced, with the
+        richer provenance the adapter path carries.
+        """
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base)
+            except AdapterError as e:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True)
+            if record.executed:
+                observations, malformed = parse_httpx_json_lines(output)
+                record_httpx_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    observations=observations,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_httpx_adapter",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "observations": len(observations),
+                    "malformed_lines": malformed,
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
+
+    def _run_whatweb_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered whatweb-probe adapter against each
+        stage-2 base URL (Phase 2B.5).
+
+        Returns 1 per base whose run executed (the same count the
+        legacy whatweb plan entries contribute). Preparation refusals
+        (out-of-scope base) and execution refusals (no egress, no
+        sandbox) are AUDITED as ``recon_active_adapter_failure`` and
+        skipped — an adapter refusal never fails the state, exactly
+        like a tool failure. Observations become ``tech_fingerprint``
+        nodes (the same node type the legacy parse produced), with the
+        parsed fields and the adapter provenance the legacy excerpt
+        cannot carry.
+        """
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base)
+            except AdapterError as e:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True)
+            if record.executed:
+                observations, malformed = parse_whatweb_lines(output)
+                record_whatweb_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    observations=observations,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_whatweb_adapter",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "observations": len(observations),
+                    "malformed_lines": malformed,
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
 
     def _spawn(self, tool: str, argv: list[str]) -> tuple[SpawnResult, int]:
         """Validate + run one tool. Returns (result, 1-if-spawned).

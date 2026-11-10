@@ -26,6 +26,144 @@ log = logging.getLogger(__name__)
 # Match the entrypoint's internal tool timeout (300s) + a small margin.
 DEFAULT_TIMEOUT_S = 330
 
+# Mode-B execution invariant (hard, permanent): every tool launch must be
+# gVisor-isolated. These are the docker-run flags that make a spawn
+# containerized execution rather than host-equivalent execution; `spawn`
+# refuses to launch if any of them is missing from the built argv, so a
+# future refactor of `_docker_argv` cannot silently drop isolation.
+# (flag, required-next-token, "" for a bare flag)
+_REQUIRED_ISOLATION_FLAGS: tuple[tuple[str, str, str], ...] = (
+    ("--runtime", "runsc", "gVisor (runsc) runtime"),
+    ("--user", "kryonsec-runner", "non-root user"),
+    ("--read-only", "", "read-only root filesystem"),
+    ("--memory", "2g", "memory limit"),
+    ("--cpus", "2", "CPU limit"),
+    ("--pids-limit", "100", "process limit"),
+)
+
+
+def missing_isolation_flags(docker_argv: list[str]) -> list[str]:
+    """The isolation requirements the launch argv fails to carry.
+
+    Pure check over the exact docker argv that would be executed. A bare
+    flag only requires presence; a paired flag requires its token to
+    follow with the required value.
+    """
+    missing: list[str] = []
+    for flag, expected, meaning in _REQUIRED_ISOLATION_FLAGS:
+        if flag not in docker_argv:
+            missing.append(f"{flag} ({meaning})")
+        elif expected and (
+            len(docker_argv) <= docker_argv.index(flag) + 1
+            or docker_argv[docker_argv.index(flag) + 1] != expected
+        ):
+            missing.append(f"{flag}={expected} ({meaning})")
+    return missing
+
+
+# Networks that would defeat the egress boundary outright — rejected
+# REGARDLESS of network_name checks. Hard-coded: no config can re-enable
+# them while an egress policy is set.
+_FORBIDDEN_NETWORKS = ("bridge", "host", "none")
+
+
+def missing_network_none_flags(
+    docker_argv: list[str], image: str | None = None,
+) -> list[str]:
+    """The requirements a NETWORK-DISCONNECTED run fails to carry
+    (Phase 2B.4.1).
+
+    A run whose contract declares network "none" (e.g. the searchsploit
+    adapter) must be provably disconnected: the docker section carries
+    EXACTLY one ``--network none`` pair, never another network mode
+    alongside it, and never a ``--dns`` override (meaningless on a
+    loopback-only interface — and a sign someone pasted egress plumbing
+    into a disconnected run). Pure — argv cannot talk its way past this.
+    Only tokens BEFORE the image position are docker flags.
+    """
+    problems: list[str] = []
+    section = docker_argv
+    if image is not None and image in docker_argv:
+        section = docker_argv[:docker_argv.index(image)]
+    networks: list[str] = []
+    i = 0
+    while i < len(section):
+        if section[i] == "--network":
+            if i + 1 < len(section):
+                networks.append(section[i + 1])
+            else:
+                problems.append("--network flag with no value")
+        elif section[i] == "--dns":
+            problems.append(
+                "--dns override on a network-none run (loopback-only "
+                "interface has no resolvers)")
+        i += 1
+    if networks != ["none"]:
+        problems.append(
+            "network-none run must carry exactly ['--network', 'none'] "
+            f"(got {networks})")
+    return problems
+
+
+def missing_egress_flags(
+    docker_argv: list[str], policy, image: str | None = None,
+) -> list[str]:
+    """The egress requirements the launch argv fails/defrauds to carry.
+
+    Only meaningful when an EgressPolicy is set (every Zone B spawn now
+    has one): the argv must run on THIS engagement's dedicated network
+    (exact name), with DNS pinned to EXACTLY the policy's resolver set,
+    and must never carry a forbidden network (bridge/host/none). Pure —
+    argv cannot talk its way past this. Only tokens BEFORE the image
+    position are docker flags (tool argv continues after it); a tool
+    argument spelled "--dns" after the image is not a docker flag and
+    cannot redirect the container's DNS anyway (the host firewall
+    enforces the resolver scope regardless).
+    """
+    problems: list[str] = []
+    docker_section = docker_argv
+    if image is not None and image in docker_argv:
+        docker_section = docker_argv[:docker_argv.index(image)]
+    networks = []
+    i = 0
+    while i < len(docker_section):
+        if docker_section[i] == "--network":
+            if i + 1 < len(docker_section):
+                networks.append(docker_section[i + 1])
+            else:
+                networks.append("<unterminated>")
+            i += 2
+            continue
+        i += 1
+    net = networks[0] if networks else None
+    if net is None:
+        problems.append(
+            f"--network {policy.network_name} — the engagement "
+            "egress boundary")
+    else:
+        if net.lower() in _FORBIDDEN_NETWORKS:
+            problems.append(
+                f"--network {net} is forbidden under an egress policy")
+        elif net != policy.network_name:
+            problems.append(
+                f"--network {net} != engagement network {policy.network_name}")
+    dns = []
+    i = 0
+    while i < len(docker_section):
+        if docker_section[i] == "--dns":
+            if i + 1 < len(docker_section):
+                dns.append(docker_section[i + 1])
+            else:
+                dns.append("<unterminated>")
+            i += 2
+            continue
+        i += 1
+    expected_dns = sorted(str(r) for r in policy.dns_resolvers)
+    if sorted(dns) != expected_dns:
+        problems.append(
+            f"--dns {dns or '(none)'} != pinned resolvers {expected_dns}")
+    return problems
+
 
 @dataclass
 class SpawnResult:
@@ -56,9 +194,17 @@ class KaliSandbox:
         timeout_s: int = DEFAULT_TIMEOUT_S,
         code_dir: str | None = None,
         evidence_dir: str | None = None,
+        egress_policy=None,
+        egress_gate=None,
     ):
         self.cfg = cfg
         self.image = cfg.sandbox_image
+        # Phase 1E: the engagement's egress boundary. When set, EVERY
+        # spawn runs on the dedicated engagement bridge network with DNS
+        # pinned to the policy resolvers, and the gate is re-verified
+        # before each launch (fail closed — see spawn()).
+        self.egress_policy = egress_policy
+        self.egress_gate = egress_gate
         # Blue-team code scanning (Phase 5): an ABSOLUTE host path, mounted
         # READ-ONLY at the fixed /code inside the container. The path comes
         # from the CLI (--code), never the LLM; a relative path is refused
@@ -139,8 +285,18 @@ class KaliSandbox:
             clone.evidence_dir = evidence_dir
         return clone
 
-    def _docker_argv(self, tool_argv: list[str]) -> list[str]:
-        """Build the docker run argv. Tool argv as container args (spec §8.5)."""
+    def _docker_argv(self, tool_argv: list[str],
+                     network_mode: "str | None" = None) -> list[str]:
+        """Build the docker run argv. Tool argv as container args (spec §8.5).
+
+        ``network_mode`` (Phase 2B.4.1): "none" builds a NETWORK-
+        DISCONNECTED container (``--network none``) — the verified
+        fail-closed isolation for tools whose contract declares network
+        "none" (e.g. the searchsploit-term adapter's local database
+        read). "none" beats everything else: a present egress policy
+        does NOT put the run on the engagement network, because the
+        tool's own contract says it must not touch the network at all.
+        """
         argv = [
             "docker", "run", "--rm",
             "--name", self._container_name(),
@@ -164,10 +320,25 @@ class KaliSandbox:
         # /code stay read-only, so a tool can only write here.
         if getattr(self, "evidence_dir", None):
             argv += ["-v", f"{self.evidence_dir}:/evidence:rw"]
-        # NOTE: full spec adds network_mode=container:kryonsec-proxy for
-        # target-scope-only egress (§8.2). The proxy does not exist yet —
-        # containers use the default bridge. Recorded in the audit chain
-        # by the EXPLOIT subagent until the proxy lands.
+        if network_mode == "none":
+            # network-none isolation (2B.4.1): the tool contract says it
+            # needs NO network — docker gives the container a loopback-
+            # only interface. This must be verifiable later (see spawn's
+            # none-invariant), so it is a real flag pair, never an
+            # omission implying "no egress policy".
+            argv += ["--network", "none"]
+        elif getattr(self, "egress_policy", None) is not None:
+            # Zone B network egress (Phase 1E): when the engagement has an
+            # egress policy, every spawn runs on the DEDICATED engagement
+            # bridge (never the default bridge), with DNS pinned to the
+            # policy's resolver set. The host firewall (built by EgressGate:
+            # DOCKER-USER for forwarded traffic, INPUT for host-local
+            # delivery since Phase 1E.1) filters every packet from that
+            # bridge; `spawn` re-verifies the boundary before each launch
+            # and refuses to run when it is missing or drifted.
+            argv += ["--network", self.egress_policy.network_name]
+            for resolver in self.egress_policy.dns_resolvers:
+                argv += ["--dns", str(resolver)]
         argv += [self.image]
         argv += list(tool_argv)
         return argv
@@ -188,23 +359,97 @@ class KaliSandbox:
         except Exception as e:  # never let cleanup mask the timeout report
             log.warning("could not kill sandbox container %s: %s", name, e)
 
-    def spawn(self, tool_argv: list[str]) -> SpawnResult:
+    def spawn(self, tool_argv: list[str], timeout_s: "int | None" = None,
+              network_mode: "str | None" = None) -> SpawnResult:
         """Run one tool in the sandbox; parse the entrypoint's JSON payload.
 
         tool_argv[0] is the tool name (must be allowlisted — the host-side
         ToolAllowlist check happens BEFORE this is called; the image's
         entrypoint re-checks it as defense-in-depth).
+
+        ``timeout_s`` (Phase 2B.2): an optional per-call bound for vetted
+        adapters — it may only TIGHTEN the sandbox's own ceiling; the
+        resource caps and every isolation/egress invariant are unchanged.
+
+        ``network_mode`` (Phase 2B.4.1): "none" builds a network-
+        disconnected container (``--network none``) for tools whose
+        contract says they touch no network at all. The invariant is
+        verified on the exact launch argv, fail closed: a launch that
+        would silently fall back to the Docker default bridge is not
+        "a weaker none-mode", it is unproven connectivity and must
+        never happen instead of a bounded one.
         """
-        docker_argv = self._docker_argv(tool_argv)
+        docker_argv = self._docker_argv(tool_argv, network_mode=network_mode)
         container_name = docker_argv[docker_argv.index("--name") + 1]
         log.info("sandbox spawn: %s", " ".join(docker_argv[:6]) + " …")
 
+        # Mode-B execution invariant: refuse to launch when the isolation
+        # flags are missing. Fail closed with a diagnostic — a spawn that
+        # would run unisolated on the Docker daemon is not "a worse sandbox",
+        # it is host-equivalent execution and must never happen instead of a
+        # sandboxed one. Audited by every caller as a failed spawn.
+        missing = missing_isolation_flags(docker_argv)
+        if missing:
+            error = (
+                "sandbox isolation invariant broken — refusing to launch "
+                f"{tool_argv[0]!r}: missing {', '.join(missing)}"
+            )
+            log.error(error)
+            return SpawnResult(ok=False, exit_code=-1, stdout="", error=error)
+
+        # Egress invariant (Phase 1E): when this engagement carries an
+        # egress policy, the launch argv must run on the dedicated
+        # engagement network with the pinned resolvers, and the boundary
+        # must STILL be live — re-verified here, fail closed. A spawn
+        # without a verified boundary would be default-bridge execution
+        # and must never happen instead of a bounded one. Audited by
+        # every caller as a failed spawn.
+        #
+        # Network-none invariant (Phase 2B.4.1): when the run declared
+        # network "none", the launch argv must instead carry the
+        # disconnected-network pair. Both are fail closed; a none-run is
+        # NOT the egress path (there is no boundary to verify — the
+        # container has no network beyond loopback at all).
+        if network_mode == "none":
+            none_problems = missing_network_none_flags(
+                docker_argv, image=self.image)
+            if none_problems:
+                error = (
+                    "sandbox network-none invariant broken — refusing to "
+                    f"launch {tool_argv[0]!r}: "
+                    + "; ".join(none_problems)
+                )
+                log.error(error)
+                return SpawnResult(
+                    ok=False, exit_code=-1, stdout="", error=error)
+        elif getattr(self, "egress_policy", None) is not None:
+            egress_problems = missing_egress_flags(
+                docker_argv, self.egress_policy, image=self.image)
+            if not egress_problems and self.egress_gate is not None:
+                ok, reason = self.egress_gate.verify(self.egress_policy)
+                if not ok:
+                    egress_problems.append(
+                        f"egress boundary not verified: {reason}")
+            if egress_problems:
+                error = (
+                    "sandbox egress invariant broken — refusing to launch "
+                    f"{tool_argv[0]!r}: "
+                    + "; ".join(egress_problems)
+                )
+                log.error(error)
+                return SpawnResult(
+                    ok=False, exit_code=-1, stdout="", error=error)
+
         try:
+            if timeout_s is None:
+                timeout = self.timeout_s
+            else:
+                timeout = max(1, min(int(timeout_s), self.timeout_s))
             proc = self._run(
                 docker_argv,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_s,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             # killing the docker CLI leaves the container running on the
@@ -212,7 +457,7 @@ class KaliSandbox:
             self._kill_container(container_name)
             return SpawnResult(
                 ok=False, exit_code=-1, stdout="",
-                error=f"tool exceeded {self.timeout_s}s sandbox timeout",
+                error=f"tool exceeded {timeout}s sandbox timeout",
             )
         except Exception as e:
             return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e))

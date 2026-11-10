@@ -252,6 +252,7 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
     # runs in a daemon thread: the chat is usable immediately and MCP
     # tools appear (with a notice) when each server lands.
     mcp_toolbox = None
+    mcp_registry = None
     if cfg.mcp_servers:
         from .copilot.mcp_tools import McpToolbox
 
@@ -259,12 +260,31 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             mcp_toolbox = McpToolbox(
                 cfg,
                 on_notice=lambda msg: err_console.print(f"[yellow]{msg}[/yellow]"))
+            # Phase 2A: MCP tools reach the LLM only through the small
+            # discovery registry - never the full server catalog. Tool
+            # EXECUTION goes through it too, under each server's explicit
+            # trust policy (disabled by default), audit, and (when trust
+            # is 'ask') the terminal approval gate.
+            from .copilot.mcp_registry import (
+                McpRegistry,
+                terminal_mcp_approver,
+            )
+
+            mcp_registry = McpRegistry(
+                cfg, mcp_toolbox, approver=terminal_mcp_approver())
+            # Phase 2A.1: the startup gate is connection-level policy —
+            # a server's PROCESS only launches when its row explicitly
+            # authorizes execution; blocked rows stay visible but never
+            # start (and their block is audited).
             threading.Thread(
-                target=mcp_toolbox.connect_all, name="mcp-connect", daemon=True,
+                target=mcp_toolbox.connect_all,
+                kwargs={"allow_start": mcp_registry.startup_allowance()},
+                name="mcp-connect", daemon=True,
             ).start()
         except Exception as e:
             err_console.print(f"[yellow]MCP unavailable: {e}[/yellow]")
             mcp_toolbox = None
+            mcp_registry = None
 
     # ---- warm the litellm import while the user reads the banner -------
     # `import litellm` takes seconds and is lazy-loaded at the first LLM
@@ -454,7 +474,10 @@ async def _chat_loop(cfg: KryonsecConfig) -> None:
             from .status import StatusLine
 
             file_tools = FileTools(cfg, approver=_console_approve)
-            mcp_extra = mcp_toolbox.snapshot() if mcp_toolbox is not None else None
+            # Phase 2A: the LLM sees the five discovery operations only;
+            # a server's catalog never enters the LLM context wholesale.
+            mcp_extra = (mcp_registry.llm_tools()
+                         if mcp_registry is not None else None)
             toolbox = build_toolbox(cfg, file_tools, extra=mcp_extra or None)
 
             status = StatusLine(console)

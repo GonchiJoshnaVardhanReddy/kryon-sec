@@ -22,6 +22,13 @@ import time
 from typing import Any
 
 from ..config import KryonsecConfig
+from .adapter_searchsploit import (
+    ADAPTER_ID as SEARCHSPLOIT_ADAPTER_ID,
+    parse_searchsploit_json,
+    record_exploitdb_evidence,
+    secure_term,
+)
+from .adapters import AdapterError, execute_adapter, prepare_adapter_run
 from .audit import AuditLog
 from .recon_passive import EngagementGraph
 from .zonea import _zone_a_fetch
@@ -355,17 +362,114 @@ def _SCRIPT_DIR() -> str:
     return SANDBOX_SCRIPT_DIR
 
 
+def _searchsploit_adapter(registry):
+    """The registered searchsploit-term adapter from an injected
+    registry, or None (unknown ids are refused everywhere — refusal
+    here means the legacy lookup runs, deterministically)."""
+    if registry is None:
+        return None
+    try:
+        return registry.get(SEARCHSPLOIT_ADAPTER_ID)
+    except AdapterError:
+        return None
+
+
+def _run_searchsploit_adapter(
+    sandbox,
+    registry,
+    adapter,
+    audit: AuditLog,
+    graph: EngagementGraph,
+    node: dict,
+    term: str,
+    enrichment: dict,
+) -> bool:
+    """Run the registered searchsploit-term adapter for ONE hypothesis.
+
+    Returns True when the run executed. Never raises: every refusal and
+    failure is an audited skip (enrichment can never fail the state).
+    Observations become ``exploit_reference`` nodes (potential references
+    ONLY, verification not_verified) plus the SAME enrichment surface
+    the legacy path wrote, so downstream readers cannot drift.
+    """
+    try:
+        safe_term = secure_term(term)
+        prepared = prepare_adapter_run(
+            registry, adapter.adapter_id, params={"term": safe_term})
+    except (AdapterError, ValueError) as e:
+        audit.write({
+            "event": "hypothesize_adapter_failure",
+            "adapter": adapter.adapter_id,
+            "hypothesis_id": node.get("label", ""),
+            "term": term[:60],
+            "reason": str(e)[:200],
+        })
+        return False
+    record, output = execute_adapter(
+        registry, prepared, sandbox=sandbox, audit=audit, graph=graph,
+        hypothesis_id=node.get("id", ""),
+        full_output=True)
+    if record.outcome == "refused" or not record.executed:
+        audit.write({
+            "event": "hypothesize_adapter_failure",
+            "adapter": adapter.adapter_id,
+            "request_id": record.request_id,
+            "hypothesis_id": node.get("label", ""),
+            "term": term[:60],
+            "outcome": record.outcome,
+            "reason": record.error_excerpt[:200],
+        })
+        return False
+    references, malformed = parse_searchsploit_json(output)
+    record_exploitdb_evidence(
+        graph, audit,
+        run_record=record,
+        term=term,
+        references=references,
+        hypothesis_id=node.get("label", ""),
+        malformations=malformed,
+    )
+    enrichment["exploit_references"] = [{
+        "edb_id": r.edb_id,
+        "title": r.title[:120],
+        "exploit_type": r.exploit_type,
+        "platform": r.platform,
+    } for r in references]
+    enrichment["exploit_available"] = bool(references)
+    # the SAME consumer surface the legacy table-tail wrote (report
+    # readers), composed from the parsed references — bounded lines,
+    # never a verdict
+    enrichment["exploits"] = [r.display_line() for r in references]
+    audit.write({
+        "event": "hypothesize_searchsploit_adapter",
+        "adapter": adapter.adapter_id,
+        "request_id": record.request_id,
+        "hypothesis_id": node.get("label", ""),
+        "term": term[:60],
+        "references": len(references),
+        "malformed": malformed,
+    })
+    return True
+
+
 def enrich_hypotheses(
     cfg: KryonsecConfig,
     graph: EngagementGraph,
     audit: AuditLog,
     sandbox=None,
+    adapter_registry=None,
 ) -> dict[str, int]:
     """Add public-risk context to every hypothesis node that names a CVE.
 
     Writes node.properties["enrichment"] = {cve, cvss_score, severity,
     cpes, kev, epss, epss_percentile, exploits, exploit_available}.
     Returns counts for the summary audit event. Never raises.
+
+    ``adapter_registry`` (Phase 2B.4): when it carries the registered
+    searchsploit-term adapter, the ExploitDB lookup runs through the
+    ADAPTER path (structured JSON evidence nodes) and the legacy
+    text-table lookup is OMITTED — one query per check, never both.
+    A registry without the adapter behaves like no registry.
     """
     counts = {"hypotheses": 0, "enriched": 0, "no_cve": 0, "lookups": 0}
     nodes = graph.by_type("hypothesis")
@@ -467,9 +571,13 @@ def enrich_hypotheses(
             enrichment["epss"] = epss["epss"]
             enrichment["epss_percentile"] = epss["percentile"]
 
-        # ExploitDB (sandbox-local database; skipped cleanly without one)
+        # ExploitDB (sandbox-local database; skipped cleanly without one).
+        # Phase 2B.4: when the searchsploit-term adapter is registered it
+        # REPLACES the legacy table lookup — one query per check, never
+        # both (deterministic either/or).
         term = sanitize_searchsploit_term(cve_id) or sanitize_searchsploit_term(
             props.get("title", ""))
+        adapter = _searchsploit_adapter(adapter_registry)
         if sandbox is None:
             audit.write({
                 "event": "enrichment_lookup",
@@ -478,6 +586,12 @@ def enrich_hypotheses(
                 "ok": False,
                 "reason": "no sandbox available (ExploitDB search skipped)",
             })
+        elif adapter is not None and term:
+            if _run_searchsploit_adapter(
+                sandbox, adapter_registry, adapter, audit, graph, node,
+                term, enrichment,
+            ):
+                counts["lookups"] += 1
         elif term:
             hits = searchsploit_hits(sandbox, audit, term)
             audit.write({

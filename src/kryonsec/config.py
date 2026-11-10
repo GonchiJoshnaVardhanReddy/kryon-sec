@@ -320,6 +320,21 @@ class KryonsecConfig:
         )
     )
 
+    # --- Zone B network-egress boundary (Phase 1E, spec §8.2) ---
+    # The sandbox run network: a DEDICATED bridge per engagement, with an
+    # allow-only firewall in the Docker host's DOCKER-USER chain. The
+    # target itself is derived from the validated engagement target; the
+    # operator widens the set here (never narrow it — the boundary is
+    # default-deny). DNS egress is permitted only to zone_b_dns_resolvers
+    # (literal IPs). Dangerous ranges (loopback, link-local incl. cloud
+    # metadata, multicast, unspec) are refused even if listed here.
+    zone_b_subnet: str = "10.213.42.0/24"
+    zone_b_allowed_cidrs: list[str] = field(default_factory=list)
+    zone_b_allowed_domains: list[str] = field(default_factory=list)
+    zone_b_dns_resolvers: list[str] = field(
+        default_factory=lambda: ["1.1.1.1", "8.8.8.8"]
+    )
+
     # ---- TOML (de)serialization -----------------------------------------
 
     def to_toml_dict(self) -> dict:
@@ -365,6 +380,10 @@ class KryonsecConfig:
             },
             "sandbox": {
                 "image": self.sandbox_image,
+                "zone_b_subnet": self.zone_b_subnet,
+                "zone_b_allowed_cidrs": list(self.zone_b_allowed_cidrs),
+                "zone_b_allowed_domains": list(self.zone_b_allowed_domains),
+                "zone_b_dns_resolvers": list(self.zone_b_dns_resolvers),
             },
             "api": {
                 "shodan_api_key": self.shodan_api_key or "",
@@ -441,6 +460,19 @@ class KryonsecConfig:
             cfg.max_tool_output_chars = int(limits["max_tool_output_chars"])
         if sandbox.get("image"):
             cfg.sandbox_image = str(sandbox["image"])
+        # Phase 1E egress scope — explicitly-empty lists round-trip as
+        # "wider scope removed", same rule as tools.enabled
+        if sandbox.get("zone_b_subnet"):
+            cfg.zone_b_subnet = str(sandbox["zone_b_subnet"])
+        if "zone_b_allowed_cidrs" in sandbox:
+            cfg.zone_b_allowed_cidrs = [
+                str(c) for c in sandbox["zone_b_allowed_cidrs"]]
+        if "zone_b_allowed_domains" in sandbox:
+            cfg.zone_b_allowed_domains = [
+                str(d) for d in sandbox["zone_b_allowed_domains"]]
+        if "zone_b_dns_resolvers" in sandbox:
+            cfg.zone_b_dns_resolvers = [
+                str(r) for r in sandbox["zone_b_dns_resolvers"]]
         if api.get("shodan_api_key"):
             cfg.shodan_api_key = api["shodan_api_key"]
         if api.get("censys_api_id"):

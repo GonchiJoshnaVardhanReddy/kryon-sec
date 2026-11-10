@@ -41,6 +41,23 @@ on the Windows host — it is gated behind a `kryonsec doctor` runtime check.
    written to disk. Head hash is anchored periodically (WORM object + stdout).
 9. Purple Team is Linux-only. `kryonsec doctor` checks Docker, `runsc` runtime,
    pinned image, and refuses to start Mode B otherwise.
+10. **Mode B tool execution is Docker-only.** Every Purple security-tool
+   launch goes through `KaliSandbox.spawn` (`src/kryonsec/purple/sandbox.py`)
+   — gVisor `runsc`, non-root, read-only rootfs, resource caps, and the
+   spawn-time isolation guard that refuses to launch if any of those
+   flags disappear. No host-side subprocess may run a security tool;
+   sandbox unavailability fails closed (audited `zone_b_blocked` halt),
+   never falls back to host execution. Zone A is fetch-only against its
+   host allowlist. Policed by `tests/test_mode_b_isolation.py` — a new
+   `subprocess` use under `purple/` fails that test and must be added to
+   it consciously, never silently.
+11. **MCP never reaches Mode B execution.** Mode A's MCP toolbox stays
+   host-side. Remote MCP command-execution servers (HexStrike-HTTP style,
+   or any "tool" endpoint that runs commands for you) must never be
+   connected to Mode B: remote execution cannot be presented as
+   Docker-contained execution. Any future MCP-to-Mode-B integration must
+   pass the same Layer-2 argv allowlist and the sandbox boundary, with
+   its own approval gate.
 
 ## Build order (agreed with user)
 1. Merged v2.1.1 spec ✅ (in progress)

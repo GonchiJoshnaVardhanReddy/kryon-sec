@@ -154,6 +154,19 @@ def _check_gvisor() -> tuple[bool, str]:
     return False, runtime_checks.gvisor_fix_hint()
 
 
+def _egress_firewall_row() -> tuple[bool | None, str]:
+    """Zone B network-boundary prerequisite (Phase 1E). None = skipped."""
+    from .purple import runtime_checks
+
+    if not sys.platform.startswith("linux"):
+        return None, (
+            "not checked on this host — the egress boundary is a "
+            "Linux host firewall, and Purple Team is Linux-only"
+        )
+    ok, msg = runtime_checks.egress_firewall_ok()
+    return ok, msg
+
+
 def _check_config(cfg: KryonsecConfig) -> tuple[bool | None, str]:
     """Check an existing config without creating or rewriting it."""
     from .config import config_file_error, config_path
@@ -391,6 +404,16 @@ def run_doctor(
                 "the selected Docker daemon",
                 "PASS" if registered else "FAIL",
                 registered_msg,
+                purple=True,
+            )
+            egress_ok, egress_msg = _egress_firewall_row()
+            status = "SKIPPED" if egress_ok is None else (
+                "PASS" if egress_ok else "FAIL")
+            add(
+                "Egress firewall",
+                "Zone B network boundary (Phase 1E)",
+                status,
+                egress_msg,
                 purple=True,
             )
             if registered:

@@ -225,9 +225,61 @@ def start_engagement(
     # image-pin warning, not one per state
     sandbox = None
     if sandbox_ok:
+        from .egress import EgressGate, build_policy, register_active
         from .sandbox import KaliSandbox
 
-        sandbox = KaliSandbox(cfg=cfg)
+        # Phase 1E: the engagement's network-egress boundary. Derived from
+        # the VALIDATED target + operator scope (never from the LLM);
+        # established ONCE, verified before every spawn, released at
+        # engagement end. Any failure blocks Zone B entirely — tools never
+        # run on an unrestricted bridge as a fallback.
+        policy = None
+        gate = None
+        try:
+            policy = build_policy(cfg, engagement_id, target)
+            gate = EgressGate()
+        except ValueError as e:
+            audit.write({
+                "event": "egress_policy_failed",
+                "phase": "build",
+                "reason": str(e),
+            })
+            sandbox_ok = False
+            sandbox_reason = (
+                f"network egress boundary unavailable: "
+                f"egress policy build failed: {e}"
+            )
+        else:
+            ok_e, reason_e = gate.establish(policy)
+            if ok_e:
+                register_active(policy, gate)
+                audit.write({
+                    "event": "egress_policy_established",
+                    "engagement_id": engagement_id,
+                    "policy": policy.summary(),
+                })
+            else:
+                audit.write({
+                    "event": "egress_policy_failed",
+                    "phase": "establish",
+                    "reason": reason_e,
+                })
+            gate_info = ({
+                "event": "sandbox_check",
+                "available": ok_e,
+                "reason": (
+                    "ok" if ok_e else
+                    f"network egress boundary unavailable: {reason_e}"),
+            })
+            audit.write(gate_info)
+            if not ok_e:
+                sandbox_reason = (
+                    f"network egress boundary unavailable: {reason_e}")
+                sandbox_ok = False
+
+        if policy is not None and sandbox_ok:
+            sandbox = KaliSandbox(
+                cfg=cfg, egress_policy=policy, egress_gate=gate)
 
     def resolve(state: str):
         """State name -> subagent run callable (or None for stubs)."""
@@ -253,12 +305,18 @@ def start_engagement(
         if state == "HYPOTHESIZE":
             from .hypothesize import HypothesizeSubagent
 
+            from .adapter_searchsploit import production_registry
+
             # the sandbox (when present) powers ExploitDB searchsploit
             # enrichment; without it enrichment runs API-only and skips
-            # searchsploit with an audited notice
+            # searchsploit with an audited notice. The vetted
+            # searchsploit-term adapter (2B.4) replaces the legacy
+            # text-table lookup when registered (its refusal path degrades
+            # to the same audited skip; never a host fallback).
             sub = HypothesizeSubagent(
                 cfg=cfg, graph=graph, audit=audit, budget=orch.budget,
                 sandbox=sandbox,
+                adapter_registry=production_registry(),
             )
             return sub.run
 
@@ -301,10 +359,16 @@ def start_engagement(
 
         if state == "RECON_ACTIVE" and sandbox is not None:
             from .recon_active import ReconActiveSubagent
+            from .adapter_whatweb import recon_active_registry
 
             sub = ReconActiveSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
+                # Phase 2B.5: the vetted production adapter registry
+                # (httpx-probe 2B.3 + whatweb-probe 2B.5). Injected
+                # explicitly; unknown adapters inside remain
+                # refused/disabled.
+                adapter_registry=recon_active_registry(),
             )
             return sub.run
 
@@ -751,6 +815,20 @@ def record_engagement_ending(
     path = cfg.home / "engagements" / engagement_id / "audit.jsonl"
 
     try:
+        # Phase 1E: tear down the engagement's network-egress boundary.
+        # Best-effort and silent for engagements that never registered
+        # one (non-Linux runs, tests, a start_engagement that failed
+        # before the sandbox block). Never allowed to mask the terminal
+        # event below.
+        try:
+            from . import egress as _egress
+
+            _egress.release_active(engagement_id)
+        except BaseException as e:
+            log.warning(
+                "engagement %s: egress teardown error (ignored): %s",
+                engagement_id, e)
+
         # No engagement_created means no engagement: the id failed
         # validation, or the run died before the chain was opened. Writing
         # an ending into a file that does not exist would create an

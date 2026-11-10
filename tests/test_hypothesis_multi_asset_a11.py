@@ -216,7 +216,13 @@ def test_the_basis_ladder_climbs_only_on_the_engines_own_records():
         "exploit_attempt", "H1:sqlmap", {"confirmed": False, "ok": True})
     assert relationship_basis(node, graph) == BASIS_TESTED
 
-    graph.add_node("verify_attempt", "H1", {"verified": True})
+    # Phase 1C: `verified: True` alone is a stored word, not a test — a
+    # fixture standing in for a real VERIFY pass must carry the execution
+    # fields VERIFY writes (both probe responses + the baseline it agreed
+    # against). The bare stored word is now covered by the tamper tests.
+    graph.add_node("verify_attempt", "H1", {
+        "verified": True, "method": "curl boolean probe",
+        "true_len": 100, "false_len": 5, "baseline_len": 100})
     assert relationship_basis(node, graph) == BASIS_VALIDATED
 
 

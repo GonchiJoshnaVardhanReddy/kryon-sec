@@ -185,7 +185,8 @@ def _startup_failure(conn: _ServerConnection) -> str:
 class _ServerConnection:
     """One live stdio server: its background loop, stop event, entries."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "") -> None:
+        self.name = name
         self.loop: Any = None            # the asyncio loop (anyio backend)
         self.stop_event: Any = None      # asyncio.Event set by close()
         self.ready = threading.Event()   # set once tools are listed (or the session ended)
@@ -299,6 +300,18 @@ class McpToolbox:
         self.on_notice = on_notice  # user-visible notices (CLI console)
         self._lock = threading.Lock()
         self._closing = False
+        # Presentation-only status.  The UI reads this snapshot; it never
+        # uses it to decide whether a tool may run.
+        self._server_status: dict[str, dict[str, Any]] = {
+            str(server.get("name", "?")): {
+                "name": str(server.get("name", "?")),
+                "status": "starting",
+                "detail": "connecting",
+                "tools": 0,
+            }
+            for server in self.cfg.mcp_servers
+            if server.get("enabled", True)
+        }
 
     def _notice(self, message: str) -> None:
         """Slow/dead servers must be VISIBLE, not just a log line."""
@@ -315,23 +328,62 @@ class McpToolbox:
         with self._lock:
             return dict(self.tools)
 
-    def connect_all(self) -> dict[str, tuple[dict, Any]]:
-        """Start every enabled server; returns the tool entries known at
+    def connect_all(
+        self,
+        allow_start: "Callable[[dict], str] | None" = None,
+    ) -> dict[str, tuple[dict, Any]]:
+        """Start AUTHORIZED servers only; returns the tool entries known at
         connect time (late booters merge into snapshot() afterwards).
         Failures are logged, noticed, and skipped. Safe to call on a
-        daemon thread — close() can interrupt it between servers."""
+        daemon thread — close() can interrupt it between servers.
+
+        Startup is a policy checkpoint, not plumbing: starting a stdio
+        server means launching a local program. ``allow_start`` is called
+        with the raw server row BEFORE anything spawns — "" permits
+        startup, a non-empty refusal reason blocks it and is shown in
+        the connection status. When no authorizer is wired (stray
+        callers), the BUILT-IN conservative gate applies
+        (:func:`_startup_refusal`): only rows that explicitly authorize
+        execution (trust 'ask'/'allow' with at least one tool allowance)
+        may start — unknown/disabled connections never execute
+        host-side programs.
+        """
+        if allow_start is None:
+            allow_start = _startup_refusal
         servers = [s for s in self.cfg.mcp_servers if s.get("enabled", True)]
         for server in servers:
             torn_down = False
             if self._closing:
                 return self.snapshot()
             name = server.get("name", "?")
+            refusal = str(allow_start(server) or "")
+            if refusal:
+                # policy refusal BEFORE any process exists: the connection
+                # stays visible (status 'blocked') but never runs anything
+                detail = refusal[:160]
+                with self._lock:
+                    self._server_status[str(name)] = {
+                        "name": str(name),
+                        "status": "blocked",
+                        "detail": detail,
+                        "tools": 0,
+                    }
+                self._notice(
+                    f"MCP server {name!r} not started: {detail}")
+                continue
             try:
                 conn, slow = self._connect_one(server)
             except Exception as e:
                 # log at info: the user already sees the notice below —
                 # a log.warning here made every failure print TWICE
                 log.info("MCP server %r failed to start: %s", name, e)
+                with self._lock:
+                    self._server_status[str(name)] = {
+                        "name": str(name),
+                        "status": "disconnected",
+                        "detail": str(e)[:160],
+                        "tools": 0,
+                    }
                 self._notice(f"MCP server {name!r} failed to start: {e}")
                 continue
             with self._lock:
@@ -343,6 +395,16 @@ class McpToolbox:
             if torn_down:
                 return dict(self.tools)  # plain copy: the lock is released
             self._merge(conn.entry)
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "connected" if conn.entry else "starting",
+                    "detail": (
+                        f"{len(conn.entry)} tool(s) available"
+                        if conn.entry else "server is still starting"
+                    ),
+                    "tools": len(conn.entry),
+                }
             if slow:
                 self._notice(
                     f"MCP server {name!r} is still starting — its tools "
@@ -367,14 +429,35 @@ class McpToolbox:
         servers used to appear next message — this restores that without
         the per-turn process leak)."""
         if not conn.ready.wait(timeout=LATE_BOOT_TIMEOUT_S):
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "disconnected",
+                    "detail": "startup timed out",
+                    "tools": 0,
+                }
             self._notice(
                 f"MCP server {name!r} never became ready — dropped for this session")
             return
         if conn.entry:
             self._merge(conn.entry)
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "connected",
+                    "detail": f"{len(conn.entry)} tool(s) available",
+                    "tools": len(conn.entry),
+                }
             self._notice(
                 f"MCP server {name!r} ready — {len(conn.entry)} tool(s) now available")
         else:
+            with self._lock:
+                self._server_status[str(name)] = {
+                    "name": str(name),
+                    "status": "disconnected",
+                    "detail": "server exited before listing tools",
+                    "tools": 0,
+                }
             self._notice(
                 f"MCP server {name!r} exited before listing any tools")
 
@@ -424,7 +507,7 @@ class McpToolbox:
         except OSError:
             pass
 
-        conn = _ServerConnection()
+        conn = _ServerConnection(str(server.get("name", "?")))
         # daemon thread, never joined — a local is enough (M6: a self._thread
         # attribute here was clobbered per server and read by nobody)
         thread = threading.Thread(
@@ -463,13 +546,54 @@ class McpToolbox:
             conn.close()
         self.connections.clear()
 
+    def statuses(self) -> list[dict[str, Any]]:
+        """Return actual configured-server connection states for the UI.
+
+        This is deliberately a snapshot.  The terminal may display it, but no
+        execution path consults it for authorization or tool selection.
+        """
+        with self._lock:
+            return [dict(value) for value in self._server_status.values()]
+
+
+def _startup_refusal(row: dict) -> str:
+    """The built-in startup gate: "" = start permitted; otherwise the
+    reason the row may not start a process.
+
+    Startup rule (conservative, matches the registry's policy): a
+    connection only launches its program when it EXPLICITLY authorizes
+    execution — trust 'ask' or 'allow' AND at least one tool allowance
+    (``allow_tools``, where ``["*"]`` counts). A row without a policy,
+    with trust 'disabled', or with nothing allowed never starts a
+    host-side program, even though its status remains visible.
+    """
+    trust = str(row.get("trust", "disabled"))
+    allow = row.get("allow_tools", [])
+    names = [
+        str(t).strip() for t in allow if isinstance(allow, (list, tuple, set))
+        and str(t).strip() and t != "*"]
+    wildcard = isinstance(allow, (list, tuple, set, frozenset)) and "*" in allow
+    if trust not in ("ask", "allow"):
+        return ("no explicit startup authorization (trust must be 'ask' "
+                "or 'allow') — server not started")
+    if not names and not wildcard:
+        return ("no allow_tools entry — starting requires explicitly "
+                "authorized tools")
+    return ""
+
 
 def _tool_name(tool: Any) -> str:
     return getattr(tool, "name", "tool")
 
 
 def _schema(tool: Any) -> dict:
-    schema = getattr(tool, "inputSchema", None) or {}
+    # mcp 1.x named the field inputSchema; 2.x renamed it input_schema —
+    # accept both so a version bump cannot silently empty every
+    # parameter schema (a tool then validates against "no parameters"
+    # and every call with arguments is refused).
+    raw = getattr(tool, "input_schema", None) or \
+        getattr(tool, "inputSchema", None) or {}
+    schema = raw if isinstance(raw, dict) else {}
     props = schema.get("properties", {})
     required = list(schema.get("required", []))
     return {

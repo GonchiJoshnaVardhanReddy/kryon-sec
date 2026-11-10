@@ -386,6 +386,7 @@ class HypothesizeSubagent:
         llm_fn: Callable[[str], HypothesisSet] | None = None,
         budget: BudgetTracker | None = None,
         sandbox: object | None = None,
+        adapter_registry=None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -403,6 +404,10 @@ class HypothesizeSubagent:
         # sandbox for ExploitDB (searchsploit) enrichment; None = skipped
         # cleanly with an audited notice (HYPOTHESIZE runs on any OS)
         self.sandbox = sandbox
+        # Phase 2B.4: the vetted tool adapters for enrichment (when
+        # registered, searchsploit-term replaces the legacy table
+        # lookup). None = legacy behavior, unchanged.
+        self.adapter_registry = adapter_registry
 
     def _default_llm(self, prompt: str) -> HypothesisSet:
         result, model = propose_hypotheses_with_model(self.cfg, prompt)
@@ -522,7 +527,8 @@ class HypothesizeSubagent:
             from .enrichment import enrich_hypotheses
 
             enrich_hypotheses(
-                self.cfg, self.graph, self.audit, sandbox=self.sandbox)
+                self.cfg, self.graph, self.audit, sandbox=self.sandbox,
+                adapter_registry=self.adapter_registry)
         except Exception as e:
             self.audit.write({
                 "event": "enrichment_failed",
