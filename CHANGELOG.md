@@ -1,5 +1,90 @@
 # Changelog
 
+## v1.3.10 — authorized MCP, the full-screen workspace, and version integrity
+
+Everything merged since the v1.3.8 release ships together here, including the
+full-screen workspace and the security fix that closed the window its merge
+opened. The version string is now consistent across the wheel, the package
+metadata, this changelog, and the README badge.
+
+### Accurate release history: where v1.3.9 stands
+
+The published v1.3.9 artifacts (the GitHub Release wheel and the GHCR sandbox
+image tagged `:v1.3.9` and `:latest`) were built from commit `ccaf635`, a
+pre-merge state: the full-screen Textual workspace had not yet been merged at
+that point. Those artifacts therefore contain neither the workspace nor the
+MCP agent-route regression described below — and neither do they include the
+merged registry, UI, and the PR #3 fix that v1.3.10 ships. The v1.3.9 tag,
+release, and image are intentionally left untouched; v1.3.10, once published,
+supersedes them as the release to install.
+
+### Mode B sandbox and security hardening
+
+- **Spawn-time isolation is verified before anything runs.** A launch guard
+  refuses every Purple security-tool execution that is not Docker-only
+  (`runsc`, non-root, read-only rootfs, resource caps, exactly one
+  network-none flag); a missing guard fails closed to an audited `zone_b_blocked`
+  halt, never a host execution.
+- **Zone B egress is policed at the Docker host boundary**, so a process inside
+  the sandbox cannot reach outside the engagement scope.
+- **EXPLOIT records and hands off on evidence**: structured, evidence-derived
+  attempt records, and an evidence-driven EXPLOIT → POST_EXPLOIT capability
+  handoff instead of a schedule.
+
+### MCP registry authorization and audit
+
+- **One execution choke point.** Every real MCP tool call goes through
+  `McpRegistry.call_mcp_tool`: trust policy → tool allowance → human approval →
+  schema validation → concurrency bound → redaction, each decision audited and
+  fail closed.
+- **Connection-level startup policy** decides which MCP server process may
+  launch at all; blocked servers stay visible but never start, and the block is
+  audited.
+- **A vetted read-only DocSafe provider** with path-scope confinement
+  (traversal, absolute-path, and symlink escapes refused before dispatch).
+- **A ship-aware wiring scan** in CI asserts the shipped code cannot execute an
+  MCP tool or feed a raw catalog outside the registry.
+
+### Mode B adapters (sandbox-contained, entrypoint-allowlisted)
+
+- **httpx-probe**, **searchsploit-term**, **whatweb-probe**: the first three
+  production Mode B adapters, each with allowlisted executables, in-scope-only
+  arguments, verified network-none isolation, and audited inputs/outputs.
+
+### Verification and evidence improvements
+
+- **Capability verification separated from approval**, with verification
+  statuses derived from concrete recorded evidence, a lineage graph over that
+  evidence, and a deterministic `report.json`.
+- **Independent capability verification** via static producer contracts, plus
+  doctor's sandbox-image validation pre-flight.
+
+### The full-screen Textual workspace
+
+- Live session tabs with persisted history, a Mode B engagement console with
+  live state/evidence views, inline approvals, the memory-browser launch point,
+  and the mode-driven workspace palette.
+
+### Fixed: the workspace goes through the MCP registry too (PR #3)
+
+- The merge sequence landed the workspace against a pre-registry base, which
+  opened a temporary authorization gap on `main`: its agent loop wired the
+  legacy toolbox catalog without policy or audit, and its launcher started MCP
+  server processes without the startup-policy gate. v1.3.10 carries the fix:
+  the workspace sees MCP exactly like the approved chat path (registry-derived
+  discovery only, `connect_all` gated by `startup_allowance()`), fail-closed
+  without a registry, pinned by dedicated regression tests.
+
+### Installation, config, and license
+
+- Installer profiles with dry run, repair, and strict pre-flight; the Windows
+  install is approved in the browser, not in the URL; the license endpoint
+  names the identity a beta key needs; site-call transport failures are named
+  without printing credentials; config writes are atomic and section-scoped.
+
+Test suite: **2128 passed, 8 skipped** on Python 3.11, 3.12, and 3.13 (CI on
+`388821a`); Docker + gVisor integration runs green on Linux.
+
 ## v1.3.8 — reliable installation and runtime validation
 
 The release now fails closed when the required Purple Team runtime is not ready,
