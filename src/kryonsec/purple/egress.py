@@ -487,23 +487,112 @@ class EgressGate:
         return (proc.returncode == 0,
                 str(getattr(proc, "stdout", "") or ""))
 
-    def _network_subnet_matches(self, policy: EgressPolicy) -> "tuple[bool, str]":
+    def _host_iface_exists(self, ifname: str) -> "tuple[bool, str]":
+        """Whether the Linux kernel currently has this link interface.
+
+        iptables happily stores rules naming interfaces that do not
+        exist — they then match NO traffic, which is exactly how a
+        boundary can look programmed while protecting nothing (the
+        Phase 2C.1R finding). The active bridge is kernel state, so the
+        existence check is against the kernel, not against Docker's
+        declaration. Reading link info needs no privilege; a missing
+        ``ip`` tool fails closed like any other unverifiable state.
+        """
+        ok, out = self._fw(["ip", "-o", "link", "show", ifname])
+        if not ok:
+            return False, (
+                f"bridge interface {ifname!r} not verifiable on the host")
+        return True, "ok"
+
+    def _network_integrity(self, policy: EgressPolicy) -> "tuple[bool, str]":
+        """Full identity check of the LIVE network against the policy.
+
+        Subnet alone is NOT proof of trustworthiness: a foreign or
+        stale network on the same address space can carry an
+        AUTO-NAMED bridge (``br-<id>``) — the DOCKER-USER/INPUT jumps
+        match on ``policy.bridge_name`` and would then bind to nothing.
+        With ICC disabled the boundary drops everything (fail-closed
+        but dead); with ICC left enabled, docker's own ACCEPT rules
+        would carry the traffic — tools running with UN-scoped egress
+        while our chain looks programmed. So the whole shape must
+        reproduce the policy: docker bridge driver, the pinned bridge
+        interface name, ICC disabled, THIS engagement's ownership
+        label, exactly one IPAM subnet equal to the policy subnet, and
+        the bridge interface actually present in the host kernel.
+        Nothing is trusted from names, labels or existing iptables
+        rules alone.
+
+        A MISSING network reports ``egress network missing: ...`` (the
+        caller's signal that first-use creation is allowed); every
+        other mismatch is an explicit, auditable refusal — never a
+        fallback to another network shape.
+        """
         ok, out, err = self._docker([
             "docker", "network", "inspect", "--format", "{{json .}}",
             policy.network_name])
         if not ok:
             return False, f"egress network missing: {(err or out)[:200]}"
         try:
-            netspec = json.loads(out)
-            subnet = (netspec.get("IPAM", {}).get("Config", [{}])[0]
-                      .get("Subnet", ""))
-        except (ValueError, KeyError, IndexError):
-            return False, "egress network IPAM spec unreadable"
-        if subnet != str(policy.subnet):
+            spec = json.loads(out)
+        except ValueError:
+            return False, "egress network spec unreadable"
+        if not isinstance(spec, dict):
+            return False, "egress network spec unreadable"
+        name = str(spec.get("Name") or "")
+        if name != policy.network_name:
             return False, (
-                f"egress network exists with subnet {subnet!r}, policy "
+                f"egress network identity mismatch: inspect returned "
+                f"{name!r}, policy requires {policy.network_name!r}")
+        driver = str(spec.get("Driver") or "")
+        if driver != "bridge":
+            return False, (
+                f"egress network driver is {driver!r}, not 'bridge' — "
+                "refusing a non-bridge boundary")
+        opts = spec.get("Options") or {}
+        if not isinstance(opts, dict):
+            return False, "egress network options unreadable"
+        ifname = str(opts.get("com.docker.network.bridge.name") or "")
+        if ifname != policy.bridge_name:
+            return False, (
+                f"egress network bridge interface is "
+                f"{ifname or '(docker auto-named)'!r}, policy requires "
+                f"{policy.bridge_name!r} — the firewall jumps would "
+                "bind to no traffic (remove the stale network or let "
+                "the gate create its own)")
+        icc = str(opts.get("com.docker.network.bridge.enable_icc") or "")
+        if icc.lower() != "false":
+            return False, (
+                f"egress network has enable_icc={icc or '(unset)'!r}, "
+                "policy requires false — refusing a boundary that "
+                "would not match the engine-created topology")
+        labels = spec.get("Labels") or {}
+        if not isinstance(labels, dict):
+            return False, "egress network labels unreadable"
+        owner = str(labels.get("kryonsec.engagement") or "")
+        if owner != policy.engagement_id:
+            return False, (
+                f"egress network is labeled for engagement {owner or '(none)'!r}, "
+                f"policy is {policy.engagement_id!r} — refusing a "
+                "foreign or stale boundary")
+        try:
+            ipam = (spec.get("IPAM") or {}).get("Config") or []
+            subnets = [str(c.get("Subnet") or "") for c in ipam]
+        except (TypeError, AttributeError):
+            return False, "egress network IPAM spec unreadable"
+        if len(subnets) != 1:
+            return False, (
+                f"egress network has {len(subnets)} IPAM configs — "
+                "ambiguous address space, refusing")
+        if subnets[0] != str(policy.subnet):
+            return False, (
+                f"egress network exists with subnet {subnets[0]!r}, policy "
                 f"requires {policy.subnet} — refusing a mismatched "
                 "boundary (remove it or align zone_b_subnet)")
+        ok_i, why = self._host_iface_exists(policy.bridge_name)
+        if not ok_i:
+            return False, (
+                f"egress bridge integrity failed: {why} — refusing a "
+                "boundary whose active bridge cannot be verified")
         return True, "ok"
 
     # -- lifecycle ---------------------------------------------------------
@@ -512,16 +601,26 @@ class EgressGate:
         """Create the network and program its firewall; the post-state
         must VERIFY back — a failed verification rolls the boundary back
         and reports failure. Never a 'best effort' commitment."""
-        ok, reason = self._network_subnet_matches(policy)
+        ok, reason = self._network_integrity(policy)
         if not ok:
-            # a PRE-EXISTING network with a DIFFERENT subnet is a conflict
-            # worth surfacing verbatim; a MISSING network is normal first use
+            # a PRE-EXISTING network with a DIFFERENT shape (subnet,
+            # bridge, owner, …) is a conflict worth surfacing verbatim;
+            # a MISSING network is normal first use
             if reason.startswith("egress network missing:"):
                 ok_c, out, err = self._docker(network_create_argv(policy))
                 if not ok_c:
                     return False, (
                         "creating egress network failed: "
                         f"{(err or out or '').strip()[:300]}")
+                # the FRESH network must pass the same integrity check:
+                # creation "succeeding" is not proof of the shape (and
+                # never an excuse for a fallback)
+                ok, reason = self._network_integrity(policy)
+                if not ok:
+                    self.release(policy)
+                    return False, (
+                        "egress network created but failed its own "
+                        f"integrity check: {reason}")
             else:
                 return False, reason
 
@@ -599,11 +698,13 @@ class EgressGate:
             f"{_rule_body(jump)}")
 
     def verify(self, policy: EgressPolicy) -> "tuple[bool, str]":
-        """The post-state must reproduce the policy: network present at
-        the policy subnet, our chain ends in an absolute DROP, every
-        allow/DNS rule present, both DOCKER-USER jumps AND the INPUT
-        jump in place — in BOTH families. Any drift fails the boundary."""
-        ok, reason = self._network_subnet_matches(policy)
+        """The post-state must reproduce the policy: network present with
+        the full integrity shape (bridge driver, pinned bridge interface,
+        ICC off, ownership label, one policy subnet, live kernel
+        interface), our chain ends in an absolute DROP, every allow/DNS
+        rule present, both DOCKER-USER jumps AND the INPUT jump in
+        place — in BOTH families. Any drift fails the boundary."""
+        ok, reason = self._network_integrity(policy)
         if not ok:
             return False, reason
         for cmd in ("iptables", "ip6tables"):

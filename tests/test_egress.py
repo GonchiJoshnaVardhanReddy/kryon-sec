@@ -63,6 +63,16 @@ class ScriptedHost:
         self.network_exists = False
         self.existing_subnet = None
         self.net_create_error = None
+        # overrides for the network-spec integrity fields (None -> the
+        # shape the gate's own create produces, i.e. trustworthy)
+        self.existing_name = None
+        self.existing_driver = None
+        self.existing_options = None
+        self.existing_labels = None
+        self.inspect_broken = False
+        self.create_then_broken = False
+        # kernel link state for `ip -o link show <ifname>`
+        self.interfaces = {policy.bridge_name}
         # per-family iptables state: {"iptables": {...}, "ip6tables": {...}}
         self.fw = {
             fam: {"existing": set(), "rules": {},
@@ -114,9 +124,19 @@ class ScriptedHost:
         self.record.append(list(argv))
         if argv[0] == "docker":
             return self._docker(argv)
+        if argv[0] == "ip":
+            return self._ip_link(argv)
         prefix = _fw_prefix()
         tokens = list(argv[len(prefix):]) if len(prefix) else list(argv)
         return self._fw(tokens)
+
+    # -- kernel links -------------------------------------------------------
+
+    def _ip_link(self, argv):
+        ifname = argv[-1] if argv[:4] == ["ip", "-o", "link", "show"] else None
+        if ifname and ifname in self.interfaces:
+            return self._done(0, f"2: {ifname}: <BROADCAST,MULTICAST,UP>\n", "")
+        return self._done(1, "", f'Device "{ifname}" does not exist.')
 
     # -- docker daemon ------------------------------------------------------
 
@@ -125,10 +145,22 @@ class ScriptedHost:
         assert argv[0] == "docker" and argv[1] == "network", f"unexpected {argv}"
         rest = argv[1:3]
         if rest == ["network", "inspect"]:
+            if self.inspect_broken:
+                return self._done(0, "«truncated daemon garbage»", "")
             if self.network_exists:
-                return self._done(0, json.dumps(
-                    {"IPAM": {"Config": [{"Subnet": self.existing_subnet}]}}),
-                    "")
+                return self._done(0, json.dumps({
+                    "Name": self.existing_name or p.network_name,
+                    "Driver": self.existing_driver or "bridge",
+                    "Options": self.existing_options
+                    if self.existing_options is not None
+                    else {"com.docker.network.bridge.enable_icc": "false",
+                          "com.docker.network.bridge.name": p.bridge_name},
+                    "Labels": self.existing_labels
+                    if self.existing_labels is not None
+                    else {"kryonsec.engagement": p.engagement_id},
+                    "IPAM": {"Config": [
+                        {"Subnet": self.existing_subnet or str(p.subnet)}]},
+                }), "")
             return self._done(1, "",
                               f"Error: No such network: {p.network_name}")
         if rest == ["network", "create"]:
@@ -136,10 +168,20 @@ class ScriptedHost:
                 return self._done(1, "", self.net_create_error)
             self.network_exists = True
             self.existing_subnet = str(p.subnet)
+            # the real daemon honours the pinned bridge name: the
+            # kernel gains that interface, and any create-time
+            # overrides reset (each create is a fresh network)
+            self.interfaces.add(p.bridge_name)
+            self.existing_name = None
+            self.existing_driver = None
+            self.existing_options = None
+            self.existing_labels = None
+            self.inspect_broken = self.create_then_broken
             return self._done(0, f"{p.network_name}\n")
         if rest == ["network", "rm"]:
             if self.network_exists:
                 self.network_exists = False
+                self.interfaces.discard(p.bridge_name)
                 return self._done(0, f"{p.network_name}\n")
             return self._done(1, "", f"Error: No such network: {p.network_name}")
         return self._done(1, "", f"unexpected docker argv: {argv}")
@@ -399,6 +441,141 @@ def test_gate_establish_refuses_subnet_mismatch():
     # nothing was created (fail closed, no partial state)
     assert not any(a[:3] == ["docker", "network", "create"]
                    for a in host.record)
+
+
+# ---- bridge integrity (Phase 2C.2): subnet alone is not trust -----------------
+
+
+def test_gate_establish_refuses_auto_named_bridge():
+    """The Phase 2C.1R finding, locked in: a pre-existing same-subnet
+    network WITHOUT the pinned bridge-name option has an auto-named
+    interface (br-<id>) that the DOCKER-USER/INPUT jumps would never
+    bind to. Subnet, owner and rules all 'look' right — still refused."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_options = {
+        "com.docker.network.bridge.enable_icc": "false"}  # no bridge.name
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok
+    assert "bridge interface" in reason and p.bridge_name in reason
+    # nothing was created and nothing was programmed
+    assert not any(a[:3] == ["docker", "network", "create"]
+                   for a in host.record)
+    assert not host.fw["iptables"]["existing"]
+
+
+def test_gate_establish_refuses_foreign_bridge_name():
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_options = {
+        "com.docker.network.bridge.enable_icc": "false",
+        "com.docker.network.bridge.name": "br-deadbeef1234"}
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "bridge interface" in reason
+
+
+def test_gate_establish_refuses_icc_enabled_network():
+    """icc=true on the boundary network means docker's own ACCEPT rules
+    carry intra-bridge traffic — combined with a jump mismatch that was
+    the UN-scoped-egress scenario; refused regardless of the bridge."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_options = {
+        "com.docker.network.bridge.name": p.bridge_name}  # icc unset
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "enable_icc" in reason
+
+
+def test_gate_establish_refuses_non_bridge_driver():
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_driver = "overlay"
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "driver" in reason and "bridge" in reason
+
+
+def test_gate_establish_refuses_foreign_owner_label():
+    """A stale network labeled for ANOTHER engagement is never adopted:
+    ownership is part of the boundary identity."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_labels = {"kryonsec.engagement": "some-other-engagement"}
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "labeled for engagement" in reason
+    # and it was left alone: not deleted, not reused
+    assert host.network_exists
+    assert not any(a[:3] == ["docker", "network", "create"]
+                   for a in host.record)
+
+
+def test_gate_establish_refuses_identity_mismatch():
+    """inspect returning a different Name than asked for cannot be the
+    boundary — assert the identity, don't assume inspect-by-name."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.existing_name = "kryonsec-egress-foreign"
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "identity mismatch" in reason
+
+
+def test_gate_establish_refuses_when_bridge_interface_missing_from_kernel():
+    """iptables stores rules for interfaces that do not exist — they
+    match NO traffic. The active bridge is kernel state: if the pinned
+    interface is not present on the host, refuse (2C.1R fail-mode)."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True  # docker spec claims our bridge name...
+    host.interfaces.clear()     # ...but the kernel disagrees
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "integrity failed" in reason and "verifiable" in reason
+
+
+def test_gate_verify_fails_when_bridge_interface_vanishes():
+    """Post-establishment drift: the bridge interface disappears (host
+    tampering, script flush) — verify must fail the boundary so no tool
+    spawns behind a jump that binds to nothing."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    gate = EgressGate(run_fn=host)
+    ok, reason = gate.establish(p)
+    assert ok, reason
+    host.interfaces.clear()
+    ok, reason = gate.verify(p)
+    assert not ok and "integrity failed" in reason
+
+
+def test_gate_establish_fails_closed_on_unreadable_network_spec():
+    """The daemon returns garbage instead of the spec: refuse — never
+    treat an unreadable network as 'missing' (that would create a
+    second network on an occupied address space) and never program."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.network_exists = True
+    host.inspect_broken = True
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "spec unreadable" in reason
+    assert not any(a[:3] == ["docker", "network", "create"]
+                   for a in host.record)
+    assert not host.fw["iptables"]["existing"]
+
+
+def test_gate_establish_rolls_back_when_fresh_network_fails_integrity():
+    """Even a just-created network must pass the SAME integrity check;
+    a 'successful' create is not proof of the shape. Failure tears the
+    fresh network back down (release) and reports explicitly."""
+    p = make_policy()
+    host = ScriptedHost(p)
+    host.create_then_broken = True
+    ok, reason = EgressGate(run_fn=host).establish(p)
+    assert not ok and "created but failed its own integrity" in reason
+    assert not host.network_exists  # rolled back by release()
+    assert not host.fw["iptables"]["existing"]
 
 
 def test_gate_establish_fails_when_network_create_fails():
