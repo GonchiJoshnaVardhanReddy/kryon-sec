@@ -152,13 +152,15 @@ def lab_env(tmp_path, monkeypatch):
     engagement_id = f"e2e-lab-{os.getpid()}"
     lab_ip = _lab_ip(cfg)
     policy = egress.build_policy(cfg, engagement_id, lab_ip)  # REAL policy
-    ok_n, err = _docker([
-        "network", "create", "--driver", "bridge",
-        "--subnet", str(policy.subnet),
-        "--opt", "com.docker.network.bridge.enable_icc=false",
-        "--label", f"kryonsec.engagement={engagement_id}",
-        policy.network_name,
-    ])
+    # The network must be EXACTLY the engine's shape — created through the
+    # engine's own argv builder (which pins the bridge interface name the
+    # gate programs DOCKER-USER jumps against). Hand-rolling the argv here
+    # silently produced a bridge the gate's rules never matched: traffic
+    # died on the icc=false isolation drop and the direct-spawn probe
+    # timed out (curl exit 28) — a fail-closed boundary nobody was behind.
+    # network_create_argv starts with the "docker" literal; the IT's
+    # _docker helper adds the binary itself, so drop the first token.
+    ok_n, err = _docker(egress.network_create_argv(policy)[1:])
     assert ok_n or "already exists" in (err or ""), err
     ok_l, reason = _start_lab(
         policy.network_name, lab_ip, cfg.sandbox_image,
@@ -203,7 +205,12 @@ def test_real_lab_container_serves_a_real_runsc_spawn(lab_env, monkeypatch):
     from kryonsec.purple.sandbox import KaliSandbox
 
     cfg, lab_ip = lab_env.cfg, lab_env.lab_ip
-    policy = egress.build_policy(cfg, "e2e-lab-direct", lab_ip)
+    # The policy MUST be derived under the fixture's engagement id: the
+    # fixture already created that engagement's network with this subnet,
+    # and establish() then reuses it instead of colliding with a second
+    # pool on the same address space.
+    policy = egress.build_policy(cfg, lab_env.engagement_id, lab_ip)
+    assert policy.network_name == lab_env.network
     gate = egress.EgressGate()
     ok, reason = gate.establish(policy)
     assert ok, f"real egress establish failed: {reason}"
@@ -275,6 +282,19 @@ def test_real_full_engagement_runs_zone_b_in_runsc(lab_env, monkeypatch):
         # nothing actually executed.
         spawned = {e["tool"] for e in _named(events, "tool_spawn")}
         assert {"sqlmap", "curl"} <= spawned, sorted(spawned)
+        # REAL target connectivity during the engagement: a curl inside
+        # the sandbox fetched a NON-EMPTY body through the REAL egress
+        # boundary. With the lab as the only authorized destination,
+        # this can only be true if the tools actually reached the
+        # authorized target (a dropped boundary yields exit 28 and
+        # output_chars 0).
+        curl_bodies = [
+            e for e in _named(events, "tool_result")
+            if e.get("tool") == "curl" and e.get("ok")
+            and e.get("output_chars", 0) > 0]
+        assert curl_bodies, (
+            "no curl result with a non-empty body — the engagement's "
+            "tools never actually reached the lab")
         sqlmap_results = [
             e for e in _named(events, "tool_result")
             if e.get("hypothesis_id") and e.get("ok")]
