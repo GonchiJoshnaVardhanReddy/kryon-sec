@@ -60,6 +60,9 @@ def _egress_boundary(request, monkeypatch):
         "test_egress_integration.py",
         "test_httpx_probe_adapter.py",
         "test_whatweb_adapter.py",
+        # Phase 2C.1 tier-2: the REAL-container lab IT must prove the
+        # REAL boundary end-to-end, exactly like the other ITs above.
+        "test_mode_b_e2e_lab_it.py",
     }
     if Path(str(request.node.fspath)).name in _exempted:
         return
