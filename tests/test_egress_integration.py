@@ -45,6 +45,7 @@ from kryonsec.purple.egress import (  # real bindings (import time)
     _fw_prefix,
     _input_jump_argv,
     build_policy,
+    network_create_argv,
     release_active,
 )
 from kryonsec.purple.sandbox import KaliSandbox
@@ -369,3 +370,76 @@ def test_container_to_host_local_traffic_is_blocked():
                 capture_output=True, text=True, timeout=30)
             assert " ".join(_input_jump_argv(policy)[3:]) not in dump.stdout, \
                 f"{cmd} INPUT jump survived teardown"
+
+
+@_env_gated
+def test_establish_refuses_a_foreign_same_subnet_network_then_accepts_its_own():
+    """The Phase 2C.1R finding, proven on a REAL daemon: a network with
+    the RIGHT subnet but an AUTO-NAMED bridge (no pinned bridge.name
+    option) is REFUSED — the DOCKER-USER/INPUT jumps match on the
+    policy's bridge name and would bind to nothing, so adopting such a
+    network is a boundary that looks programmed but filters no traffic.
+    Nothing of ours is programmed for the foreign network (no chain, no
+    jump), and the gate's OWN create still establishes cleanly.
+
+    The foreign network is created and removed by this test and nothing
+    else touches it."""
+    _skip_unless_host_can_program_fw()
+    prefix = _sudo_prefix()
+    cfg = KryonsecConfig()
+    policy = build_policy(
+        cfg, "eng-integ-foreign0", "203.0.113.10",
+        resolver=lambda h: [(2, 1, 6, "", ("203.0.113.10", 0))])
+    gate = EgressGate()
+
+    def _sh(args, timeout=60):
+        p = subprocess.run(args, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    # the foreign network: SAME subnet, NO pinned bridge name (docker
+    # will auto-name its interface br-<id>), NO ownership label
+    foreign = ["docker", "network", "create", "--driver", "bridge",
+               "--subnet", str(policy.subnet), policy.network_name]
+    ok_f, out_f, err_f = _sh(foreign)
+    assert ok_f == 0, f"fixture network create failed: {err_f}"
+    try:
+        ok, reason = gate.establish(policy)
+        assert not ok, (
+            "establish ADOPTED a foreign same-subnet network with an "
+            "auto-named bridge — the jumps would bind to nothing")
+        assert "bridge interface" in reason, reason
+        assert policy.bridge_name in reason, reason
+
+        # nothing of OURS was programmed against the foreign network
+        for cmd in ("iptables", "ip6tables"):
+            dump = _sh(prefix + [cmd, "-S", policy.chain_name])
+            assert dump[0] != 0, (
+                f"{cmd} chain was created for a rejected boundary")
+            ju = _sh(prefix + [cmd, "-S", "DOCKER-USER"])
+            assert ju[0] == 0
+            assert f"-i {policy.bridge_name}" not in ju[1] and \
+                f"-o {policy.bridge_name}" not in ju[1], ju[1]
+        # and the foreign network was left alone (not adopted, not deleted)
+        still, _, _ = _sh(["docker", "network", "inspect",
+                           policy.network_name])
+        assert still == 0
+    finally:
+        _sh(["docker", "network", "rm", policy.network_name])
+
+    # the gate's OWN create (engine shape: pinned bridge, icc off,
+    # ownership label) establishes and verifies cleanly on the same host
+    ok, reason = gate.establish(policy)
+    try:
+        assert ok, f"own-shape establishment failed: {reason}"
+        assert gate.verify(policy) == (True, "ok")
+        # the pinned bridge interface really exists in the kernel
+        link = _sh(["ip", "-o", "link", "show", policy.bridge_name])
+        assert link[0] == 0, (
+            f"engine-created bridge {policy.bridge_name} is not in the "
+            f"kernel: {link[2]}")
+    finally:
+        gate.release(policy)
+        for cmd in ("iptables", "ip6tables"):
+            dump = _sh(prefix + [cmd, "-S", policy.chain_name])
+            assert dump[0] != 0, f"{cmd} chain survived teardown"
