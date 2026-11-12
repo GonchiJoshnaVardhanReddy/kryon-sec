@@ -216,6 +216,33 @@ def test_from_toml_defaults_when_partial(clean_env):
     assert cfg.mcp_servers == []
 
 
+def test_tool_planner_gate_default_off_and_round_trips(tmp_path,
+                                                       clean_env,
+                                                       monkeypatch):
+    """Phase 2B.6: the tool-planner feature gate defaults OFF (the
+    conservative pre-2B.6 path), round-trips through the [tool_planner]
+    table, and the env var wins over TOML."""
+    monkeypatch.delenv("KRYONSEC_TOOL_PLANNER_ENABLED", raising=False)
+    assert KryonsecConfig(home=tmp_path).tool_planner_enabled is False
+
+    cfg = KryonsecConfig(home=tmp_path)
+    cfg.tool_planner_enabled = True
+    path = write_config(config_path(tmp_path), cfg.to_toml_dict())
+    text = path.read_text(encoding="utf-8")
+    assert "[tool_planner]" in text
+
+    loaded = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert loaded.tool_planner_enabled is True
+
+    # env beats TOML (off wins when the env var says off)
+    monkeypatch.setenv("KRYONSEC_TOOL_PLANNER_ENABLED", "0")
+    env_off = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert env_off.tool_planner_enabled is False
+    monkeypatch.setenv("KRYONSEC_TOOL_PLANNER_ENABLED", "1")
+    env_on = KryonsecConfig(home=tmp_path)
+    assert env_on.tool_planner_enabled is True
+
+
 def test_env_overrides_toml(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
     monkeypatch.setenv("OLLAMA_HOST", "http://env-host:11434")

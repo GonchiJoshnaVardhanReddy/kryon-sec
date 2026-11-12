@@ -335,6 +335,20 @@ class KryonsecConfig:
         default_factory=lambda: ["1.1.1.1", "8.8.8.8"]
     )
 
+    # --- Mode B tool planner (Phase 2B.6) ---
+    # Conservative default OFF: with the flag unset, RECON_ACTIVE runs
+    # the exact pre-2B.6 deterministic plan (bit-identical behavior).
+    # When ON, a bounded ToolPlanner filters the RECON_ACTIVE adapter
+    # lanes; eligibility, scope, argv, sandbox and egress rules are
+    # unchanged — the planner only decides WHICH vetted checks run for
+    # WHICH already-validated in-scope bases. Env:
+    # KRYONSEC_TOOL_PLANNER_ENABLED=1|true|yes|on.
+    tool_planner_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "KRYONSEC_TOOL_PLANNER_ENABLED", ""
+        ).strip().lower() in ("1", "true", "yes", "on"),
+    )
+
     # ---- TOML (de)serialization -----------------------------------------
 
     def to_toml_dict(self) -> dict:
@@ -385,6 +399,9 @@ class KryonsecConfig:
                 "zone_b_allowed_domains": list(self.zone_b_allowed_domains),
                 "zone_b_dns_resolvers": list(self.zone_b_dns_resolvers),
             },
+            "tool_planner": {
+                "enabled": self.tool_planner_enabled,
+            },
             "api": {
                 "shodan_api_key": self.shodan_api_key or "",
                 "censys_api_id": self.censys_api_id or "",
@@ -413,6 +430,7 @@ class KryonsecConfig:
         session = data.get("session", {})
         limits = data.get("limits", {})
         sandbox = data.get("sandbox", {})
+        planner = data.get("tool_planner", {})
         api = data.get("api", {})
         license_ = data.get("license", {})
 
@@ -473,6 +491,8 @@ class KryonsecConfig:
         if "zone_b_dns_resolvers" in sandbox:
             cfg.zone_b_dns_resolvers = [
                 str(r) for r in sandbox["zone_b_dns_resolvers"]]
+        if "enabled" in planner:
+            cfg.tool_planner_enabled = bool(planner["enabled"])
         if api.get("shodan_api_key"):
             cfg.shodan_api_key = api["shodan_api_key"]
         if api.get("censys_api_id"):
@@ -523,6 +543,13 @@ class KryonsecConfig:
         cfg.license_key = (
             os.environ.get("KRYONSEC_LICENSE_KEY") or cfg.license_key
         )
+        # Phase 2B.6: the tool-planner gate — env beats TOML like every
+        # other overridable; absent env keeps the TOML value.
+        env_planner = os.environ.get(
+            "KRYONSEC_TOOL_PLANNER_ENABLED", "").strip().lower()
+        if env_planner:
+            cfg.tool_planner_enabled = env_planner in (
+                "1", "true", "yes", "on")
         return cfg
 
     # ---- lifecycle --------------------------------------------------------

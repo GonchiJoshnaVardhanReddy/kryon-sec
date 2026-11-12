@@ -367,6 +367,21 @@ def start_engagement(
             from .recon_active import ReconActiveSubagent
             from .adapter_whatweb import recon_active_registry
 
+            # Phase 2B.6: the optional bounded tool planner. Built ONLY
+            # when the feature gate is on; from the SAME vetted adapter
+            # registry the lanes dispatch through — the catalog is a
+            # view, never an executable surface. Gate off (or planner
+            # failure at run time) -> the exact pre-2B.6 deterministic
+            # path, unchanged.
+            planner = None
+            if getattr(cfg, "tool_planner_enabled", False):
+                from .tool_planner import ToolCapabilityCatalog, \
+                    ToolPlanner
+
+                planner = ToolPlanner(
+                    ToolCapabilityCatalog(recon_active_registry()))
+                log.info("Mode B tool planner enabled (2B.6)")
+
             sub = ReconActiveSubagent(
                 cfg=cfg, graph=graph, audit=audit, target=target,
                 sandbox=sandbox.copy_with(evidence_dir=str(evidence_dir)),
@@ -375,6 +390,7 @@ def start_engagement(
                 # explicitly; unknown adapters inside remain
                 # refused/disabled.
                 adapter_registry=recon_active_registry(),
+                planner=planner,
             )
             return sub.run
 

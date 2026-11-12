@@ -13,6 +13,15 @@ host-side ToolAllowlist (Layer 2), and audited. The LLM has no say in
 what gets scanned. A failed tool never fails the state — HYPOTHESIZE
 just has less evidence (each failure is audited).
 
+Phase 2B.6 adds an OPTIONAL deterministic tool planner between the
+evidence graph and the adapter lanes: when a ``ToolPlanner`` is
+injected (feature-gated in config), it decides which already-vetted
+adapter checks run for which already-validated in-scope bases —
+eligibility, dedupe against complete prior runs, priority and a
+conservative time budget — and every decision is audited. It never
+executes anything, never builds argv, and a planner failure falls back
+to the exact pre-2B.6 path below (audited).
+
 rustscan is allowlisted but not in the default plan (nmap + naabu already
 cover port discovery; one of them failing is not worth a third scanner's
 runtime). hakrawler duplicates katana. massdns (Phase 8) is allowlisted
@@ -34,6 +43,7 @@ from .audit import AuditLog
 from .orchestrator import SubagentResult
 from .recon_passive import EngagementGraph
 from .sandbox import KaliSandbox, SpawnResult
+from .tool_planner import ToolPlanner, normalize_target
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +205,7 @@ class ReconActiveSubagent:
         sandbox: KaliSandbox,
         allowlist: ToolAllowlist | None = None,
         adapter_registry: "AdapterRegistry | None" = None,
+        planner: "ToolPlanner | None" = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -207,6 +218,15 @@ class ReconActiveSubagent:
         # unchanged. An injected registry that does not carry the
         # adapter is equivalent to no registry (unknown = disabled).
         self.adapter_registry = adapter_registry
+        # Phase 2B.6: the optional bounded tool planner. None (the
+        # default) -> the exact pre-2B.6 deterministic path. The planner
+        # NEVER executes anything and NEVER builds argv — it only
+        # decides which already-vetted adapter checks run for which
+        # already-validated in-scope bases. A planner crash falls back
+        # to the legacy path, audited, never to anything new.
+        self.planner = planner
+        self._plan = None
+        self._executed_pairs: "list[tuple[str, str]]" = []
 
     # ---- plan construction (deterministic, no LLM input) -----------------
 
@@ -282,6 +302,33 @@ class ReconActiveSubagent:
         except AdapterError:
             return None
 
+    def _planned_bases(self, adapter_id: str,
+                       bases: "list[str]") -> "list[str]":
+        """The plan-selected bases for ONE adapter (Phase 2B.6).
+
+        With a plan, only bases whose (adapter, base) entry the planner
+        SELECTED are returned — ``covered`` (complete prior run),
+        ``deferred`` (budget) and ``rejected`` entries never dispatch.
+        With NO plan (planner off, or a planner failure) every
+        validated base is returned unchanged — the exact pre-2B.6
+        behavior. This NEVER widens the base set: the planner receives
+        and returns only bases ``_web_bases`` derived from observed
+        open ports, and each one still passes the adapter's own
+        scope validation inside ``prepare_adapter_run``.
+        """
+        if self._plan is None:
+            return bases
+        selected = {(e.adapter_id, normalize_target(e.target))
+                    for e in self._plan.selected()}
+        return [b for b in bases
+                if (adapter_id, normalize_target(b)) in selected]
+
+    def _plan_record_executed(self, adapter_id: str, base: str) -> None:
+        """Record that a planned adapter run actually executed (used for
+        the planned-vs-executed comparison in ``recon_active_done``)."""
+        if self._plan is not None:
+            self._executed_pairs.append((adapter_id, base))
+
     def _web_bases(self, ports: set[int]) -> "list[str]":
         """The in-scope base URLs stage 2 probes (deterministic order)."""
         web_ports = sorted(p for p in ports if p in WEB_PORTS)
@@ -346,6 +393,7 @@ class ReconActiveSubagent:
     # ---- execution --------------------------------------------------------
 
     def run(self) -> SubagentResult:
+        self._executed_pairs = []  # per-run comparison, never cross-run
         self.audit.write({
             "event": "state_enter",
             "state": "RECON_ACTIVE",
@@ -403,6 +451,31 @@ class ReconActiveSubagent:
                     "resolved_ips": ips,
                 })
 
+        # Phase 2B.6: the optional bounded tool planner. Built from the
+        # SAME validated evidence the legacy path uses (observed open
+        # ports -> in-scope web bases) and the SAME injected adapter
+        # registry. A planner crash is audited and falls back to the
+        # exact pre-2B.6 deterministic path — never to anything new.
+        bases = self._web_bases(open_ports)
+        if self.planner is not None:
+            try:
+                self._plan = self.planner.plan(
+                    state="RECON_ACTIVE", target=self.target,
+                    bases=bases, graph=self.graph, audit=self.audit)
+                self.audit.write({
+                    "event": "planner_plan_applied",
+                    "plan_id": self._plan.plan_id,
+                    "selected": len(self._plan.selected()),
+                    "counts": self._plan.counts(),
+                })
+            except Exception as e:  # noqa: BLE001 — fail closed to legacy
+                self._plan = None
+                self.audit.write({
+                    "event": "planner_failed",
+                    "error": str(e)[:200],
+                    "fallback": "pre-2B.6 deterministic adapter path",
+                })
+
         # the registered httpx adapter (Phase 2B.3) REPLACES the legacy
         # httpx entries for the same base URLs — one probe per check,
         # never both. The adapter probe runs FIRST; its web_endpoint
@@ -410,8 +483,8 @@ class ReconActiveSubagent:
         # HYPOTHESIZE reads one uniform surface.
         httpx_adapter = self._httpx_adapter()
         if httpx_adapter is not None:
-            executed += self._run_httpx_adapter(httpx_adapter,
-                                                self._web_bases(open_ports))
+            executed += self._run_httpx_adapter(
+                httpx_adapter, self._planned_bases("httpx-probe", bases))
 
         # the registered whatweb adapter (Phase 2B.5) REPLACES the
         # legacy whatweb entries — same deterministic either/or as the
@@ -420,8 +493,8 @@ class ReconActiveSubagent:
         # richer tech_fingerprint nodes carry the adapter provenance.
         whatweb_adapter = self._whatweb_adapter()
         if whatweb_adapter is not None:
-            executed += self._run_whatweb_adapter(whatweb_adapter,
-                                                  self._web_bases(open_ports))
+            executed += self._run_whatweb_adapter(
+                whatweb_adapter, self._planned_bases("whatweb-probe", bases))
 
         # the registered tls-probe adapter (Phase 2B.5) REPLACES the
         # legacy sslscan/testssl.sh entries for TLS bases — one TLS
@@ -429,7 +502,7 @@ class ReconActiveSubagent:
         # Only https bases get a TLS inspection: a TLS scan is not
         # forced onto plain-http services.
         tls_adapter = self._tls_adapter()
-        tls_bases = [b for b in self._web_bases(open_ports)
+        tls_bases = [b for b in self._planned_bases("tls-probe", bases)
                      if b.startswith("https://")]
         if tls_adapter is not None and tls_bases:
             executed += self._run_tls_adapter(tls_adapter, tls_bases)
@@ -439,8 +512,8 @@ class ReconActiveSubagent:
         # API baseline per check, never both.
         api_adapter = self._api_adapter()
         if api_adapter is not None:
-            executed += self._run_api_adapter(api_adapter,
-                                              self._web_bases(open_ports))
+            executed += self._run_api_adapter(
+                api_adapter, self._planned_bases("api-probe", bases))
 
         # the registered nuclei adapter (Phase 2B.4) ADDS the vetted
         # non-destructive checks the fixed plan does not have (the
@@ -451,8 +524,8 @@ class ReconActiveSubagent:
         # them as candidate leads.
         nuclei_adapter = self._nuclei_adapter()
         if nuclei_adapter is not None:
-            executed += self._run_nuclei_adapter(nuclei_adapter,
-                                                 self._web_bases(open_ports))
+            executed += self._run_nuclei_adapter(
+                nuclei_adapter, self._planned_bases("nuclei-probe", bases))
 
         for tool, argv in self._web_plan(
                 open_ports, use_httpx_adapter=httpx_adapter is not None,
@@ -554,11 +627,30 @@ class ReconActiveSubagent:
                 )
 
         if executed:
-            self.audit.write({
+            done = {
                 "event": "recon_active_done",
                 "tools_executed": executed,
                 "open_ports": sorted(open_ports),
-            })
+            }
+            # Phase 2B.6: the planned-vs-executed comparison — the final
+            # report can check every planning decision against what the
+            # existing dispatch path actually ran (refusals are already
+            # audited per base as ``recon_active_adapter_failure``).
+            if self._plan is not None:
+                executed_norms = {(aid, normalize_target(b))
+                                  for aid, b in self._executed_pairs}
+                planned = self._plan.selected()
+                not_executed = [
+                    e.line() for e in planned
+                    if (e.adapter_id, normalize_target(e.target))
+                    not in executed_norms]
+                done.update({
+                    "plan_id": self._plan.plan_id,
+                    "planned_selected": len(planned),
+                    "planned_executed": len(planned) - len(not_executed),
+                    "planned_not_executed": not_executed[:50],
+                })
+            self.audit.write(done)
             return SubagentResult(status="ok")
         # every tool failed — the loop still continues deterministically;
         # HYPOTHESIZE just has less evidence, but say so honestly
@@ -600,6 +692,7 @@ class ReconActiveSubagent:
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
                 full_output=True)
             if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
                 observations, malformed = parse_httpx_json_lines(output)
                 record_httpx_evidence(
                     self.graph, self.audit,
@@ -609,6 +702,7 @@ class ReconActiveSubagent:
                 )
                 self.audit.write({
                     "event": "recon_active_httpx_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
                     "adapter": adapter.adapter_id,
                     "request_id": record.request_id,
                     "base": base[:300],
@@ -660,6 +754,7 @@ class ReconActiveSubagent:
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
                 full_output=True)
             if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
                 observations, malformed = parse_whatweb_lines(output)
                 record_whatweb_evidence(
                     self.graph, self.audit,
@@ -669,6 +764,7 @@ class ReconActiveSubagent:
                 )
                 self.audit.write({
                     "event": "recon_active_whatweb_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
                     "adapter": adapter.adapter_id,
                     "request_id": record.request_id,
                     "base": base[:300],
@@ -722,6 +818,7 @@ class ReconActiveSubagent:
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
                 full_output=True)
             if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
                 candidates, malformed = parse_nuclei_json_lines(output)
                 record_nuclei_evidence(
                     self.graph, self.audit,
@@ -731,6 +828,7 @@ class ReconActiveSubagent:
                 )
                 self.audit.write({
                     "event": "recon_active_nuclei_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
                     "adapter": adapter.adapter_id,
                     "request_id": record.request_id,
                     "base": base[:300],
@@ -791,6 +889,7 @@ class ReconActiveSubagent:
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
                 full_output=True)
             if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
                 run, malformed = parse_tls_probe_payload(output)
                 record_tls_evidence(
                     self.graph, self.audit,
@@ -800,6 +899,7 @@ class ReconActiveSubagent:
                 )
                 self.audit.write({
                     "event": "recon_active_tls_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
                     "adapter": adapter.adapter_id,
                     "request_id": record.request_id,
                     "base": base[:300],
@@ -861,6 +961,7 @@ class ReconActiveSubagent:
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
                 full_output=True)
             if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
                 run, malformed = parse_api_probe_payload(output)
                 record_api_evidence(
                     self.graph, self.audit,
@@ -870,6 +971,7 @@ class ReconActiveSubagent:
                 )
                 self.audit.write({
                     "event": "recon_active_api_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
                     "adapter": adapter.adapter_id,
                     "request_id": record.request_id,
                     "base": base[:300],
