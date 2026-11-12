@@ -158,7 +158,8 @@ def test_production_registry_registers_whatweb_probe_explicitly():
 def test_combined_recon_active_registry_carries_both_web_adapters():
     reg = recon_active_registry()
     assert reg.adapter_ids() == (
-        "httpx-probe", "nuclei-probe", "whatweb-probe")
+        "api-probe", "httpx-probe", "nuclei-probe", "tls-probe",
+        "whatweb-probe")
     # all three stay RECON_ACTIVE-only; none mounted a gate
     for adapter in reg.list_adapters():
         assert adapter.stages == ("RECON_ACTIVE",)
@@ -632,7 +633,7 @@ def test_adapter_mode_probes_whatweb_once_never_both(tmp_path):
     assert runs_legacy_httpx == []
     assert len(runs_toolkt) == 1
     assert len(graph.by_type("web_endpoint")) == 1
-    assert len(graph.by_type("adapter_attempt")) == 3
+    assert len(graph.by_type("adapter_attempt")) == 4
     names = _event_names(audit)
     assert "recon_active_whatweb_adapter" in names
     assert "recon_active_adapter_failure" not in names

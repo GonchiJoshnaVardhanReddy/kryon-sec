@@ -169,13 +169,14 @@ def test_production_registry_registers_nuclei_probe_explicitly():
         empty.get(ADAPTER_ID)
 
 
-def test_combined_recon_active_registry_carries_three_web_adapters():
+def test_combined_recon_active_registry_carries_five_web_adapters():
     from kryonsec.purple.adapter_whatweb import recon_active_registry
 
     reg = recon_active_registry()
     assert reg.adapter_ids() == (
-        "httpx-probe", "nuclei-probe", "whatweb-probe")
-    # all three stay RECON_ACTIVE-only; none mounted a gate
+        "api-probe", "httpx-probe", "nuclei-probe", "tls-probe",
+        "whatweb-probe")
+    # all five stay RECON_ACTIVE-only; none mounted a gate
     for adapter in reg.list_adapters():
         assert adapter.stages == ("RECON_ACTIVE",)
         assert adapter.approvals == ()
@@ -695,7 +696,10 @@ def test_adapter_mode_runs_nuclei_once_per_base(tmp_path):
     assert candidates[0]["properties"]["adapter"] == ADAPTER_ID
     assert candidates[0]["properties"]["verification"] == "not_verified"
     # all three adapters ran; each left its own attempt node
-    assert len(graph.by_type("adapter_attempt")) == 3
+    # all FOUR adapters with a lane here ran (httpx/whatweb/api/nuclei);
+    # the tls-probe lane correctly does NOT run — the stage-2 base is
+    # plain http, and a TLS baseline is never forced onto an http base
+    assert len(graph.by_type("adapter_attempt")) == 4
     names = _event_names(audit)
     assert "recon_active_nuclei_adapter" in names
     assert "recon_active_adapter_failure" not in names
@@ -729,7 +733,10 @@ def test_zero_match_run_is_an_honest_inconclusive(tmp_path):
     assert ev[0]["candidates"] == 0
     # the attempt node still exists (the run happened; its outcome is
     # recorded honestly on it)
-    assert len(graph.by_type("adapter_attempt")) == 3
+    # all FOUR adapters with a lane here ran (httpx/whatweb/api/nuclei);
+    # the tls-probe lane correctly does NOT run — the stage-2 base is
+    # plain http, and a TLS baseline is never forced onto an http base
+    assert len(graph.by_type("adapter_attempt")) == 4
     ok, reason = audit.verify()
     assert ok, reason
 

@@ -24,6 +24,12 @@ ALLOWED_TOOLS=(
     "feroxbuster" "sslscan" "testssl.sh" "dnsx"
     # active recon (Phase 8): screenshots, DNS brute-force, API discovery
     "gowitness" "massdns" "/opt/kryonsec/openapi_probe.py"
+    # vetted TLS/API baseline adapters (Phase 2B.5): baked wrapper
+    # scripts, fixed argv = [script, url]. tls_probe.py owns the image's
+    # real testssl binary (/usr/bin/testssl) with frozen flags;
+    # api_probe.py is read-only GET/OPTIONS against the ONE approved
+    # base URL's host.
+    "/opt/kryonsec/tls_probe.py" "/opt/kryonsec/api_probe.py"
     # exploit / testing
     "nuclei" "sqlmap" "nikto" "curl" "wget" "ffuf" "gobuster" "wfuzz"
     "dalfox" "commix" "ssrfmap" "arjun" "tplmap" "jwt_tool" "kr"

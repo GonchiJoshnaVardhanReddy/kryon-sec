@@ -368,6 +368,14 @@ _SOURCES: tuple[_Source, ...] = (
         weight=3,
     ),
     _Source(
+        key="api_observations",
+        node_type="api_observation",
+        heading="API OBSERVATIONS (api-probe — read-only baseline, "
+                "metadata only)",
+        fields=("status", "requests_sent"),
+        weight=2,
+    ),
+    _Source(
         key="vuln_candidates",
         node_type="vuln_candidate",
         heading="VULN CANDIDATES (nuclei — detection only, never "

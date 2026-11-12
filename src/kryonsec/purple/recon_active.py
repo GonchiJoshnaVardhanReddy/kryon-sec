@@ -256,6 +256,32 @@ class ReconActiveSubagent:
         except AdapterError:
             return None
 
+    def _tls_adapter(self):
+        """The registered tls-probe adapter (Phase 2B.5), or None —
+        the same explicit-registration rule: an injected registry
+        without it means the legacy sslscan/testssl.sh plan entries
+        run, deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_tls import TLS_PROBE_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(TLS_PROBE_ADAPTER_ID)
+        except AdapterError:
+            return None
+
+    def _api_adapter(self):
+        """The registered api-probe adapter (Phase 2B.5), or None —
+        the same explicit-registration rule: an injected registry
+        without it means the legacy openapi_probe plan entry runs,
+        deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_api import API_PROBE_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(API_PROBE_ADAPTER_ID)
+        except AdapterError:
+            return None
+
     def _web_bases(self, ports: set[int]) -> "list[str]":
         """The in-scope base URLs stage 2 probes (deterministic order)."""
         web_ports = sorted(p for p in ports if p in WEB_PORTS)
@@ -269,15 +295,19 @@ class ReconActiveSubagent:
 
     def _web_plan(self, ports: set[int],
                   use_httpx_adapter: bool = False,
-                  use_whatweb_adapter: bool = False
+                  use_whatweb_adapter: bool = False,
+                  use_tls_adapter: bool = False,
+                  use_api_adapter: bool = False
                   ) -> list[tuple[str, list[str]]]:
         """Stage 2: http probes on discovered web ports.
 
-        ``use_httpx_adapter`` (Phase 2B.3) and ``use_whatweb_adapter``
-        (Phase 2B.5) omit the corresponding legacy plan entries when
-        the registered adapter probe runs instead — NO duplicate
-        probing of the same check (deterministic either/or). The other
-        probes (katana/feroxbuster/...) are unchanged either way.
+        ``use_httpx_adapter`` (Phase 2B.3), ``use_whatweb_adapter``
+        (Phase 2B.5), ``use_tls_adapter`` (Phase 2B.5) and
+        ``use_api_adapter`` (Phase 2B.5) omit the corresponding legacy
+        plan entries when the registered adapter probe runs instead —
+        NO duplicate probing of the same check (deterministic
+        either/or). The other probes (katana/feroxbuster/gowitness)
+        are unchanged either way.
         """
         plan: list[tuple[str, list[str]]] = []
         # same filter/order as _web_bases, so (port, base) stay paired
@@ -297,13 +327,14 @@ class ReconActiveSubagent:
                           "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"]))
             # Phase 8: API surface discovery + a screenshot per web port —
             # the PNG lands in the rw /evidence mount (engagement folder)
-            plan.append(("openapi_probe",
-                         ["/opt/kryonsec/openapi_probe.py", base]))
+            if not use_api_adapter:
+                plan.append(("openapi_probe",
+                             ["/opt/kryonsec/openapi_probe.py", base]))
             plan.append(("gowitness",
                          ["gowitness", "scan", "website", "--url", base,
                           "--screenshot-path", "/evidence", "--no-console",
                           "--disable-db"]))
-            if port in TLS_PORTS:
+            if port in TLS_PORTS and not use_tls_adapter:
                 plan.append(("sslscan",
                              ["sslscan", "--no-failed", "--sleep", "100",
                               self.target]))
@@ -392,6 +423,25 @@ class ReconActiveSubagent:
             executed += self._run_whatweb_adapter(whatweb_adapter,
                                                   self._web_bases(open_ports))
 
+        # the registered tls-probe adapter (Phase 2B.5) REPLACES the
+        # legacy sslscan/testssl.sh entries for TLS bases — one TLS
+        # baseline per check, never both (deterministic either/or).
+        # Only https bases get a TLS inspection: a TLS scan is not
+        # forced onto plain-http services.
+        tls_adapter = self._tls_adapter()
+        tls_bases = [b for b in self._web_bases(open_ports)
+                     if b.startswith("https://")]
+        if tls_adapter is not None and tls_bases:
+            executed += self._run_tls_adapter(tls_adapter, tls_bases)
+
+        # the registered api-probe adapter (Phase 2B.5) REPLACES the
+        # legacy openapi_probe entry for every web base — one read-only
+        # API baseline per check, never both.
+        api_adapter = self._api_adapter()
+        if api_adapter is not None:
+            executed += self._run_api_adapter(api_adapter,
+                                              self._web_bases(open_ports))
+
         # the registered nuclei adapter (Phase 2B.4) ADDS the vetted
         # non-destructive checks the fixed plan does not have (the
         # legacy plan's nuclei entry lives in EXPLOIT and stays there).
@@ -406,7 +456,9 @@ class ReconActiveSubagent:
 
         for tool, argv in self._web_plan(
                 open_ports, use_httpx_adapter=httpx_adapter is not None,
-                use_whatweb_adapter=whatweb_adapter is not None):
+                use_whatweb_adapter=whatweb_adapter is not None,
+                use_tls_adapter=tls_adapter is not None,
+                use_api_adapter=api_adapter is not None):
             result, ran = self._spawn(tool, argv)
             executed += ran if result.ok else 0
             if not result.ok:
@@ -689,6 +741,144 @@ class ReconActiveSubagent:
                     # detected, nothing proven), never a negative
                     "outcome": ("detected_candidates"
                                 if candidates else "inconclusive"),
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
+
+    def _run_tls_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered tls-probe adapter against each HTTPS
+        base URL (Phase 2B.5).
+
+        Returns 1 per base whose run executed (the same count the
+        legacy sslscan + testssl.sh plan entries contribute).
+        Preparation refusals (out-of-scope base) and execution
+        refusals (no egress, no sandbox) are AUDITED as
+        ``recon_active_adapter_failure`` and skipped — an adapter
+        refusal never fails the state, exactly like a tool failure.
+        Observations become ``tls_observation`` nodes (the SAME node
+        type the legacy excerpt path produced) plus, for every
+        tool-reported weakness, a ``vuln_candidate`` node —
+        detection, never confirmation.
+        """
+        from .adapter_tls import parse_tls_probe_payload, \
+            record_tls_evidence
+
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base)
+            except AdapterError as e:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True)
+            if record.executed:
+                run, malformed = parse_tls_probe_payload(output)
+                record_tls_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    run=run,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_tls_adapter",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    # honest classification: an unparseable or partial
+                    # payload is never read as a clean bill of health
+                    "probe_status": run.status if run else "unparseable",
+                    "findings": len(run.findings) if run else 0,
+                    "malformed_lines": malformed,
+                    "outcome": ("observed"
+                                if run and run.findings
+                                else "inconclusive"),
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
+
+    def _run_api_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered api-probe adapter against each stage-2
+        base URL (Phase 2B.5).
+
+        Returns 1 per base whose run executed (the same count the
+        legacy openapi_probe plan entry contributes). Preparation
+        refusals (out-of-scope base) and execution refusals (no
+        egress, no sandbox) are AUDITED as
+        ``recon_active_adapter_failure`` and skipped — an adapter
+        refusal never fails the state, exactly like a tool failure.
+        Observations become ``api_observation`` nodes, OpenAPI-declared
+        paths ``path`` nodes (metadata only), and tool-flagged baseline
+        weaknesses ``vuln_candidate`` nodes — data, never exploit
+        claims.
+        """
+        from .adapter_api import parse_api_probe_payload, \
+            record_api_evidence
+
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base)
+            except AdapterError as e:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True)
+            if record.executed:
+                run, malformed = parse_api_probe_payload(output)
+                record_api_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    run=run,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_api_adapter",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "probe_status": run.status if run else "unparseable",
+                    "requests_sent": run.requests_sent if run else 0,
+                    "malformed_lines": malformed,
+                    "outcome": ("observed"
+                                if run and run.base_status
+                                else "inconclusive"),
                 })
                 executed += 1
             else:

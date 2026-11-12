@@ -116,7 +116,8 @@ def test_sections_follow_the_fixed_priority_order():
         "findings", "exploit_attempts", "verify_attempts",
         # ...then the A2 reconnaissance categories, in their own order
         "services", "web_endpoints", "dns", "tls",
-        "technologies", "vuln_candidates", "subdomains", "paths", "osint",
+        "technologies", "api_observations", "vuln_candidates",
+        "subdomains", "paths", "osint",
     ]
 
 
@@ -429,9 +430,9 @@ def test_empty_graph_renders_every_category_as_none():
     assert context.nodes_read == 0
     assert context.item_count == 0
     assert context.truncated is False
-    assert len(context.sections) == 12
+    assert len(context.sections) == 13
     assert all(section.items == () for section in context.sections)
-    assert context.text.count("- (none)") == 12
+    assert context.text.count("- (none)") == 13
     assert count_tokens(context.text) <= context.budget.max_tokens
 
 
@@ -1303,7 +1304,7 @@ def test_an_empty_graph_is_untouched_by_the_allocation():
 
     assert context.item_count == 0
     assert context.truncated is False
-    assert context.text.count("- (none)") == 12
+    assert context.text.count("- (none)") == 13
     assert "- (none kept)" not in context.text
 
 
@@ -1779,13 +1780,13 @@ def test_a_value_cannot_forge_the_empty_categories_line():
 @pytest.mark.parametrize("kind", ["paths", "subdomains", "history"])
 def test_the_accounting_holds_under_the_collapse(kind, max_tokens):
     """The record is not the block: collapsing headings changes what is
-    rendered, never what is accounted for. All twelve keys survive, every
+    rendered, never what is accounted for. All thirteen keys survive, every
     invariant that held before holds, and the bound is the rendered text's."""
     context = build_investigation_context(
         _sparse_graph(kind), ContextBudget(max_tokens=max_tokens))
 
     assert count_tokens(context.text) <= max_tokens
-    assert len(context.truncation) == 12
+    assert len(context.truncation) == 13
     for key, stat in context.truncation.items():
         assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
                               + stat.over_budget), key

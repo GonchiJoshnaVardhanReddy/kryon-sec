@@ -82,7 +82,7 @@ def test_every_history_line_names_the_asset_its_hypothesis_targets():
                              "spawn_ok=yes exit_code=0 marker_matched=no"],
         "verify_attempts": ["H1 asset=/Login.asp?id=1 outcome=reproduced"],
         "services": [], "web_endpoints": [], "dns": [], "tls": [],
-        "technologies": [], "vuln_candidates": [],
+        "technologies": [], "api_observations": [], "vuln_candidates": [],
         "subdomains": [], "paths": [], "osint": [],
     }
 
@@ -382,7 +382,7 @@ def test_a_graph_predating_the_join_renders_every_line_as_before():
         "verify_attempts": ["H1 asset=unresolved outcome=inconclusive "
                             "reason=probe run failed"],
         "services": [], "web_endpoints": [], "dns": [], "tls": [],
-        "technologies": [], "vuln_candidates": [],
+        "technologies": [], "api_observations": [], "vuln_candidates": [],
         "subdomains": [], "paths": [], "osint": [],
     }
     assert context.truncated is False
