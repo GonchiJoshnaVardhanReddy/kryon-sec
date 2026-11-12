@@ -84,7 +84,7 @@ def test_prompt_empty_graph():
     # the block still renders, and names every category as empty rather
     # than going silent about evidence it does not have
     assert "read from 0 graph nodes" in prompt
-    assert prompt.count("- (none)") == 11
+    assert prompt.count("- (none)") == 12
 
 
 # --- schema ---

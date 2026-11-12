@@ -127,15 +127,17 @@ def production_registry():
 
 
 def recon_active_registry():
-    """The combined RECON_ACTIVE registry the runner injects (2B.5):
-    BOTH vetted production web adapters — httpx-probe (2B.3) and
-    whatweb-probe (this module). One probe per check is preserved by
-    ReconActiveSubagent's deterministic either/or rules, not by
-    pretending one of the adapters does not exist."""
+    """The combined RECON_ACTIVE registry the runner injects (2B.4):
+    the three vetted production web adapters — httpx-probe (2B.3),
+    whatweb-probe (this module) and nuclei-probe (2B.4). One probe per
+    check is preserved by ReconActiveSubagent's deterministic either/or
+    rules, not by pretending one of the adapters does not exist."""
     registry = production_registry()
     from .adapter_httpx import make_httpx_probe_adapter
+    from .adapter_nuclei import make_nuclei_probe_adapter
 
     registry.register(make_httpx_probe_adapter())
+    registry.register(make_nuclei_probe_adapter())
     return registry
 
 

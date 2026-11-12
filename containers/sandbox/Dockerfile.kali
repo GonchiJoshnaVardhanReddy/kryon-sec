@@ -63,12 +63,20 @@ RUN EXTENDED_TOOLS=" \
 
 # Bake nuclei templates at BUILD time, not runtime (sandbox has no
 # internet egress to template sources). The tool runs as
-# kryonsec-runner (non-root), so move the templates OUT of /root into a
-# world-readable dir — otherwise every nuclei spawn dies on permissions.
-RUN nuclei -update-templates || true; \
-    mkdir -p /opt/nuclei-templates && \
-    cp -r /root/nuclei-templates/* /opt/nuclei-templates/ 2>/dev/null || true; \
-    chmod -R a+rX /opt/nuclei-templates 2>/dev/null || true
+# kryonsec-runner (non-root), so the tree MUST end up world-readable —
+# otherwise every nuclei spawn dies on permissions.
+#
+# Root-cause fix (Phase 2B.4, verified against the shipped image): the
+# old step copied `/root/nuclei-templates/*`, but nuclei v3 installs the
+# downloaded tree to `~/.local/nuclei-templates` — the cp matched
+# nothing, the `|| true` chain swallowed it, and the image shipped with
+# an EMPTY /opt/nuclei-templates (no template-based nuclei run — legacy
+# EXPLOIT path included — could work; verified live: 0 files). The bake
+# is now REQUIRED and installs DIRECTLY to the target dir (`-ud`): a
+# build without templates is a FAILED build, never a silent hole.
+RUN nuclei -update-templates -ud /opt/nuclei-templates \
+    && chmod -R a+rX /opt/nuclei-templates \
+    && test -n "$(find /opt/nuclei-templates -name '*.yaml' -type f | head -1)"
 
 # PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
 # all-or-nothing: one unresolvable name aborts the whole command and
@@ -154,6 +162,15 @@ RUN chmod 0755 /opt/kryonsec/*.py
 
 # Create non-root user for tool execution
 RUN useradd -m -s /bin/false kryonsec-runner
+
+# Nuclei's writable home: the SANDBOX provides it, not this image.
+# Verified live under the sandbox's exact spawn flags: nuclei ALWAYS
+# rewrites .templates-config.json and the uncover provider config into
+# $HOME at startup, so on this image's read-only rootfs a baked empty
+# dir is FATAL ("Could not create runner") exactly like an absent one.
+# KaliSandbox._docker_argv therefore mounts a capped tmpfs at
+# /home/kryonsec-runner for every spawn (volatile, no host path), which
+# is what nuclei (and subfinder/amass) write their configs into.
 
 # Evidence directory
 RUN mkdir -p /evidence && chown kryonsec-runner:kryonsec-runner /evidence

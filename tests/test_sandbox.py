@@ -37,10 +37,32 @@ def test_docker_argv_flags_and_image(tmp_path):
     assert argv[argv.index("--memory") + 1] == "2g"
     assert argv[argv.index("--cpus") + 1] == "2"
     assert argv[argv.index("--pids-limit") + 1] == "100"
+    # writable VOLATILE home tmpfs (nuclei et al. insist on writing their
+    # configs into $HOME; a read-only home kills them at startup): same
+    # mount class as /tmp — memory-backed, capped, no host path
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp:size=100m"
+    home_idx = argv.index("--tmpfs", argv.index("--tmpfs") + 1)
+    assert argv[home_idx + 1] == "/home/kryonsec-runner:size=100m"
     # image, then tool argv as container args
     assert argv[-3:] == ["nmap", "-sV", "target.com"]
     # the image actually configured (tag, or pinned digest from env) is used
     assert s.image in argv
+
+
+def test_docker_argv_home_tmpfs_never_replaces_rw_host_mounts(tmp_path):
+    """The home tmpfs grants NO host access: /evidence stays the only
+    rw host mount, /code stays :ro, and the home mount itself is a bare
+    tmpfs (no bind source)."""
+    s = _sandbox(tmp_path)
+    code = tmp_path / "code"
+    code.mkdir()
+    s2 = s.copy_with(code_dir=str(code))
+    argv = s2._docker_argv(["bandit", "-r", "/code"])
+    assert f"{code}:/code:ro" in argv
+    # exactly two tmpfs mounts: /tmp and the runner home — no bind of
+    # the host anywhere near $HOME
+    tmpfs = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert tmpfs == ["/tmp:size=100m", "/home/kryonsec-runner:size=100m"]
 
 
 def test_docker_argv_never_builds_shell_string(tmp_path):

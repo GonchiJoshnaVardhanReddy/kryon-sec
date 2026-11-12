@@ -50,9 +50,10 @@ def _egress_boundary(request, monkeypatch):
     its own import-time bindings, and tests that need a failing boundary
     patch the module attributes themselves. The integration test files
     are skipped here too: the opt-in ITs (test_egress_integration.py,
-    test_httpx_probe_adapter.py::test_real_httpx_probe_lab_it and
-    test_whatweb_adapter.py::test_real_whatweb_probe_lab_it — Phase
-    2B.5) must use the REAL boundary against a real daemon; arming one
+    test_httpx_probe_adapter.py::test_real_httpx_probe_lab_it,
+    test_whatweb_adapter.py::test_real_whatweb_probe_lab_it and
+    test_nuclei_adapter.py::test_real_nuclei_probe_lab_it — Phase
+    2B.4) must use the REAL boundary against a real daemon; arming one
     (`*_IT=1`) while the autouse fake silently substituted the
     boundary would prove a boundary that is not there.
     """
@@ -60,6 +61,7 @@ def _egress_boundary(request, monkeypatch):
         "test_egress_integration.py",
         "test_httpx_probe_adapter.py",
         "test_whatweb_adapter.py",
+        "test_nuclei_adapter.py",
         # Phase 2C.1 tier-2: the REAL-container lab IT must prove the
         # REAL boundary end-to-end, exactly like the other ITs above.
         "test_mode_b_e2e_lab_it.py",
