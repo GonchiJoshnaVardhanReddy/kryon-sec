@@ -157,8 +157,9 @@ def test_production_registry_registers_whatweb_probe_explicitly():
 
 def test_combined_recon_active_registry_carries_both_web_adapters():
     reg = recon_active_registry()
-    assert reg.adapter_ids() == ("httpx-probe", "whatweb-probe")
-    # both stay RECON_ACTIVE-only; neither mounted a gate
+    assert reg.adapter_ids() == (
+        "httpx-probe", "nuclei-probe", "whatweb-probe")
+    # all three stay RECON_ACTIVE-only; none mounted a gate
     for adapter in reg.list_adapters():
         assert adapter.stages == ("RECON_ACTIVE",)
         assert adapter.approvals == ()
@@ -550,7 +551,8 @@ def test_fingerprint_is_recon_evidence_never_confirmation(tmp_path):
 # ---- 15. no host execution fallback ---------------------------------------------------------
 
 def test_no_host_execution_in_adapter_modules():
-    for mod in ("adapter_httpx.py", "adapter_whatweb.py", "adapters.py"):
+    for mod in ("adapter_httpx.py", "adapter_whatweb.py",
+                "adapter_nuclei.py", "adapters.py"):
         source = Path("src/kryonsec/purple") / mod
         text = source.read_text(encoding="utf-8")
         assert "subprocess" not in text, mod
@@ -623,13 +625,14 @@ def test_adapter_mode_probes_whatweb_once_never_both(tmp_path):
     assert fps[0]["properties"]["adapter"] == ADAPTER_ID
     # the httpx adapter side of the combined registry still runs its
     # lane — and its web_endpoint evidence is SEPARATE from the
-    # whatweb tech_fingerprint evidence
+    # whatweb tech_fingerprint evidence (the nuclei-probe adapter, the
+    # third member, runs its vuln-check lane separately too)
     runs_toolkt = [a for a in cmdl if a and a[0] == "httpx-toolkit"]
     runs_legacy_httpx = [a for a in cmdl if a and a[0] == "httpx"]
     assert runs_legacy_httpx == []
     assert len(runs_toolkt) == 1
     assert len(graph.by_type("web_endpoint")) == 1
-    assert len(graph.by_type("adapter_attempt")) == 2
+    assert len(graph.by_type("adapter_attempt")) == 3
     names = _event_names(audit)
     assert "recon_active_whatweb_adapter" in names
     assert "recon_active_adapter_failure" not in names

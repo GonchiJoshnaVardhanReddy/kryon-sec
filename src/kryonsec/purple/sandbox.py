@@ -304,6 +304,14 @@ class KaliSandbox:
             "--user", "kryonsec-runner",
             "--read-only",
             "--tmpfs", "/tmp:size=100m",
+            # writable, VOLATILE home (same mount class as /tmp): several
+            # tools insist on writing their config into $HOME at startup
+            # (nuclei FATALS on a read-only home: it always rewrites
+            # .templates-config.json and the uncover provider config).
+            # A tmpfs dies with the container and grants no host path —
+            # rootfs stays read-only; /evidence stays the only rw HOST
+            # mount. The image bakes the mount point (useradd -m).
+            "--tmpfs", "/home/kryonsec-runner:size=100m",
             "--memory", "2g",
             "--cpus", "2",
             "--pids-limit", "100",

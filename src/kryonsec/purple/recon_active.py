@@ -49,6 +49,11 @@ HTTPX_ADAPTER_ID = "httpx-probe"
 #: fixed-plan whatweb entry runs exactly as before — DETERMINISTICALLY
 #: one or the other, never both probing the same base.
 WHATWEB_ADAPTER_ID = "whatweb-probe"
+#: the third production adapter id RECON_ACTIVE runs when registered
+#: (Phase 2B.4): the vetted non-destructive nuclei checks. The legacy
+#: fixed-plan nuclei entry lives in EXPLOIT and is untouched — this
+#: adapter never enters that stage and never re-uses its verdict words.
+NUCLEI_ADAPTER_ID = "nuclei-probe"
 
 # nmap -sV lines look like:
 # "80/tcp   open  http    Microsoft IIS httpd 8.5"
@@ -238,6 +243,19 @@ class ReconActiveSubagent:
         except AdapterError:
             return None
 
+    def _nuclei_adapter(self):
+        """The registered nuclei-probe adapter (Phase 2B.4), or None —
+        the same explicit-registration rule: an injected registry
+        without it means RECON_ACTIVE runs exactly the fixed plan, no
+        vuln checks added."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_nuclei import NUCLEI_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(NUCLEI_ADAPTER_ID)
+        except AdapterError:
+            return None
+
     def _web_bases(self, ports: set[int]) -> "list[str]":
         """The in-scope base URLs stage 2 probes (deterministic order)."""
         web_ports = sorted(p for p in ports if p in WEB_PORTS)
@@ -373,6 +391,18 @@ class ReconActiveSubagent:
         if whatweb_adapter is not None:
             executed += self._run_whatweb_adapter(whatweb_adapter,
                                                   self._web_bases(open_ports))
+
+        # the registered nuclei adapter (Phase 2B.4) ADDS the vetted
+        # non-destructive checks the fixed plan does not have (the
+        # legacy plan's nuclei entry lives in EXPLOIT and stays there).
+        # Detection candidates are ``vuln_candidate`` nodes — a node
+        # type EXPLOIT's ``finding`` flow never reads, so a detection
+        # can never pose as a confirmed finding; HYPOTHESIZE reads
+        # them as candidate leads.
+        nuclei_adapter = self._nuclei_adapter()
+        if nuclei_adapter is not None:
+            executed += self._run_nuclei_adapter(nuclei_adapter,
+                                                 self._web_bases(open_ports))
 
         for tool, argv in self._web_plan(
                 open_ports, use_httpx_adapter=httpx_adapter is not None,
@@ -592,6 +622,73 @@ class ReconActiveSubagent:
                     "base": base[:300],
                     "observations": len(observations),
                     "malformed_lines": malformed,
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
+
+    def _run_nuclei_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered nuclei-probe adapter against each stage-2
+        base URL (Phase 2B.4).
+
+        Returns 1 per base whose run executed. Preparation refusals
+        (out-of-scope base) and execution refusals (no egress, no
+        sandbox) are AUDITED as ``recon_active_adapter_failure`` and
+        skipped — an adapter refusal never fails the state, exactly
+        like a tool failure. Detected matches become ``vuln_candidate``
+        nodes (detection, never confirmation); a clean zero-match run
+        is an honest INCONCLUSIVE result, audited as its own event and
+        never a negative finding.
+        """
+        from .adapter_nuclei import parse_nuclei_json_lines, \
+            record_nuclei_evidence
+
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base)
+            except AdapterError as e:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True)
+            if record.executed:
+                candidates, malformed = parse_nuclei_json_lines(output)
+                record_nuclei_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    candidates=candidates,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_nuclei_adapter",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "candidates": len(candidates),
+                    "malformed_lines": malformed,
+                    # honest classification: a zero-candidate, zero-
+                    # malformed clean run is INCONCLUSIVE (nothing
+                    # detected, nothing proven), never a negative
+                    "outcome": ("detected_candidates"
+                                if candidates else "inconclusive"),
                 })
                 executed += 1
             else:

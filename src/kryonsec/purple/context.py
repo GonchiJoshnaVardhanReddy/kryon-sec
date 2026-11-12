@@ -368,6 +368,14 @@ _SOURCES: tuple[_Source, ...] = (
         weight=3,
     ),
     _Source(
+        key="vuln_candidates",
+        node_type="vuln_candidate",
+        heading="VULN CANDIDATES (nuclei — detection only, never "
+                "confirmation)",
+        fields=("severity_as_reported",),
+        weight=3,
+    ),
+    _Source(
         key="subdomains",
         node_type="subdomain",
         heading="SUBDOMAINS (passive sources)",
