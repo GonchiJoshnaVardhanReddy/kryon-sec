@@ -172,10 +172,36 @@ class SpawnResult:
     stdout: str              # the tool's raw output
     error: str = ""          # spawn/parse failure reason
     truncated: bool = False  # output was bounded
+    # Phase 2B.7: WHY a spawn failed, as a structured kind (set at the
+    # exact decision point that produced the failure — never guessed
+    # later by string-matching). One of the SPAWN_ERROR_KIND_* values;
+    # "" when ok (the tool itself may still have exited nonzero — that
+    # is the TOOL's outcome, not a spawn failure).
+    error_kind: str = ""
 
 
 class SandboxSpawnError(RuntimeError):
     pass
+
+
+# ---- structured spawn-failure kinds (Phase 2B.7) ---------------------------
+# Set at the exact decision point that produced a failed SpawnResult, so
+# callers classify deterministically instead of string-matching later.
+# ``refused_*`` kinds are DETERMINISTIC fail-closed rejections (never
+# retryable); ``sandbox_infrastructure`` means the tool provably never
+# launched (bounded retry is the caller's choice); ``timeout`` means the
+# tool RAN and was killed (never retried — the target was already
+# contacted for the full window).
+
+#: an isolation/egress invariant refused the launch (fail closed)
+SPAWN_ERROR_KIND_INVARIANT = "refused_sandbox_invariant"
+#: the entrypoint refused the tool (not in the image allowlist)
+SPAWN_ERROR_KIND_ALLOWLIST = "refused_allowlist"
+#: the tool ran and exceeded the sandbox timeout (target was contacted)
+SPAWN_ERROR_KIND_TIMEOUT = "timeout"
+#: docker/entrypoint broke before the tool could run — no tool execution
+#: happened, so a bounded caller-side retry touches no new target
+SPAWN_ERROR_KIND_INFRASTRUCTURE = "sandbox_infrastructure"
 
 
 def _seccomp_default() -> Path:
@@ -403,7 +429,8 @@ class KaliSandbox:
                 f"{tool_argv[0]!r}: missing {', '.join(missing)}"
             )
             log.error(error)
-            return SpawnResult(ok=False, exit_code=-1, stdout="", error=error)
+            return SpawnResult(ok=False, exit_code=-1, stdout="", error=error,
+                               error_kind=SPAWN_ERROR_KIND_INVARIANT)
 
         # Egress invariant (Phase 1E): when this engagement carries an
         # egress policy, the launch argv must run on the dedicated
@@ -429,7 +456,8 @@ class KaliSandbox:
                 )
                 log.error(error)
                 return SpawnResult(
-                    ok=False, exit_code=-1, stdout="", error=error)
+                    ok=False, exit_code=-1, stdout="", error=error,
+                    error_kind=SPAWN_ERROR_KIND_INVARIANT)
         elif getattr(self, "egress_policy", None) is not None:
             egress_problems = missing_egress_flags(
                 docker_argv, self.egress_policy, image=self.image)
@@ -446,7 +474,8 @@ class KaliSandbox:
                 )
                 log.error(error)
                 return SpawnResult(
-                    ok=False, exit_code=-1, stdout="", error=error)
+                    ok=False, exit_code=-1, stdout="", error=error,
+                    error_kind=SPAWN_ERROR_KIND_INVARIANT)
 
         try:
             if timeout_s is None:
@@ -466,9 +495,10 @@ class KaliSandbox:
             return SpawnResult(
                 ok=False, exit_code=-1, stdout="",
                 error=f"tool exceeded {timeout}s sandbox timeout",
-            )
+                error_kind=SPAWN_ERROR_KIND_TIMEOUT)
         except Exception as e:
-            return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e))
+            return SpawnResult(ok=False, exit_code=-1, stdout="", error=str(e),
+                               error_kind=SPAWN_ERROR_KIND_INFRASTRUCTURE)
         except BaseException:
             # Ctrl+C during a long scan, or a signal handler raising
             # SystemExit. KeyboardInterrupt/SystemExit derive from
@@ -495,13 +525,18 @@ class KaliSandbox:
                 return SpawnResult(
                     ok=False, exit_code=proc.returncode, stdout="",
                     error=f"no JSON payload from sandbox: {err}",
+                    error_kind=SPAWN_ERROR_KIND_INFRASTRUCTURE,
                 )
 
         if "error" in payload:
             # the entrypoint rejected the tool (not in image allowlist)
+            kind = (SPAWN_ERROR_KIND_ALLOWLIST
+                    if payload["error"] == "tool_not_in_allowlist"
+                    else SPAWN_ERROR_KIND_INFRASTRUCTURE)
             return SpawnResult(
                 ok=False, exit_code=proc.returncode, stdout="",
                 error=str(payload["error"]),
+                error_kind=kind,
             )
 
         stdout = str(payload.get("stdout", ""))

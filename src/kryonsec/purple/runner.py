@@ -391,6 +391,9 @@ def start_engagement(
                 # refused/disabled.
                 adapter_registry=recon_active_registry(),
                 planner=planner,
+                # Phase 2B.7: the same one-line progress channel EXPLOIT
+                # uses — per-adapter redacted start/outcome lines.
+                progress=progress,
             )
             return sub.run
 

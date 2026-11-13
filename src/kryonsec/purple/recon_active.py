@@ -32,12 +32,15 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Callable
 
 from ..config import KryonsecConfig
 from .adapter_httpx import parse_httpx_json_lines, record_httpx_evidence
 from .adapter_whatweb import parse_whatweb_lines, record_whatweb_evidence
 from .adapters import AdapterError, AdapterRegistry, \
-    execute_adapter, prepare_adapter_run
+    classify_adapter_exception, execute_adapter, \
+    failure_explanation, failure_explanation_for_exception, \
+    prepare_adapter_run
 from .allowlist import AllowlistViolation, ToolAllowlist
 from .audit import AuditLog
 from .orchestrator import SubagentResult
@@ -206,6 +209,7 @@ class ReconActiveSubagent:
         allowlist: ToolAllowlist | None = None,
         adapter_registry: "AdapterRegistry | None" = None,
         planner: "ToolPlanner | None" = None,
+        progress: "Callable[[str], None] | None" = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -227,6 +231,17 @@ class ReconActiveSubagent:
         self.planner = planner
         self._plan = None
         self._executed_pairs: "list[tuple[str, str]]" = []
+        # Phase 2B.7: optional redacted execution-progress callback (the
+        # same one-line channel the EXPLOIT subagent uses — the CLI
+        # forwards non-state lines to the UI's notice area). Metadata
+        # only: adapter id, target, attempt outcome — never tool output.
+        self.progress = progress
+        # Phase 2B.7: bounded sandbox-infrastructure retry budget for
+        # adapter spawns (0 disables; execute_adapter caps at 2 attempts
+        # regardless). Only the sandbox_infrastructure class — where the
+        # tool provably never launched — is ever retried.
+        self.spawn_retries = max(0, min(int(getattr(
+            cfg, "adapter_spawn_retries", 1)), 1))
 
     # ---- plan construction (deterministic, no LLM input) -----------------
 
@@ -680,17 +695,27 @@ class ReconActiveSubagent:
                     self.adapter_registry, adapter.adapter_id,
                     target=self.target, target_asset=base)
             except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
                 self.audit.write({
                     "event": "recon_active_adapter_failure",
                     "adapter": adapter.adapter_id,
                     "base": base[:300],
                     "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
                 })
                 continue
             record, output = execute_adapter(
                 self.adapter_registry, prepared,
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
-                full_output=True)
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
             if record.executed:
                 self._plan_record_executed(adapter.adapter_id, base)
                 observations, malformed = parse_httpx_json_lines(output)
@@ -717,6 +742,8 @@ class ReconActiveSubagent:
                     "request_id": record.request_id,
                     "base": base[:300],
                     "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
                     "reason": record.error_excerpt[:200],
                 })
         return executed
@@ -742,17 +769,27 @@ class ReconActiveSubagent:
                     self.adapter_registry, adapter.adapter_id,
                     target=self.target, target_asset=base)
             except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
                 self.audit.write({
                     "event": "recon_active_adapter_failure",
                     "adapter": adapter.adapter_id,
                     "base": base[:300],
                     "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
                 })
                 continue
             record, output = execute_adapter(
                 self.adapter_registry, prepared,
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
-                full_output=True)
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
             if record.executed:
                 self._plan_record_executed(adapter.adapter_id, base)
                 observations, malformed = parse_whatweb_lines(output)
@@ -779,6 +816,8 @@ class ReconActiveSubagent:
                     "request_id": record.request_id,
                     "base": base[:300],
                     "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
                     "reason": record.error_excerpt[:200],
                 })
         return executed
@@ -806,17 +845,27 @@ class ReconActiveSubagent:
                     self.adapter_registry, adapter.adapter_id,
                     target=self.target, target_asset=base)
             except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
                 self.audit.write({
                     "event": "recon_active_adapter_failure",
                     "adapter": adapter.adapter_id,
                     "base": base[:300],
                     "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
                 })
                 continue
             record, output = execute_adapter(
                 self.adapter_registry, prepared,
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
-                full_output=True)
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
             if record.executed:
                 self._plan_record_executed(adapter.adapter_id, base)
                 candidates, malformed = parse_nuclei_json_lines(output)
@@ -848,6 +897,8 @@ class ReconActiveSubagent:
                     "request_id": record.request_id,
                     "base": base[:300],
                     "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
                     "reason": record.error_excerpt[:200],
                 })
         return executed
@@ -877,17 +928,27 @@ class ReconActiveSubagent:
                     self.adapter_registry, adapter.adapter_id,
                     target=self.target, target_asset=base)
             except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
                 self.audit.write({
                     "event": "recon_active_adapter_failure",
                     "adapter": adapter.adapter_id,
                     "base": base[:300],
                     "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
                 })
                 continue
             record, output = execute_adapter(
                 self.adapter_registry, prepared,
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
-                full_output=True)
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
             if record.executed:
                 self._plan_record_executed(adapter.adapter_id, base)
                 run, malformed = parse_tls_probe_payload(output)
@@ -920,6 +981,8 @@ class ReconActiveSubagent:
                     "request_id": record.request_id,
                     "base": base[:300],
                     "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
                     "reason": record.error_excerpt[:200],
                 })
         return executed
@@ -949,17 +1012,27 @@ class ReconActiveSubagent:
                     self.adapter_registry, adapter.adapter_id,
                     target=self.target, target_asset=base)
             except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
                 self.audit.write({
                     "event": "recon_active_adapter_failure",
                     "adapter": adapter.adapter_id,
                     "base": base[:300],
                     "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
                 })
                 continue
             record, output = execute_adapter(
                 self.adapter_registry, prepared,
                 sandbox=self.sandbox, audit=self.audit, graph=self.graph,
-                full_output=True)
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
             if record.executed:
                 self._plan_record_executed(adapter.adapter_id, base)
                 run, malformed = parse_api_probe_payload(output)
@@ -990,6 +1063,8 @@ class ReconActiveSubagent:
                     "request_id": record.request_id,
                     "base": base[:300],
                     "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
                     "reason": record.error_excerpt[:200],
                 })
         return executed

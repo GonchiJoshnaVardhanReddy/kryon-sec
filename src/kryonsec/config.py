@@ -349,6 +349,18 @@ class KryonsecConfig:
         ).strip().lower() in ("1", "true", "yes", "on"),
     )
 
+    # --- Adapter spawn retry budget (Phase 2B.7) ---
+    # How many EXTRA attempts a RECON_ACTIVE adapter spawn gets when it
+    # fails with the ``sandbox_infrastructure`` class — the sandbox or
+    # daemon failed BEFORE the tool launched, so no target was contacted
+    # and a retry touches no new target. Only that class is ever
+    # retried: refusals are deterministic policy, and timeouts/tool
+    # failures already reached the target. The engine hard-caps attempts
+    # at two total regardless of this value; 0 disables retrying.
+    # TOML only ([adapters] spawn_retries) — no env override, this is an
+    # operator tuning knob, not a deployment switch.
+    adapter_spawn_retries: int = field(default=1)
+
     # ---- TOML (de)serialization -----------------------------------------
 
     def to_toml_dict(self) -> dict:
@@ -402,6 +414,9 @@ class KryonsecConfig:
             "tool_planner": {
                 "enabled": self.tool_planner_enabled,
             },
+            "adapters": {
+                "spawn_retries": self.adapter_spawn_retries,
+            },
             "api": {
                 "shodan_api_key": self.shodan_api_key or "",
                 "censys_api_id": self.censys_api_id or "",
@@ -431,6 +446,7 @@ class KryonsecConfig:
         limits = data.get("limits", {})
         sandbox = data.get("sandbox", {})
         planner = data.get("tool_planner", {})
+        adapters_cfg = data.get("adapters", {})
         api = data.get("api", {})
         license_ = data.get("license", {})
 
@@ -493,6 +509,12 @@ class KryonsecConfig:
                 str(r) for r in sandbox["zone_b_dns_resolvers"]]
         if "enabled" in planner:
             cfg.tool_planner_enabled = bool(planner["enabled"])
+        # Phase 2B.7 adapter retry budget (stored raw except that a
+        # negative value is nonsense; the engine still caps attempts at
+        # two total, so a larger number stays a single retry)
+        if "spawn_retries" in adapters_cfg:
+            cfg.adapter_spawn_retries = max(
+                0, int(adapters_cfg["spawn_retries"]))
         if api.get("shodan_api_key"):
             cfg.shodan_api_key = api["shodan_api_key"]
         if api.get("censys_api_id"):

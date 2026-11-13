@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Any, Callable, Literal
 
@@ -62,6 +63,9 @@ from .exploit import compose_url
 from .lineage import link
 from .orchestrator import STATES
 from .recon_passive import EngagementGraph
+from .sandbox import SPAWN_ERROR_KIND_ALLOWLIST, \
+    SPAWN_ERROR_KIND_INFRASTRUCTURE, SPAWN_ERROR_KIND_INVARIANT, \
+    SPAWN_ERROR_KIND_TIMEOUT
 
 log = logging.getLogger(__name__)
 
@@ -610,6 +614,14 @@ class AdapterRunRecord(BaseModel):
     error_excerpt: str = ""
     truncated: bool = False
     evidence_kind: str
+    # Phase 2B.7: WHY a non-executed/failed attempt failed, as one of the
+    # ADAPTER_FAILURE_* classes below — classified at the decision point
+    # that produced it, never guessed from text after the fact. "" when
+    # the attempt executed (the tool's own result is the outcome field).
+    failure_class: str = ""
+    #: wall-clock seconds the attempt took (spawn + tool), 0.0 when the
+    #: attempt was refused before any spawn
+    duration_s: float = 0.0
     untrusted: Literal[True] = True
     verification: Literal["not_verified"] = "not_verified"
 
@@ -658,6 +670,123 @@ def _excerpt(text: str, bound: int) -> str:
     return redacted
 
 
+# ---- failure classification (Phase 2B.7) ------------------------------------
+# Deterministic classes set at the decision point that PRODUCED the
+# failure — the same discipline as the sandbox's error_kind. No string
+# matching against tool output; the class travels on the record, the
+# audit event and the adapter_attempt node.
+
+#: Gate 3 / hypothesis gate did not authorize the run
+ADAPTER_FAILURE_REFUSED_APPROVAL = "refused_approval"
+#: scope validation, or the sandbox/egress boundary is absent — the
+#: run was never authorized under the current policy
+ADAPTER_FAILURE_REFUSED_POLICY = "refused_policy"
+#: the sandbox image's entrypoint refused the executable
+ADAPTER_FAILURE_REFUSED_ALLOWLIST = "refused_allowlist"
+#: a launch invariant (isolation/egress/network-none) refused the launch
+ADAPTER_FAILURE_REFUSED_INVARIANT = "refused_sandbox_invariant"
+#: the sandbox/daemon broke BEFORE the tool ran — no target contact,
+#: so this is the only failure class eligible for a bounded retry
+ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE = "sandbox_infrastructure"
+#: the tool ran for its whole window and was killed by the timeout —
+#: the target WAS contacted; never retried automatically
+ADAPTER_FAILURE_TIMEOUT = "timeout"
+#: the tool ran and exited nonzero — a real tool result, never retried
+ADAPTER_FAILURE_TOOL_FAILURE = "tool_failure"
+
+_RETRYABLE_FAILURE_CLASSES = frozenset({
+    ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE,
+})
+
+_FAILURE_EXPLANATIONS: dict[str, str] = {
+    ADAPTER_FAILURE_REFUSED_APPROVAL:
+        "not run: the required approval gate was not granted",
+    ADAPTER_FAILURE_REFUSED_POLICY:
+        "not run: the current policy (scope, egress or sandbox "
+        "availability) does not authorize this attempt",
+    ADAPTER_FAILURE_REFUSED_ALLOWLIST:
+        "not run: the sandbox image's executable allowlist rejected "
+        "the tool",
+    ADAPTER_FAILURE_REFUSED_INVARIANT:
+        "not run: a sandbox isolation/egress invariant refused the "
+        "launch (fail closed)",
+    ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE:
+        "not run: the sandbox or container daemon failed before the "
+        "tool could launch — no target was contacted",
+    ADAPTER_FAILURE_TIMEOUT:
+        "failed: the tool ran for its whole time window and was "
+        "killed by the sandbox timeout",
+    ADAPTER_FAILURE_TOOL_FAILURE:
+        "failed: the tool ran and exited with an error",
+}
+
+
+def failure_explanation(record: "AdapterRunRecord") -> str:
+    """The operator-facing one-line explanation for a record's failure
+    class. Deterministic text per class (plus the raw excerpt when the
+    caller wants detail) — never a guess, never tool output."""
+    if not record.failure_class:
+        return ""
+    base = _FAILURE_EXPLANATIONS.get(record.failure_class,
+                                     f"failed ({record.failure_class})")
+    if record.failure_class in _RETRYABLE_FAILURE_CLASSES or \
+            record.failure_class == ADAPTER_FAILURE_TIMEOUT:
+        return f"{base} ({record.error_excerpt[:160]})" \
+            if record.error_excerpt else base
+    return base
+
+
+def classify_adapter_exception(exc: "BaseException") -> str:
+    """The failure class for a prepare-time adapter exception (the lane
+    catch of AdapterError). Deterministic by exception type."""
+    if isinstance(exc, AdapterScopeRefused):
+        return ADAPTER_FAILURE_REFUSED_POLICY
+    if isinstance(exc, AdapterNotRegistered):
+        return ADAPTER_FAILURE_REFUSED_POLICY
+    if isinstance(exc, AdapterError):
+        return ADAPTER_FAILURE_REFUSED_POLICY
+    return ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE
+
+
+def failure_explanation_for_exception(exc: "BaseException") -> str:
+    """The operator-facing one-line explanation for a prepare-time
+    adapter exception — the same deterministic text the record path
+    uses, for lanes that announce a refusal before any attempt."""
+    return _FAILURE_EXPLANATIONS.get(
+        classify_adapter_exception(exc), "failed")
+
+
+def _classify_spawn_result(result: Any,
+                           adapter: "ModeBToolAdapter") -> str:
+    """The failure class for a non-ok SpawnResult.
+
+    Structured first (error_kind set by the sandbox at the decision
+    point); a duck-typed fallback (fakes in tests and any sandbox built
+    before the field) maps the sandbox's own stable error strings —
+    still deterministic, never tool output.
+    """
+    kind = getattr(result, "error_kind", "") or ""
+    if kind == SPAWN_ERROR_KIND_INVARIANT:
+        return ADAPTER_FAILURE_REFUSED_INVARIANT
+    if kind == SPAWN_ERROR_KIND_ALLOWLIST:
+        return ADAPTER_FAILURE_REFUSED_ALLOWLIST
+    if kind == SPAWN_ERROR_KIND_TIMEOUT:
+        return ADAPTER_FAILURE_TIMEOUT
+    if kind == SPAWN_ERROR_KIND_INFRASTRUCTURE:
+        return ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE
+    # fallback for result objects without error_kind: the sandbox's
+    # error strings are its own stable protocol, not tool output
+    error = str(getattr(result, "error", "") or "")
+    if f"exceeded {adapter.max_seconds}s sandbox timeout" in error or \
+            "sandbox timeout" in error:
+        return ADAPTER_FAILURE_TIMEOUT
+    if "tool_not_in_allowlist" in error:
+        return ADAPTER_FAILURE_REFUSED_ALLOWLIST
+    if "invariant broken" in error or "refusing to launch" in error:
+        return ADAPTER_FAILURE_REFUSED_INVARIANT
+    return ADAPTER_FAILURE_SANDBOX_INFRASTRUCTURE
+
+
 def execute_adapter(
     registry: AdapterRegistry,
     prepared: PreparedAdapterRun,
@@ -668,6 +797,8 @@ def execute_adapter(
     hypothesis_id: str = "",
     approvals_granted: "frozenset[str] | set[str] | None" = None,
     full_output: bool = False,
+    max_spawn_attempts: int = 1,
+    progress: "Callable[[str], None] | None" = None,
 ) -> "AdapterRunRecord | tuple[AdapterRunRecord, str]":
     """Run one prepared adapter request through the sandbox.
 
@@ -683,6 +814,21 @@ def execute_adapter(
     stays bounded exactly as before). Callers that need to PARSE the
     output (e.g. the httpx-probe JSONL reader) request it; untrusted
     data, same rules.
+
+    Phase 2B.7 additions:
+    - every record carries a structured ``failure_class`` (set at the
+      decision point that produced it) and the attempt's wall-clock
+      ``duration_s``;
+    - ``max_spawn_attempts`` > 1 enables ONE bounded retry — and ONLY
+      for the ``sandbox_infrastructure`` class, where the sandbox or
+      daemon provably failed before the tool launched, so no target was
+      contacted and a retry touches no new target. Refusals, timeouts
+      and tool failures are NEVER retried (the refusal is deterministic
+      policy; the other two already reached the target). Every retry is
+      audited with its own fresh request_id, re-validated by the SAME
+      sandbox path (egress, isolation, caps all re-enforced);
+    - ``progress`` optionally receives one redacted one-line string per
+      attempt outcome (metadata only — never tool output).
     """
     denied_reasons: list[str] = []
     try:
@@ -724,11 +870,16 @@ def execute_adapter(
             "is never a fallback for Mode B")
     if denied_reasons:
         reason = "; ".join(denied_reasons)
+        failure_class = (
+            ADAPTER_FAILURE_REFUSED_APPROVAL
+            if "approval gate" in reason
+            else ADAPTER_FAILURE_REFUSED_POLICY)
         audit.write({
             "event": "adapter_refused",
             "adapter_id": adapter.adapter_id,
             "request_id": prepared.request_id,
             "reason": reason,
+            "failure_class": failure_class,
         })
         log.warning("adapter %s refused: %s", adapter.adapter_id, reason)
         record = AdapterRunRecord(
@@ -742,6 +893,7 @@ def execute_adapter(
             outcome="refused",
             error_excerpt=reason[:_EXCERPT_CHARS],
             evidence_kind=adapter.evidence_kind,
+            failure_class=failure_class,
         )
         return (record, "") if full_output else record
 
@@ -762,6 +914,7 @@ def execute_adapter(
                 "adapter_id": adapter.adapter_id,
                 "request_id": prepared.request_id,
                 "reason": reason,
+                "failure_class": ADAPTER_FAILURE_REFUSED_APPROVAL,
             })
             record = AdapterRunRecord(
                 adapter_id=adapter.adapter_id,
@@ -774,34 +927,86 @@ def execute_adapter(
                 outcome="refused",
                 error_excerpt=reason[:_EXCERPT_CHARS],
                 evidence_kind=adapter.evidence_kind,
+                failure_class=ADAPTER_FAILURE_REFUSED_APPROVAL,
             )
             return (record, "") if full_output else record
 
-    audit.write({
-        "event": "adapter_spawn",
-        "adapter_id": adapter.adapter_id,
-        "request_id": prepared.request_id,
-        "argv": list(prepared.argv),
-        "target": prepared.target,
-        "network": adapter.network,
-    })
+    attempts_left = max(1, int(max_spawn_attempts))
+    if attempts_left > 2:
+        # the hard cap: at most ONE retry (two attempts total). A bounded
+        # infra retry must never become a retry loop.
+        attempts_left = 2
+    started = time.monotonic()
+    failure_class = ""
+    while True:
+        if progress is not None:
+            progress(f"{adapter.adapter_id} → {prepared.target}")
+        audit.write({
+            "event": "adapter_spawn",
+            "adapter_id": adapter.adapter_id,
+            "request_id": prepared.request_id,
+            "argv": list(prepared.argv),
+            "target": prepared.target,
+            "network": adapter.network,
+        })
 
-    result = sandbox.spawn(list(prepared.argv),
-                           timeout_s=adapter.max_seconds,
-                           **({"network_mode": "none"}
-                              if adapter.network == "none" else {}))
+        result = sandbox.spawn(list(prepared.argv),
+                               timeout_s=adapter.max_seconds,
+                               **({"network_mode": "none"}
+                                  if adapter.network == "none" else {}))
 
-    error_excerpt = _excerpt(result.error or "", _EXCERPT_CHARS)
-    audit.write({
-        "event": "adapter_result",
-        "adapter_id": adapter.adapter_id,
-        "request_id": prepared.request_id,
-        "ok": result.ok,
-        "exit_code": result.exit_code,
-        "output_chars": len(result.stdout or ""),
-        "truncated": result.truncated,
-        "error": error_excerpt,
-    })
+        error_excerpt = _excerpt(result.error or "", _EXCERPT_CHARS)
+        audit.write({
+            "event": "adapter_result",
+            "adapter_id": adapter.adapter_id,
+            "request_id": prepared.request_id,
+            "ok": result.ok,
+            "exit_code": result.exit_code,
+            "output_chars": len(result.stdout or ""),
+            "truncated": result.truncated,
+            "error": error_excerpt,
+        })
+        if result.ok:
+            failure_class = ""
+            break
+        failure_class = _classify_spawn_result(result, adapter)
+        if failure_class in _RETRYABLE_FAILURE_CLASSES and \
+                attempts_left > 1:
+            # Phase 2B.7: the ONLY retryable class. The sandbox or
+            # daemon failed BEFORE the tool launched — no target was
+            # contacted, so one fresh attempt touches no new target.
+            # The retry re-enters the SAME sandbox path (isolation,
+            # egress, caps all re-enforced) under a fresh request_id,
+            # and the retry itself is audited.
+            attempts_left -= 1
+            retry_request_id = uuid.uuid4().hex
+            audit.write({
+                "event": "adapter_infra_retry",
+                "adapter_id": adapter.adapter_id,
+                "request_id": prepared.request_id,
+                "retry_request_id": retry_request_id,
+                "failure_class": failure_class,
+                "reason": error_excerpt[:200],
+            })
+            log.warning("adapter %s: sandbox infrastructure failure, "
+                        "retrying once as %s", adapter.adapter_id,
+                        retry_request_id)
+            prepared = prepared.model_copy(
+                update={"request_id": retry_request_id})
+            continue
+        break
+    duration_s = max(0.0, time.monotonic() - started)
+
+    if progress is not None:
+        if result.ok:
+            progress(f"{adapter.adapter_id} ← {prepared.target} "
+                     f"(exit {int(result.exit_code)}, "
+                     f"{duration_s:.0f}s)")
+        else:
+            explanation = _FAILURE_EXPLANATIONS.get(
+                failure_class, f"failed ({failure_class})")
+            progress(f"{adapter.adapter_id} ✗ {prepared.target}: "
+                     f"{explanation}")
 
     record = AdapterRunRecord(
         adapter_id=adapter.adapter_id,
@@ -820,6 +1025,8 @@ def execute_adapter(
         error_excerpt=error_excerpt,
         truncated=bool(result.truncated),
         evidence_kind=adapter.evidence_kind,
+        failure_class=failure_class,
+        duration_s=round(duration_s, 3),
     )
 
     # evidence persists ONLY when a run actually happened (refusals are
