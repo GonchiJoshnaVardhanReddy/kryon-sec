@@ -244,5 +244,45 @@ RUN mkdir -p /evidence && chown kryonsec-runner:kryonsec-runner /evidence
 
 COPY containers/sandbox/entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
+
+# REQUIRED-tool verification (v1.3.11). If ANY of these is absent the
+# build FAILS — a release image that silently lost a required tool ships
+# a dead Mode B behind a digest that looks valid.
+#
+#   REQUIRED = the six vetted Mode B adapters (httpx-toolkit, whatweb,
+#   searchsploit, nuclei, /usr/bin/testssl, python3), the entrypoint's
+#   own helpers (jq/timeout/python3 — missing jq or timeout breaks EVERY
+#   tool run, not one capability), and the legacy EXPLOIT/verify lane's
+#   frozen-argv core tools + wordlists (all guaranteed by the core apt
+#   block above; asserted for free so the requirement stays true even if
+#   that block is ever loosened).
+#
+#   OPTIONAL (deliberately NOT in this list) = checkov, graphql-cop,
+#   semgrep, hadolint, kube-bench and the other best-effort extended /
+#   GitHub / PyPI tools: Kali does not package some of them and the PyPI
+#   / GitHub fetches are best-effort. Their absence is an audited spawn
+#   failure inside the sandbox — never a silent security hole — so a
+#   mirror hiccup may not fail a release build over them.
+RUN set -eu; \
+    missing=""; \
+    check_cmd() { command -v "$1" >/dev/null 2>&1 || missing="$missing $1"; }; \
+    check_file() { test -e "$1" || missing="$missing $1"; }; \
+    check_cmd httpx-toolkit; check_cmd whatweb; check_cmd searchsploit; \
+    check_cmd nuclei; check_cmd python3; check_file /usr/bin/testssl; \
+    check_cmd jq; check_cmd timeout; \
+    check_cmd nmap; check_cmd sqlmap; check_cmd nikto; check_cmd gobuster; \
+    check_cmd ffuf; check_cmd curl; check_cmd wget; check_cmd openssl; \
+    check_cmd dig; check_cmd nc; \
+    check_file /usr/share/seclists/Discovery/Web-Content/common.txt; \
+    check_file /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt; \
+    check_file /usr/share/seclists/Miscellaneous/dns-resolvers.txt; \
+    check_file /opt/kryonsec/tls_probe.py; \
+    check_file /opt/kryonsec/api_probe.py; \
+    check_file /opt/kryonsec/nuclei_gate.py; \
+    check_file /opt/kryonsec/nuclei_manifest.json; \
+    check_file /opt/nuclei-templates/.kryonsec-commit; \
+    [ -z "$missing" ] || { echo "FATAL: required tools/files missing:$missing"; exit 1; }; \
+    echo "required tools verified: 6 Mode B adapters + entrypoint helpers + EXPLOIT core"
+
 ENTRYPOINT ["/entrypoint.sh"]
 USER kryonsec-runner

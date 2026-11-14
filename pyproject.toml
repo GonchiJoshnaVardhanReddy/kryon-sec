@@ -41,10 +41,17 @@ where = ["src"]
 kryonsec = [
     "templates/*.jinja",
     "containers/*.json",
-    # The nuclei template manifest (Phase 2B.8) is the reviewed,
-    # hash-pinned allowlist the adapter loads from the package — it
-    # MUST ship in the wheel or Nuclei execution refuses to enable.
-    "nuclei_manifest.json",
+    # The nuclei template manifest (Phase 2B.8) is the reviewed, hash-pinned
+    # allowlist the adapter loads from the package — it MUST ship in the
+    # wheel or Nuclei execution refuses to enable. It lives in the purple
+    # subpackage (adapter_nuclei.py resolves it next to itself via
+    # __file__), so the pattern carries the DIRECTORY: a bare
+    # "nuclei_manifest.json" here resolves against src/kryonsec/ and
+    # matches nothing — v1.3.10's wheel shipped without the manifest and a
+    # wheel-installed RECON_ACTIVE raised NucleiPolicyError (fail-closed;
+    # caught in the v1.3.11 release preflight, guarded by
+    # tests/test_packaging.py).
+    "purple/nuclei_manifest.json",
     # The memory browser's page, style and scripts, plus the brand mark and
     # the two fonts it serves. These must ship in the wheel: `kryonsec memory`
     # reads them off disk at request time, and a wheel without them would
