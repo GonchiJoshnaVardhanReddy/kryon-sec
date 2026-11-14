@@ -8,7 +8,8 @@ Kryonsec is a single-user CLI cybersecurity platform with two modes:
 - **Mode B — Purple Team:** deterministic 10-state loop + terminal HALT penetration
   testing engine. Requires Linux + Docker + gVisor (WSL2 works).
 
-The dev machine is **Windows 11**. Purple Team tool execution must never be attempted
+The dev machines are **Omarchy / Arch Linux** (primary) and **Windows 11**
+(Copilot mode only). Purple Team tool execution must never be attempted
 on the Windows host — it is gated behind a `kryonsec doctor` runtime check.
 
 ## Authoritative documents
@@ -38,7 +39,10 @@ on the Windows host — it is gated behind a `kryonsec doctor` runtime check.
    socket proxy with endpoint allowlisting; sandbox image is pinned by digest.
 8. **Audit chain:** append-only JSONL, SHA256 chained, hashes computed over
    canonical JSON (sorted keys, separators) — the same serialization that is
-   written to disk. Head hash is anchored periodically (WORM object + stdout).
+   written to disk. The head hash is displayed at engagement end (report +
+   CLI) and patched into the report as its fingerprint; periodic WORM-object
+   anchoring of the head is **planned, not implemented** — never describe it
+   as done.
 9. Purple Team is Linux-only. `kryonsec doctor` checks Docker, `runsc` runtime,
    pinned image, and refuses to start Mode B otherwise.
 10. **Mode B tool execution is Docker-only.** Every Purple security-tool
@@ -86,3 +90,35 @@ on the Windows host — it is gated behind a `kryonsec doctor` runtime check.
 ## User preference
 The user prefers communication in **simple, plain English**. Ask questions in
 simple words before big decisions. Don't over-explain; deliver working software.
+
+## Project memory (Obsidian vault)
+A durable second project memory lives at
+`~/Documents/Obsidian Vault/Kryonsec/` (Obsidian notes, NOT part of the app —
+never a dependency, never committed to this repo).
+
+**At the START of every task:**
+1. Read `Memory/Current-State.md` and `Memory/Agent-Handoff.md` from the vault.
+2. Read the vault notes relevant to the task (Architecture/, Security/, Tools/).
+3. Reconcile against the real repo state (`git fetch`, `git log`, `git status`) —
+   vault notes can go stale; the repository is the source of truth.
+
+**At the END of every task:**
+1. Update `Memory/Current-State.md` and `Memory/Agent-Handoff.md` with what
+   changed, the commit SHA, test results, and the next task.
+2. Append new architectural decisions to `Memory/Decision-Log.md`.
+3. Update the affected Architecture/Security/Tools notes with a fresh
+   `verified:` date and commit.
+4. Log the session in `Logs/README.md`; save the task prompt in `Prompts/`.
+
+**Vault rules:**
+- Never commit the vault; never stage it in this repo.
+- Never store credentials, tokens, real target evidence, engagement records,
+  or client data in it — sanitized facts and file references only.
+- Obsidian is developer workflow support only. It is not the Kryonsec
+  engagement memory, not an MCP server, and not visible to the product.
+
+## Current status pointer
+Live status, test snapshots, and the release state (v1.3.11 preflight-ready,
+NOT published) are maintained in the vault's `Memory/Current-State.md` and in
+`CHANGELOG.md` / `README.md` here. Verify against the repo before trusting
+either.
