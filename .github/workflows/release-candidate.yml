@@ -1,0 +1,326 @@
+name: release-candidate
+
+# STAGE A of the two-stage release process (see RELEASING.md).
+#
+# Builds the release wheel and the Zone B sandbox image from ONE exact commit
+# and stores them as restricted workflow artifacts plus a provenance record.
+# It NEVER creates a tag, never publishes a GitHub Release, and never moves
+# the GHCR `latest` pointer — production publication happens only in
+# release-promote.yml (Stage B) behind the protected `release-production`
+# environment, after the owner approves the exact artifact hashes.
+#
+# Deliberately NOT triggered by v* tag pushes: an ordinary tag push must not
+# be able to publish or move anything. A manually pushed v* tag trips
+# release-guard.yml with a loud error instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Kryonsec version to stage (e.g. 1.3.11; must match pyproject.toml)"
+        required: true
+        type: string
+      ref:
+        description: "Exact commit SHA to build from (leave empty for main HEAD; a SHA is strongly preferred so every job builds identical source)"
+        required: false
+        default: ""
+        type: string
+      push_staging_image:
+        description: >-
+          Push the candidate image to GHCR as :staging-<version>. The package
+          is publicly pullable; the staging tag must be disclosed to and
+          approved by the owner before this run. false keeps the image
+          artifact-only (Stage B image promotion then requires a later run
+          with the staging push).
+        required: false
+        default: "true"
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    if: github.repository == 'GonchiJoshnaVardhanReddy/kryon-sec'
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      wheel_sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Record the source commit
+        id: src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Version guard
+        run: |
+          PYPROJECT_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' pyproject.toml)"
+          if [ "$PYPROJECT_VERSION" != "${{ inputs.version }}" ]; then
+            echo "::error::pyproject.toml version '$PYPROJECT_VERSION' does not match the staged version '${{ inputs.version }}'"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --quiet --upgrade build
+          python -m build --wheel
+
+      - name: Verify the wheel (name, manifest, templates, no stray paths)
+        run: |
+          WHEEL=$(ls dist/*.whl)
+          echo "built: $WHEEL"
+          case "$WHEEL" in
+            *"-${{ inputs.version }}-"*) : ;;
+            *) echo "::error::$WHEEL does not carry version ${{ inputs.version }}"; exit 1 ;;
+          esac
+          python -m zipfile -l "$WHEEL" > /tmp/contents.txt
+          grep -q "kryonsec/purple/nuclei_manifest.json" /tmp/contents.txt || {
+            echo "::error::nuclei_manifest.json is missing from the wheel"; exit 1; }
+          grep -q "kryonsec/templates/" /tmp/contents.txt || {
+            echo "::error::Jinja2 templates are missing from the wheel"; exit 1; }
+          if grep -Eq "(^|/)(build/lib|\.git|engagements)(/|$)" /tmp/contents.txt; then
+            echo "::error::unexpected paths packaged in the wheel:"
+            grep -E "(^|/)(build/lib|\.git|engagements)(/|$)" /tmp/contents.txt
+            exit 1
+          fi
+
+      - name: Packaging tests against this tree
+        run: |
+          python -m pip install --quiet -e ".[dev]"
+          python -m pytest -q tests/test_packaging.py
+
+      - name: Wheel SHA-256
+        id: hash
+        run: |
+          SHA="$(sha256sum dist/*.whl | awk '{print $1}')"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "wheel sha256: $SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ inputs.version }}
+          path: dist/*.whl
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "## Candidate wheel (Stage A — NOT published)"
+            echo ""
+            echo "- source commit: \`${{ steps.src.outputs.sha }}\`"
+            echo "- wheel sha256: \`${{ steps.hash.outputs.sha256 }}\`"
+            echo "- artifact: \`wheel-${{ inputs.version }}\` (restricted, 14-day retention)"
+            echo ""
+            echo "No tag was created and no release was published. Promotion"
+            echo "happens only via release-promote.yml after owner approval."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    runs-on: ubuntu-latest
+    if: github.repository == 'GonchiJoshnaVardhanReddy/kryon-sec'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: python -m pip install --quiet -e ".[dev]"
+
+      # The env-gated Docker/gVisor lab tier is skipped by design on shared
+      # runners; the real-gVisor evidence comes from the local lab runs
+      # recorded in the release preflight and from R5 post-staging validation.
+      - name: Run the suite
+        run: python -m pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    if: github.repository == 'GonchiJoshnaVardhanReddy/kryon-sec'
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      image_digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Record the source commit
+        id: src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Kali + ~50 tools is a large image; the runner's default 14 GB disk has
+      # exhausted itself on this build before. Drop toolchains we don't use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          docker image prune -af || true
+          df -h /
+
+      - name: Compute lowercased image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kryonsec-sandbox" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the candidate tag
+        id: tag
+        run: |
+          if [ "${{ inputs.push_staging_image }}" = "true" ]; then
+            echo "tag=${{ steps.img.outputs.name }}:staging-${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=kryonsec/sandbox:candidate" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR (staging push only)
+        if: inputs.push_staging_image
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The Dockerfile's required-tool guard fails this build if any required
+      # adapter executable, entrypoint helper, EXPLOIT/VERIFY core tool or
+      # frozen-argv wordlist is missing — a silent tool loss cannot build.
+      - name: Build the candidate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: containers/sandbox/Dockerfile.kali
+          build-args: |
+            KRYONSEC_VERSION=v${{ inputs.version }}
+          load: true
+          push: ${{ inputs.push_staging_image }}
+          tags: ${{ steps.tag.outputs.tag }}
+
+      - name: Tool inventory (record versions; assert the required set)
+        run: |
+          set -o pipefail
+          OUT="$(mktemp)"
+          docker run --rm --network none --entrypoint /bin/sh \
+            "${{ steps.tag.outputs.tag }}" -c '
+              for t in nmap naabu dnsx httpx httpx-toolkit whatweb katana hakrawler \
+                       feroxbuster massdns gowitness sslscan testssl.sh nuclei sqlmap \
+                       nikto ffuf gobuster wfuzz dalfox commix ssrfmap arjun tplmap \
+                       graphql-cop jwt_tool kr searchsploit curl wget dig nc ncat \
+                       openssl http jq timeout python3; do
+                if command -v "$t" >/dev/null 2>&1; then
+                  printf "%-16s %s\n" "$t" present
+                else
+                  printf "%-16s %s\n" "$t" MISSING
+                fi
+              done
+              nuclei --version 2>/dev/null | head -1 || true
+              testssl.sh --version 2>/dev/null | head -1 || true
+              nmap --version 2>/dev/null | head -1 || true
+              python3 --version 2>/dev/null || true
+            ' | tee "$OUT"
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          for REQUIRED in httpx whatweb testssl.sh nuclei searchsploit jq timeout python3; do
+            grep -q "^${REQUIRED} *present$" "$OUT" || {
+              echo "::error::required tool missing from the built image: $REQUIRED"; exit 1; }
+          done
+          for BAKED in api_probe.py tls_probe.py nuclei_gate.py probe.py; do
+            docker run --rm --network none --entrypoint /bin/sh \
+              "${{ steps.tag.outputs.tag }}" -c "test -r /opt/kryonsec/$BAKED" || {
+              echo "::error::baked script missing from the built image: $BAKED"; exit 1; }
+          done
+
+      - name: Record the candidate digest
+        id: digest
+        run: |
+          if [ "${{ inputs.push_staging_image }}" = "true" ]; then
+            docker pull "${{ steps.tag.outputs.tag }}" >/dev/null
+            D="$(docker image inspect "${{ steps.tag.outputs.tag }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+            echo "digest=$D" >> "$GITHUB_OUTPUT"
+            echo "staging image digest: $D"
+          else
+            echo "digest=none-staging-push-disabled" >> "$GITHUB_OUTPUT"
+            echo "::warning::staging push disabled — no registry digest; Stage B image promotion requires a run with the staging push"
+          fi
+
+      - name: Save the image for restricted-artifact storage
+        run: docker save "${{ steps.tag.outputs.tag }}" | gzip > /tmp/sandbox-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-image-${{ inputs.version }}
+          path: /tmp/sandbox-image.tar.gz
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "## Candidate image (Stage A — NOT published)"
+            echo ""
+            echo "- source commit: \`${{ steps.src.outputs.sha }}\`"
+            echo "- built tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- digest: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- artifact: \`sandbox-image-${{ inputs.version }}\` (restricted, 14-day retention)"
+            if [ "${{ inputs.push_staging_image }}" = "true" ]; then
+              echo ""
+              echo "The staging tag \`:staging-${{ inputs.version }}\` is now on the"
+              echo "public GHCR package (disclosed, owner-approved opt-in). It is"
+              echo "NOT \`latest\` and NOT the production version tag."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provenance:
+    runs-on: ubuntu-latest
+    needs: [wheel, tests, image]
+    steps:
+      - name: Same-source check
+        run: |
+          W="${{ needs.wheel.outputs.sha }}"
+          I="${{ needs.image.outputs.sha }}"
+          if [ "$W" != "$I" ]; then
+            echo "::error::provenance mismatch: wheel built from $W but image from $I"
+            exit 1
+          fi
+
+      - name: Write the provenance record
+        run: |
+          {
+            echo "version=${{ inputs.version }}"
+            echo "source_commit=${{ needs.wheel.outputs.sha }}"
+            echo "wheel_sha256=${{ needs.wheel.outputs.wheel_sha256 }}"
+            echo "image_digest=${{ needs.image.outputs.image_digest }}"
+            echo "pytest_matrix=${{ needs.tests.result }}"
+            echo "staging_image_tag=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kryonsec-sandbox:staging-${{ inputs.version }}"
+            echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "note=Stage A candidate; not a release; promotion only via release-promote.yml after owner approval"
+          } > provenance.txt
+          cat provenance.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: provenance-${{ inputs.version }}
+          path: provenance.txt
+          retention-days: 14
+          if-no-files-found: error

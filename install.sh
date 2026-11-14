@@ -823,12 +823,14 @@ if [ "$PURPLE_REQUESTED" = "1" ]; then
     say "gVisor (runsc) is registered with the selected Docker daemon"
 fi
 
-# Registry image published by .github/workflows/sandbox-image.yml on every
-# release tag. Pulling is the only path: ready-made layers download in
-# parallel and resume on failure, where a local build downloaded ~50 tools
-# (~2 GB) inside a Docker build and took 30+ min on a slow link. That build
-# path needed the repository sources, which are no longer public, so it is
-# gone rather than left in place to fail confusingly.
+# Registry image published by .github/workflows/release-promote.yml (Stage B
+# of the two-stage release process described in RELEASING.md): the validated
+# candidate is promoted to :v<version> by digest when the release is published.
+# Pulling is the only path: ready-made layers download in parallel and resume
+# on failure, where a local build downloaded ~50 tools (~2 GB) inside a Docker
+# build and took 30+ min on a slow link — so the local-build path was removed
+# rather than left in place to fail confusingly. (The source repo is public;
+# pulling wins on speed, not privacy.)
 SANDBOX_REGISTRY_IMAGE="ghcr.io/gonchijoshnavardhanreddy/kryonsec-sandbox"
 
 # The version we actually installed, straight from the package metadata. The

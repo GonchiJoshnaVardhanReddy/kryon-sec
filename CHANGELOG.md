@@ -37,7 +37,13 @@ fail closed is caught and fixed before release.
 - **The legacy EXPLOIT-stage path keeps its spec semantics unchanged** — the
   exact template-tree root stays its one allowed directory, and every EXPLOIT
   nuclei run still requires explicit Gate-2 human approval per hypothesis
-  (non-TTY approves nothing; every decision audited).
+  (non-TTY approves nothing; every decision audited). **These approved
+  whole-tree runs are genuinely state-changing**: nuclei probes can exercise
+  potentially exploitable behavior against the authorized target, including
+  effects on target systems and data. That is precisely why they sit behind
+  Gate 2 per-hypothesis approval and are unreachable from RECON_ACTIVE or
+  model-generated arguments — but they are not "detection-only", and the
+  release notes state that plainly.
 
 ### New vetted adapters: tls-probe and api-probe (2B.5)
 
@@ -94,6 +100,25 @@ fail closed is caught and fixed before release.
   failure, never a silent hole.
 - apt installs retry per package with bounded timeouts, so one mirror hiccup
   cannot silently drop a tool (the whatweb lesson, measured live).
+
+### Release engineering: two-stage publication
+
+- **The one-stage tag-push release path is gone.** The old `release-wheel.yml`
+  and `sandbox-image.yml` published a wheel, created the GitHub Release and
+  moved the GHCR `latest` pointer straight off a `v*` tag push — a single
+  unreviewed tag could expose unvalidated code to members and re-point
+  production installs. They are replaced by `release-candidate.yml` (Stage A:
+  builds wheel + image from one frozen commit as restricted artifacts — no
+  tag, no release, no `latest`), `release-promote.yml` (Stage B: promotes the
+  already-validated image by digest — no rebuild — publishes the release with
+  the hash-verified wheel, and moves `latest` only after the release exists
+  and only on explicit request, behind the `release-production` environment),
+  and `release-guard.yml` (fails loudly on manually pushed `v*` tags).
+- **No `--clobber`, no tag rewriting, no overwrite of published releases** —
+  recovery is fixing forward with a new version; see RELEASING.md.
+- RELEASING.md's stale "the repo is private" claims are corrected (the repo
+  is public since the docs commit; distribution is gated by the membership
+  key, not by repository visibility).
 
 ### Known limitations
 

@@ -1897,8 +1897,10 @@ kryonsec/
 │       ├── enum_processes.py / enum_fs.py / enum_network.py
 │       ├── find_secrets.py / cloud_meta.py
 ├── .github/workflows/
-│   ├── release-wheel.yml             # builds the member wheel on v* tags
-│   └── sandbox-image.yml             # builds + pushes the image on every v* tag
+│   ├── release-candidate.yml         # Stage A: builds wheel+image candidates, no tag/release
+│   ├── release-promote.yml           # Stage B: publishes behind the release-production env
+│   ├── release-guard.yml             # fails loudly on manually pushed v* tags
+│   └── test.yml                      # pytest 3.11/3.12/3.13 on push/PR
 ├── src/kryonsec/
 │   ├── cli.py                        # entry point: argparse, chat loops, purple runner
 │   ├── config.py                     # TOML config (read/write, env overrides)
@@ -1973,10 +1975,12 @@ kryonsec/
 
 How releases work:
 
-1. `release-wheel.yml` builds the Python wheel on a `v*` tag — the artifact kryonsec.in
-   serves to members.
-2. `sandbox-image.yml` builds and pushes the sandbox image to GHCR as `:vX.Y.Z` and
-   `:latest` (non-prerelease tags only).
+1. **Stage A (`release-candidate.yml`)** builds the wheel and sandbox image from one
+   frozen commit and stores them as restricted artifacts — no tag, no release, no
+   `latest` move. It can optionally push the candidate image to GHCR as
+   `:staging-<version>` (a public upload, disclosed to and approved by the owner first).
+2. **The owner approves the exact manifest** — source commit, wheel SHA-256, image
+   digest — before anything production-facing happens.
 3. **The CI-built image digest can differ from a local candidate build** (base image
    updates, layer timestamps). That's why the installer resolves the digest of the image
    it *actually pulled* and pins that — and why `kryonsec doctor` validates the local

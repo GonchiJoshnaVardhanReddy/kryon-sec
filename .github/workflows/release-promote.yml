@@ -1,0 +1,343 @@
+name: release-promote
+
+# STAGE B of the two-stage release process (see RELEASING.md).
+#
+# Takes the owner-approved manifest (version, source commit, Stage A run id,
+# wheel SHA-256, candidate image digest) and — after re-verifying every value
+# against the actual Stage A artifacts and the GHCR staging image — promotes
+# the ALREADY-VALIDATED image to the production version tag (pull by digest,
+# re-tag, push: no rebuild, no new bytes), publishes the GitHub Release with
+# the verified wheel attached, and moves `latest` only if (and only after)
+# the release exists and move_latest was explicitly set.
+#
+# Every job runs behind the `release-production` GitHub environment. That is
+# a real approval gate ONLY once the owner has configured required reviewers
+# for it (RELEASING.md); until then the input verification below is the gate.
+#
+# Safeguards:
+# - Refuses unless the Stage A run is a successful release-candidate run for
+#   the approved source commit.
+# - Refuses unless the wheel bytes hash to the approved SHA-256.
+# - Refuses unless the staging image digest matches the approved digest.
+# - Never rebuilds; never rewrites tags; never uses --clobber; refuses to
+#   overwrite an existing version tag or an existing release. A bad release
+#   is fixed forward with a NEW version, never by replacing this one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to promote (e.g. 1.3.11; must match pyproject.toml)"
+        required: true
+        type: string
+      source_sha:
+        description: "Frozen source commit SHA the candidate was built from"
+        required: true
+        type: string
+      stage_run_id:
+        description: "Stage A (release-candidate) run id to verify and promote from"
+        required: true
+        type: number
+      wheel_sha256:
+        description: "Owner-approved wheel SHA-256"
+        required: true
+        type: string
+      staging_image_digest:
+        description: "Owner-approved candidate image digest (sha256:...)"
+        required: true
+        type: string
+      publish_release:
+        description: "Publish the GitHub Release with the verified wheel attached"
+        required: false
+        default: true
+        type: boolean
+      move_latest:
+        description: "Move the GHCR :latest pointer (only meaningful AFTER publish_release; latest must never move before its release)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+jobs:
+  verify:
+    name: Verify the approved manifest against reality
+    runs-on: ubuntu-latest
+    environment: release-production
+    steps:
+      - name: Validate manifest inputs
+        run: |
+          VERSION="${{ inputs.version }}"
+          SHA="${{ inputs.source_sha }}"
+          WHEEL="${{ inputs.wheel_sha256 }}"
+          DIGEST="${{ inputs.staging_image_digest }}"
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version '$VERSION' is not X.Y.Z"; exit 1; }
+          echo "$SHA" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "::error::source_sha is not a 40-hex commit SHA"; exit 1; }
+          echo "$WHEEL" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::wheel_sha256 is not a 64-hex digest"; exit 1; }
+          echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::staging_image_digest must look like sha256:<64 hex> (a Stage A run with push_staging_image=true is required)"; exit 1; }
+
+      - name: Verify the Stage A run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN="$(gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.stage_run_id }}")"
+          echo "$RUN" | jq -r '"stage run: \(.name) | event=\(.event) | head_sha=\(.head_sha) | conclusion=\(.conclusion)"'
+          [ "$(echo "$RUN" | jq -r .name)" = "release-candidate" ] \
+            || { echo "::error::run ${{ inputs.stage_run_id }} is not a release-candidate run"; exit 1; }
+          [ "$(echo "$RUN" | jq -r .event)" = "workflow_dispatch" ] \
+            || { echo "::error::Stage A run was not a manual dispatch run"; exit 1; }
+          [ "$(echo "$RUN" | jq -r .head_sha)" = "${{ inputs.source_sha }}" ] \
+            || { echo "::error::Stage A run head_sha does not match the approved source_sha"; exit 1; }
+          [ "$(echo "$RUN" | jq -r .conclusion)" = "success" ] \
+            || { echo "::error::Stage A run did not succeed"; exit 1; }
+
+      - name: Download the Stage A wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ inputs.version }}
+          path: stage/wheel
+          run-id: ${{ inputs.stage_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the Stage A provenance artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: provenance-${{ inputs.version }}
+          path: stage/provenance
+          run-id: ${{ inputs.stage_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-verify the wheel bytes against the approved hash
+        run: |
+          ls -la stage/wheel
+          GOT="$(sha256sum stage/wheel/*.whl | awk '{print $1}')"
+          [ "$GOT" = "${{ inputs.wheel_sha256 }}" ] \
+            || { echo "::error::wheel bytes hash to $GOT; manifest says ${{ inputs.wheel_sha256 }}"; exit 1; }
+          echo "wheel sha256 verified: $GOT"
+
+      - name: Cross-check the Stage A provenance record
+        run: |
+          cat stage/provenance/provenance.txt
+          grep -q "^source_commit=${{ inputs.source_sha }}$" stage/provenance/provenance.txt \
+            || { echo "::error::provenance source_commit does not match the approved source_sha"; exit 1; }
+          grep -q "^wheel_sha256=${{ inputs.wheel_sha256 }}$" stage/provenance/provenance.txt \
+            || { echo "::error::provenance wheel_sha256 does not match the approved hash"; exit 1; }
+          grep -q "^image_digest=${{ inputs.staging_image_digest }}$" stage/provenance/provenance.txt \
+            || { echo "::error::provenance image_digest does not match the approved digest"; exit 1; }
+
+  promote-image:
+    name: Promote the validated image to the version tag (no rebuild)
+    runs-on: ubuntu-latest
+    environment: release-production
+    needs: verify
+    outputs:
+      final_digest: ${{ steps.verify-push.outputs.digest }}
+    steps:
+      - name: Resolve the image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kryonsec-sandbox" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing production version tag
+        run: |
+          TAG="${{ steps.img.outputs.name }}:v${{ inputs.version }}"
+          EXISTING="$(docker buildx imagetools inspect "$TAG" 2>/dev/null | awk '/^Digest:/ {print $2}')"
+          if [ -n "$EXISTING" ]; then
+            if [ "$EXISTING" = "${{ inputs.staging_image_digest }}" ]; then
+              echo "version tag already points at the approved digest; promotion is idempotent"
+            else
+              echo "::error::$TAG already exists with digest $EXISTING (approved: ${{ inputs.staging_image_digest }})."
+              echo "::error::A published version tag is never overwritten — fix forward with a new version."
+              exit 1
+            fi
+          else
+            echo "no existing v${{ inputs.version }} tag; safe to promote"
+          fi
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the approved candidate by digest
+        run: |
+          IMG="${{ steps.img.outputs.name }}"
+          DIGEST="${{ inputs.staging_image_digest }}"
+          docker pull "${IMG}@${DIGEST}"
+          GOT="$(docker image inspect "${IMG}@${DIGEST}" --format '{{index .RepoDigests 0}}')"
+          [ "$GOT" = "${IMG}@${DIGEST}" ] \
+            || { echo "::error::pulled image reports $GOT, expected ${IMG}@${DIGEST}"; exit 1; }
+
+      - name: Tag the validated image as the production version
+        run: |
+          IMG="${{ steps.img.outputs.name }}"
+          ID="$(docker image inspect "${IMG}@${{ inputs.staging_image_digest }}" --format '{{.Id}}')"
+          docker tag "$ID" "${IMG}:v${{ inputs.version }}"
+          docker push "${IMG}:v${{ inputs.version }}"
+
+      - name: Verify the pushed version tag still has the approved digest
+        id: verify-push
+        run: |
+          IMG="${{ steps.img.outputs.name }}"
+          GOT="$(docker buildx imagetools inspect "${IMG}:v${{ inputs.version }}" | awk '/^Digest:/ {print $2}')"
+          [ "$GOT" = "${{ inputs.staging_image_digest }}" ] \
+            || { echo "::error::promoted digest $GOT != approved ${{ inputs.staging_image_digest }}"; exit 1; }
+          echo "digest=$GOT" >> "$GITHUB_OUTPUT"
+          echo "production version tag ${IMG}:v${{ inputs.version }} verified at digest $GOT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Production image promoted (Stage B)"
+            echo ""
+            echo "- \`${{ steps.img.outputs.name }}:v${{ inputs.version }}\`"
+            echo "- digest: \`${{ steps.verify-push.outputs.digest }}\` (identical to the validated candidate — content-addressed promotion, no rebuild)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-release:
+    name: Publish the GitHub Release with the verified wheel
+    runs-on: ubuntu-latest
+    environment: release-production
+    needs: [verify, promote-image]
+    if: inputs.publish_release
+    outputs:
+      release_url: ${{ steps.create.outputs.url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Extract the reviewed notes from CHANGELOG.md
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, sys
+          version = "${{ inputs.version }}"
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          pat = rf"^## v{re.escape(version)}(?:[ \t][^\n]*)?\n(.*?)(?=^## |\Z)"
+          m = re.search(pat, text, re.M | re.S)
+          if not m:
+              sys.exit(f"no CHANGELOG section for v{version}")
+          pathlib.Path("release_notes.md").write_text(m.group(1).strip() + "\n")
+          print(pathlib.Path("release_notes.md").read_text())
+          PY
+
+      - name: Re-download and re-verify the wheel from the Stage A run
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ inputs.version }}
+          path: stage/wheel
+          run-id: ${{ inputs.stage_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-check the wheel hash
+        run: |
+          GOT="$(sha256sum stage/wheel/*.whl | awk '{print $1}')"
+          [ "$GOT" = "${{ inputs.wheel_sha256 }}" ] \
+            || { echo "::error::wheel bytes hash to $GOT; manifest says ${{ inputs.wheel_sha256 }}"; exit 1; }
+
+      - name: Refuse if the tag or release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/git/ref/tags/v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag v${{ inputs.version }} already exists. Never rewrite or re-point a published tag; fix forward with a new version."
+            exit 1
+          fi
+          if gh release view "v${{ inputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::release v${{ inputs.version }} already exists. Never overwrite a published release; fix forward with a new version."
+            exit 1
+          fi
+
+      - name: Create the release with the verified wheel attached
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL="$(gh release create "v${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ inputs.source_sha }}" \
+            --title "Kryonsec v${{ inputs.version }}" \
+            --notes-file release_notes.md \
+            stage/wheel/*.whl)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "created: $URL"
+
+      - name: Verify the tag points at the approved commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_SHA="$(gh api "repos/${{ github.repository }}/git/ref/tags/v${{ inputs.version }}" --jq '.object.sha')"
+          [ "$TAG_SHA" = "${{ inputs.source_sha }}" ] \
+            || { echo "::error::tag v${{ inputs.version }} points at $TAG_SHA; approved commit is ${{ inputs.source_sha }}"; exit 1; }
+
+      - name: Verify the published wheel asset bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf release-verify && mkdir release-verify
+          gh release download "v${{ inputs.version }}" --repo "${{ github.repository }}" \
+            --dir release-verify --pattern '*.whl'
+          GOT="$(sha256sum release-verify/*.whl | awk '{print $1}')"
+          [ "$GOT" = "${{ inputs.wheel_sha256 }}" ] \
+            || { echo "::error::published asset hashes to $GOT; approved is ${{ inputs.wheel_sha256 }}"; exit 1; }
+          echo "published asset verified at $GOT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## GitHub Release published (Stage B)"
+            echo ""
+            echo "- release: ${{ steps.create.outputs.url }}"
+            echo "- source commit: \`${{ inputs.source_sha }}\`"
+            echo "- wheel sha256: \`${{ inputs.wheel_sha256 }}\` (verified on the published asset)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  move-latest:
+    name: Move the GHCR :latest pointer (explicit, last)
+    runs-on: ubuntu-latest
+    environment: release-production
+    needs: [promote-image, publish-release]
+    if: always() && inputs.move_latest && needs.promote-image.result == 'success' && (needs.publish-release.result == 'success' || needs.publish-release.result == 'skipped')
+    steps:
+      - name: Resolve the image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kryonsec-sandbox" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move :latest to the approved digest
+        run: |
+          IMG="${{ steps.img.outputs.name }}"
+          DIGEST="${{ inputs.staging_image_digest }}"
+          docker pull "${IMG}@${DIGEST}"
+          ID="$(docker image inspect "${IMG}@${DIGEST}" --format '{{.Id}}')"
+          docker tag "$ID" "${IMG}:latest"
+          docker push "${IMG}:latest"
+
+      - name: Verify the :latest digest
+        run: |
+          GOT="$(docker buildx imagetools inspect "${{ steps.img.outputs.name }}:latest" | awk '/^Digest:/ {print $2}')"
+          [ "$GOT" = "${{ inputs.staging_image_digest }}" ] \
+            || { echo "::error::latest now has digest $GOT; approved is ${{ inputs.staging_image_digest }}"; exit 1; }
+          echo ":latest verified at $GOT (release ${{ needs.publish-release.outputs.release_url || 'not published in this run' }})"
+
+      - name: Summary
+        run: |
+          {
+            echo "## GHCR :latest moved (Stage B, final step)"
+            echo ""
+            echo "- \`${{ steps.img.outputs.name }}:latest\`"
+            echo "- digest: \`${{ inputs.staging_image_digest }}\` (verified)"
+          } >> "$GITHUB_STEP_SUMMARY"

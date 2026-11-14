@@ -1,0 +1,32 @@
+name: release-guard
+
+# A manually pushed v* tag used to be the whole release process: the old
+# one-stage release-wheel.yml published a wheel and the old sandbox-image.yml
+# moved `latest` straight off a tag push. That path is gone. Tags must now be
+# created by release-promote.yml (Stage B) — and a tag created by the Stage B
+# GITHUB_TOKEN does NOT trigger workflows, so a v* push that lands here was
+# done by hand and must fail loudly instead of silently shipping anything.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  refuse-manual-tag:
+    runs-on: ubuntu-latest
+    if: github.repository == 'GonchiJoshnaVardhanReddy/kryon-sec'
+    steps:
+      - name: Refuse the manual tag push
+        run: |
+          echo "::error::Tag ${GITHUB_REF_NAME} was pushed by hand."
+          echo "::error::Manual v* tag pushes cannot publish anything, but they are also not a reviewed release path."
+          echo "::error::Delete this tag if it has no release attached (orphan tag), and run the two-stage process instead:"
+          echo "::error::  Stage A: release-candidate (build + stage a candidate, no tag, no release)"
+          echo "::error::  Gate:    owner approves the exact wheel sha256 + image digest"
+          echo "::error::  Stage B: release-promote behind the release-production environment"
+          echo "::error::If a release IS attached to this tag, do not delete it — fix forward with a new version (see RELEASING.md)."
+          exit 1
