@@ -10,7 +10,7 @@ A single-user CLI security platform with two modes: an AI copilot you can talk t
 and a deterministic purple-team engine that finds, tests and proves.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-1.3.10-8e44ad)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.11-8e44ad)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-red)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-2128%20passing-brightgreen)](#development)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2%20%7C%20macOS%20%7C%20Windows%20(copilot)-lightgrey)](#requirements)

@@ -1,5 +1,115 @@
 # Changelog
 
+## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
+
+Eleven commits since v1.3.10, all in the Purple Team engine. The headline: the
+Nuclei template policy is now an enforced, hash-pinned manifest instead of a
+directory allowlist — and a packaging bug that would have made wheel installs
+fail closed is caught and fixed before release.
+
+### Packaging fix: the Nuclei manifest now ships in the wheel (v1.3.10 bug)
+
+- **v1.3.10's wheel omitted `nuclei_manifest.json`.** pyproject.toml declared
+  it under the wrong package-data key, so the pattern matched nothing: the
+  file silently stayed out of the wheel. A wheel-installed RECON_ACTIVE then
+  raised `NucleiPolicyError` at registry build — fail-closed, but Mode B was
+  dead on arrival for wheel installs. Tests never saw it because the source
+  tree kept the real file on disk. Caught in the v1.3.11 release preflight by
+  building and inspecting the actual wheel.
+- **The fix plus a class guard**: the manifest is declared with its directory
+  (`purple/nuclei_manifest.json`), and `tests/test_packaging.py` now fails the
+  suite if ANY declared package-data glob matches no real file — the mistake
+  can never again ship silently.
+
+### Mode B: the Nuclei template policy is an enforced manifest (2B.8)
+
+- **1,605 reviewed templates, pinned by sha256 at upstream commit `1cb2d50b`.**
+  The manifest replaces the four-directory allowlist as the RECON_ACTIVE
+  probe's policy. `token-spray/` and `misconfiguration/` carry zero entries
+  and are not execution-eligible.
+- **Enforced at three layers**: the adapter's argv is built FROM the manifest
+  (no caller input); adapter registration refuses a policy-violating
+  configuration; and a sandbox-side gate refuses unapproved `-t` values at
+  execution time (exit 125, fail-closed even if the gate itself cannot run).
+- **The image bakes the policy**: the template tree is pinned at the reviewed
+  commit and the build fails if any manifest entry is missing or drifted, or
+  if an unsafe subtree appears in the manifest.
+- **The legacy EXPLOIT-stage path keeps its spec semantics unchanged** — the
+  exact template-tree root stays its one allowed directory, and every EXPLOIT
+  nuclei run still requires explicit Gate-2 human approval per hypothesis
+  (non-TTY approves nothing; every decision audited).
+
+### New vetted adapters: tls-probe and api-probe (2B.5)
+
+- **tls-probe** runs the image's real testssl binary through a baked wrapper
+  with a frozen flag set — no phone-out, no authenticated testing, one
+  approved https host:port, a 240s internal kill with honest partial-JSON
+  salvage. **2B.8 adds the bounded summary**: a 10,000-character self-bound
+  (inside the unchanged 20,000-character host cap), totals and severity
+  histogram that reflect every salvaged finding, and the full redacted
+  artifact written to the engagement evidence directory (O_EXCL|O_NOFOLLOW,
+  0600, sha256 recorded).
+- **api-probe** is read-only: GET/OPTIONS only, redirects recorded and never
+  followed, one fixed inert CORS test origin, no credentials, at most 7
+  requests, 512 KiB reads, `$ref` counted and never resolved.
+- **One probe per check**: the either/or wiring keeps the legacy
+  sslscan/testssl.sh and openapi_probe entries out exactly while the vetted
+  adapters are registered. RECON_ACTIVE now carries five vetted web adapters
+  (httpx-probe, whatweb-probe, searchsploit-term, tls-probe, api-probe) plus
+  the nuclei-probe adapter from this range.
+
+### Zone B boundary: Docker bridge integrity (2C.2)
+
+- The egress gate now verifies the WHOLE network shape before adopting it —
+  exact name, bridge driver, explicit bridge name (auto-named refused),
+  inter-container communication disabled, ownership label, the policy subnet,
+  and the bridge interface actually present in the host kernel right now. A
+  foreign or stale network can no longer be adopted while the iptables chains
+  match a name that binds to no traffic; the same check re-runs at every
+  verify, so post-establishment drift fails the boundary before any spawn.
+
+### Deterministic tool planning (2B.6) — OFF by default
+
+- A bounded, evidence-backed execution planner for RECON_ACTIVE: eligibility
+  gates, conservative dedupe, explicit priority ordering, a wall-clock budget
+  with audited deferral. It is a VIEW over the vetted adapter registry and
+  advisory-only — it can never supply executables, argv, targets or
+  templates. Feature-gated: OFF unless `KRYONSEC_TOOL_PLANNER_ENABLED` or
+  `[tool_planner] enabled = true` is set, and a planner crash falls back to
+  the exact pre-2B.6 deterministic path with an audited notice.
+
+### Honest failures and bounded retries (2B.7)
+
+- Adapter failures are classified (policy, tool, infra, timeout…) instead of
+  flattened, infrastructure errors get a bounded retry, and every adapter
+  start/outcome reaches the operator as one redacted progress line.
+
+### Image build integrity
+
+- **A required-tool check now FAILS the sandbox image build** when any of the
+  six Mode B adapter executables, the entrypoint helpers (jq, timeout,
+  python3), the EXPLOIT/verify lane's core tools, or the frozen-argv
+  wordlists is missing. Optional tools (checkov, graphql-cop, semgrep,
+  hadolint, kube-bench) stay best-effort: their absence is an audited spawn
+  failure, never a silent hole.
+- apt installs retry per package with bounded timeouts, so one mirror hiccup
+  cannot silently drop a tool (the whatweb lesson, measured live).
+
+### Known limitations
+
+- semgrep, hadolint and kube-bench are absent from the 2026-11 Kali snapshot;
+  checkov and graphql-cop install best-effort from PyPI/GitHub. Spawns for
+  those tools fail closed with an audited `tool_failure` — they are optional
+  capabilities, not release requirements.
+- Adapters remain network-none or target-scope-only; RECON_PASSIVE still
+  sends zero packets to any target.
+
+Test suite: **2331 passed, 55 skipped** (local full run, Python 3.11, on the
+release-prep commit; the 55 skips are env-gated Docker/gVisor lab tests; CI
+covers 3.11/3.12/3.13). Real Docker + gVisor verification: 12/12 adapter lab
+ITs and 2/2 full-engagement e2e lab ITs against the digest-pinned image
+`sha256:d759cef7d0b364bcb3f0182388797cbc3c0d9de980278b9f04bdf584400a8f85`.
+
 ## v1.3.10 — authorized MCP, the full-screen workspace, and version integrity
 
 Everything merged since the v1.3.8 release ships together here, including the
