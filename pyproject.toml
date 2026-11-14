@@ -41,6 +41,10 @@ where = ["src"]
 kryonsec = [
     "templates/*.jinja",
     "containers/*.json",
+    # The nuclei template manifest (Phase 2B.8) is the reviewed,
+    # hash-pinned allowlist the adapter loads from the package — it
+    # MUST ship in the wheel or Nuclei execution refuses to enable.
+    "nuclei_manifest.json",
     # The memory browser's page, style and scripts, plus the brand mark and
     # the two fonts it serves. These must ship in the wheel: `kryonsec memory`
     # reads them off disk at request time, and a wheel without them would

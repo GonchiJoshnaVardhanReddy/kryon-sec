@@ -28,9 +28,9 @@ from kryonsec.purple.adapters import (
 )
 from kryonsec.purple.adapter_nuclei import (
     ADAPTER_ID,
+    APPROVED_TEMPLATE_PATHS,
     NUCLEI_PROBE_TEMPLATE,
     TOOL_EXECUTABLE,
-    VETTED_TEMPLATE_DIRS,
     find_adapter_attempt_node,
     make_nuclei_probe_adapter,
     parse_nuclei_json_lines,
@@ -195,12 +195,12 @@ def test_fixed_template_rendering():
     rebuilt = ["http://target-corp.com:8080/" if a == "{url}" else a
                for a in NUCLEI_PROBE_TEMPLATE]
     assert prep.argv == [TOOL_EXECUTABLE, *rebuilt]
-    # every one of the four pinned dirs is a literal in the argv, in a
-    # -t <dir> pair — never a caller-chosen value
-    for d in VETTED_TEMPLATE_DIRS:
+    # every one of the approved templates is a literal in the argv, in
+    # a -t <file> pair — never a caller-chosen value, never a directory
+    for d in APPROVED_TEMPLATE_PATHS:
         i = prep.argv.index(d)
         assert prep.argv[i - 1] == "-t"
-    assert prep.argv.count("-t") == len(VETTED_TEMPLATE_DIRS)
+    assert prep.argv.count("-t") == len(APPROVED_TEMPLATE_PATHS)
 
 
 def test_template_policy_is_frozen():
@@ -226,12 +226,15 @@ def test_template_policy_is_frozen():
     ]
     for flag in forbidden:
         assert flag not in template, flag
-    # the four vetted local categories are the ONLY -t values
+    # the approved templates (manifest paths) are the ONLY -t values
     t_values = [template[i + 1] for i, a in enumerate(template)
                 if a == "-t"]
-    assert t_values == list(VETTED_TEMPLATE_DIRS)
+    assert t_values == list(APPROVED_TEMPLATE_PATHS)
     for d in t_values:
         assert d.startswith("/opt/nuclei-templates/http/")
+        assert d.endswith(".yaml")          # files, never directories
+        assert "/token-spray/" not in d
+        assert "/misconfiguration/" not in d
         assert d not in ("/opt/nuclei-templates/http/cves/",
                          "/opt/nuclei-templates/http/vulnerabilities/",
                          "/opt/nuclei-templates/http/default-logins/",
@@ -689,7 +692,7 @@ def test_adapter_mode_runs_nuclei_once_per_base(tmp_path):
     assert len(runs) == 1
     run = runs[0]
     assert run[run.index("-u") + 1] == "http://target-corp.com:8080/"
-    assert run.count("-t") == len(VETTED_TEMPLATE_DIRS)
+    assert run.count("-t") == len(APPROVED_TEMPLATE_PATHS)
     assert "-ni" in run and "-duc" in run and "-etags" in run
     candidates = graph.by_type("vuln_candidate")
     assert len(candidates) == 1

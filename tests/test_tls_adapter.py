@@ -289,7 +289,13 @@ def test_wrapper_policy_is_frozen():
     assert "Popen(" not in text
     # the wrapper kills the tool itself, INSIDE the sandbox ceiling
     assert script.TESTSSL_TIMEOUT_S == 240
-    assert script.MAX_FINDINGS == 120
+    # Phase 2B.8 bounded summary: the self-bound stays well inside the
+    # host's unchanged 20,000-char cap (the entrypoint's jq escaping
+    # grows the payload); the selection bounds keep the sections small
+    assert script.OUTPUT_BOUND_CHARS == 10_000
+    assert script.OUTPUT_BOUND_CHARS < 20_000
+    assert script.TOP_WEAK_FINDINGS == 20
+    assert script.ARTIFACT_MAX_BYTES == 2_000_000
 
 
 def test_image_tools_match_the_wrapper_contract():

@@ -149,11 +149,39 @@ class TLSFinding(BaseModel):
     port: str = Field(default="", max_length=10)
 
 
+class TLSArtifact(BaseModel):
+    """The full-output artifact reference the wrapper recorded when the
+    run carried the engagement evidence mount. The sha256/bytes are of
+    the bytes ACTUALLY WRITTEN (post-redaction) — the integrity record
+    matches the artifact on disk. Absent when no evidence dir was
+    mounted or the persistence was omitted (reason recorded)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1, max_length=200)
+    sha256: str = Field(min_length=64, max_length=64)
+    bytes: int = Field(ge=0)
+    redactions: int = Field(default=0, ge=0)
+    source_file: str = Field(default="", max_length=200)
+    note: str = Field(default="", max_length=300)
+
+
 class TLSProbeRun(BaseModel):
     """The parsed tls_probe.py payload — one run against one approved
     node. ``status`` is the wrapper's own honest verdict: ``complete``
     or ``partial`` (killed at the time bound; the findings it got to
-    write are kept, never padded)."""
+    write are kept, never padded).
+
+    Phase 2B.8 v2 payload: the wrapper self-bounds its stdout
+    (10,000 chars, far inside the sandbox's unchanged 20,000-char
+    cap), so a full testssl run's observations survive as a COMPACT
+    summary: ``finding_count_total``/``finding_count_emitted`` carry
+    the honest totals vs the emitted selection,
+    ``severity_histogram`` counts EVERY salvaged finding,
+    ``protocols``/``certificates`` carry their sections bounded, and
+    ``artifact`` references the full redacted output persisted in the
+    engagement evidence dir when the run had one.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -167,6 +195,20 @@ class TLSProbeRun(BaseModel):
     findings: tuple[TLSFinding, ...] = Field(default=(), max_length=120)
     truncated: bool = Field(default=False)
     argv_reference: tuple[str, ...] = Field(default=(), max_length=12)
+    # --- v2 fields (defaults keep v1-shaped payloads parseable) ---
+    version: int = Field(default=1)
+    finding_count_total: int = Field(default=0, ge=0)
+    finding_count_emitted: int = Field(default=0, ge=0)
+    severity_histogram: dict[str, int] = Field(default_factory=dict)
+    summary_truncated: bool = Field(default=False)
+    summary_bound_chars: int = Field(default=0, ge=0)
+    artifact: "TLSArtifact | None" = None
+    #: the v2 wrapper's dedicated protocol/certificate sections
+    #: (bounded); empty on a v1-shaped payload — the prefix scan over
+    #: ``findings`` is the fallback in that case
+    protocols_section: tuple[TLSFinding, ...] = Field(default=(), max_length=12)
+    certificates_section: tuple[TLSFinding, ...] = Field(default=(),
+                                                        max_length=12)
 
     @property
     def weak_findings(self) -> "tuple[TLSFinding, ...]":
@@ -178,15 +220,24 @@ class TLSProbeRun(BaseModel):
     def summary_properties(self, *, request_id: str) -> dict:
         """The run-summary ``tls_observation`` node properties."""
         weak = self.weak_findings
-        protocols = {
-            f.finding_id: f.finding for f in self.findings
-            if f.finding_id.startswith(("SSLv", "TLS1"))
-        }
-        certs = {
-            f.finding_id: f.finding for f in self.findings
-            if f.finding_id.startswith("cert_")
-        }
-        return {
+        if self.protocols_section:
+            protocols = {f.finding_id: f.finding
+                         for f in self.protocols_section}
+        else:
+            # v1-shaped payload: derive from the emitted findings
+            protocols = {
+                f.finding_id: f.finding for f in self.findings
+                if f.finding_id.startswith(("SSLv", "TLS1"))
+            }
+        if self.certificates_section:
+            certs = {f.finding_id: f.finding
+                     for f in self.certificates_section}
+        else:
+            certs = {
+                f.finding_id: f.finding for f in self.findings
+                if f.finding_id.startswith("cert_")
+            }
+        props = {
             "classification": "tool_reported_observation",
             "tool": self.tool,
             "tool_version": self.tool_version,
@@ -214,6 +265,25 @@ class TLSProbeRun(BaseModel):
             "untrusted": True,
             "verification": "not_verified",
         }
+        if self.version >= 2:
+            # honest totals + histogram + the artifact relationship —
+            # the emitted selection is a subset; the counts are not
+            props["payload_version"] = self.version
+            props["finding_count_total"] = self.finding_count_total
+            props["finding_count_emitted"] = self.finding_count_emitted
+            props["severity_histogram"] = dict(
+                sorted(self.severity_histogram.items()))
+            props["summary_truncated"] = self.summary_truncated
+            props["summary_bound_chars"] = self.summary_bound_chars
+            if self.artifact is not None:
+                props["artifact"] = {
+                    "name": self.artifact.name,
+                    "sha256": self.artifact.sha256,
+                    "bytes": self.artifact.bytes,
+                    "redactions": self.artifact.redactions,
+                    "note": self.artifact.note,
+                }
+        return props
 
 
 def parse_tls_probe_payload(
@@ -266,6 +336,59 @@ def parse_tls_probe_payload(
             except Exception:   # defensive: bad entry is data
                 malformed += 1
         try:
+            # --- v2 fields (a v1-shaped payload parses via defaults;
+            # every value is defensive: bad shapes are dropped, never
+            # interpreted)
+            histogram_raw = raw.get("severity_histogram")
+            histogram = {}
+            if isinstance(histogram_raw, dict):
+                for k, v in list(histogram_raw.items())[:12]:
+                    if isinstance(k, str) and isinstance(v, int) \
+                            and not isinstance(v, bool):
+                        histogram[k.strip()[:20]] = max(0, v)
+            artifact_raw = raw.get("artifact")
+            artifact = None
+            if isinstance(artifact_raw, dict) \
+                    and isinstance(artifact_raw.get("name"), str) \
+                    and artifact_raw["name"].strip() \
+                    and isinstance(artifact_raw.get("sha256"), str) \
+                    and len(artifact_raw["sha256"]) == 64:
+                try:
+                    artifact = TLSArtifact(
+                        name=artifact_raw["name"].strip()[:200],
+                        sha256=artifact_raw["sha256"].lower()[:64],
+                        bytes=int(artifact_raw.get("bytes") or 0),
+                        redactions=max(0, int(
+                            artifact_raw.get("redactions") or 0)),
+                        source_file=str(
+                            artifact_raw.get("source_file") or "")[:200],
+                        note=str(artifact_raw.get("note") or "")[:300],
+                    )
+                except Exception:
+                    artifact = None
+
+            def _section(key: str) -> "list[TLSFinding]":
+                out: list[TLSFinding] = []
+                for entry in (raw.get(key) or ())[:12]:
+                    if not isinstance(entry, dict):
+                        continue
+                    fid = entry.get("id")
+                    if not isinstance(fid, str) or not fid.strip():
+                        continue
+                    try:
+                        out.append(TLSFinding(
+                            finding_id=fid.strip()[:60],
+                            severity_as_reported=str(
+                                entry.get("severity_as_reported") or
+                                entry.get("severity") or "")[:20],
+                            finding=str(entry.get("finding") or "")[:300],
+                            cve=str(entry.get("cve") or "")[:60],
+                            port=str(entry.get("port") or "")[:10],
+                        ))
+                    except Exception:
+                        continue
+                return out
+
             run = TLSProbeRun(
                 url=url.strip()[:500],
                 node=node.strip()[:300],
@@ -279,6 +402,18 @@ def parse_tls_probe_payload(
                 argv_reference=tuple(
                     str(a)[:200] for a in
                     (raw.get("argv_reference") or ())[:12]),
+                version=int(raw.get("version") or 1),
+                finding_count_total=max(0, int(
+                    raw.get("finding_count_total") or 0)),
+                finding_count_emitted=max(0, int(
+                    raw.get("finding_count_emitted") or 0)),
+                severity_histogram=histogram,
+                summary_truncated=bool(raw.get("summary_truncated")),
+                summary_bound_chars=max(0, int(
+                    raw.get("summary_bound_chars") or 0)),
+                artifact=artifact,
+                protocols_section=tuple(_section("protocols")),
+                certificates_section=tuple(_section("certificates")),
             )
         except Exception:
             malformed += 1

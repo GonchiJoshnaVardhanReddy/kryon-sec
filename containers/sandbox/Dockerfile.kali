@@ -40,8 +40,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Tool-expansion block (2026-09-13). Kali package names drift; if the
 # batch install fails, retry per-package so ONE bad name doesn't drop the
-# whole extended set. Unavailable packages log a WARN and are simply
-# absent (spawning them then fails inside the sandbox — audited, safe).
+# whole extended set. Every apt-get carries Acquire::Retries/Timeout: a
+# transient http.kali.org redirector hiccup retried itself into a lost
+# tool once (whatweb + ruby deps, Phase 2B.8 candidate build) and the
+# per-package fallback only tried once — a lost tool must be a build
+# failure or a loud retry, never a silent WARN. Unavailable packages log
+# a WARN after three full retries and are simply absent (spawning them
+# then fails inside the sandbox — audited, safe).
 # ncat ships with the nmap package; nc comes from netcat-traditional.
 # searchsploit ships with exploitdb.
 # checkov is deliberately NOT in this list: Kali has no checkov package
@@ -55,10 +60,18 @@ RUN EXTENDED_TOOLS=" \
     semgrep bandit gitleaks trivy hadolint kube-bench \
     gowitness massdns impacket-scripts \
     " && apt-get update && \
-    (apt-get install -y --no-install-recommends $EXTENDED_TOOLS || \
+    (apt-get install -y --no-install-recommends \
+        -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
+        $EXTENDED_TOOLS || \
      for t in $EXTENDED_TOOLS; do \
-        apt-get install -y --no-install-recommends "$t" \
-          || echo "WARN: $t unavailable in this Kali snapshot"; \
+        ok=0; \
+        for try in 1 2 3; do \
+            apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=8 -o Acquire::http::Timeout=60 "$t" \
+              && ok=1 && break; \
+            sleep 5; \
+        done; \
+        [ "$ok" = 1 ] || echo "WARN: $t unavailable in this Kali snapshot"; \
      done) && rm -rf /var/lib/apt/lists/*
 
 # Bake nuclei templates at BUILD time, not runtime (sandbox has no
@@ -66,17 +79,66 @@ RUN EXTENDED_TOOLS=" \
 # kryonsec-runner (non-root), so the tree MUST end up world-readable —
 # otherwise every nuclei spawn dies on permissions.
 #
-# Root-cause fix (Phase 2B.4, verified against the shipped image): the
-# old step copied `/root/nuclei-templates/*`, but nuclei v3 installs the
-# downloaded tree to `~/.local/nuclei-templates` — the cp matched
-# nothing, the `|| true` chain swallowed it, and the image shipped with
-# an EMPTY /opt/nuclei-templates (no template-based nuclei run — legacy
-# EXPLOIT path included — could work; verified live: 0 files). The bake
-# is now REQUIRED and installs DIRECTLY to the target dir (`-ud`): a
-# build without templates is a FAILED build, never a silent hole.
-RUN nuclei -update-templates -ud /opt/nuclei-templates \
-    && chmod -R a+rX /opt/nuclei-templates \
-    && test -n "$(find /opt/nuclei-templates -name '*.yaml' -type f | head -1)"
+# Phase 2B.8: the tree is now PINNED to the exact upstream commit the
+# template review ran against (NUCLEI-TEMPLATES-COMMIT below == the
+# manifest's templates_commit) — a rebuild months later gets the exact
+# reviewed bytes, never a drifted "latest". The full tree stays baked:
+# the legacy EXPLOIT-stage nuclei path (spec-protected semantics)
+# selects from the whole tree behind Gate 2, and the RECON_ACTIVE
+# probe selects ONLY manifest-approved files from it.
+#
+# Root-cause fix (Phase 2B.4, kept): the bake is REQUIRED (a build
+# without templates is a FAILED build, never a silent hole).
+ARG NUCLEI_TEMPLATES_COMMIT=1cb2d50b4f0f5cbdb600165b0afe556b4623f29a
+RUN cd /tmp && \
+    wget -q --tries=3 --timeout=60 \
+      "https://codeload.github.com/projectdiscovery/nuclei-templates/tar.gz/${NUCLEI_TEMPLATES_COMMIT}" \
+      -O nuclei-templates.tar.gz && \
+    tar xzf nuclei-templates.tar.gz && \
+    rm -rf /opt/nuclei-templates && \
+    mv "nuclei-templates-${NUCLEI_TEMPLATES_COMMIT}" /opt/nuclei-templates && \
+    rm -f nuclei-templates.tar.gz && \
+    chmod -R a+rX /opt/nuclei-templates && \
+    test -n "$(find /opt/nuclei-templates -name '*.yaml' -type f | head -1)" && \
+    printf '%s' "${NUCLEI_TEMPLATES_COMMIT}" > /opt/nuclei-templates/.kryonsec-commit
+
+# The reviewed, hash-pinned template manifest (Phase 2B.8): the policy
+# the adapter, this image and the entrypoint all enforce. The build
+# FAILS unless EVERY manifest entry exists in the baked tree with the
+# exact reviewed sha256 — template drift is never silently shipped —
+# and unless the unsafe subtrees the Phase 2B.7 audit identified
+# (token-spray/, misconfiguration/) are ABSENT from the manifest.
+COPY src/kryonsec/purple/nuclei_manifest.json /opt/kryonsec/nuclei_manifest.json
+RUN python3 - <<'EOF'
+import hashlib, json, sys
+m = json.load(open("/opt/kryonsec/nuclei_manifest.json"))
+commit = open("/opt/nuclei-templates/.kryonsec-commit").read().strip()
+if not commit or commit != m.get("templates_commit"):
+    sys.exit(f"FATAL: image tree commit {commit!r} != reviewed manifest "
+             f"commit {m.get('templates_commit')!r}")
+entries = m.get("templates") or {}
+if not entries:
+    sys.exit("FATAL: manifest carries no reviewed templates")
+bad = []
+for path, meta in sorted(entries.items()):
+    try:
+        h = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError as e:
+        bad.append(f"missing approved template {path}: {e}")
+        continue
+    if h != meta.get("sha256"):
+        bad.append(f"content drift for {path}")
+unsafe = [p for p in entries if "/token-spray/" in p or
+          "/misconfiguration/" in p]
+if unsafe:
+    bad.append(f"unsafe subtree present in manifest: {unsafe[:3]}")
+if bad:
+    sys.exit("FATAL: template manifest verification failed:\n" +
+             "\n".join(bad[:20]))
+print(f"nuclei manifest verified: {len(entries)} reviewed templates at "
+      f"commit {commit}")
+EOF
+RUN chmod -R a+rX /opt/kryonsec/nuclei_manifest.json
 
 # PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
 # all-or-nothing: one unresolvable name aborts the whole command and
@@ -88,7 +150,12 @@ RUN nuclei -update-templates -ud /opt/nuclei-templates \
 # only that one tool — the same rule as the apt block above.
 #   bloodhound-python -> the real PyPI name; provides `bloodhound-python`
 #   checkov           -> no Kali package (see the apt note above), on PyPI
-# semgrep is NOT here: Kali ships it and the apt install above works.
+# semgrep is NOT here: the intent was "Kali ships it and the apt install
+# above works", but in the 2026-11 kali-rolling snapshot it is NOT
+# packaged (per-build "WARN: semgrep unavailable"). If blue-team code
+# scanning needs it, install from PyPI below like checkov — after a
+# real run proves the version pin. Until then blue-team semgrep spawns
+# fail closed (audited tool_failure), never fall back.
 RUN for pkg in bloodhound-python checkov; do \
       pip install --no-cache-dir --break-system-packages \
         --index-url https://pypi.org/simple/ \

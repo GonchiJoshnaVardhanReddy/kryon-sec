@@ -10,29 +10,49 @@ tool. This module adds NO general-purpose command interface: the
 executable is the fixed ``nuclei`` binary and the argv template is
 fixed and Layer-2 validated.
 
-TEMPLATE POLICY (the reviewed, pinned local allowlist):
+TEMPLATE POLICY (the reviewed, hash-pinned manifest — Phase 2B.8):
 
+- Phase 2B.7 audited the previous directory-level allowlist and found
+  UNSAFE templates inside dirs it had called "vetted": token-spray/
+  (third-party token validation using discovered credentials),
+  misconfiguration/ (state-changing POST/PURGE operations, unsafe raw
+  HTTP requests, OAST/interactsh dependencies) and a login/logout
+  template inside exposed-panels/. DIRECTORY MEMBERSHIP ALONE DOES NOT
+  ESTABLISH SAFETY.
 - The sandbox image bakes the upstream nuclei-templates tree at build
-  time (Dockerfile.kali); the image is digest-pinned, so the tree is
-  IMMUTABLE for every run — no template can be uploaded, fetched or
-  changed at runtime.
-- The adapter's argv carries the template set as FIXED LITERALS: the
-  four vetted detection sets
-  ``http/exposures/configs/`` (exposed .env/.git/config files, backups),
-  ``http/misconfiguration/`` (missing headers, insecure settings),
-  ``http/exposed-panels/`` (admin panels and consoles),
-  ``http/token-spray/`` (secrets/tokens leaked in responses).
-  There is NO ``{template}`` variable: a caller cannot choose a
-  template. Everything else the tree contains — cves, vulnerabilities,
-  default-logins, fuzzing, credential-stuffing, takeovers, and the
-  rest of exposures (measured: its scan overruns the entrypoint's
-  hard 300s bound under the sandbox's caps) — is simply never
+  time (Dockerfile.kali, PINNED to the reviewed commit recorded in the
+  manifest); the image is digest-pinned, so the tree is IMMUTABLE for
+  every run — no template can be uploaded, fetched or changed at
+  runtime.
+- The policy is an EXPLICIT, version-pinned allowlist of individually
+  REVIEWED templates (``nuclei_manifest.json``: template id, image
+  path, sha256 of the reviewed content). The adapter's argv carries
+  the approved set as FIXED LITERALS — one ``-t <file>`` pair per
+  reviewed template, built FROM the manifest, so a manifest change is
+  an adapter change. There is NO ``{template}`` variable: a caller
+  cannot choose a template. token-spray/ and misconfiguration/ are
+  entirely ABSENT from the manifest this phase (no per-template
+  review passed them yet); everything else the tree contains — cves,
+  vulnerabilities, default-logins, fuzzing, credential-stuffing,
+  takeovers and the unreviewed rest of exposures — is simply never
   emitted by the adapter.
+- Every manifest entry was machine-reviewed (per-template gates:
+  GET-only, no body/raw HTTP, no credential-bearing parameters, no
+  login/logout or session-destroying paths, no external hosts, no
+  interactsh/OAST, no payloads/fuzzing, no intrusive tag, no
+  code/network/file protocol blocks) and only templates that passed
+  ALL gates are approved — if a template cannot be confidently
+  demonstrated safe, it is not approved.
+- The Docker build verifies EVERY manifest entry against the baked
+  tree (exists + sha256 match) and FAILS the build on drift; the
+  sandbox entrypoint re-verifies the argv's -t files against the
+  baked manifest at every spawn and refuses unreviewed, missing or
+  content-changed templates (fail closed, never silently executed).
 - Remote template sources are structurally impossible here: the fixed
   argv never carries ``-turl``/``-wurl``/``-ut`` (remote template /
-  workflow URLs, template update), and ``-duc`` additionally disables
-  the update check. The sandbox's egress boundary is target-scope
-  anyway.
+  workflow URLs, template update), ``-duc`` additionally disables
+  the update check, and the entrypoint refuses those flags on every
+  nuclei run. The sandbox's egress boundary is target-scope anyway.
 - ``-etags intrusive`` excludes any template that declares itself
   intrusive; OAST/out-of-band callbacks are OFF via ``-ni`` (which
   also excludes OAST-based templates); local-file payload access
@@ -44,8 +64,8 @@ TEMPLATE POLICY (the reviewed, pinned local allowlist):
 BOUNDS: ``-rl 20`` requests/second, ``-c 10`` template concurrency,
 ``-timeout 15`` per request, ``-retries 1``, ``-mt 2m`` nuclei's own
 graceful max-time (measured live through gVisor under the sandbox's
-caps: the full four-dir run completes in ~175s, and the entrypoint
-kills any tool at 300s hard; the adapter's max_seconds is 300).
+caps; the entrypoint kills any tool at 300s hard; the adapter's
+max_seconds is 300).
 
 OUTPUT CONTRACT (verified against the pinned image's nuclei v3.11.1):
     -j / -jsonl   one JSON object per match line (stable contract)
@@ -81,6 +101,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -103,30 +124,102 @@ TOOL_EXECUTABLE = "nuclei"
 #: template sources does not exist in the sandbox anyway)
 TEMPLATE_ROOT = "/opt/nuclei-templates/http"
 
-#: the reviewed, pinned template allowlist: four vetted detection
-#: sets, FIXED LITERALS in the argv template below. Content inside
-#: them is immutable (digest-pinned image).
+#: the reviewed, hash-pinned template manifest (Phase 2B.8):
 #:
-#: WHY ``exposures/configs/`` and not the whole ``exposures/`` tree
-#: (measured live under the sandbox's exact resource caps): nuclei's
-#: full exposures directory runs past the entrypoint's hard 300s kill
-#: and ignores its own graceful max-time there, while the high-value
-#: exposed-config coverage (.env, .git, backups, config files) in its
-#: ``configs/`` subtree completes bounded (~30s alone; the combined
-#: four-dir run measures ~175s, twice, through the egress bridge).
-VETTED_TEMPLATE_DIRS: tuple[str, ...] = (
-    f"{TEMPLATE_ROOT}/exposures/configs/",
-    f"{TEMPLATE_ROOT}/misconfiguration/",
-    f"{TEMPLATE_ROOT}/exposed-panels/",
-    f"{TEMPLATE_ROOT}/token-spray/",
-)
+#: Phase 2B.7 audited the previous directory-allowlist policy and found
+#: UNSAFE templates inside dirs it called "vetted": token-spray/
+#: (third-party token validation with discovered credentials),
+#: misconfiguration/ (state-changing POST/PURGE, unsafe raw HTTP,
+#: OAST/interactsh dependencies) and a login/logout template inside
+#: exposed-panels/. Directory membership never established safety, so
+#: the policy now draws from an EXPLICIT, version-pinned allowlist of
+#: individually reviewed template files:
+#:
+#: - every entry is a reviewed template ID + its IMAGE path + the
+#:   sha256 of the reviewed content, produced by
+#:   ``tools/nuclei_template_review.py`` against a pinned
+#:   nuclei-templates commit (recorded inside the manifest);
+#: - the Docker build verifies every entry against the baked tree and
+#:   FAILS the build on any mismatch (reproducibility);
+#: - the sandbox entrypoint re-verifies the argv's -t files against the
+#:   baked manifest at every spawn and REFUSES unreviewed, missing or
+#:   content-changed templates (fail closed);
+#: - remote template sources stay structurally impossible: the fixed
+#:   argv never carries -turl/-wurl/-ut, -duc disables the update
+#:   check, and the entrypoint additionally refuses those flags on
+#:   every nuclei run.
+#:
+#: token-spray/ and misconfiguration/ are NOT in the manifest at all
+#: this phase (no per-template review passed them yet). The non-GET,
+#: body/raw, credential-parameter, login/logout, external-host,
+#: interactsh, payloads/fuzzing, intrusive-tag and code/network/file
+#: protocol gates all REJECTED during review; only pure-GET, single/
+#: few-request, BaseURL-rooted detection templates are approved.
+
+_MANIFEST_PATH = Path(__file__).resolve().parent / "nuclei_manifest.json"
+
+
+class NucleiPolicyError(RuntimeError):
+    """The template manifest is missing, malformed or inconsistent —
+    Nuclei execution stays DISABLED (fail closed, never a fallback to
+    the unsafe directory policy)."""
+
+
+def load_template_manifest() -> dict[str, dict[str, str]]:
+    """The reviewed manifest: {image template path: {id, sha256}}.
+
+    Hard-requires every entry to carry a non-empty id and a 64-hex
+    sha256; any malformed entry refuses the whole manifest.
+    """
+    try:
+        raw = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise NucleiPolicyError(
+            f"nuclei template manifest unreadable at {_MANIFEST_PATH}: "
+            f"{e} — Nuclei execution stays disabled") from e
+    entries = raw.get("templates")
+    if not isinstance(entries, dict) or not entries:
+        raise NucleiPolicyError(
+            "nuclei template manifest carries no reviewed templates "
+            "— Nuclei execution stays disabled")
+    for path, meta in entries.items():
+        ok = (
+            isinstance(path, str)
+            and path.startswith(f"{TEMPLATE_ROOT}/")
+            and path.endswith(".yaml")
+            and isinstance(meta, dict)
+            and isinstance(meta.get("id"), str) and meta["id"].strip()
+            and isinstance(meta.get("sha256"), str)
+            and len(meta["sha256"]) == 64
+            and all(c in "0123456789abcdef" for c in meta["sha256"])
+        )
+        if not ok:
+            raise NucleiPolicyError(
+                f"malformed manifest entry for {path!r} — Nuclei "
+                "execution stays disabled")
+    return entries
+
+
+#: THE approved inventory — the ONLY template files the adapter may
+#: ever schedule (frozen literals in the argv template below).
+APPROVED_TEMPLATES: dict[str, dict[str, str]] = load_template_manifest()
+
+#: the approved paths in manifest order (deterministic; the argv is
+#: built from these, so a manifest change IS an adapter change)
+APPROVED_TEMPLATE_PATHS: tuple[str, ...] = tuple(
+    sorted(APPROVED_TEMPLATES))
+
+#: the manifest's reviewed templates commit (reproducibility record)
+NUCLEI_TEMPLATES_COMMIT = json.loads(_MANIFEST_PATH.read_text(
+    encoding="utf-8")).get("templates_commit", "")
 
 #: the fixed argv template — frozen literals everywhere except {url}.
 #: Every safety flag is a LITERAL: the caller cannot add, remove or
 #: reshape a single argument (the Layer-2 check re-validates the
-#: rendered argv against exactly this template).
+#: rendered argv against exactly this template). The template list is
+#: EXACTLY the reviewed manifest: no directory is ever passed.
 _TEMPLATE_ARGS: tuple[str, ...] = tuple(
-    arg for dir_path in VETTED_TEMPLATE_DIRS for arg in ("-t", dir_path)
+    arg for path in APPROVED_TEMPLATE_PATHS for arg in ("-t", path)
 )
 NUCLEI_PROBE_TEMPLATE: tuple[str, ...] = (
     "-u", "{url}",
@@ -143,13 +236,47 @@ NUCLEI_PROBE_TEMPLATE: tuple[str, ...] = (
     "-c", "10",                # 10 templates in parallel
     "-timeout", "15",          # per-request timeout (seconds)
     "-retries", "1",           # single retry, no hammering
-    "-mt", "2m",               # nuclei's own graceful max-time: the full
-                               # four-dir run measures ~175s through
-                               # gVisor under the sandbox's caps (and
-                               # the entrypoint kills at 300s hard —
-                               # measured live; 3m+ and the full
-                               # exposures tree overrun that bound)
+    "-mt", "2m",               # nuclei's own graceful max-time: the
+                               # reviewed-template run is bounded well
+                               # inside it (the entrypoint kills at 300s
+                               # hard — measured live)
 )
+
+
+def template_policy_violations(argv: "tuple[str, ...] | list[str]") \
+        -> "list[str]":
+    """Every way ``argv`` violates the non-destructive template policy.
+
+    The hard rule: a ``-t`` value must be EXACTLY an approved manifest
+    path — no directories, no unreviewed files, no token-spray/ or
+    misconfiguration/ subtree, nothing outside the manifest. (The
+    legacy EXPLOIT stage keeps its own path via its own allowlist; this
+    policy is the RECON_ACTIVE probe's.) Remote-template/OAST/update
+    flags are refused here too, so the check documents the whole
+    boundary in one place; Layer-2 argv validation remains the
+    execution-time enforcement.
+    """
+    violations: list[str] = []
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-t":
+            value = args[i + 1] if i + 1 < len(args) else ""
+            if value not in APPROVED_TEMPLATES:
+                violations.append(
+                    f"template not in the reviewed inventory: {value!r}")
+            i += 2
+            continue
+        for flag in ("-turl", "-wurl", "-ut", "-update-templates", "-ud",
+                     "-iserver", "-itoken", "-lfa", "-esc", "-code",
+                     "-fuzz", "-dast", "-headless", "-automatic-scan",
+                     "-new-templates", "-ai", "-config", "-profile",
+                     "-itags"):
+            if a == flag:
+                violations.append(f"forbidden flag: {flag}")
+        i += 1
+    return violations
 
 
 def make_nuclei_probe_adapter():
@@ -157,19 +284,23 @@ def make_nuclei_probe_adapter():
 
     A factory (not a module constant) keeps the import graph light and
     lets each caller own its instance; the definition itself is fully
-    determined — same registry identity everywhere.
+    determined — same registry identity everywhere. Registration
+    REFUSES (NucleiPolicyError) unless the argv template's -t values
+    are exactly the reviewed manifest — the policy is enforced by the
+    adapter itself, not merely documented.
     """
     from .adapters import ModeBToolAdapter
 
-    return ModeBToolAdapter(
+    adapter = ModeBToolAdapter(
         adapter_id=ADAPTER_ID,
         title="nuclei non-destructive check",
         purpose=(
             "Authorized non-destructive vulnerability checks against "
-            "in-scope web endpoints: Nuclei over a pinned local "
-            "template allowlist (exposed configs, misconfigurations, "
-            "panels, leaked tokens) — detection only, RECON_ACTIVE "
-            "only. Matches are candidates, never confirmed findings."
+            "in-scope web endpoints: Nuclei over the reviewed, "
+            "hash-pinned template manifest (exposed configs and "
+            "panels; no token spraying, no state-changing checks) — "
+            "detection only, RECON_ACTIVE only. Matches are "
+            "candidates, never confirmed findings."
         ),
         category="web_recon",
         stages=("RECON_ACTIVE",),
@@ -183,6 +314,15 @@ def make_nuclei_probe_adapter():
         risk="active",           # as the legacy recon probes
         evidence_kind="json_report",
     )
+    # self-check: the adapter's argv must carry EXACTLY the reviewed
+    # inventory — a drift between the manifest and the frozen template
+    # refuses registration (fail closed)
+    violations = template_policy_violations(adapter.command_template)
+    if violations:
+        raise NucleiPolicyError(
+            f"{ADAPTER_ID}: template policy violated — "
+            f"{violations[:3]} — Nuclei execution stays disabled")
+    return adapter
 
 
 def production_registry():

@@ -67,6 +67,9 @@ def _egress_boundary(request, monkeypatch):
         # Phase 2C.1 tier-2: the REAL-container lab IT must prove the
         # REAL boundary end-to-end, exactly like the other ITs above.
         "test_mode_b_e2e_lab_it.py",
+        # Phase 2B.8: the adapter lab IT validates ALL SIX adapters
+        # through the REAL boundary — same rule as the e2e lab IT.
+        "test_mode_b_adapter_lab_it.py",
         # Phase 2B.6: the planner lab IT arms the REAL boundary too —
         # a faked boundary would prove planning decisions that were
         # never really enforced.

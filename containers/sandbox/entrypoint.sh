@@ -69,6 +69,27 @@ if [[ -z "$TOOL" ]] || [[ ! " ${ALLOWED_TOOLS[*]} " =~ " ${TOOL} " ]]; then
     exit 125
 fi
 
+# Nuclei template-policy gate (Phase 2B.8, defense-in-depth Layer 2b).
+# Before every nuclei run: every -t value must be a manifest-approved
+# template file with the exact reviewed sha256 (the one allowed
+# directory value is the exact tree root — the legacy EXPLOIT-stage
+# selection, unchanged); remote-template/OAST/update/local-file flags
+# are refused. The gate prints its own JSON error and exits 125; fail
+# closed even if the gate itself cannot run.
+if [[ "$TOOL" == "nuclei" ]]; then
+    GATE_OUT="$(python3 /opt/kryonsec/nuclei_gate.py "$@" 2>/dev/null)"
+    GATE_RC=$?
+    if [[ $GATE_RC -ne 0 ]]; then
+        if [[ -n "$GATE_OUT" ]]; then
+            printf '%s\n' "$GATE_OUT"
+        else
+            printf '{"error": "template_policy_gate_failed", "gate_rc": %d}\n' \
+                "$GATE_RC"
+        fi
+        exit 125
+    fi
+fi
+
 # Execute; capture output and the REAL exit code
 OUTFILE="$(mktemp /tmp/toolout.XXXXXX)"
 timeout --signal=KILL 300 "$@" >"$OUTFILE" 2>&1
