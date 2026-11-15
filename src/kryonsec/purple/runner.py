@@ -51,7 +51,11 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "does": "scan the target (packets to target)",
         "tools": "nmap, naabu, dnsx, httpx, whatweb, katana, feroxbuster, "
                  "openapi_probe, gowitness (screenshots → /evidence), "
-                 "sslscan, testssl.sh",
+                 "sslscan, testssl.sh; vetted adapter probes where "
+                 "registered: httpx-probe, whatweb-probe, tls-probe, "
+                 "api-probe, nuclei-probe (web) + naabu-probe, "
+                 "dnsx-probe (discovery), katana-probe (crawl) — same "
+                 "binaries, same fixed argv, one probe per check",
         "zone": "B (sandbox)",
     },
     "HYPOTHESIZE": {

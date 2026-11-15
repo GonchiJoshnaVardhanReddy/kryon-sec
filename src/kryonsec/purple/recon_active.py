@@ -8,6 +8,16 @@ the sandbox (the only place packets to the target are ever allowed):
                         → katana → feroxbuster → openapi_probe → gowitness;
                         sslscan + testssl.sh when the service is TLS
 
+Tool Expansion Batch 1: when the corresponding vetted adapter is
+registered, the naabu/dnsx discovery entries and the katana web entry
+run as ADAPTER lanes instead of the legacy plan entries (deterministic
+either/or — same binaries, byte-identical argv, plus run provenance
+and structured failure classification). The discovery lanes are NOT
+planner-gated: they run BEFORE the plan is built (the planner needs
+their observed ports — chicken-and-egg), and a plan built afterwards
+reports a successful lane as ``covered`` post-hoc via its fresh
+adapter_attempt node.
+
 Every argv is built here as a fixed constant list, validated against the
 host-side ToolAllowlist (Layer 2), and audited. The LLM has no say in
 what gets scanned. A failed tool never fails the state — HYPOTHESIZE
@@ -245,15 +255,27 @@ class ReconActiveSubagent:
 
     # ---- plan construction (deterministic, no LLM input) -----------------
 
-    def _discovery_plan(self) -> list[tuple[str, list[str]]]:
-        """Stage 1: port/service discovery + DNS resolution."""
-        return [
+    def _discovery_plan(self, use_naabu_adapter: bool = False,
+                        use_dnsx_adapter: bool = False
+                        ) -> list[tuple[str, list[str]]]:
+        """Stage 1: port/service discovery + DNS resolution.
+
+        ``use_naabu_adapter`` / ``use_dnsx_adapter`` (Tool Expansion
+        Batch 1) omit the corresponding legacy plan entry when the
+        registered adapter probe runs instead — NO duplicate scanning
+        of the same check (deterministic either/or). nmap stays the
+        authoritative service scan either way.
+        """
+        plan: list[tuple[str, list[str]]] = [
             ("nmap", ["nmap", "-Pn", "-sT", "-sV", "-sC", "--max-rate", "100",
                       "-p", RECON_PORTS, self.target]),
-            ("naabu", ["naabu", "-host", self.target, "-p", RECON_PORTS,
-                       "-rate", "100", "-silent"]),
-            ("dnsx", ["dnsx", "-d", self.target, "-silent"]),
         ]
+        if not use_naabu_adapter:
+            plan.append(("naabu", ["naabu", "-host", self.target, "-p",
+                                   RECON_PORTS, "-rate", "100", "-silent"]))
+        if not use_dnsx_adapter:
+            plan.append(("dnsx", ["dnsx", "-d", self.target, "-silent"]))
+        return plan
 
     def _httpx_adapter(self):
         """The registered httpx-probe adapter, or None (unknown ids are
@@ -317,6 +339,45 @@ class ReconActiveSubagent:
         except AdapterError:
             return None
 
+    def _naabu_adapter(self):
+        """The registered naabu-probe adapter (Tool Expansion Batch 1),
+        or None — the same explicit-registration rule: an injected
+        registry without it means the legacy naabu discovery entry
+        runs, deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_naabu import NAABU_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(NAABU_ADAPTER_ID)
+        except AdapterError:
+            return None
+
+    def _dnsx_adapter(self):
+        """The registered dnsx-probe adapter (Tool Expansion Batch 1),
+        or None — the same explicit-registration rule: an injected
+        registry without it means the legacy dnsx discovery entry
+        runs, deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_dnsx import DNSX_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(DNSX_ADAPTER_ID)
+        except AdapterError:
+            return None
+
+    def _katana_adapter(self):
+        """The registered katana-probe adapter (Tool Expansion Batch
+        1), or None — the same explicit-registration rule: an injected
+        registry without it means the legacy katana web-plan entry
+        runs, deterministically (one or the other, never both)."""
+        if self.adapter_registry is None:
+            return None
+        from .adapter_katana import KATANA_ADAPTER_ID
+        try:
+            return self.adapter_registry.get(KATANA_ADAPTER_ID)
+        except AdapterError:
+            return None
+
     def _planned_bases(self, adapter_id: str,
                        bases: "list[str]") -> "list[str]":
         """The plan-selected bases for ONE adapter (Phase 2B.6).
@@ -358,18 +419,19 @@ class ReconActiveSubagent:
     def _web_plan(self, ports: set[int],
                   use_httpx_adapter: bool = False,
                   use_whatweb_adapter: bool = False,
+                  use_katana_adapter: bool = False,
                   use_tls_adapter: bool = False,
                   use_api_adapter: bool = False
                   ) -> list[tuple[str, list[str]]]:
         """Stage 2: http probes on discovered web ports.
 
         ``use_httpx_adapter`` (Phase 2B.3), ``use_whatweb_adapter``
-        (Phase 2B.5), ``use_tls_adapter`` (Phase 2B.5) and
-        ``use_api_adapter`` (Phase 2B.5) omit the corresponding legacy
-        plan entries when the registered adapter probe runs instead —
-        NO duplicate probing of the same check (deterministic
-        either/or). The other probes (katana/feroxbuster/gowitness)
-        are unchanged either way.
+        (Phase 2B.5), ``use_katana_adapter`` (Tool Expansion Batch 1),
+        ``use_tls_adapter`` (Phase 2B.5) and ``use_api_adapter``
+        (Phase 2B.5) omit the corresponding legacy plan entries when
+        the registered adapter probe runs instead — NO duplicate
+        probing of the same check (deterministic either/or). The other
+        probes (feroxbuster/gowitness) are unchanged either way.
         """
         plan: list[tuple[str, list[str]]] = []
         # same filter/order as _web_bases, so (port, base) stay paired
@@ -383,7 +445,9 @@ class ReconActiveSubagent:
                 plan.append(("whatweb", ["whatweb", "-a", "3",
                                          "--no-errors", "--color=never",
                                          base]))
-            plan.append(("katana", ["katana", "-u", base, "-d", "2", "-silent"]))
+            if not use_katana_adapter:
+                plan.append(("katana", ["katana", "-u", base, "-d", "2",
+                                        "-silent"]))
             plan.append(("feroxbuster",
                          ["feroxbuster", "-u", base.rstrip("/") + "/FUZZ",
                           "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"]))
@@ -418,8 +482,16 @@ class ReconActiveSubagent:
         executed = 0
         # stage 1 — discovery. nmap output is authoritative for services;
         # naabu is both a second opinion and the fallback if nmap fails.
+        # Batch 1: when the naabu-probe / dnsx-probe adapters are
+        # registered they REPLACE the corresponding legacy entries here
+        # (deterministic either/or); the adapter lanes run in the legacy
+        # order right after this loop.
+        naabu_adapter = self._naabu_adapter()
+        dnsx_adapter = self._dnsx_adapter()
         open_ports: set[int] = set()
-        for tool, argv in self._discovery_plan():
+        for tool, argv in self._discovery_plan(
+                use_naabu_adapter=naabu_adapter is not None,
+                use_dnsx_adapter=dnsx_adapter is not None):
             result, ran = self._spawn(tool, argv)
             executed += ran if result.ok else 0
             if not result.ok:
@@ -466,17 +538,37 @@ class ReconActiveSubagent:
                     "resolved_ips": ips,
                 })
 
+        # Batch 1: the adapter lanes for the discovery entries — run in
+        # the legacy order (naabu, then dnsx) ONCE per state, merging
+        # into the SAME shared state the legacy parse feeds (the
+        # open_ports set; the dns_resolution node). They are NOT
+        # planner-gated: they run BEFORE the plan is built (the planner
+        # needs their observed ports — chicken-and-egg), and a plan
+        # built afterwards reports a successful lane as ``covered``
+        # post-hoc via its fresh adapter_attempt node. Preparation and
+        # execution refusals are audited and skipped — never fatal,
+        # exactly like a tool failure.
+        if naabu_adapter is not None:
+            executed += self._run_naabu_adapter(naabu_adapter, open_ports)
+        if dnsx_adapter is not None:
+            executed += self._run_dnsx_adapter(dnsx_adapter)
+
         # Phase 2B.6: the optional bounded tool planner. Built from the
         # SAME validated evidence the legacy path uses (observed open
         # ports -> in-scope web bases) and the SAME injected adapter
-        # registry. A planner crash is audited and falls back to the
+        # registry. Batch 1: the engagement target is passed as the
+        # DOMAIN-kind target so the registered domain adapters
+        # (naabu-probe / dnsx-probe) are described against IT — never
+        # against the URL bases (prepare_adapter_run would refuse that
+        # pairing). A planner crash is audited and falls back to the
         # exact pre-2B.6 deterministic path — never to anything new.
         bases = self._web_bases(open_ports)
         if self.planner is not None:
             try:
                 self._plan = self.planner.plan(
                     state="RECON_ACTIVE", target=self.target,
-                    bases=bases, graph=self.graph, audit=self.audit)
+                    bases=bases, graph=self.graph, audit=self.audit,
+                    domain_targets=(self.target,))
                 self.audit.write({
                     "event": "planner_plan_applied",
                     "plan_id": self._plan.plan_id,
@@ -510,6 +602,18 @@ class ReconActiveSubagent:
         if whatweb_adapter is not None:
             executed += self._run_whatweb_adapter(
                 whatweb_adapter, self._planned_bases("whatweb-probe", bases))
+
+        # the registered katana adapter (Tool Expansion Batch 1)
+        # REPLACES the legacy katana web-plan entries — same
+        # deterministic either/or: the adapter crawl runs against the
+        # same base URLs, the legacy plan entry contributes nothing;
+        # crawled paths become ``path`` nodes with the adapter
+        # provenance. Like the other web lanes it is planner-gated
+        # (2B.6): only plan-SELECTED bases dispatch.
+        katana_adapter = self._katana_adapter()
+        if katana_adapter is not None:
+            executed += self._run_katana_adapter(
+                katana_adapter, self._planned_bases("katana-probe", bases))
 
         # the registered tls-probe adapter (Phase 2B.5) REPLACES the
         # legacy sslscan/testssl.sh entries for TLS bases — one TLS
@@ -545,6 +649,7 @@ class ReconActiveSubagent:
         for tool, argv in self._web_plan(
                 open_ports, use_httpx_adapter=httpx_adapter is not None,
                 use_whatweb_adapter=whatweb_adapter is not None,
+                use_katana_adapter=katana_adapter is not None,
                 use_tls_adapter=tls_adapter is not None,
                 use_api_adapter=api_adapter is not None):
             result, ran = self._spawn(tool, argv)
@@ -822,6 +927,85 @@ class ReconActiveSubagent:
                 })
         return executed
 
+    def _run_katana_adapter(self, adapter, bases: "list[str]") -> int:
+        """Run the registered katana-probe adapter against each stage-2
+        base URL (Tool Expansion Batch 1).
+
+        Returns 1 per base whose run executed (the same count the
+        legacy katana plan entries contribute). The crawl depth is
+        PINNED to the legacy plan's ``-d 2`` via params — never caller
+        input. Preparation refusals (out-of-scope base) and execution
+        refusals (no egress, no sandbox) are AUDITED as
+        ``recon_active_adapter_failure`` and skipped — an adapter
+        refusal never fails the state, exactly like a tool failure.
+        Observations become ``path`` nodes (the same node type the
+        legacy parse produced), with the adapter provenance.
+        """
+        from .adapter_katana import PINNED_DEPTH, parse_katana_lines, \
+            record_katana_evidence
+
+        executed = 0
+        for base in bases:
+            try:
+                prepared = prepare_adapter_run(
+                    self.adapter_registry, adapter.adapter_id,
+                    target=self.target, target_asset=base,
+                    params={"depth": PINNED_DEPTH})
+            except AdapterError as e:
+                # Phase 2B.7: the ONLY progress line the lane emits —
+                # prepare refusals never reach execute_adapter's own
+                # per-attempt lines, so the refusal is announced here.
+                if self.progress is not None:
+                    self.progress(
+                        f"{adapter.adapter_id} ✗ {base}: "
+                        f"{failure_explanation_for_exception(e)}")
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "base": base[:300],
+                    "reason": str(e)[:200],
+                    "failure_class": classify_adapter_exception(e),
+                })
+                continue
+            record, output = execute_adapter(
+                self.adapter_registry, prepared,
+                sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+                full_output=True,
+                max_spawn_attempts=1 + self.spawn_retries,
+                progress=self.progress)
+            if record.executed:
+                self._plan_record_executed(adapter.adapter_id, base)
+                observations, malformed = parse_katana_lines(
+                    output, target=self.target)
+                record_katana_evidence(
+                    self.graph, self.audit,
+                    run_record=record,
+                    observations=observations,
+                    malformed_lines=malformed,
+                )
+                self.audit.write({
+                    "event": "recon_active_katana_adapter",
+                    "plan_id": self._plan.plan_id if self._plan else None,
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "observations": len(observations),
+                    "malformed_lines": malformed,
+                })
+                executed += 1
+            else:
+                self.audit.write({
+                    "event": "recon_active_adapter_failure",
+                    "adapter": adapter.adapter_id,
+                    "request_id": record.request_id,
+                    "base": base[:300],
+                    "outcome": record.outcome,
+                    "failure_class": record.failure_class,
+                    "explanation": failure_explanation(record),
+                    "reason": record.error_excerpt[:200],
+                })
+        return executed
+
     def _run_nuclei_adapter(self, adapter, bases: "list[str]") -> int:
         """Run the registered nuclei-probe adapter against each stage-2
         base URL (Phase 2B.4).
@@ -1068,6 +1252,175 @@ class ReconActiveSubagent:
                     "reason": record.error_excerpt[:200],
                 })
         return executed
+
+    def _run_naabu_adapter(self, adapter, open_ports: "set[int]") -> int:
+        """Run the registered naabu-probe adapter as the discovery-stage
+        port scan (Tool Expansion Batch 1).
+
+        Runs ONCE per state — the same standing the legacy naabu
+        discovery entry has — and is NOT planner-gated: it executes
+        BEFORE the plan is built (the planner needs its observed
+        ports), and a plan built afterwards reports the successful run
+        as ``covered`` post-hoc via its fresh adapter_attempt node.
+        The rendered argv is byte-identical to the legacy entry: the
+        lane pins ``ports`` to RECON_PORTS and ``rate`` to 100 —
+        never caller input. Parsed ports merge into ``open_ports``
+        (legacy parity: the adapter adds NO graph nodes of its own;
+        the run's ``adapter_attempt`` node is the evidence).
+        Preparation refusals and execution refusals are AUDITED as
+        ``recon_active_adapter_failure`` and skipped — never fatal.
+
+        Returns 1 when the run executed (the same count the legacy
+        naabu plan entry contributes).
+        """
+        from .adapter_naabu import parse_naabu_lines, record_naabu_evidence
+
+        try:
+            prepared = prepare_adapter_run(
+                self.adapter_registry, adapter.adapter_id,
+                target=self.target,
+                params={"ports": RECON_PORTS, "rate": "100"})
+        except AdapterError as e:
+            # Phase 2B.7: the ONLY progress line the lane emits —
+            # prepare refusals never reach execute_adapter's own
+            # per-attempt lines, so the refusal is announced here.
+            if self.progress is not None:
+                self.progress(
+                    f"{adapter.adapter_id} ✗ {self.target}: "
+                    f"{failure_explanation_for_exception(e)}")
+            self.audit.write({
+                "event": "recon_active_adapter_failure",
+                "adapter": adapter.adapter_id,
+                "base": self.target[:300],
+                "reason": str(e)[:200],
+                "failure_class": classify_adapter_exception(e),
+            })
+            return 0
+        record, output = execute_adapter(
+            self.adapter_registry, prepared,
+            sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+            full_output=True,
+            max_spawn_attempts=1 + self.spawn_retries,
+            progress=self.progress)
+        if record.executed:
+            # recorded for the planned-vs-executed comparison; with the
+            # plan built AFTER discovery this is a no-op today (the
+            # plan sees the fresh adapter_attempt node and reports the
+            # lane as covered) — a pre-discovery planning pass (Batch
+            # 2) would make this line do real work.
+            self._plan_record_executed(adapter.adapter_id, self.target)
+            observations, malformed = parse_naabu_lines(output)
+            for observation in observations:
+                open_ports.add(observation.port)
+            record_naabu_evidence(
+                self.graph, self.audit,
+                run_record=record,
+                observations=observations,
+                malformed_lines=malformed,
+            )
+            self.audit.write({
+                "event": "recon_active_naabu_adapter",
+                "plan_id": self._plan.plan_id if self._plan else None,
+                "adapter": adapter.adapter_id,
+                "request_id": record.request_id,
+                "open_ports": sorted(o.port for o in observations),
+                "malformed_lines": malformed,
+            })
+            return 1
+        self.audit.write({
+            "event": "recon_active_adapter_failure",
+            "adapter": adapter.adapter_id,
+            "request_id": record.request_id,
+            "base": self.target[:300],
+            "outcome": record.outcome,
+            "failure_class": record.failure_class,
+            "explanation": failure_explanation(record),
+            "reason": record.error_excerpt[:200],
+        })
+        return 0
+
+    def _run_dnsx_adapter(self, adapter) -> int:
+        """Run the registered dnsx-probe adapter as the discovery-stage
+        DNS resolution (Tool Expansion Batch 1).
+
+        Runs ONCE per state — the same standing the legacy dnsx
+        discovery entry has — and is NOT planner-gated: it executes
+        BEFORE the plan is built, and a plan built afterwards reports
+        the successful run as ``covered`` post-hoc. Observations
+        become ONE legacy-shape ``dns_resolution`` node (the same node
+        type the legacy parse produced), with the adapter provenance;
+        a run that resolved nothing is an honest INCONCLUSIVE result,
+        audited and never a negative claim. Preparation refusals and
+        execution refusals are AUDITED as
+        ``recon_active_adapter_failure`` and skipped — never fatal.
+
+        Returns 1 when the run executed (the same count the legacy
+        dnsx plan entry contributes).
+        """
+        from .adapter_dnsx import parse_dnsx_lines, record_dnsx_evidence
+
+        try:
+            prepared = prepare_adapter_run(
+                self.adapter_registry, adapter.adapter_id,
+                target=self.target)
+        except AdapterError as e:
+            # Phase 2B.7: the ONLY progress line the lane emits —
+            # prepare refusals never reach execute_adapter's own
+            # per-attempt lines, so the refusal is announced here.
+            if self.progress is not None:
+                self.progress(
+                    f"{adapter.adapter_id} ✗ {self.target}: "
+                    f"{failure_explanation_for_exception(e)}")
+            self.audit.write({
+                "event": "recon_active_adapter_failure",
+                "adapter": adapter.adapter_id,
+                "base": self.target[:300],
+                "reason": str(e)[:200],
+                "failure_class": classify_adapter_exception(e),
+            })
+            return 0
+        record, output = execute_adapter(
+            self.adapter_registry, prepared,
+            sandbox=self.sandbox, audit=self.audit, graph=self.graph,
+            full_output=True,
+            max_spawn_attempts=1 + self.spawn_retries,
+            progress=self.progress)
+        if record.executed:
+            # recorded for the planned-vs-executed comparison (no-op
+            # today — see _run_naabu_adapter)
+            self._plan_record_executed(adapter.adapter_id, self.target)
+            observations, malformed = parse_dnsx_lines(output)
+            record_dnsx_evidence(
+                self.graph, self.audit,
+                run_record=record,
+                observations=observations,
+                malformed_lines=malformed,
+            )
+            self.audit.write({
+                "event": "recon_active_dnsx_adapter",
+                "plan_id": self._plan.plan_id if self._plan else None,
+                "adapter": adapter.adapter_id,
+                "request_id": record.request_id,
+                "resolved": len(observations),
+                "malformed_lines": malformed,
+                # honest classification: a zero-resolution clean run is
+                # INCONCLUSIVE (nothing resolved, nothing proven),
+                # never a "no records" negative claim
+                "outcome": ("resolved" if observations
+                            else "inconclusive"),
+            })
+            return 1
+        self.audit.write({
+            "event": "recon_active_adapter_failure",
+            "adapter": adapter.adapter_id,
+            "request_id": record.request_id,
+            "base": self.target[:300],
+            "outcome": record.outcome,
+            "failure_class": record.failure_class,
+            "explanation": failure_explanation(record),
+            "reason": record.error_excerpt[:200],
+        })
+        return 0
 
     def _spawn(self, tool: str, argv: list[str]) -> tuple[SpawnResult, int]:
         """Validate + run one tool. Returns (result, 1-if-spawned).

@@ -120,6 +120,38 @@ full-range scan against a third party is exactly what spec §9.1 fears.
 **`nmap` uses `-sT` (connect scan) on purpose.** gVisor grants no raw sockets,
 so the default SYN scan dies with *"Couldn't open a raw socket"*.
 
+### Adapter probes over three legacy entries (Tool Expansion Batch 1)
+
+RECON_ACTIVE can run three of the entries above through the Phase 2B adapter
+framework instead of the bare stdout pipe: `naabu` (port discovery), `dnsx`
+(DNS resolution), and `katana` (web crawling). When the matching adapter is
+registered (`naabu-probe`, `dnsx-probe`, `katana-probe`), it **replaces** the
+legacy entry deterministically — one probe per check, never both. The adapter
+runs the **same binary with the same argv shape** (byte-identical templates,
+lockstep-tested against this table): the lane pins `ports=RECON_PORTS` and
+`rate=100` for naabu, nothing for dnsx, and `depth=2` for katana — the exact
+constants the legacy plan uses, never caller input.
+
+What the adapter adds over the legacy parse:
+
+- a structured `adapter_attempt` run record on the evidence graph (argv, exit
+  code, excerpts, provenance) and its own audit event per lane;
+- bounded, defensive per-line parsing (`host:port` / IPs / bare URLs) with a
+  hard observation cap and honest malformed-line counts;
+- `not_verified` everywhere: an open port, a resolved IP, and a crawled path
+  are facts about the target — never findings. `naabu-probe` still feeds the
+  shared `open_ports` set and adds **no** graph nodes of its own (legacy
+  parity); `dnsx-probe` emits the one legacy-shape `dns_resolution` node;
+  `katana-probe` emits legacy-shape `path` nodes tagged with adapter
+  provenance (first-wins dedupe by label);
+- the discovery lanes (`naabu-probe`, `dnsx-probe`) run **before** the
+  optional planner and are not planner-gated (the plan needs their observed
+  ports); `katana-probe` is planner-gated like every other web lane. With the
+  planner off, behavior is otherwise identical to the fixed plan.
+
+These adapters need no allowlist or image change: `naabu`, `dnsx`, and
+`katana` were already allowlisted and baked into the pinned sandbox image.
+
 ---
 
 ## 3. Exploit — only operator-approved hypotheses

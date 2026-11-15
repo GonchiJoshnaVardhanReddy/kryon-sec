@@ -223,6 +223,7 @@ feature-gated **OFF by default** · 💤 wired but dormant by design · 🗺️ 
 | Independent VERIFY (boolean SQLi probe through the sandbox) | ⚙️ needs sandbox |
 | Blue-team code scanners (`--code`, read-only mount) | ⚙️ needs sandbox |
 | Vetted web adapters (httpx/whatweb/tls/api/searchsploit-term/nuclei probes) | 🧪 12/12 lab IT |
+| Batch 1 adapter probes (naabu/dnsx/katana) — same sandbox+allowlist path | 🧪 mocked suites green; lab ITs armed, not run |
 | Nuclei hash-pinned template manifest + sandbox-side gate (2B.8) | 🧪 enforced, fail-closed |
 | Zone B egress boundary (per-engagement bridge, DOCKER-USER/INPUT allow-only) | ⚙️ needs Docker host + `sudo -n` helper |
 | Deterministic tool planner (2B.6) | 🚧 OFF unless enabled |
@@ -950,7 +951,7 @@ Two details worth calling out:
 |---|---|---|---|---|---|---|
 | `INIT` | Load config, validate the target into a bare in-scope domain, derive engagement id | init (deterministic) | none | validated scope + budget tracker · `engagement_created`, `state_enter` | `RECON_PASSIVE` | none — *authorization is yours*; an invalid target exits 2 before anything starts |
 | `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
-| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe) **or** vetted adapters (httpx/whatweb/tls/api/nuclei probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
+| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe) **or** vetted adapters (httpx/whatweb/tls/api/nuclei/naabu/dnsx/katana probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
 | `HYPOTHESIZE` | Propose vulnerability hypotheses from the graph | hypothesizer **(LLM)** | nothing touches the target; enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (host-side), searchsploit + nuclei-meta (sandbox-local) | hypothesis nodes with confidence, CVSS vector, enrichment · `enrichment_lookup` events | `HUMAN_REVIEW` | none |
 | `HUMAN_REVIEW` | **Blocking approval** of hypotheses | **you** | none | approved/rejected sets · every decision audited; **non-TTY approves nothing** | `EXPLOIT` if ≥1 approved, else `BLUE_TEAM` | **Gate 2** |
 | `EXPLOIT` | Execute **approved hypotheses only** | exploit (deterministic, LLM parses output) | `EXPLOIT` allowlist (sqlmap, nuclei, ffuf, gobuster, wfuzz, dalfox, commix, ssrfmap, arjun, tplmap, nikto, …); every nuclei run needs per-hypothesis approval | exploit_attempt nodes, exit codes, evidence · `tool_spawn/tool_result`, `capability_recorded` | `POST_EXPLOIT` only if shell detected **and** separately approved; else `VERIFY` | Gate-2 approval per hypothesis (+ **Gate 3** if a shell is claimed) |
@@ -1155,6 +1156,9 @@ policy-violating configuration is refused at registration — never defaulted to
 | `api-probe` | read-only API inspection | RECON_ACTIVE | sandbox | base URL → headers/CORS/OPTIONS/OpenAPI notes | GET/OPTIONS only, ≤7 requests, redirects never followed | 🧪 lab IT |
 | `nuclei-probe` | manifest-driven template scan | RECON_ACTIVE | sandbox | in-scope URL → vuln candidates | templates chosen **by the manifest**, gate-enforced | 🧪 lab IT |
 | `searchsploit-term` | offline ExploitDB lookup | HYPOTHESIZE | sandbox | sanitized term → exploit references | informational only, results `not_verified` | 🧪 lab IT |
+| `naabu-probe` | TCP port discovery (Batch 1) | RECON_ACTIVE | sandbox | domain → open ports (merged into the shared port set, no own nodes) | pinned `ports=RECON_PORTS`, `rate=100`; replaces the legacy naabu entry; not planner-gated | 🧪 mocked suite green · lab IT armed, not run |
+| `dnsx-probe` | DNS resolution (Batch 1) | RECON_ACTIVE | sandbox | domain → one legacy-shape `dns_resolution` node | replaces the legacy dnsx entry; not planner-gated | 🧪 mocked suite green · lab IT armed, not run |
+| `katana-probe` | web crawl (Batch 1) | RECON_ACTIVE | sandbox | base URL → legacy-shape `path` nodes | pinned `depth=2`; replaces the legacy katana entry; planner-gated | 🧪 mocked suite green · lab IT armed, not run |
 
 ### B. Fixed-plan allowlist tools (deterministic plans)
 
@@ -1697,6 +1701,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | TLS + API probes with bounded summaries (2B.5) | ✅ done |
 | Deterministic tool planner (2B.6) | ✅ done — **feature-gated OFF** |
 | Honest failures + bounded infra retries (2B.7) | ✅ done |
+| Tool Expansion Batch 1 — naabu/dnsx/katana adapter probes | ✅ code + mocked suites done — real-gVisor lab ITs armed, **NOT RUN on the Windows dev host** |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1729,6 +1734,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | v1.3.10 release CI | 2026-11-10 | 2,128 passed / 8 skipped (Python 3.11, 3.12, 3.13) |
 | Phase 2B.8 completion | 2026-11 | 2,328 passed / 55 skipped locally; **12/12 real adapter lab ITs** and **2/2 full-engagement e2e lab ITs** against the digest-pinned image `sha256:d759cef7d0b3…f85` |
 | v1.3.11 preflight | 2026-11-14/15 | **2,331 passed / 55 skipped** locally (Python 3.11); CI green on 3.11/3.12/3.13 at the release-prep commit |
+| Tool Expansion Batch 1 | 2026-11-15 | **2,401 passed / 58 skipped** in a WSL2 Ubuntu venv (Python 3.14) — the 2 failures are environmental (no `ensurepip` in that Python; no docker group access), not code. The 3 new opt-in lab ITs (naabu/dnsx/katana through real Docker+gVisor) stay NOT RUN on this host |
 
 Honest caveats:
 
@@ -1944,6 +1950,7 @@ kryonsec/
 │   │   ├── adapters.py               #   vetted adapter registry + prepared runs
 │   │   ├── adapter_nuclei.py / adapter_tls.py / adapter_api.py
 │   │   ├── adapter_httpx.py / adapter_whatweb.py / adapter_searchsploit.py
+│   │   ├── adapter_naabu.py / adapter_dnsx.py / adapter_katana.py   # Batch 1 probes
 │   │   ├── nuclei_manifest.json      #   1,605 reviewed templates, sha256-pinned
 │   │   ├── tool_planner.py           #   optional planner (OFF by default)
 │   │   ├── allowlist.py              #   57 argv templates, 5 stage groups

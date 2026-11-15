@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased — Tool Expansion Batch 1 (feature branch, not released)
+
+Three new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
+`katana-probe` — built on the existing Phase 2B adapter framework. Branch
+`feature/tool-expansion-batch1`; nothing below is published yet.
+
+### New vetted adapters (Batch 1)
+
+- **naabu-probe** (TCP port discovery) runs the image's real naabu with the
+  SAME fixed argv the legacy discovery entry uses — the lane pins
+  `ports=RECON_PORTS` (the bounded 18-port list, never a full-range scan) and
+  `rate=100`. Legacy parity preserved: the parsed ports merge into the shared
+  `open_ports` set and the adapter adds **no graph nodes of its own** — the
+  run's `adapter_attempt` node is the evidence. Replaces the legacy naabu
+  entry deterministically (one probe per check, never both).
+- **dnsx-probe** (DNS resolution) runs dnsx with the legacy `-d {target}
+  -silent` shape and emits ONE legacy-shape `dns_resolution` node (all IPs,
+  adapter provenance, first-wins dedupe). A clean run that resolves nothing
+  is an honest INCONCLUSIVE — no node, no negative claim. Replaces the legacy
+  dnsx entry.
+- **katana-probe** (web crawl) runs katana with the legacy `-u {url} -d 2
+  -silent` shape, the crawl depth pinned to `2` via a named constant (a
+  deeper crawl would be a conscious code change, never caller input).
+  Emits legacy-shape `path` nodes with adapter provenance, first-wins dedupe
+  by label (cross-source: a path another source already placed is skipped).
+  Replaces the legacy katana entry; planner-gated like every other web lane.
+- **TEXT output contracts, not `-json`**: the shipped Layer-2 templates must
+  stay in lockstep, and the JSON field shapes could not be verified against
+  the real binaries from the development environment. `-silent` text lines
+  (`host:port`, IPs, bare URLs) parse deterministically with bounded,
+  defensive parsers.
+- **No allowlist or image change**: all three binaries were already
+  allowlisted and baked into the pinned sandbox image.
+
+### Planner (2B.6) — domain-target pairing
+
+- `ToolPlanner.plan()` gained a `domain_targets` parameter: domain-kind
+  adapters (naabu-probe, dnsx-probe) are paired ONLY with the engagement
+  target, never with URL bases; URL-kind adapters pair only with bases. The
+  two discovery lanes run BEFORE the plan (they produce the ports it plans
+  from) and are reported as `covered` post-hoc; a FAILED lane stays selected
+  and is honestly listed as planned-but-not-executed. The planner remains
+  **OFF by default**; with it off, behavior is identical to the fixed plan
+  plus the three adapter lanes.
+
+### Tests and honest status
+
+- New mocked suites: `tests/test_dnsx_adapter.py` (24), `tests/
+  test_naabu_adapter.py` (22), `tests/test_katana_adapter.py` (26) — argv
+  lockstep against the shipped Layer-2 templates, scope/option-injection
+  refusals, gate/sandbox/egress refusals, honest failure classification,
+  bounded output, `not_verified` invariants, either/or integration, planner
+  gating, no-subprocess scans. Plus one opt-in real-gVisor lab IT per
+  adapter (`KRYONSEC_NAABU_IT=1`, `KRYONSEC_DNSX_IT=1`,
+  `KRYONSEC_KATANA_IT=1`) — **armed but NOT RUN on the Windows dev host**;
+  run them in the Linux lab.
+- Full suite on the branch: 2,401 passed / 58 skipped (WSL2, Python 3.14);
+  the 2 failures are environmental (no `ensurepip` in that Python; no docker
+  group access), not regressions.
+
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 
 Eleven commits since v1.3.10, all in the Purple Team engine. The headline: the
