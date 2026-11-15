@@ -25,6 +25,7 @@ from .models import (
     GeneralSession,
     GeneralUserLtm,
     HandoffRecordRow,
+    HandoffSchedulerRow,
     LtmEngagementSummary,
     LtmTargetProfile,
     StmEdge,
@@ -58,4 +59,5 @@ __all__ = [
     "EngagementSecretMap",
     "Checkpoint",
     "HandoffRecordRow",
+    "HandoffSchedulerRow",
 ]
