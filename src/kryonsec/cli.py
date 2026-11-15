@@ -1080,9 +1080,12 @@ def _run_purple(
         # the same failure shape — reported to the operator, never fatal,
         # never silent. The engagement's own record (audit chain,
         # evidence, report, graph) is complete either way.
+        # Batch 4C: the specialist scheduler's snapshot rides along in the
+        # same write, so a later run of this id can resume from it.
         coordinator = getattr(orch, "handoff_coordinator", None)
+        scheduler = getattr(orch, "specialist_scheduler", None)
         if coordinator is not None and not persist_handoffs(
-                cfg, engagement_id, coordinator, audit):
+                cfg, engagement_id, coordinator, audit, scheduler=scheduler):
             _notice(
                 "handoff records not saved — the engagement record itself "
                 "is complete; see the debug log"
