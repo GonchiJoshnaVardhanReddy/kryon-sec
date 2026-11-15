@@ -1,12 +1,13 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–2 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–3 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
 `gowitness-probe` (Batch 2) — built on the existing Phase 2B adapter
-framework. Branch `feature/tool-expansion-batch1`; nothing below is
-published yet.
+framework, plus structured agent handoffs with a deterministic coordinator
+and shared evidence (Batch 3, Phase 3A + 3C). Branch
+`feature/tool-expansion-batch1`; nothing below is published yet.
 
 ### New vetted adapters (Batch 2)
 
@@ -104,6 +105,78 @@ published yet.
 - Full suite on the branch after Batch 2: 2,481 passed / 61 skipped (WSL2,
   Python 3.14); the 2 failures are environmental (no `ensurepip` in that
   Python; no docker group access), not regressions.
+
+### Structured agent handoffs (Batch 3 — Phase 3A + 3C)
+
+The specialist states now exchange **typed, de-duplicated, persisted**
+messages through a deterministic coordinator — data exchange along the
+existing workflow, never a second transition authority. No new LLM calls,
+no new tools, no allowlist or image change; Gate 2 and Gate 3 are exactly
+where they were.
+
+- **Typed contracts** (`purple/handoff.py`): eight Pydantic message kinds —
+  `TaskAssignment`, `EvidenceRef`, `Observation`, `TaskResult`, `BlockedTask`,
+  `HumanApprovalRequest`, `VerificationResult`, `CompletionSummary` — each
+  carrying engagement id, source/destination, correlation id, hypothesis /
+  finding / evidence refs, a bounded sanitized `content` (one line, capped,
+  **redacted first** so a length cap can never split a secret into a
+  fragment that no longer matches a pattern) and a status from a closed
+  vocabulary. `extra="forbid"` is the impersonation control: **no schema
+  accepts an `approved` field**, so a producer cannot claim a human decision
+  it did not receive; the only approval-shaped message is a `HumanApprovalRequest`
+  pinned `requested_of="human"`, and `requires_approval` on assignments is
+  derived from the task-type safety class, never declared by the caller.
+- **Deterministic dedup**: stable content-addressed identities
+  (`task_identity` / `message_identity` = SHA256 over engagement, task type,
+  normalized target, subject — plus content for data messages). A re-dispatch
+  of a known identity never creates a second record; it returns one word from
+  the closed `DISPATCH_OUTCOMES` set that says what the known record means:
+  `new`, `already_registered`, `already_completed`, `already_recorded`,
+  `in_progress`, `safe_retry`, `needs_approval`, `blocked`, `failed`,
+  `inconclusive`. Outcomes are **never invented** — a record that says
+  `failed` stays `failed`.
+- **The one rule the batch exists for**: a failed/inconclusive/cancelled
+  **state-changing** task (exploit test, verification probe, post-exploit
+  enumeration) is never silently re-run because a dispatcher asked twice —
+  the answer is the same status word, and `retry()` is refused until the
+  task goes back through a recorded human approval. Read-only work may
+  retry freely (`safe_retry`).
+- **A closed transition table** (`purple/coordinator.py`): every status
+  change is validated against `TRANSITIONS`; anything else raises
+  `HandoffTransitionError` and is audited (`handoff_invalid_transition`).
+  Terminal statuses have no exits; `needs_approval -> registered` is the one
+  recovery, and it is `approve()` recording a decision a human gate already
+  made — never a message's word.
+- **Shared evidence stays in the ONE graph**: evidence links are node ids
+  plus a `produced`/`consumed` role into the engagement's `EngagementGraph`
+  — never a copy of raw output. A register whose evidence refs don't resolve
+  in the live graph is refused (`MissingEvidenceError`); another
+  engagement's evidence is unreachable (`CrossEngagementError`).
+- **Persistence via the existing storage layer**: one `handoff_records` row
+  per record (SQLAlchemy `HandoffRecordRow`, unique on engagement +
+  identity-key), replaced per engagement in a single transaction — replaying
+  a save writes the same rows, a restored coordinator re-deduplicates, and a
+  foreign or future-version payload is refused loudly. Migration
+  `0003_handoff_records`, gated on the same purple-storage check as 0002
+  (the Copilot fallback database never grows engagement tables).
+- **Wired at the state boundary**: `purple/runner.start_engagement` attaches
+  a `StageBoundaryRecorder` to the same `on_state_complete` boundary the
+  graph checkpoint uses. After a state finishes (and AFTER the orchestrator
+  has already chosen the next one), it derives records from the graph —
+  RECON summaries, HYPOTHESIZE observations, the Gate 2 outcome plus one
+  assignment per approved hypothesis (registered as data, never as the
+  reason EXPLOIT runs), EXPLOIT/VERIFY execution results read from the
+  attempts' own evidence (a not-run attempt produces NO invented record),
+  BLUE_TEAM/REPORT summaries. Every handler is best-effort: a derivation
+  problem is audited (`stage_boundary_failed`) and never fatal, and the
+  loop's transition decision is never an input to it. Records checkpoint at
+  every boundary and persist at HALT (`handoff_checkpoint_written`,
+  `handoff_persisted`), with the same reported-never-fatal failure policy
+  as the graph checkpoint.
+- **What it does not do (yet — Batch 4)**: no agent memory/context, no
+  per-agent token budgets, no scheduler that dispatches specialists from the
+  records, and no real Docker/gVisor validation of the wiring (mocked tests
+  only, by design on this host).
 
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 

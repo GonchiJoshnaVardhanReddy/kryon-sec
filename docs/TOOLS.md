@@ -352,3 +352,17 @@ accepted an argument ending in `\n`.
 On top of the allowlist, the joined argv is checked against destructive
 patterns and rejected if matched: `rm -rf`, `dd if=`, `DROP TABLE`, `mkfs`,
 `shred`, and fork bombs. This is re-checked host-side.
+
+---
+
+## Note on the agent handoff layer (Batch 3)
+
+Tool Expansion Batch 3 added **no tools, no allowlist entries and no image
+change**. What it added is a structured exchange *between* the states: typed,
+de-duplicated handoff messages with a deterministic coordinator
+(`purple/handoff.py`, `purple/coordinator.py`) and a `handoff_records` table
+(migration `0003`, purple storage only). The coordinator is a data exchange —
+it runs after a state completes, reads the evidence graph, and never decides a
+transition, launches a tool, or grants an approval. See the
+[structured handoffs section](../README.md#structured-handoffs-between-the-states-batch-3)
+in the README for the full contract.

@@ -20,6 +20,7 @@ from .. import __version__
 from ..secrets import redact
 from . import runtime_checks
 from .audit import AuditLog
+from .coordinator import HandoffCoordinator, StageBoundaryRecorder
 from .orchestrator import HALT, PurpleOrchestrator, SubagentResult
 
 log = logging.getLogger(__name__)
@@ -210,6 +211,17 @@ def start_engagement(
         "run_id": new_run_id(),
     })
     graph = EngagementGraph(engagement_id=engagement_id)
+
+    # Batch 3 (Phase 3A): the coordinator for structured handoffs. It
+    # shares the graph (the one evidence store — links are node ids,
+    # never copies) and the audit chain (its events reach the UI through
+    # the ordinary observers). The boundary recorder derives records from
+    # the graph at each state boundary; the orchestrator alone decides
+    # transitions, so a record can describe what finished but never
+    # trigger the next state.
+    coordinator = HandoffCoordinator(
+        engagement_id=engagement_id, graph=graph, audit=audit)
+    boundary = StageBoundaryRecorder(coordinator)
 
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     audit.write({
@@ -481,8 +493,21 @@ def start_engagement(
     # chain and the config are all built here. It runs on the same
     # single-threaded loop as everything else, so the snapshot cannot race a
     # subagent still writing to the graph.
-    orch.on_state_complete = lambda state: checkpoint_graph(
-        cfg, engagement_id, graph, audit, state)
+    #
+    # Batch 3: the same boundary now also derives the state's handoff
+    # records (best-effort, never a transition input) and checkpoints
+    # them, each step reported, never fatal, never silent — the loop's
+    # ordering is: graph checkpoint, boundary handoffs, handoff
+    # checkpoint, then the orchestrator picks the next state.
+    def _on_state_complete(state: str) -> None:
+        checkpoint_graph(cfg, engagement_id, graph, audit, state)
+        boundary.on_state_complete(state)
+        checkpoint_handoffs(cfg, engagement_id, coordinator, audit, state)
+
+    orch.on_state_complete = _on_state_complete
+    # Carried for the end-of-run persist (the CLI reads it the way it
+    # reads the graph); the loop itself never consults it.
+    orch.handoff_coordinator = coordinator
 
     return orch, audit, graph
 
@@ -672,6 +697,122 @@ def checkpoint_graph(
         "nodes": nodes,
         "edges": edges,
     })
+    return True
+
+
+def checkpoint_handoffs(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    coordinator: HandoffCoordinator,
+    audit: AuditLog,
+    state: str,
+) -> bool:
+    """Write the handoff records to engagement storage mid-run (Batch 3).
+
+    The same shape as :func:`checkpoint_graph`, for the same reason: the
+    records are written at the state boundary, where nothing is mid-write,
+    so an interruption costs at most the records the state that was
+    running would have added. ``save_handoffs`` replaces the engagement's
+    rows in a single transaction, so a crash part-way leaves the previous
+    checkpoint intact — and replaying the save writes the same rows, not
+    new ones.
+
+    This is not resume by itself: ``load_handoffs`` restores the records,
+    and a restored coordinator de-duplicates whatever it is given, so a
+    replayed boundary cannot double-record work. Nothing here reads a
+    checkpoint back to continue a run.
+
+    Failure policy: **reported, never fatal, never silent** — the event
+    lands in the chain as ``handoff_checkpoint_failed`` and the loop
+    continues. A handoff record is never worth an engagement.
+
+    Returns True when the checkpoint was written.
+    """
+    from ..storage import get_purple_session, init_purple_db
+    from .handoff_store import save_handoffs
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            count = save_handoffs(session, engagement_id, coordinator)
+    except Exception as exc:
+        # Deliberately broad, like checkpoint_graph's: everything that can
+        # go wrong here has the same outcome (no handoff checkpoint) and
+        # the same handling (say so).
+        detail = f"{type(exc).__name__}: {exc}"
+        _announce(audit, {
+            "event": "handoff_checkpoint_failed",
+            "engagement_id": engagement_id,
+            "state": state,
+            "error": _safe_error(exc, cfg),
+        })
+        log.warning(
+            "engagement %s: handoff checkpoint after %s failed: %s",
+            engagement_id, state, detail, exc_info=True,
+        )
+        return False
+
+    _announce(audit, {
+        "event": "handoff_checkpoint_written",
+        "engagement_id": engagement_id,
+        "state": state,
+        "records": count,
+    })
+    return True
+
+
+def persist_handoffs(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    coordinator: HandoffCoordinator | None,
+    audit: AuditLog,
+) -> bool:
+    """Write the handoff records once, after the loop reaches HALT.
+
+    The end-of-run counterpart of :func:`persist_graph`, with the same
+    contract: the engagement is already over by the time this runs, so a
+    storage problem here cannot undo any of it — the failure is written
+    to the chain as ``handoff_persist_failed`` (append-only, so it stays),
+    logged, and returned so the CLI can tell the operator.
+
+    A ``None`` coordinator (an engagement wired without one, or a test
+    harness) persists nothing and reports success — there is simply
+    nothing to store.
+
+    Returns True when the records were stored.
+    """
+    if coordinator is None:
+        return True
+
+    from ..storage import get_purple_session, init_purple_db
+    from .handoff_store import save_handoffs
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            count = save_handoffs(session, engagement_id, coordinator)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        audit.write({
+            "event": "handoff_persist_failed",
+            "engagement_id": engagement_id,
+            "error": _safe_error(exc, cfg),
+        })
+        log.warning(
+            "engagement %s: handoff records not persisted: %s",
+            engagement_id, detail, exc_info=True,
+        )
+        return False
+
+    audit.write({
+        "event": "handoff_persisted",
+        "engagement_id": engagement_id,
+        "records": count,
+    })
+    log.info(
+        "engagement %s: handoff records persisted (%d)",
+        engagement_id, count,
+    )
     return True
 
 

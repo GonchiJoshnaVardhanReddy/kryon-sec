@@ -997,6 +997,51 @@ verification contract, and a shell-producing tool, all reviewed, plus your opera
 approval. The report states this dormancy explicitly rather than implying a capability
 that isn't there.
 
+### Structured handoffs between the states (Batch 3)
+
+The states exchange typed messages through a deterministic coordinator
+(`purple/handoff.py` + `purple/coordinator.py`). This is **data exchange along the
+existing workflow — it never decides a transition.** The ten-state orchestrator stays
+the only transition authority; the recorder runs *after* a state completes and derives
+its records from the graph, so a record can describe what finished but cannot trigger
+EXPLOIT, POST_EXPLOIT, a network request or a tool launch. It makes no LLM call and
+touches no tool.
+
+What it gives the loop:
+
+- **Typed contracts.** Eight message kinds (task assignment, evidence reference,
+  observation, task result, blocked task, human-approval request, verification result,
+  completion summary) with engagement id, source/destination, correlation id,
+  hypothesis/finding/evidence refs, and bounded sanitized content — one line, capped,
+  redacted *before* capping. `extra="forbid"` means no message schema accepts an
+  `approved` field: an agent cannot claim a human decision it did not receive. The only
+  approval-shaped message is a *request* addressed to the human, and `requires_approval`
+  is derived from the task type's safety class, never declared by the caller.
+- **Deterministic dedup.** Stable content-addressed identities: a re-dispatch of known
+  work never creates a second record — it returns one word from a closed outcome set
+  (`already_completed`, `in_progress`, `safe_retry`, `needs_approval`, `failed`,
+  `inconclusive`, …) that says what the known record means. Outcomes are never invented.
+- **State-changing work never re-runs silently.** A failed or inconclusive exploit test
+  or verification probe is not re-run because a dispatcher asked twice: `retry()` is
+  refused until the task goes back through a recorded human approval. Read-only work
+  (recon sweeps, blue-team scans) may retry freely.
+- **Shared evidence stays in the one graph.** Links are node ids plus a
+  `produced`/`consumed` role into the engagement graph — never copies of raw output.
+  A record citing evidence that does not exist in the live graph is refused; another
+  engagement's evidence is unreachable.
+- **Persistence through the existing storage layer.** One `handoff_records` row per
+  record (migration `0003`, purple storage only), replaced per engagement in a single
+  transaction — checkpointed at every state boundary, persisted at HALT, replayed
+  idempotently, restored coordinators re-deduplicate. Storage failures are audited and
+  reported, never fatal to the engagement.
+- **Progress you can watch.** Every boundary appends a `handoff_progress` event
+  (counts by status and task type) to the audit chain, which is what the terminal UI
+  and the event stream read.
+
+Gate 2 and Gate 3 are untouched: the Gate 2 outcome is *recorded* as a task result and
+one assignment per approved hypothesis — registered after the transition, as data, never
+as the reason EXPLOIT runs.
+
 ### The evidence ladder
 
 Findings are never just *"the scanner said so."* Every finding climbs three rungs:
@@ -1552,6 +1597,7 @@ Copilot fallback database.
 | `ltm_engagement_summaries` | B | sanitized summaries — the only engagement data Mode A can read |
 | `engagement_secret_map` | B | `«SECRET_n»` → secret mappings (Fernet-encrypted at rest) |
 | `checkpoints` | B | engagement checkpoints |
+| `handoff_records` | B | structured agent-handoff records (Batch 3; one row per record, unique per engagement + identity) |
 
 Schema changes go through versioned migrations (`src/kryonsec/migrations/`), never ad-hoc
 DDL. Redis (ephemeral cache) and MinIO (evidence object storage) exist in the spec but are
@@ -1775,8 +1821,11 @@ What Kryonsec is **not** (yet), stated plainly:
 Roadmap, in the order I actually want them:
 
 1. **Publish v1.3.11** once the release decision is made (sequence in [Release and versioning](#release-and-versioning)).
-2. **Phase 3 — multi-agent intelligence:** structured handoffs between specialist agents,
-   shared memory/context, checkpoint/recovery, cost/token management, and specialist skills.
+2. **Phase 3 — multi-agent intelligence:** the first piece — structured handoffs between
+   specialist agents with a deterministic coordinator and shared evidence — is built on
+   the feature branch (see [the 10-state loop](#the-10-state-loop-and-the-two-human-gates));
+   still to come: agent memory/context, richer checkpoint/resume, per-agent token/cost
+   budgets, and specialist skills.
 3. **Phase 4 — independent exploit verification:** deeper verification contracts, which is
    also the prerequisite chain for activating POST_EXPLOIT.
 4. **Interactsh and Burp Community** — both need listening services and callback traffic,

@@ -109,6 +109,11 @@ class PurpleOrchestrator:
     # (Phase 4.3). Notified, never consulted: it cannot influence a
     # transition, and a listener that raises is logged and ignored.
     on_state_complete: Callable[[str], None] | None = None
+    # The Batch-3 handoff coordinator, when one is wired (the runner sets
+    # it; tests may leave it None). Never consulted by the loop — it is
+    # carried so the CLI can persist the records at the end of the run,
+    # exactly like the graph. Data exchange, never transition authority.
+    handoff_coordinator: object | None = None
 
     def run(self) -> list[str]:
         """Run the loop to HALT. Returns the list of completed states."""

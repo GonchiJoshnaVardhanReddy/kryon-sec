@@ -869,6 +869,7 @@ def _run_purple(
     from .license import LicenseError, ensure_purple_allowed
     from .purple.runner import (
         persist_graph,
+        persist_handoffs,
         record_engagement_ending,
         safe_exception_type,
         safe_halt_code,
@@ -1073,6 +1074,18 @@ def _run_purple(
             _notice(
                 "graph memory not saved — the engagement itself is complete "
                 "(audit chain, evidence and report are on disk); see the debug log"
+            )
+
+        # Batch 3: the handoff records get the same end-of-run persist and
+        # the same failure shape — reported to the operator, never fatal,
+        # never silent. The engagement's own record (audit chain,
+        # evidence, report, graph) is complete either way.
+        coordinator = getattr(orch, "handoff_coordinator", None)
+        if coordinator is not None and not persist_handoffs(
+                cfg, engagement_id, coordinator, audit):
+            _notice(
+                "handoff records not saved — the engagement record itself "
+                "is complete; see the debug log"
             )
 
         # Read after persist_graph, not before: a crash while saving the
