@@ -1,10 +1,49 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batch 1 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–2 (feature branch, not released)
 
-Three new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
-`katana-probe` — built on the existing Phase 2B adapter framework. Branch
-`feature/tool-expansion-batch1`; nothing below is published yet.
+Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
+`katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
+`gowitness-probe` (Batch 2) — built on the existing Phase 2B adapter
+framework. Branch `feature/tool-expansion-batch1`; nothing below is
+published yet.
+
+### New vetted adapters (Batch 2)
+
+- **nmap-probe** (the authoritative stage-1 service scan) runs nmap with the
+  SAME fixed argv the legacy discovery entry uses (`-Pn -sT -sV -sC
+  --max-rate 100 -p RECON_PORTS` — `-sT` because gVisor grants no raw
+  sockets; the bounded 18-port list, never a full-range scan). It REUSES the
+  legacy TEXT parser (`parse_nmap_services` — no second regex to drift) and
+  emits the SAME legacy-shape `service` nodes, now with adapter provenance
+  (`target:port/proto` labels, first-wins dedupe). Replaces the legacy nmap
+  entry deterministically; NOT planner-gated (pre-plan discovery lane,
+  reported `covered` post-hoc like naabu/dnsx).
+- **feroxbuster-probe** (content discovery) runs feroxbuster with the legacy
+  `-u {urlfuzz} -w <baked seclists> -t 5 --timeout 30` shape. The FUZZ-marker
+  URL is composed DETERMINISTICALLY by the adapter framework from the
+  scope-validated base (`base.rstrip('/') + '/FUZZ'` — the same composition
+  the legacy entry applies); the lane can never point the fuzzing at a
+  different origin than the base it was given, and a params dict carrying
+  `urlfuzz` is refused as unexpected. Reuses the legacy result-line regex
+  (`_FEROX_RE`/`_FEROX_STATUS` — lockstep by construction); emits legacy
+  shape `path` nodes with adapter provenance, first-wins dedupe by label
+  (cross-source: a path katana or a passive source already placed is
+  skipped). Replaces the legacy feroxbuster entry; planner-gated like every
+  other web lane.
+- **gowitness-probe** (screenshots) runs gowitness with the legacy
+  `scan website --url {base} --screenshot-path /evidence --no-console
+  --disable-db` shape — the PNG lands in the rw `/evidence` mount (the
+  engagement folder), NOT in tool output. There is NO text contract to
+  parse: the run's exit code is the truth. ONE legacy-shape `screenshot`
+  node per successful run (label = the base URL, `dir=/evidence` plus
+  adapter provenance); a refused/failed run records NO node. Replaces the
+  legacy gowitness entry; planner-gated like every other web lane.
+- **TEXT output contracts, not `-json/-oX`**: the shipped Layer-2 templates
+  stay in lockstep, and XML/JSON field shapes could not be verified against
+  the real binaries from the development environment.
+- **No allowlist or image change**: all three binaries were already
+  allowlisted and baked into the pinned sandbox image.
 
 ### New vetted adapters (Batch 1)
 
@@ -37,28 +76,34 @@ Three new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 ### Planner (2B.6) — domain-target pairing
 
 - `ToolPlanner.plan()` gained a `domain_targets` parameter: domain-kind
-  adapters (naabu-probe, dnsx-probe) are paired ONLY with the engagement
-  target, never with URL bases; URL-kind adapters pair only with bases. The
-  two discovery lanes run BEFORE the plan (they produce the ports it plans
-  from) and are reported as `covered` post-hoc; a FAILED lane stays selected
-  and is honestly listed as planned-but-not-executed. The planner remains
-  **OFF by default**; with it off, behavior is identical to the fixed plan
-  plus the three adapter lanes.
+  adapters (nmap-probe, naabu-probe, dnsx-probe) are paired ONLY with the
+  engagement target, never with URL bases; URL-kind adapters pair only with
+  bases. The three discovery lanes run BEFORE the plan (they produce the
+  ports it plans from) and are reported as `covered` post-hoc; a FAILED lane
+  stays selected and is honestly listed as planned-but-not-executed. The
+  planner remains **OFF by default**; with it off, behavior is identical to
+  the fixed plan plus the six adapter lanes. Planner metadata now covers all
+  eleven registered adapters (priority, cost, requires/produces evidence).
 
 ### Tests and honest status
 
-- New mocked suites: `tests/test_dnsx_adapter.py` (24), `tests/
-  test_naabu_adapter.py` (22), `tests/test_katana_adapter.py` (26) — argv
-  lockstep against the shipped Layer-2 templates, scope/option-injection
-  refusals, gate/sandbox/egress refusals, honest failure classification,
-  bounded output, `not_verified` invariants, either/or integration, planner
-  gating, no-subprocess scans. Plus one opt-in real-gVisor lab IT per
-  adapter (`KRYONSEC_NAABU_IT=1`, `KRYONSEC_DNSX_IT=1`,
-  `KRYONSEC_KATANA_IT=1`) — **armed but NOT RUN on the Windows dev host**;
-  run them in the Linux lab.
-- Full suite on the branch: 2,401 passed / 58 skipped (WSL2, Python 3.14);
-  the 2 failures are environmental (no `ensurepip` in that Python; no docker
-  group access), not regressions.
+- Batch 1 mocked suites: `tests/test_dnsx_adapter.py` (24),
+  `tests/test_naabu_adapter.py` (22), `tests/test_katana_adapter.py` (26).
+- Batch 2 mocked suites: `tests/test_nmap_adapter.py` (28),
+  `tests/test_feroxbuster_adapter.py` (27), `tests/test_gowitness_adapter.py`
+  (25) — argv lockstep against the shipped Layer-2 templates (byte-identical,
+  including the framework-composed `{urlfuzz}`), scope/option-injection
+  refusals, unexpected-params refusals (the FUZZ URL and the screenshot dir
+  are never caller input), gate/sandbox/egress refusals, honest failure
+  classification, bounded output, `not_verified` invariants, either/or
+  integration (one probe per check, never both), planner gating, and
+  no-subprocess scans. Plus one opt-in real-gVisor lab IT per adapter
+  (`KRYONSEC_NAABU_IT=1`, `KRYONSEC_DNSX_IT=1`, `KRYONSEC_KATANA_IT=1`,
+  `KRYONSEC_NMAP_IT=1`, `KRYONSEC_FEROX_IT=1`, `KRYONSEC_GOWITNESS_IT=1`) —
+  **armed but NOT RUN on the Windows dev host**; run them in the Linux lab.
+- Full suite on the branch after Batch 2: 2,481 passed / 61 skipped (WSL2,
+  Python 3.14); the 2 failures are environmental (no `ensurepip` in that
+  Python; no docker group access), not regressions.
 
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 

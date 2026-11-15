@@ -684,13 +684,15 @@ def test_planner_selected_crawl_runs_with_the_pinned_argv(tmp_path):
     assert runs[0] == ["katana", "-u", BASE, "-d", "2", "-silent"]
     events = _events(audit)
     decided = next(e for e in events if e["event"] == "planning_decided")
-    # one plain-http base: 5 eligible checks selected, tls rejected,
-    # the two discovery probes covered post-hoc (pre-plan lanes)
-    assert decided["counts"] == {"selected": 5, "rejected": 1,
-                                 "covered": 2}
+    # one plain-http base: 7 eligible checks selected (httpx, whatweb,
+    # api, katana, gowitness, nuclei, feroxbuster), tls rejected, and
+    # the three discovery probes (nmap, naabu, dnsx) covered post-hoc
+    # (pre-plan lanes)
+    assert decided["counts"] == {"selected": 7, "rejected": 1,
+                                 "covered": 3}
     done = next(e for e in events if e["event"] == "recon_active_done")
-    assert done["planned_selected"] == 5
-    assert done["planned_executed"] == 5
+    assert done["planned_selected"] == 7
+    assert done["planned_executed"] == 7
     assert done["planned_not_executed"] == []
     # the lane's own event links to the plan id
     katana_ev = [e for e in events
@@ -718,7 +720,7 @@ def test_zero_budget_defers_the_crawl_never_spawns_katana(tmp_path):
     events = _events(audit)
     decided = next(e for e in events if e["event"] == "planning_decided")
     assert decided["counts"].get("selected", 0) == 0
-    assert decided["counts"].get("covered") == 2   # the discovery lanes
+    assert decided["counts"].get("covered") == 3   # the discovery lanes
     done = next(e for e in events if e["event"] == "recon_active_done")
     assert done["planned_selected"] == 0
     assert done["planned_executed"] == 0

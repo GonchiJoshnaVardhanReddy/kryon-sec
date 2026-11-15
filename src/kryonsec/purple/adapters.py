@@ -228,9 +228,18 @@ class ModeBToolAdapter(BaseModel):
 
         if placeholder and not any(placeholder in arg
                                    for arg in self.command_template):
-            raise ValueError(
-                f"command_template must carry {placeholder} for "
-                f"target_kind={self.target_kind!r}")
+            # Tool Expansion Batch 2: a url-kind adapter may carry the
+            # FUZZ-marker placeholder ({urlfuzz}) instead of {url} —
+            # feroxbuster's shipped Layer-2 argv shape is the URL with
+            # the FUZZ marker, and the framework composes it
+            # deterministically from the scope-validated url (see
+            # prepare_adapter_run); the caller can never supply it.
+            if not (self.target_kind == "url"
+                    and any("{urlfuzz}" in arg
+                            for arg in self.command_template)):
+                raise ValueError(
+                    f"command_template must carry {placeholder} for "
+                    f"target_kind={self.target_kind!r}")
         if self.target_kind == "assetless":
             bad = [v for v in ("url", "urlfuzz", "target", "hostport",
                                "term") if _has(v)]
@@ -524,6 +533,15 @@ def prepare_adapter_run(
                 f"adapter {adapter_id}: asset {target_asset!r} resolves "
                 f"outside engagement scope (target {target!r})")
         variables["url"] = url
+        # Tool Expansion Batch 2: the FUZZ-marker placeholder is composed
+        # HERE, deterministically, from the scope-validated url — the
+        # SAME composition the legacy feroxbuster plan entry performs
+        # (base without the trailing slash + "/FUZZ"). A params dict
+        # carrying "urlfuzz" is refused below as unexpected, so the fuzz
+        # URL's scope holds by construction: it derives from a URL that
+        # already passed compose_url's scope check.
+        if any("{urlfuzz}" in arg for arg in adapter.command_template):
+            variables["urlfuzz"] = url.rstrip("/") + "/FUZZ"
         used_target = url
     elif adapter.target_kind == "domain":
         if not target.strip():

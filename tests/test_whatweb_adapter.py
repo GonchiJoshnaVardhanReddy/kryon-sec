@@ -155,12 +155,13 @@ def test_production_registry_registers_whatweb_probe_explicitly():
         empty.get(ADAPTER_ID)
 
 
-def test_combined_recon_active_registry_carries_all_eight_adapters():
+def test_combined_recon_active_registry_carries_all_eleven_adapters():
     reg = recon_active_registry()
     assert reg.adapter_ids() == (
-        "api-probe", "dnsx-probe", "httpx-probe", "katana-probe",
-        "naabu-probe", "nuclei-probe", "tls-probe", "whatweb-probe")
-    # all eight stay RECON_ACTIVE-only; none mounted a gate
+        "api-probe", "dnsx-probe", "feroxbuster-probe", "gowitness-probe",
+        "httpx-probe", "katana-probe", "naabu-probe", "nmap-probe",
+        "nuclei-probe", "tls-probe", "whatweb-probe")
+    # all eleven stay RECON_ACTIVE-only; none mounted a gate
     for adapter in reg.list_adapters():
         assert adapter.stages == ("RECON_ACTIVE",)
         assert adapter.approvals == ()
@@ -636,9 +637,9 @@ def test_adapter_mode_probes_whatweb_once_never_both(tmp_path):
     assert runs_legacy_httpx == []
     assert len(runs_toolkt) == 1
     assert len(graph.by_type("web_endpoint")) == 1
-    # 7 attempt nodes: httpx, whatweb, api, nuclei (web lanes) +
-    # naabu, dnsx (discovery lanes) + katana (per base)
-    assert len(graph.by_type("adapter_attempt")) == 7
+    # 10 attempt nodes: httpx, whatweb, api, nuclei, katana, gowitness,
+    # feroxbuster (web lanes) + nmap, naabu, dnsx (discovery lanes)
+    assert len(graph.by_type("adapter_attempt")) == 10
     names = _event_names(audit)
     assert "recon_active_whatweb_adapter" in names
     assert "recon_active_adapter_failure" not in names

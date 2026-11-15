@@ -129,13 +129,14 @@ def production_registry():
 
 def recon_active_registry():
     """The combined RECON_ACTIVE registry the runner injects: the
-    EIGHT vetted production adapters — the five web adapters (httpx-probe
-    2B.3, whatweb-probe 2B.5, tls-probe 2B.5, api-probe 2B.5,
-    nuclei-probe 2B.4) plus the three Batch 1 discovery/crawl probes
-    (dnsx-probe, naabu-probe, katana-probe — Tool Expansion Batch 1).
-    One probe per check is preserved by ReconActiveSubagent's
-    deterministic either/or rules, not by pretending one of the
-    adapters does not exist."""
+    ELEVEN vetted production adapters — the five web adapters
+    (httpx-probe 2B.3, whatweb-probe 2B.5, tls-probe 2B.5, api-probe
+    2B.5, nuclei-probe 2B.4), the three Batch 1 discovery/crawl probes
+    (dnsx-probe, naabu-probe, katana-probe — Tool Expansion Batch 1)
+    and the three Batch 2 probes (nmap-probe, feroxbuster-probe,
+    gowitness-probe — Tool Expansion Batch 2). One probe per check is
+    preserved by ReconActiveSubagent's deterministic either/or rules,
+    not by pretending one of the adapters does not exist."""
     registry = production_registry()
     from .adapter_httpx import make_httpx_probe_adapter
     from .adapter_nuclei import make_nuclei_probe_adapter
@@ -144,6 +145,9 @@ def recon_active_registry():
     from .adapter_dnsx import make_dnsx_probe_adapter
     from .adapter_naabu import make_naabu_probe_adapter
     from .adapter_katana import make_katana_probe_adapter
+    from .adapter_nmap import make_nmap_probe_adapter
+    from .adapter_feroxbuster import make_feroxbuster_probe_adapter
+    from .adapter_gowitness import make_gowitness_probe_adapter
 
     registry.register(make_httpx_probe_adapter())
     registry.register(make_tls_probe_adapter())
@@ -152,6 +156,9 @@ def recon_active_registry():
     registry.register(make_dnsx_probe_adapter())
     registry.register(make_naabu_probe_adapter())
     registry.register(make_katana_probe_adapter())
+    registry.register(make_nmap_probe_adapter())
+    registry.register(make_feroxbuster_probe_adapter())
+    registry.register(make_gowitness_probe_adapter())
     return registry
 
 

@@ -146,10 +146,12 @@ def test_catalog_describes_exactly_the_registered_adapters():
     rows = _catalog().describe()
     ids = [r["adapter_id"] for r in rows]
     # stable, priority-ordered (discovery probes first, then basic
-    # identification, then the long checks)
-    assert ids == ["naabu-probe", "dnsx-probe", "httpx-probe",
+    # identification, then the long checks; Batches 1–2 added the
+    # nmap/naabu/dnsx discovery trio, gowitness and feroxbuster)
+    assert ids == ["nmap-probe", "naabu-probe", "dnsx-probe", "httpx-probe",
                    "whatweb-probe", "api-probe", "katana-probe",
-                   "tls-probe", "nuclei-probe"]
+                   "gowitness-probe", "tls-probe", "nuclei-probe",
+                   "feroxbuster-probe"]
     row = next(r for r in rows if r["adapter_id"] == "tls-probe")
     assert row["executable"] == "/opt/kryonsec/tls_probe.py"
     assert row["stages"] == ["RECON_ACTIVE"]
@@ -176,10 +178,11 @@ def test_catalog_metadata_defaults_are_consistent():
         assert entry.priority > 0
         assert entry.cost_category in ("low", "medium", "high")
         assert entry.adapter.max_seconds >= 10
-        # every check names its inputs — EXCEPT the two Batch 1
-        # discovery probes, which run pre-discovery by design: their
-        # input is the engagement target itself, not graph evidence
-        if entry.adapter_id in ("naabu-probe", "dnsx-probe"):
+        # every check names its inputs — EXCEPT the three discovery
+        # probes (Batches 1–2), which run pre-discovery by design:
+        # their input is the engagement target itself, not graph
+        # evidence
+        if entry.adapter_id in ("nmap-probe", "naabu-probe", "dnsx-probe"):
             assert entry.requires_evidence == ()
         else:
             assert entry.requires_evidence
@@ -194,14 +197,15 @@ def test_https_website_selects_the_full_web_surface():
     plan = _plan(bases=[HTTPS_BASE])
     sm = _status_map(plan)
     for adapter in ("httpx-probe", "whatweb-probe", "api-probe",
-                    "katana-probe", "tls-probe", "nuclei-probe"):
+                    "katana-probe", "gowitness-probe", "tls-probe",
+                    "nuclei-probe", "feroxbuster-probe"):
         assert sm[(adapter, normalize_target(HTTPS_BASE))] == "selected"
-    assert plan.counts() == {"selected": 6}
+    assert plan.counts() == {"selected": 8}   # 1560s of the 1800s budget
     # the domain-kind discovery probes are NOT paired with URL bases:
     # without domain_targets they get no entries at all (never
     # mis-dispatched against a target kind they cannot prepare)
-    assert ("naabu-probe", normalize_target(HTTPS_BASE)) not in sm
-    assert ("dnsx-probe", normalize_target(HTTPS_BASE)) not in sm
+    for discovery in ("nmap-probe", "naabu-probe", "dnsx-probe"):
+        assert (discovery, normalize_target(HTTPS_BASE)) not in sm
 
 
 def test_http_only_website_never_gets_a_tls_check():
@@ -211,7 +215,8 @@ def test_http_only_website_never_gets_a_tls_check():
     entry = next(e for e in plan.entries if e.adapter_id == "tls-probe")
     assert "TLS" in entry.reason or "tls" in entry.reason
     for adapter in ("httpx-probe", "whatweb-probe", "api-probe",
-                    "katana-probe", "nuclei-probe"):
+                    "katana-probe", "gowitness-probe", "nuclei-probe",
+                    "feroxbuster-probe"):
         assert sm[(adapter, normalize_target(HTTP_BASE))] == "selected"
 
 
@@ -294,7 +299,8 @@ def test_dependency_order_basic_identification_first():
     order = [e.adapter_id for e in plan.entries
              if e.target == HTTPS_BASE]
     assert order == ["httpx-probe", "whatweb-probe", "api-probe",
-                     "katana-probe", "tls-probe", "nuclei-probe"]
+                     "katana-probe", "gowitness-probe", "tls-probe",
+                     "nuclei-probe", "feroxbuster-probe"]
 
 
 def test_duplicate_work_avoided_on_complete_prior_run():
@@ -407,13 +413,18 @@ def test_budget_exhaustion_defers_with_an_explainable_reason():
     assert sm[("httpx-probe", normalize_target(HTTP_BASE))] == "selected"
     assert sm[("whatweb-probe", normalize_target(HTTP_BASE))] == "selected"
     assert sm[("api-probe", normalize_target(HTTP_BASE))] == "selected"
+    assert sm[("gowitness-probe", normalize_target(HTTP_BASE))] == \
+        "selected"
     # priority packing: 120+120+120 = 360s committed; the crawl (180s)
-    # and nuclei (300s) no longer fit in 500s. The TLS check is
-    # REJECTED outright (plain-http scheme gate) — eligibility always
-    # beats the budget.
+    # no longer fits in 500s but the screenshot (120s) does; nuclei and
+    # feroxbuster (300s each) no longer fit. The TLS check is REJECTED
+    # outright (plain-http scheme gate) — eligibility always beats the
+    # budget.
     assert sm[("katana-probe", normalize_target(HTTP_BASE))] == "deferred"
     assert sm[("tls-probe", normalize_target(HTTP_BASE))] == "rejected"
     assert sm[("nuclei-probe", normalize_target(HTTP_BASE))] == "deferred"
+    assert sm[("feroxbuster-probe", normalize_target(HTTP_BASE))] == \
+        "deferred"
     assert plan.planned_seconds <= 500
     deferred = [e for e in plan.entries if e.status == "deferred"]
     for e in deferred:
@@ -421,7 +432,7 @@ def test_budget_exhaustion_defers_with_an_explainable_reason():
         # the reason carries the entry's own seconds honestly
         assert str(e.estimated_seconds) in e.reason
     decided = audit.events[-1]
-    assert decided["counts"]["deferred"] == 2
+    assert decided["counts"]["deferred"] == 3
     lines = decided["entries"]
     assert any("deferred" in ln for ln in lines)
 
@@ -462,7 +473,7 @@ def test_planner_works_with_no_llm():
     plan = planner.plan(state="RECON_ACTIVE", target=TARGET,
                         bases=[HTTPS_BASE], graph=_graph(),
                         audit=RecordingAudit())
-    assert plan.counts() == {"selected": 6}
+    assert plan.counts() == {"selected": 8}
     assert planner.suggestion_rejections == []
     assert not any(e.suggested for e in plan.entries)
 
@@ -492,7 +503,7 @@ def test_malformed_suggestion_recorded_never_policy_weakening():
     plan = planner.plan(state="RECON_ACTIVE", target=TARGET,
                         bases=[HTTPS_BASE], graph=_graph(),
                         audit=RecordingAudit())
-    assert plan.counts() == {"selected": 6}
+    assert plan.counts() == {"selected": 8}
     assert planner.suggestion_rejections and \
         "not registered" in planner.suggestion_rejections[0]
 
@@ -705,19 +716,22 @@ def test_plan_filters_lanes_and_links_audit_events(tmp_path):
         tmp_path, planner=planner)
     assert result.status == "ok"
     tools_spawned = [argv[0] for argv, _t in sandbox.spawned]
-    # discovery + legacy web tools ran exactly as before. katana is NO
-    # longer among them: its legacy entry is omitted (the katana-probe
-    # adapter is registered) and the adapter lane itself is deferred by
-    # the zero budget — the same rule the other web lanes always had.
-    for tool in ("nmap", "naabu", "dnsx", "feroxbuster", "gowitness"):
+    # discovery ran exactly as before (nmap now VIA the nmap-probe
+    # adapter lane — same executable, same argv). katana/feroxbuster/
+    # gowitness are NO longer among them: their legacy entries are
+    # omitted (the adapters are registered) and the adapter lanes
+    # themselves are deferred by the zero budget — the same rule the
+    # other web lanes always had.
+    for tool in ("nmap", "naabu", "dnsx"):
         assert tool in tools_spawned, tool
-    assert "katana" not in tools_spawned
-    # the PLANNER-GATED web adapters spawned nothing at all; the two
-    # discovery probes (naabu-probe / dnsx-probe) are the documented
-    # exception — their lanes run pre-discovery, so their executables
-    # DID spawn (as the naabu/dnsx entries above show)
+    for gated in ("katana", "feroxbuster", "gowitness"):
+        assert gated not in tools_spawned, gated
+    # the PLANNER-GATED web adapters spawned nothing at all; the three
+    # discovery probes (nmap-probe / naabu-probe / dnsx-probe) are the
+    # documented exception — their lanes run pre-discovery, so their
+    # executables DID spawn (as the nmap/naabu/dnsx entries above show)
     reg = recon_active_registry()
-    un_gated = {"naabu-probe", "dnsx-probe"}
+    un_gated = {"nmap-probe", "naabu-probe", "dnsx-probe"}
     for adapter in reg.list_adapters():
         if adapter.adapter_id in un_gated:
             continue
@@ -727,10 +741,10 @@ def test_plan_filters_lanes_and_links_audit_events(tmp_path):
     assert "planning_decided" in names
     assert "planner_plan_applied" in names
     decided = next(e for e in events if e["event"] == "planning_decided")
-    # the two discovery lanes ran BEFORE the plan and show up post-hoc
-    # as covered (fresh successful adapter_attempt nodes) — never as
-    # fabricated selections
-    assert decided["counts"].get("covered") == 2
+    # the three discovery lanes ran BEFORE the plan and show up
+    # post-hoc as covered (fresh successful adapter_attempt nodes) —
+    # never as fabricated selections
+    assert decided["counts"].get("covered") == 3
     assert decided["counts"].get("selected", 0) == 0
     done = next(e for e in events if e["event"] == "recon_active_done")
     assert done["planned_selected"] == 0
@@ -750,14 +764,16 @@ def test_planned_and_executed_agree_on_a_full_run(tmp_path):
     events = _events(audit)
     decided = next(e for e in events
                    if e["event"] == "planning_decided")
-    # one plain-http base: 5 eligible checks selected (httpx, whatweb,
-    # api, katana, nuclei), tls rejected, and the two discovery probes
-    # covered post-hoc (their lanes ran before the plan)
-    assert decided["counts"] == {"selected": 5, "rejected": 1,
-                                 "covered": 2}
+    # one plain-http base: 7 eligible checks selected (httpx, whatweb,
+    # api, katana, gowitness, nuclei, feroxbuster — 1260s of the 1800s
+    # default budget), tls rejected, and the three discovery probes
+    # (nmap, naabu, dnsx) covered post-hoc (their lanes ran before the
+    # plan)
+    assert decided["counts"] == {"selected": 7, "rejected": 1,
+                                 "covered": 3}
     done = next(e for e in events if e["event"] == "recon_active_done")
-    assert done["planned_selected"] == 5
-    assert done["planned_executed"] == 5
+    assert done["planned_selected"] == 7
+    assert done["planned_executed"] == 7
     assert done["planned_not_executed"] == []
     # the tls check was rejected for the plain-http base — recorded
     assert decided["counts"].get("rejected", 0) == 1

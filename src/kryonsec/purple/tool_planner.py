@@ -199,53 +199,66 @@ class PlannerBudget(BaseModel):
 # the selection metadata table — DESCRIBES, never enables
 # ---------------------------------------------------------------------------
 
-#: priority: lower runs first. The Batch 1 discovery probes plan
+#: priority: lower runs first. The Batch 1/2 discovery probes plan
 #: first (they run pre-discovery in practice and plan as covered
 #: post-hoc), then basic service/web identification, then dependent
-#: or long checks; the two long checks last.
+#: or long checks; the two longest checks last.
 _PRIORITY = {
+    "nmap-probe": 4,         # discovery: authoritative service scan (pre-plan lane)
     "naabu-probe": 5,        # discovery: bounded port scan (pre-plan lane)
     "dnsx-probe": 6,         # discovery: DNS resolution (pre-plan lane)
     "httpx-probe": 10,       # base evidence: statuses, titles, tech
     "whatweb-probe": 20,     # richer technology fingerprints
     "api-probe": 30,         # read-only API baseline (bounded, quick)
     "katana-probe": 35,      # pinned-depth web crawl (bounded, medium)
+    "gowitness-probe": 36,   # bounded screenshot per web base (Batch 2)
     "tls-probe": 40,         # ~3-5 min under real caps (measured 2B.5)
     "nuclei-probe": 50,      # vetted non-destructive template checks
+    "feroxbuster-probe": 60,  # bounded directory busting (longest web check)
 }
 _COST = {
+    "nmap-probe": "medium",      # -sV -sC service scan, bounded port list
     "naabu-probe": "low",
     "dnsx-probe": "low",
     "httpx-probe": "low",
     "whatweb-probe": "low",
     "api-probe": "medium",
     "katana-probe": "medium",
+    "gowitness-probe": "medium",  # headless-browser screenshot per base
     "tls-probe": "high",
     "nuclei-probe": "high",
+    "feroxbuster-probe": "high",
 }
 #: what each check consumes / produces in the evidence graph — used for
 #: the explainability report and the requires-evidence reason strings.
 #: The discovery probes consume nothing (naabu) or the engagement
-#: target itself (dnsx): their lanes run pre-discovery, not planner-gated.
+#: target itself (dnsx/nmap): their lanes run pre-discovery, not
+#: planner-gated.
 _REQUIRES = {
+    "nmap-probe": (),
     "naabu-probe": (),
     "dnsx-probe": (),
     "httpx-probe": ("web_endpoint",),
     "whatweb-probe": ("web_endpoint",),
     "api-probe": ("web_endpoint",),
     "katana-probe": ("web_endpoint",),
+    "gowitness-probe": ("web_endpoint",),
     "tls-probe": ("https_base",),
     "nuclei-probe": ("web_endpoint",),
+    "feroxbuster-probe": ("web_endpoint",),
 }
 _PRODUCES = {
-    "naabu-probe": (),          # feeds the shared port set; no nodes
+    "nmap-probe": ("service",),   # the authoritative service nodes
+    "naabu-probe": (),            # feeds the shared port set; no nodes
     "dnsx-probe": ("dns_resolution",),
     "httpx-probe": ("web_endpoint",),
     "whatweb-probe": ("tech_fingerprint",),
     "api-probe": ("api_observation", "path"),
     "katana-probe": ("path",),
+    "gowitness-probe": ("screenshot",),
     "tls-probe": ("tls_observation", "vuln_candidate"),
     "nuclei-probe": ("vuln_candidate",),
+    "feroxbuster-probe": ("path",),
 }
 #: the honest-partial rule: these wrappers exit 0 even when they were
 #: killed at their internal bound — their run-summary node carries the
