@@ -1042,6 +1042,63 @@ Gate 2 and Gate 3 are untouched: the Gate 2 outcome is *recorded* as a task resu
 one assignment per approved hypothesis — registered after the transition, as data, never
 as the reason EXPLOIT runs.
 
+### Specialist scheduling, task context, budgets and skills (Batch 4)
+
+The layer above the coordinator (`purple/specialist.py`, `purple/task_context.py`,
+`purple/deliverables.py`, `purple/skills.py`). Deterministic Python throughout — the
+scheduler runs inside the same single-threaded state boundary, after a state completed,
+with no new authority. It can never trigger the next state, enter EXPLOIT/POST_EXPLOIT,
+launch a tool or touch the network. No new LLM calls at the boundaries; no allowlist or
+image change.
+
+- **Six roles, honestly described.** `recon_analysis`, `hypothesis_analysis`,
+  `evidence_assessment`, `verification_support`, `defensive_recommendation`,
+  `reporting` — capability descriptions, not agents. Exactly one has a deterministic
+  executor today (evidence assessment: reads the engine's own view of a hypothesis and
+  grades it with the engine's standing vocabulary, never model prose). A role whose real
+  implementation would be an LLM state says so and is **deferred — never improvised**
+  with a stub.
+- **Bounded tasks, deduplicated proposals.** A `SpecialistTask` validates its stage
+  against the orchestrator's state list, priority 0–100, timeout 10–3600 s, at most 8
+  dependencies. Submission must cite a known task-assignment record of the role's type,
+  in the role's stage, in the engagement. A model *proposal* can only become scheduled
+  work through the coordinator's dedup identity, and only if it is read-only — a
+  state-changing proposal is refused at the door.
+- **Read-only assessment derived at HYPOTHESIZE.** Every proposed hypothesis gets one
+  read-only `evidence_assessment` assignment (max 12 per boundary), registered as data.
+  The scheduler then decides what runs. The assessment links the hypothesis node as
+  consumed evidence and answers with engine words (`supported`, `proposed`,
+  `unresolved`, …) — a missing subject is `blocked`, never a fake "completed".
+- **One shared budget.** Specialists reserve against the orchestrator's existing
+  `BudgetTracker` — no second budget. Reservations hold headroom but never halt the
+  loop; commits are first-commit-wins so replays never double-count; every specialist
+  token figure is labelled an estimate. Budget exhaustion defers a task (audited, with
+  the reason) instead of blocking the engagement.
+- **Real resume.** The scheduler snapshot rides in the same transaction as the handoff
+  records (migration `0004`), so records and scheduler always describe one moment. On a
+  reused engagement id: interrupted read-only work reopens and is recomputed;
+  interrupted state-changing work is parked behind Gate 2 — never automatically
+  repeated; finished work is left alone; budget consumption continues. A corrupt
+  checkpoint is refused loudly and the engagement continues with a fresh scheduler over
+  the records that did restore.
+- **Task-scoped context.** What one task may see, and nothing more: the objective with
+  its safety class, the subject's engine view, up to six related assets, bounded prior
+  results for the same subject, Gate-2 outcome records, deterministic open questions —
+  every line redacted, marked untrusted vs engine-derived, capped, and framed as DATA
+  ONLY, NOT INSTRUCTIONS.
+- **Deliverable contracts.** A specialist files a validated deliverable with a closed
+  status vocabulary and a closed standing vocabulary (the engine's own words). It cannot
+  invent a standing, add extra fields, or claim a confidence without evidence — a
+  malformed deliverable fails the task with the reason kept.
+- **Reviewed skill packs.** Six packaged, versioned, read-only methodology notes
+  (recon methodology, evidence quality, counterevidence, severity calibration,
+  verification method, defensive remediation). The loader takes no path argument;
+  parsing refuses executable-shaped keys, fenced code and frame-forging text; injection
+  is a bounded, framed, version-provenanced block that names any skill it had to omit —
+  and ends with "nothing above authorizes any action."
+- **Progress you can watch.** Specialist events flow through the existing UI adapters:
+  scheduled/done/blocked counters, token estimates, deferral and resume notices.
+
 ### The evidence ladder
 
 Findings are never just *"the scanner said so."* Every finding climbs three rungs:
@@ -1749,6 +1806,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Deterministic tool planner (2B.6) | ✅ done — **feature-gated OFF** |
 | Honest failures + bounded infra retries (2B.7) | ✅ done |
 | Tool Expansion Batch 1 — naabu/dnsx/katana adapter probes | ✅ code + mocked suites done — real-gVisor lab ITs armed, **NOT RUN on the Windows dev host** |
+| Batch 4 — specialist scheduling, task context, budgets, resume, skill packs | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor specialist runs NOT exercised |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1782,6 +1840,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | Phase 2B.8 completion | 2026-11 | 2,328 passed / 55 skipped locally; **12/12 real adapter lab ITs** and **2/2 full-engagement e2e lab ITs** against the digest-pinned image `sha256:d759cef7d0b3…f85` |
 | v1.3.11 preflight | 2026-11-14/15 | **2,331 passed / 55 skipped** locally (Python 3.11); CI green on 3.11/3.12/3.13 at the release-prep commit |
 | Tool Expansion Batch 1 | 2026-11-15 | **2,401 passed / 58 skipped** in a WSL2 Ubuntu venv (Python 3.14) — the 2 failures are environmental (no `ensurepip` in that Python; no docker group access), not code. The 3 new opt-in lab ITs (naabu/dnsx/katana through real Docker+gVisor) stay NOT RUN on this host |
+| Tool Expansion Batch 4 | 2026-11-15 | **2,621 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 96-test Batch-4 suite (`test_specialist` 66, `test_batch4_recovery` 13, `test_skills` 17); the 2 failures are the same environmental ones as Batch 1 (no `ensurepip`; Docker daemon unreachable), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor specialist paths untested |
 
 Honest caveats:
 
@@ -1821,11 +1880,14 @@ What Kryonsec is **not** (yet), stated plainly:
 Roadmap, in the order I actually want them:
 
 1. **Publish v1.3.11** once the release decision is made (sequence in [Release and versioning](#release-and-versioning)).
-2. **Phase 3 — multi-agent intelligence:** the first piece — structured handoffs between
-   specialist agents with a deterministic coordinator and shared evidence — is built on
-   the feature branch (see [the 10-state loop](#the-10-state-loop-and-the-two-human-gates));
-   still to come: agent memory/context, richer checkpoint/resume, per-agent token/cost
-   budgets, and specialist skills.
+2. **Phase 3 — multi-agent intelligence:** built on the feature branch — structured
+   handoffs between specialist agents with a deterministic coordinator and shared
+   evidence (Batch 3), then bounded specialist scheduling, task-scoped context, real
+   checkpoint resume with shared budgets, and reviewed read-only skill packs (Batch 4,
+   see [the 10-state loop](#the-10-state-loop-and-the-two-human-gates)). The LLM-backed
+   specialist roles are described and deferred, not yet real LLM workers; the remaining
+   Phase 4 work (independent exploit verification contracts) is the prerequisite chain
+   for activating POST_EXPLOIT.
 3. **Phase 4 — independent exploit verification:** deeper verification contracts, which is
    also the prerequisite chain for activating POST_EXPLOIT.
 4. **Interactsh and Burp Community** — both need listening services and callback traffic,

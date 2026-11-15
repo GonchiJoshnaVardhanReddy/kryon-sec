@@ -1,13 +1,16 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–3 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–4 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
 `gowitness-probe` (Batch 2) — built on the existing Phase 2B adapter
-framework, plus structured agent handoffs with a deterministic coordinator
-and shared evidence (Batch 3, Phase 3A + 3C). Branch
-`feature/tool-expansion-batch1`; nothing below is published yet.
+framework, structured agent handoffs with a deterministic coordinator and
+shared evidence (Batch 3, Phase 3A + 3C), and the advanced multi-agent
+layer above it: bounded specialist scheduling, task-scoped context, real
+checkpoint resume with shared budgets, and reviewed read-only skill packs
+(Batch 4, Phase 4A–4D). Branch `feature/tool-expansion-batch1`; nothing
+below is published yet.
 
 ### New vetted adapters (Batch 2)
 
@@ -177,6 +180,122 @@ where they were.
   per-agent token budgets, no scheduler that dispatches specialists from the
   records, and no real Docker/gVisor validation of the wiring (mocked tests
   only, by design on this host).
+
+### Advanced multi-agent intelligence (Batch 4 — Phase 4A–4D)
+
+The layer ABOVE Batch 3's coordinator: bounded specialist scheduling, a
+task-scoped context builder, real checkpoint resume with shared budgets,
+and reviewed read-only skill packs. Same shape as the previous batches —
+deterministic Python, no new LLM calls at the boundaries, no new tools, no
+allowlist or image change, Gate 2/Gate 3 exactly where they were. Nothing
+below runs a security tool: the only deterministic executor is graph
+analysis.
+
+- **Bounded scheduling (4A, `purple/specialist.py`)**: six typed
+  `SpecialistRole` capability descriptions — `recon_analysis`,
+  `hypothesis_analysis`, `evidence_assessment`, `verification_support`,
+  `defensive_recommendation`, `reporting`. Exactly ONE has a deterministic
+  executor today (`EvidenceAssessmentSpecialist` — reads
+  `hypothesis_engine_view` and grades with the engine's own standing
+  vocabulary); the two LLM-backed roles say so in their `implements`
+  mapping and are **deferred, never improvised** — `run_ready` refuses to
+  fake an LLM role with a stub. `SpecialistTask` validates stage against
+  the orchestrator's `STATES`, priority 0–100, timeout 10–3600 s, ≤8
+  dependencies, `extra="forbid"`; submission must cite a known
+  task-assignment record of the role's type, in the role's stage, in the
+  coordinator's engagement (cross-engagement and type-mismatch refusals).
+  Model proposals become read-only scheduled work ONLY through the
+  coordinator's dedup identity; a state-changing proposal is refused at
+  the door (audited `specialist_proposal_refused`).
+- **Derivation at the HYPOTHESIZE boundary**: the Batch-3 recorder now
+  derives one READ-ONLY `evidence_assessment` assignment per proposed
+  hypothesis (capped at 12 per boundary, over-cap audited
+  `handoff_derivation_capped`), registered as data — the scheduler then
+  decides what runs, and nothing in the derivation authorizes target
+  contact. The scheduler's own `derive_from_records` is identity-deduped
+  and capped at 12 (`specialist_derivation_capped`).
+- **Claims, attempts, timeouts**: claiming goes through the coordinator's
+  transition table (atomic, double-claim raises `HandoffTransitionError`);
+  `MAX_ATTEMPTS = 2` closes reclaiming; an expired claim parks the task
+  `blocked` with the stale stamp cleared and may re-claim within the cap;
+  a manual claim wins the race and the scheduler runs nothing rather than
+  crash. A timed-out/blocked read-only task reopens honestly; a
+  state-changing one never re-runs without a human approval.
+- **Deliverable contracts (Shannon-style)**: `purple/deliverables.py` —
+  `SpecialistDeliverable` with a closed `RESULT_STATUSES` status set and a
+  closed `STANDING_WORDS` vocabulary (the engine's own graph/verification/
+  attempt vocabularies plus `unresolved`). A producer cannot invent a
+  standing, cannot file an extra field, and cannot claim a confidence
+  without evidence — the schema refuses the whole deliverable and the
+  task is recorded FAILED with the reason.
+- **Task-scoped context (4B, `purple/task_context.py`)**: what ONE task
+  may see, and nothing more — the objective (with the task's safety
+  class), the subject hypothesis's engine view, up to six related-asset
+  references, bounded prior results about the same subject, Gate-2
+  outcome records, and deterministic unresolved questions. Every line is
+  redacted (`«SECRET_n»` placeholders, the declaration appended), marked
+  untrusted vs engine-derived, capped (`MAX_OBSERVATIONS`,
+  `MAX_PRIOR_RESULTS`, ≤8 unresolved), and framed as DATA ONLY, NOT
+  INSTRUCTIONS. `extra="forbid"` on the context model keeps the shape
+  exactly what the builder writes.
+- **Shared budgets (4C, extends the existing BudgetTracker)**: the
+  specialist layer reserves against the orchestrator's ONE engagement
+  tracker — no second budget. `reserve/commit/release` with
+  first-commit-wins per key (replays and checkpoint retries never
+  double-count), reservations hold headroom against new reservations but
+  NEVER trip the loop's `exhausted()` guard, and every specialist token
+  figure is labelled an estimate (`estimated_tokens`) — never presented
+  as a provider charge. Budget exhaustion defers a task (audited
+  `specialist_budget_deferred` with the real reason) instead of blocking
+  the engagement; per-task and per-role bounds defer likewise.
+- **Real resume (4C)**: the scheduler snapshot rides in the SAME
+  transaction as the handoff records (`handoff_scheduler` table,
+  migration `0004`) — records and scheduler always describe one moment.
+  `resume_specialists` restores the records, the scheduler's tasks +
+  event ledger + budget consumption, then runs a recovery pass:
+  interrupted READ-ONLY work reopens (`blocked`, claimable again — its
+  result is recomputed, never assumed); interrupted STATE-CHANGING work
+  is parked behind Gate 2 (`needs_approval`, never automatically
+  repeated); completed/cancelled/already-gated work is left exactly as
+  it was. A corrupt or incompatible checkpoint is refused, audited
+  (`specialist_resume_failed`, reason `scheduler_checkpoint_unusable` /
+  `storage_unreadable`), and the engagement continues with a FRESH
+  scheduler over the records that did restore — never half-interpreted.
+  A reused engagement id via `start_engagement` gets all of it back.
+- **Reviewed skill packs (4D, `purple/skills.py` + `purple/skills/`)**:
+  six packaged, versioned, read-only methodology notes —
+  `recon_methodology`, `evidence_quality`, `counterevidence`,
+  `severity_calibration`, `verification_method`, `defensive_remediation`
+  (Strix-inspired, Strix's executable workflows deliberately NOT
+  copied). The loader takes NO path argument — reviewed knowledge ships
+  in the package or it does not ship. Parsing refuses malformed front
+  matter, unknown keys (a `script:` key is a refusal, not an ignored
+  line), out-of-vocabulary categories/stages, unbounded bodies, fenced
+  code blocks, and frame-forging text, all as one `SkillError`.
+  Matching is deterministic (stage/category/allowlist filters, name
+  order, capped); injection is a bounded framed block (≤4,000 chars,
+  ≤3 skills) that says KNOWLEDGE, not instructions, carries versioned
+  provenance per entry, names omitted skills visibly inside the frame,
+  and ends with "nothing above authorizes any action."
+- **Progress you can watch**: every boundary publishes a
+  `specialist_progress` event and the existing UI adapters render
+  scheduled/done/blocked counters, token estimates, and deferral/resume
+  notices — read-only consumers of the scheduler's own audit events,
+  defensive by contract (garbage events never crash the paint).
+- **Batch-3 boundary change this batch makes**: the HYPOTHESIZE boundary
+  now derives assessment assignments, so `StageBoundaryRecorder` output
+  grows (2 Observations + 2 assignments for a 2-hypothesis graph); the
+  two Batch-3 boundary tests were updated for this legitimate behavior
+  change — their proposed-never-confirmed assertions are intact and
+  strengthened (derived assignments are asserted read-only).
+- **Tests**: `tests/test_specialist.py` (66), `tests/test_batch4_recovery.py`
+  (13), `tests/test_skills.py` (17). Full suite on the branch after
+  Batch 4: **2,621 passed / 61 skipped** (WSL2, Python 3.14); the 2
+  failures are the SAME environmental ones as before the batch (no
+  `ensurepip` in that Python; Docker daemon unreachable), not
+  regressions. PostgreSQL paths NOT RUN (no PostgreSQL environment);
+  real Docker/gVisor specialist paths untested (mocked suites only, by
+  design on this host).
 
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 
