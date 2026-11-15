@@ -799,19 +799,29 @@ def test_hypothesize_boundary_proposes_never_confirms():
 
     recorder.on_state_complete("HYPOTHESIZE")
     records = coord.records()
-    assert len(records) == 2
+    # Batch 4A: the boundary ALSO derives one READ-ONLY evidence-assessment
+    # assignment per hypothesis — proposed work for the specialist layer,
+    # registered only, never authorization to touch the target.
+    observations = [r for r in records if r.kind == "observation"]
+    derived = [r for r in records if r.kind == "task_assignment"]
+    assert len(observations) == 2 and len(derived) == 2
     node_ids = {n["label"]: n["id"] for n in graph.by_type("hypothesis")}
-    for record in records:
-        assert record.kind == "observation"
+    for record in observations:
         assert record.status == "proposed"  # a model's word, labelled as one
         assert record.destination == "HUMAN_REVIEW"
         assert record.source == "HYPOTHESIZE"
         assert record.message["evidence_refs"] == [node_ids[record.subject_ref]]
-    assert {r.subject_ref for r in records} == {"H1", "H2"}
+    assert {r.subject_ref for r in observations} == {"H1", "H2"}
+    for record in derived:
+        assert record.task_type == "evidence_assessment"  # read-only by type
+        assert record.destination == "specialist"
+        assert record.message["requires_approval"] is False
+        assert record.message["evidence_refs"] == [node_ids[record.subject_ref]]
+    assert {r.subject_ref for r in derived} == {"H1", "H2"}
 
     # the same boundary again — replay, restore, whatever: no duplicates
     recorder.on_state_complete("HYPOTHESIZE")
-    assert len(coord.records()) == 2
+    assert len(coord.records()) == 4
 
 
 def test_human_review_boundary_records_the_gate_never_makes_it():
@@ -1007,11 +1017,20 @@ def test_gate2_still_owns_the_transition_and_handoffs_follow():
     assert next_state("VERIFY", SubagentResult(status="ok")) == "BLUE_TEAM"
 
     assignments = [r for r in coord.records() if r.kind == "task_assignment"]
-    assert [r.subject_ref for r in assignments] == ["H1"]
+    # HYPOTHESIZE derived READ-ONLY assessments for every hypothesis; the
+    # only STATE-CHANGING assignment is still Gate 2's exploit_test, and
+    # only for the hypothesis the human approved
+    derived = [r for r in assignments if r.task_type == "evidence_assessment"]
+    exploit = [r for r in assignments if r.task_type == "exploit_test"]
+    assert {r.subject_ref for r in derived} == {"H1", "H2"}
+    assert all(r.message["requires_approval"] is False for r in derived)
+    assert [r.subject_ref for r in exploit] == ["H1"]
+    assert all(r.message["requires_approval"] is True for r in exploit)
     for record in coord.records():
         assert not _has_key(record.model_dump(), "approved")
 
-    # with zero approvals the same wiring never produces an assignment
+    # with zero approvals the same wiring never produces a STATE-CHANGING
+    # assignment — only the read-only assessments HYPOTHESIZE always derives
     graph2 = _gate_graph("e-gate2")
     # the graph is what human_review would have left: H1 not approved
     graph2.by_type("hypothesis")[0]["properties"]["approved"] = False
@@ -1025,7 +1044,10 @@ def test_gate2_still_owns_the_transition_and_handoffs_follow():
     )
     orch2.on_state_complete = StageBoundaryRecorder(coord2).on_state_complete
     orch2.run()
-    assert not [r for r in coord2.records() if r.kind == "task_assignment"]
+    left = [r for r in coord2.records() if r.kind == "task_assignment"]
+    assert left  # the read-only assessments exist...
+    assert all(r.task_type == "evidence_assessment" for r in left)
+    assert not [r for r in left if r.task_type == "exploit_test"]  # ...only
     assert orch2.completed.count("EXPLOIT") == 0
 
 

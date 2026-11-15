@@ -145,6 +145,8 @@ TASK_TYPES: dict[str, str] = {
     "verify_check":     "state_changing",
     "blue_team_scan":   "read_only",       # static analysis of /code
     "report_compile":   "read_only",
+    "evidence_assessment": "read_only",    # Batch 4: deterministic graph analysis of
+                                           # evidence quality — no target contact
 }
 
 # Message kinds — the closed set the Batch-3 contract names.

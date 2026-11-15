@@ -14,6 +14,11 @@ the same shape ``purple.graph_store`` is for the graph:
   payload that claims to belong to another engagement (the
   cross-engagement rule holds in storage too) or a version this build
   does not understand.
+* ``save_handoffs`` also carries the Batch 4 specialist scheduler's own
+  snapshot (``handoff_scheduler``, one row per engagement) in the SAME
+  transaction, so records and scheduler checkpoint can never disagree
+  about where an interruption found them. ``load_scheduler_payload``
+  reads that row back for :meth:`SpecialistScheduler.from_dict`.
 
 Redaction is applied again on the way in, even though every text field
 was sanitized at message construction: this is a durable copy, and the
@@ -32,16 +37,31 @@ allowlists — a storage boundary, and nothing else.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
 from ..secrets import redact
-from ..storage.models import HandoffRecordRow
+from ..storage.models import HandoffRecordRow, HandoffSchedulerRow
 from .coordinator import HandoffCoordinator, HandoffError
 from .handoff import HANDOFF_FORMAT_VERSION
 from .recon_passive import CrossEngagementError, _parse_timestamp
 
-__all__ = ["load_handoffs", "save_handoffs"]
+if TYPE_CHECKING:  # pragma: no cover - hints only, never a runtime import
+    from .recon_passive import EngagementGraph
+    from .audit import AuditLog
+
+__all__ = [
+    "SCHEDULER_FORMAT_VERSION",
+    "load_handoffs",
+    "load_scheduler_payload",
+    "save_handoffs",
+]
+
+# The scheduler snapshot's own format version — bumped when the snapshot
+# shape changes, exactly like HANDOFF_FORMAT_VERSION. A checkpoint a
+# build cannot read is refused, never half-interpreted.
+SCHEDULER_FORMAT_VERSION = 1
 
 
 def _redacted(value):
@@ -64,6 +84,8 @@ def save_handoffs(
     session: Session,
     engagement_id: str,
     coordinator: HandoffCoordinator,
+    *,
+    scheduler: object | None = None,
 ) -> int:
     """Write the coordinator's records as the engagement's current state.
 
@@ -71,6 +93,12 @@ def save_handoffs(
     structured exchange, and a record that no longer exists in RAM must
     not linger in the table. History lives in the audit chain, which this
     never touches.
+
+    When ``scheduler`` is given, its snapshot is written into
+    ``handoff_scheduler`` (one row per engagement, replaced the same way)
+    INSIDE the same transaction — so the records and the scheduler
+    checkpoint always describe the same moment, and a crash part-way
+    leaves the previous checkpoint of both.
 
     Returns the record count. Commits before returning.
     """
@@ -102,8 +130,60 @@ def save_handoffs(
             updated_at=_parse_timestamp(record.get("updated_at")),
         ))
 
+    if scheduler is not None:
+        snapshot = scheduler.to_dict()
+        if snapshot.get("engagement_id") != engagement_id:
+            raise CrossEngagementError(
+                f"scheduler holds engagement "
+                f"{snapshot.get('engagement_id')!r}, but was asked to save "
+                f"engagement {engagement_id!r}")
+        session.query(HandoffSchedulerRow).filter(
+            HandoffSchedulerRow.engagement_id == engagement_id
+        ).delete(synchronize_session=False)
+        session.add(HandoffSchedulerRow(
+            engagement_id=engagement_id,
+            payload=_redacted(snapshot),
+        ))
+
     session.commit()
     return len(payload["records"])
+
+
+def load_scheduler_payload(session: Session, engagement_id: str) -> dict | None:
+    """The scheduler snapshot an earlier run saved, or None.
+
+    A malformed or cross-engagement payload is REFUSED, not half-read:
+    the caller's resume pass treats the refusal as a corrupt checkpoint
+    and recovers the audited way. ``None`` simply means no scheduler
+    checkpoint exists (Batch 3 saves, an engagement that scheduled
+    nothing, or a hand-mixed store) — nothing to restore, nothing to
+    fear.
+    """
+    rows = session.query(HandoffSchedulerRow).filter(
+        HandoffSchedulerRow.engagement_id == engagement_id
+    ).all()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        # More than one row for one engagement means the replace-on-save
+        # contract was violated somewhere — refuse rather than guess.
+        raise HandoffError(
+            f"engagement {engagement_id!r} holds "
+            f"{len(rows)} scheduler checkpoint rows; expected exactly one")
+    payload = rows[0].payload
+    if not isinstance(payload, dict):
+        raise HandoffError(
+            "scheduler checkpoint row holds no readable payload")
+    version = payload.get("version")
+    if version != SCHEDULER_FORMAT_VERSION:
+        raise HandoffError(
+            f"scheduler checkpoint was written by format version "
+            f"{version!r}; this build reads {SCHEDULER_FORMAT_VERSION}")
+    if payload.get("engagement_id") != engagement_id:
+        raise CrossEngagementError(
+            f"scheduler checkpoint holds engagement "
+            f"{payload.get('engagement_id')!r}, not {engagement_id!r}")
+    return payload
 
 
 def load_handoffs(

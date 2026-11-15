@@ -737,8 +737,15 @@ class StageBoundaryRecorder:
             f"{len(endpoints)} web endpoints",
             [n["id"] for n in services] + [n["id"] for n in endpoints])
 
+    # Batch 4: at most this many evidence-assessment assignments are
+    # derived per HYPOTHESIZE boundary. The cap is what keeps a
+    # hypothesis flood from becoming an unbounded task list; the
+    # scheduler audits what it did not derive.
+    MAX_ASSESSMENT_TASKS = 12
+
     def _on_HYPOTHESIZE(self) -> None:
-        for node in self.graph.by_type("hypothesis"):
+        hypotheses = self.graph.by_type("hypothesis")
+        for node in hypotheses:
             props = node.get("properties") or {}
             self.coordinator.register(Observation(
                 engagement_id=self._engagement,
@@ -752,6 +759,34 @@ class StageBoundaryRecorder:
                 hypothesis_refs=[node["label"]],
                 evidence_refs=[node["id"]],
             ))
+        # Batch 4A: one READ-ONLY evidence-assessment assignment per
+        # proposed hypothesis. Registering the assignment is as far as
+        # this boundary goes — scheduling and running it is the
+        # specialist scheduler's decision, and nothing here authorizes
+        # any target contact. Identity-deduped by content, so a repeated
+        # boundary re-derives the same records, not new ones.
+        for node in hypotheses[: self.MAX_ASSESSMENT_TASKS]:
+            props = node.get("properties") or {}
+            self.coordinator.register(TaskAssignment(
+                engagement_id=self._engagement,
+                message_id=new_message_id(),
+                source="HYPOTHESIZE",
+                destination="specialist",
+                task_type="evidence_assessment",
+                subject_ref=node["label"],
+                target_asset=claim_text(props.get("target_asset") or "", 300),
+                content=claim_text(
+                    props.get("title") or node["label"], 400),
+                hypothesis_refs=[node["label"]],
+                evidence_refs=[node["id"]],
+            ))
+        if len(hypotheses) > self.MAX_ASSESSMENT_TASKS:
+            self.audit.write({
+                "event": "handoff_derivation_capped",
+                "state": "HYPOTHESIZE",
+                "derived": self.MAX_ASSESSMENT_TASKS,
+                "total": len(hypotheses),
+            })
 
     def _on_HUMAN_REVIEW(self) -> None:
         hypotheses = self.graph.by_type("hypothesis")
