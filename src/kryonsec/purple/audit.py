@@ -105,6 +105,28 @@ class AuditLog:
     def head_hash(self) -> str:
         return self.last_hash
 
+    def entries(self) -> list[dict]:
+        """Every entry so far, in chain order, parsed.
+
+        A read back of the append-only file — the same lines ``verify``
+        replays, without the integrity walk. Callers use it to cite
+        provenance that already happened (Batch 5A: the Gate-2 decision
+        an EXPLOIT contract points at); it is never a decision input for
+        anything that has not been audited yet, because it can only hold
+        what was already written.
+        """
+        result: list[dict] = []
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    result.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return result
+
     # ---- verification ----------------------------------------------------
 
     def verify(self) -> tuple[bool, str | None]:
