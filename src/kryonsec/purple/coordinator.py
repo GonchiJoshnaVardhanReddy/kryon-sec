@@ -743,6 +743,12 @@ class StageBoundaryRecorder:
     # scheduler audits what it did not derive.
     MAX_ASSESSMENT_TASKS = 12
 
+    # Batch 6B: at most this many post-exploit enumeration assignments
+    # are derived per EXPLOIT boundary — Gate 3 approves at most a
+    # handful of capability records, and each approved record is one
+    # bounded enumeration handoff, never an open-ended task list.
+    MAX_ENUM_TASKS = 3
+
     def _on_HYPOTHESIZE(self) -> None:
         hypotheses = self.graph.by_type("hypothesis")
         for node in hypotheses:
@@ -860,6 +866,44 @@ class StageBoundaryRecorder:
                     decision.record.message_id,
                     edge["target_node_id"], "produced")
 
+        # Batch 6B: one post_exploit_enum assignment per Gate-3-approved
+        # capability record — the structured form of what Gate 3
+        # authorized for the POST_EXPLOIT stage. Registered AFTER the
+        # transition as data for the record, never as the reason
+        # POST_EXPLOIT runs (the orchestrator alone routes; the
+        # subagent's own eligibility check re-derives everything at
+        # consumption time). Identity-deduped by content, so a repeated
+        # boundary re-derives the same records, not new ones.
+        capabilities = [
+            n for n in self.graph.by_type("capability")
+            if (n.get("properties") or {}).get("status") == "approved"
+        ]
+        for node in capabilities[: self.MAX_ENUM_TASKS]:
+            props = node.get("properties") or {}
+            self.coordinator.register(TaskAssignment(
+                engagement_id=self._engagement,
+                message_id=new_message_id(),
+                source="EXPLOIT",
+                destination="POST_EXPLOIT",
+                task_type="post_exploit_enum",
+                subject_ref=node["label"],
+                target_asset=claim_text(
+                    str(props.get("target_host") or ""), 300),
+                content=claim_text(
+                    f"{props.get('capability')} shell handoff on "
+                    f"{props.get('target_host')} via {props.get('tool')} "
+                    f"(attempt {props.get('attempt_label')})", 400),
+                hypothesis_refs=[str(props.get("hypothesis_id") or "")],
+                evidence_refs=[node["id"]],
+            ))
+        if len(capabilities) > self.MAX_ENUM_TASKS:
+            self.audit.write({
+                "event": "handoff_derivation_capped",
+                "state": "EXPLOIT",
+                "derived": self.MAX_ENUM_TASKS,
+                "total": len(capabilities),
+            })
+
     def _on_VERIFY(self) -> None:
         for node in self.graph.by_type("verify_attempt"):
             vs = verification_status(node)
@@ -883,11 +927,16 @@ class StageBoundaryRecorder:
                     edge["source_node_id"], "consumed")
 
     def _on_POST_EXPLOIT(self) -> None:
-        notes = self.graph.by_type("engagement_note")
+        # Batch 6B fix: this state produces `post_exploit_evidence` nodes
+        # (the fixed enum plan's outputs) — the old code counted
+        # `engagement_note` nodes, which POST_EXPLOIT never writes, so
+        # the summary always said "0 notes".
+        evidence = self.graph.by_type("post_exploit_evidence")
         self._summary(
             "POST_EXPLOIT", "VERIFY",
-            f"post-exploit enumeration recorded ({len(notes)} notes)",
-            [])
+            f"post-exploit enumeration recorded "
+            f"({len(evidence)} evidence nodes)",
+            [n["id"] for n in evidence])
 
     def _on_BLUE_TEAM(self) -> None:
         findings = self.graph.by_type("finding")
