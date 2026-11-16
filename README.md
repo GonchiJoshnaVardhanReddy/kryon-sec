@@ -1157,6 +1157,50 @@ counterevidence rule (`purple/exploit_contract.py`, `purple/verify_contract.py`,
   specialist that could probe would be a second, uncontracted path to target contact.
   Checkpoint/resume covers it like every other read-only task.
 
+### The controlled Post-Exploit lifecycle (Batch 6)
+
+Phases 1B–1D proved a capability claim, verified it independently, and gated it. Batch 6
+finishes the record's LIFE — where it may live, how long it lives, how it dies, and what
+consuming it means (`purple/capability.py`, `purple/post_exploit.py`,
+`purple/coordinator.py`).
+
+- **Records are bound, stamped, and mortal (6A).** Every claimed record carries the
+  engagement that claimed it (`engagement_id`) and the moment it was claimed
+  (`recorded_at`). Eligibility is ONE ordered, pure, fail-closed check
+  (`capability_eligibility`) every consumer re-derives at consumption time: consumed →
+  revoked → approved → independently verified → bound to THIS engagement → in scope →
+  fresh → its attempt still exists, matches the tool, and still confirms. Six hours after
+  the stamp the record expires (`CAPABILITY_MAX_AGE_S`): a capability is a statement about
+  a shell that existed at a moment in time, never a standing authorization. Unbound legacy
+  records are refused, not grandfathered; a missing, unparseable or future stamp is never
+  read as fresh.
+- **Revocation is recorded, never deleted (6A).** The audited kill switch
+  (`revoke_capability`) flips a record to the one-way `revoked` status in place — the same
+  direct write the Gate 3 decision uses — with a `capability_revoked` audit entry carrying
+  the previous status. Revoked records are refused everywhere; re-revoking is an idempotent
+  no-op; unknown or malformed nodes refuse.
+- **The producer registry has a front door, and it is still empty (6A).**
+  `register_capability_parser()` is the reviewed-configuration entry point: bounded names
+  (≤64 chars, no control characters), callable parsers, deliberate overwrite on
+  re-registration (mirroring the verification-contract registry). The shipped registry
+  stays EMPTY — asserted as data by test — so POST_EXPLOIT remains dormant exactly as
+  before: activation stays a separately reviewed, human-approved, lab-validated decision.
+- **Gate 3's approval becomes bounded handoff data (6B).** The EXPLOIT boundary derives
+  one `post_exploit_enum` task assignment per Gate-3-approved record — capped at three,
+  identity-deduped on replay, approval requirement re-derived from the state-changing task
+  type — registered after the transition as a record of what was authorized; the
+  orchestrator alone routes. Fixed: the POST_EXPLOIT boundary counted engagement notes
+  (a node type that state never writes) and always reported zero — it now counts the
+  `post_exploit_evidence` nodes the state actually produced.
+- **Consumption is one-shot (6C).** The subagent no longer hand-rolls its checks; it
+  re-derives eligibility at consumption time with the graph's engagement id and the real
+  clock, then marks the eligible record `consumed_at` at the START of the run (audited
+  `capability_consumed`). A crash mid-plan leaves the record consumed: a re-run REFUSES it
+  instead of silently replaying state-changing enumeration. Recovery is a fresh claim from
+  fresh evidence — and the tests prove both the refusal and that recovery path. A
+  save/reload roundtrip through the engagement store preserves both the consumption guard
+  and eligibility.
+
 ### The evidence ladder
 
 Findings are never just *"the scanner said so."* Every finding climbs three rungs:
@@ -1867,6 +1911,8 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Honest failures + bounded infra retries (2B.7) | ✅ done |
 | Tool Expansion Batch 1 — naabu/dnsx/katana adapter probes | ✅ code + mocked suites done — real-gVisor lab ITs armed, **NOT RUN on the Windows dev host** |
 | Batch 4 — specialist scheduling, task context, budgets, resume, skill packs | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor specialist runs NOT exercised |
+| Batch 5 — exploit/verify contracts, counterevidence, verification-support specialist | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor runs NOT exercised |
+| Batch 6 — capability lifecycle: binding, expiry, revocation, consumption guard, handoffs | ✅ code + mocked suites done on the feature branch — registries deliberately still EMPTY; PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1902,6 +1948,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | Tool Expansion Batch 1 | 2026-11-15 | **2,401 passed / 58 skipped** in a WSL2 Ubuntu venv (Python 3.14) — the 2 failures are environmental (no `ensurepip` in that Python; no docker group access), not code. The 3 new opt-in lab ITs (naabu/dnsx/katana through real Docker+gVisor) stay NOT RUN on this host |
 | Tool Expansion Batch 4 | 2026-11-15 | **2,621 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 96-test Batch-4 suite (`test_specialist` 66, `test_batch4_recovery` 13, `test_skills` 17); the 2 failures are the same environmental ones as Batch 1 (no `ensurepip`; Docker daemon unreachable), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor specialist paths untested |
 | Tool Expansion Batch 5 | 2026-11-16 | **2,710 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new Batch-5 suites (`test_exploit_contract` 32, `test_verify_contract` 19, `test_evidence_quality` 21, `test_verification_support` 14); 1 failure is the same environmental one (no `ensurepip` in that Python), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
+| Tool Expansion Batch 6 | 2026-11-16 | **2,748 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 38-test Batch-6 suite (`test_post_exploit_batch6`: eligibility ordering, revocation, consumption guard, interrupted-run recovery, persistence roundtrips, coordinator handoffs); 1 failure is the same environmental one (no `ensurepip` in that Python — the Docker-daemon check passed this run), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
 
 Honest caveats:
 

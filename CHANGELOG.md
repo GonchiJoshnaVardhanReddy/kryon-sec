@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–5 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–6 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
@@ -13,7 +13,11 @@ checkpoint resume with shared budgets, and reviewed read-only skill packs
 typed EXPLOIT input contracts, a registered per-category verification
 contract, recorded counterevidence with the honest `unresolved` status,
 and the read-only verification-support specialist (Batch 5, Phase
-5A–5D). Branch `feature/tool-expansion-batch1`; nothing below is
+5A–5D), and the controlled Post-Exploit lifecycle: engagement-bound,
+stamped, expiring and revocable capability records, one ordered
+consumption-time eligibility check, a one-shot consumption guard with
+crash-safe recovery, and bounded coordinator handoffs (Batch 6, Phase
+6A–6D). Branch `feature/tool-expansion-batch1`; nothing below is
 published yet.
 
 ### New vetted adapters (Batch 2)
@@ -366,6 +370,64 @@ analysis.
   injection boolean-probing is the ONLY finding category independently verifiable
   today; XSS, command injection, web/discovery categories are recorded and
   reachability-checked but NOT independently verified — never labeled otherwise.
+
+### The controlled Post-Exploit lifecycle (Batch 6 — Phase 6A–6D)
+
+- **Engagement-bound, stamped, expiring capability records (6A, `purple/capability.py`)**:
+  every claimed record now carries `engagement_id` (the claiming graph's engagement — a
+  claim is never portable) and `recorded_at` (ISO-8601 UTC, written by
+  `claim_from_attempt`). A new one-way `revoked` status joins the lifecycle.
+  `capability_eligibility()` is the ONE ordered, pure, fail-closed check every consumer
+  runs at consumption time: retyped node → consumed → revoked → not approved → not
+  independently verified → unbound → cross-engagement → out of scope → missing/unusable
+  stamp → expired (`CAPABILITY_MAX_AGE_S`, 6 h) → attempt missing / tool mismatch / no
+  longer confirms (invalidated). Records expire because a capability is a statement about
+  a shell that existed at a moment in time, never a standing authorization. The producer
+  registry gains `register_capability_parser()` — the reviewed-configuration entry point
+  (bounded ≤64-char names, no control characters, callable, deliberate overwrite on
+  re-registration) — and the shipped registry stays EMPTY (dormant by emptiness, asserted
+  as data by test).
+- **The audited kill switch (6A)**: `revoke_capability()` flips a record to `revoked` in
+  place (the same direct write the Gate 3 decision uses), records the revocation in the
+  audit chain (`capability_revoked`, with the previous status), refuses unknown/malformed
+  nodes, and is idempotent. Revocation is recorded, never deleted.
+- **Bounded handoff records (6B, `purple/coordinator.py`)**: the EXPLOIT boundary derives
+  one `post_exploit_enum` TaskAssignment per Gate-3-approved capability record — capped at
+  3 (`handoff_derivation_capped`), identity-deduped on replay, `requires_approval`
+  re-derived from the state-changing task type — registered AFTER the transition as data
+  for the record, never the reason POST_EXPLOIT runs. Fixed: the POST_EXPLOIT boundary
+  counted `engagement_note` nodes (which that state never writes) and always reported
+  zero — it now counts the `post_exploit_evidence` nodes the state actually produced and
+  carries them by id.
+- **Consumption-time eligibility + the one-shot consumption guard (6C,
+  `purple/post_exploit.py`)**: the subagent no longer hand-rolls its checks; eligibility
+  is re-derived at consumption time via `capability_eligibility` with the graph's
+  engagement id and the real clock. The eligible record is marked `consumed_at` at the
+  START of the run (audited `capability_consumed`): after a crash or interruption a re-run
+  REFUSES the record instead of silently replaying state-changing enumeration — recovery
+  is a fresh claim from fresh evidence, not a replay.
+- **The standing safety rule, unchanged**: nothing in Batch 6 activates a shell-producing
+  tool. Every test record is schema-built data through the real validator, every sandbox
+  is a fake, and both the producer and verifier registries ship EMPTY — activation remains
+  a separate reviewed, human-approved, disposable-lab-validated decision registered in
+  BOTH registries. With empty registries nothing claims, verifies, or consumes a
+  capability, and EXPLOIT still routes EXPLOIT -> VERIFY exactly as before Batch 1.
+- **Tests**: new `tests/test_post_exploit_batch6.py` (38): the eligibility ordering
+  (consumed / revoked / the exact approval refusal string / verification / binding /
+  cross-engagement / scope + subdomain / expiry boundary at exactly `MAX_AGE_S` /
+  unusable stamps / all three staleness invalidations), `record_age_s`
+  garbage-and-future refusal, registry validation + overwrite + the empty-registry
+  assertion, fake-capability schema refusal, revocation (recorded, idempotent, refuses,
+  never runs the plan), consumption (gate denial, scope, expiry, cross-engagement,
+  duplicate execution, interrupted run, recovery-via-fresh-record, the happy path), two
+  persistence roundtrips through the real embedded store (a consumed record stays
+  consumed; eligibility survives reload), and the coordinator derivations (bounded,
+  capped, unapproved records hand off nothing, the POST_EXPLOIT evidence-count fix).
+  Full suite after Batch 6: **2,748 passed / 61 skipped** (WSL2, Python 3.14); the 1
+  failure is the SAME environmental one as Batches 1–5 (no `ensurepip` in that Python —
+  the Docker-daemon check passed this run), not a regression. PostgreSQL paths NOT RUN
+  (no PostgreSQL environment); real Docker/gVisor paths untested (mocked suites only, by
+  design on this host).
 
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 
