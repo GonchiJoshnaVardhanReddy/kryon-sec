@@ -195,16 +195,19 @@ def _complete(coord: HandoffCoordinator, task_id: str,
 
 
 def test_roles_are_honest_about_what_runs():
-    """Six roles; one deterministic executor; LLM roles deferred."""
+    """Six roles; two deterministic executors (Batch 5D added the
+    verification-support one, read-only analysis); LLM roles deferred."""
     assert set(SPECIALIST_ROLES) == {
         "recon_analysis", "hypothesis_analysis", "evidence_assessment",
         "verification_support", "defensive_recommendation", "reporting",
     }
     executors = {r.name: r.executor for r in SPECIALIST_ROLES.values()}
     assert executors["evidence_assessment"] == "evidence_assessment"
+    assert executors["verification_support"] == "verification_support"
     assert all(
-        v is None for k, v in executors.items() if k != "evidence_assessment")
-    assert EXECUTORS.keys() == {"evidence_assessment"}
+        v is None for k, v in executors.items()
+        if k not in ("evidence_assessment", "verification_support"))
+    assert set(EXECUTORS) == {"evidence_assessment", "verification_support"}
     llm_roles = {r.name for r in SPECIALIST_ROLES.values() if r.llm}
     assert llm_roles == {"hypothesis_analysis", "defensive_recommendation"}
 

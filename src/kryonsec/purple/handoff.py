@@ -147,6 +147,10 @@ TASK_TYPES: dict[str, str] = {
     "report_compile":   "read_only",
     "evidence_assessment": "read_only",    # Batch 4: deterministic graph analysis of
                                            # evidence quality — no target contact
+    "verification_analysis": "read_only",  # Batch 5D: deterministic analysis of
+                                           # verification records — no target
+                                           # contact; the PROBES stay with the
+                                           # VERIFY state (verify_check)
 }
 
 # Message kinds — the closed set the Batch-3 contract names.

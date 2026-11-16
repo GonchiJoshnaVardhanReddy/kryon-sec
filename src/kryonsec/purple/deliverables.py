@@ -51,6 +51,7 @@ from .views import (
     VERIFICATION_DISAGREED,
     VERIFICATION_INCONCLUSIVE,
     VERIFICATION_NOT_RUN,
+    VERIFICATION_UNRESOLVED,
     VERIFICATION_VERIFIED,
 )
 
@@ -83,8 +84,11 @@ RESULT_STATUSES: frozenset[str] = frozenset({
 STANDING_WORDS: frozenset[str] = frozenset({
     # graph node statuses (recon_passive.NODE_STATUSES)
     "observed", "inferred", "proposed", "validated", "confirmed", "rejected",
-    # independent-verification outcomes (views.VERIFICATION_*)
-    VERIFICATION_VERIFIED, VERIFICATION_DISAGREED,
+    # independent-verification outcomes (views.VERIFICATION_*):
+    # unresolved is the contested word — an agreeing difference with
+    # counterevidence standing — and shares the spelling of the basis
+    # level ``unresolved`` below (both mean: the engine settles nothing)
+    VERIFICATION_VERIFIED, VERIFICATION_DISAGREED, VERIFICATION_UNRESOLVED,
     VERIFICATION_INCONCLUSIVE, VERIFICATION_NOT_RUN,
     # exploit-attempt outcomes (views.ATTEMPT_*): what a test recorded,
     # which is not what a model claimed and not a finding

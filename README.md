@@ -1053,11 +1053,13 @@ image change.
 
 - **Six roles, honestly described.** `recon_analysis`, `hypothesis_analysis`,
   `evidence_assessment`, `verification_support`, `defensive_recommendation`,
-  `reporting` — capability descriptions, not agents. Exactly one has a deterministic
-  executor today (evidence assessment: reads the engine's own view of a hypothesis and
-  grades it with the engine's standing vocabulary, never model prose). A role whose real
-  implementation would be an LLM state says so and is **deferred — never improvised**
-  with a stub.
+  `reporting` — capability descriptions, not agents. Two have deterministic executors
+  today: evidence assessment (reads the engine's own view of a hypothesis and grades it
+  with the engine's standing vocabulary, never model prose) and — Batch 5D —
+  verification support (reads a finding's verification records and grades their
+  QUALITY — evidence analysis only; it runs no probe, and can neither promote nor
+  demote a finding). A role whose real implementation would be an LLM state says so
+  and is **deferred — never improvised** with a stub.
 - **Bounded tasks, deduplicated proposals.** A `SpecialistTask` validates its stage
   against the orchestrator's state list, priority 0–100, timeout 10–3600 s, at most 8
   dependencies. Submission must cite a known task-assignment record of the role's type,
@@ -1099,6 +1101,62 @@ image change.
 - **Progress you can watch.** Specialist events flow through the existing UI adapters:
   scheduled/done/blocked counters, token estimates, deferral and resume notices.
 
+### Exploit contracts, honest verification (Batch 5)
+
+The layer that turns "an approved hypothesis" into "a test that may run", and "a tool
+said so" into "an independent check agreed" — typed contracts around both, plus the
+counterevidence rule (`purple/exploit_contract.py`, `purple/verify_contract.py`,
+`purple/evidence_quality.py`).
+
+- **EXPLOIT builds a typed contract before anything runs (5A).** From the approved
+  hypothesis: engagement and target identity, the ONE target asset, derived categories,
+  the hypothesis's OWN tool list verbatim (approving `sqlmap` is not approving
+  `nuclei`), the Gate-2 approval reference (citing the actual `hypothesis_reviewed`
+  audit entry's hash), and the sandbox time ceiling. Every refusal — cross-engagement
+  hypothesis, missing Gate-2 approval, out-of-scope asset, no adapter, allowlist
+  rejection, no tools at all — is a structured typed refusal that is audited
+  (`exploit_contract_refused`) and recorded on the graph as an `exploit_refusal` node:
+  a skipped test is visible evidence, not a silent gap. The attempt record carries the
+  references, a structured failure classification (the sandbox's own failure words),
+  wall-clock duration, the audit-entry hash for correlation, and the honest limitations
+  of marker-based confirmation — a spawn that worked and an exit code are stated, on
+  the record, to be neither evidence nor an independent check.
+- **VERIFY runs a REGISTERED contract, not a hardcoded branch (5B).** The boolean curl
+  probe (AND 1=1 vs AND 1=2 against the baseline) is a contract scoped to the one
+  category it is evidence for — SQL injection. A contract binds category → one
+  independent method and states the tool, the evidence prerequisites, what agreement
+  and contradiction look like, the budget (probes count + per-probe seconds, enforced
+  in the fixed argv), the stage (VERIFY only), the approval basis, and — written down —
+  what the method CANNOT establish. Registration is fail closed: an unimplemented
+  method, an unreachable or `unknown` category, a duplicate, bad bounds — all refuse to
+  register. The registry starts with exactly ONE entry. A nikto or dalfox finding on
+  `?id=1` is NO LONGER probed with the boolean-SQL method (that was a false-positive
+  factory): unsupported categories take an honest `not_run` with the real reason and
+  keep only reachability evidence. The contract's tool must differ from the finding's
+  own tool — a repeat is not an independent check.
+- **Counterevidence is recorded, never discarded; contested verdicts read
+  `unresolved` (5C).** On an agreeing boolean signature the verifier fetches one more
+  baseline: if the baseline itself moves between requests, content rotates, and the
+  observed difference may be rotation, not the injection — that observation is
+  RECORDED on the attempt (`counterevidence`), the finding is NOT promoted, and the
+  status reads `unresolved`: the question is left open, never settled either way by a
+  word. A substantial difference without a baseline no longer reads `verified` at all.
+  Disagreement and the no-baseline weakness are recorded the same way. Only agreement
+  WITH zero counterevidence promotes a finding.
+- **The evidence-quality review (5C).** Five Strix/Shannon-style checks per verify
+  attempt, derived from the record's own fields — ran, reachability (up to and
+  including "inapplicable: outside engagement scope"), baseline control, independence,
+  and conclusion-strength-vs-observations (a stored status word the evidence does not
+  derive is flagged and ignored). Quality words: `supported` / `contradicted` /
+  `contested` / `weak` / `reachability_only` / `blocked` / `none`. It is an annotation
+  layer over the status derivation — never a promotion path.
+- **The verification-support specialist (5D) reads, never probes.** A new read-only
+  task type (`verification_analysis`), derived from registered records at the VERIFY
+  boundary: the specialist files the derived standing, the counterevidence verbatim,
+  and the deterministic open questions — no sandbox, no spawn, no promotion. A
+  specialist that could probe would be a second, uncontracted path to target contact.
+  Checkpoint/resume covers it like every other read-only task.
+
 ### The evidence ladder
 
 Findings are never just *"the scanner said so."* Every finding climbs three rungs:
@@ -1125,9 +1183,11 @@ makes it feel like a researcher's workflow rather than a scanner dump.
 
 Two honest nuances the graph carries everywhere: exploit *references* (searchsploit
 hits, matching nuclei templates) are recorded with status `not_verified` — a public
-exploit existing is context, not proof. And verification can honestly end
-`disagreed` or `inconclusive`; a blocked check is `not_run` with a real reason, never
-disguised as a pass.
+exploit existing is context, not proof. And verification can honestly end `disagreed`,
+`inconclusive` — or `unresolved`, when the check saw an agreeing difference but
+counterevidence stands that a benign cause could produce the same difference (recorded
+verbatim, never discarded). A blocked check is `not_run` with a real reason, never
+disguised as a pass; a verdict with standing counterevidence never promotes.
 
 ---
 
@@ -1841,6 +1901,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | v1.3.11 preflight | 2026-11-14/15 | **2,331 passed / 55 skipped** locally (Python 3.11); CI green on 3.11/3.12/3.13 at the release-prep commit |
 | Tool Expansion Batch 1 | 2026-11-15 | **2,401 passed / 58 skipped** in a WSL2 Ubuntu venv (Python 3.14) — the 2 failures are environmental (no `ensurepip` in that Python; no docker group access), not code. The 3 new opt-in lab ITs (naabu/dnsx/katana through real Docker+gVisor) stay NOT RUN on this host |
 | Tool Expansion Batch 4 | 2026-11-15 | **2,621 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 96-test Batch-4 suite (`test_specialist` 66, `test_batch4_recovery` 13, `test_skills` 17); the 2 failures are the same environmental ones as Batch 1 (no `ensurepip`; Docker daemon unreachable), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor specialist paths untested |
+| Tool Expansion Batch 5 | 2026-11-16 | **2,710 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new Batch-5 suites (`test_exploit_contract` 32, `test_verify_contract` 19, `test_evidence_quality` 21, `test_verification_support` 14); 1 failure is the same environmental one (no `ensurepip` in that Python), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
 
 Honest caveats:
 

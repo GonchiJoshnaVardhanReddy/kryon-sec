@@ -153,7 +153,7 @@ def evidence_quality(node: dict, finding_tool: str = "") -> EvidenceQuality:
         reason = str(props.get("reason") or "no reason recorded")
         checks.append(QualityCheck(
             "ran", CHECK_FAILED,
-            f"the method never executed ({reason})"))
+            f"the method never ran ({reason})"))
 
     # ---- reachability -----------------------------------------------------
     secondary = props.get("secondary_evidence")

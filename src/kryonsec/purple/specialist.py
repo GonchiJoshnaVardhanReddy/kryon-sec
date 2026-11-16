@@ -71,9 +71,14 @@ from .handoff import (
     task_safety,
     utc_now_iso,
 )
+from .evidence_quality import CHECK_FAILED, evidence_quality
 from .handoff_store import SCHEDULER_FORMAT_VERSION
 from .orchestrator import STATES
-from .views import claim_text, hypothesis_engine_view
+from .views import (
+    claim_text,
+    finding_verification_detail,
+    hypothesis_engine_view,
+)
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +90,7 @@ __all__ = [
     "SpecialistBudget",
     "SpecialistEventLedger",
     "EvidenceAssessmentSpecialist",
+    "VerificationSupportSpecialist",
     "EXECUTORS",
     "SpecialistError",
     "evidence_questions",
@@ -168,13 +174,15 @@ SPECIALIST_ROLES: dict[str, SpecialistRole] = {r.name: r for r in [
     ),
     SpecialistRole(
         name="verification_support",
-        task_type="verify_check",
+        task_type="verification_analysis",
         stages={"VERIFY"},
         implements=(
-            "the VERIFY state's boolean probes (sandbox, runs in its own "
-            "lifecycle state); deterministic support via "
-            "views.verification_status"),
-        executor=None,
+            "deterministic evidence analysis of one finding's verification "
+            "records (views.finding_verification_detail + "
+            "evidence_quality.evidence_quality) — read-only; the probes "
+            "themselves stay with the VERIFY state's own subagent and its "
+            "registered contract (Batch 5D)"),
+        executor="verification_support",
     ),
     SpecialistRole(
         name="defensive_recommendation",
@@ -393,7 +401,66 @@ class SpecialistEventLedger:
 # One executor per role that can actually run today. Everything here is a
 # read-only graph analysis: no LLM, no sandbox, no network, no tool.
 
-class EvidenceAssessmentSpecialist:
+class ReadOnlySpecialist:
+    """Shared plumbing for the deterministic read-only executors.
+
+    Both executors analyze the engagement's own records and file one
+    ``SpecialistDeliverable`` — the honest token estimate (marked an
+    estimate, never a charge) and the deliverable shape are identical;
+    only the analysis and the limitation line differ. Nothing here
+    spawns, probes, or calls a model.
+    """
+
+    role_name = ""
+    limitation = ""
+
+    def _estimate(
+        self, coordinator: HandoffCoordinator, task: SpecialistTask,
+        summary: str,
+    ) -> int:
+        """Honest estimate of the tokens this task's context + output size.
+
+        Marked as an estimate everywhere it is recorded — a deterministic
+        read has no provider usage to report, so its number must never be
+        presented as a charge.
+        """
+        from ..llm import count_tokens
+
+        nodes = len(coordinator.graph.nodes)
+        return count_tokens(
+            f"{task.role} {task.task_id} {summary} nodes={nodes}") + 24
+
+    def _deliverable(
+        self,
+        task: SpecialistTask,
+        engagement: str,
+        status: str,
+        standing: str,
+        summary: str,
+        claims: list[DeliverableClaim],
+        evidence_refs: list[str],
+        unresolved: list[str],
+        errors: list[str],
+        usage: BudgetUsage,
+        record: HandoffRecord,
+    ) -> SpecialistDeliverable:
+        return SpecialistDeliverable(
+            task_id=task.task_id,
+            producer=self.role_name,
+            source_stage=task.stage,
+            status=status,
+            standing=standing,
+            summary=summary,
+            evidence_refs=evidence_refs,
+            claims=claims,
+            limitations=[self.limitation],
+            unresolved=unresolved,
+            errors=errors,
+            budget=usage,
+        )
+
+
+class EvidenceAssessmentSpecialist(ReadOnlySpecialist):
     """Assesses one hypothesis's evidence standing — the Batch 4 specialist.
 
     The analysis path is the one the report and the memory browser already
@@ -406,6 +473,9 @@ class EvidenceAssessmentSpecialist:
     """
 
     role_name = "evidence_assessment"
+    limitation = (
+        "deterministic engine-view assessment — it grades what the "
+        "engagement recorded, it does not test anything")
 
     def run(
         self,
@@ -476,57 +546,152 @@ class EvidenceAssessmentSpecialist:
     def _unresolved_questions(self, view: dict, subject: str) -> list[str]:
         return evidence_questions(view, subject)
 
-    def _estimate(
-        self, coordinator: HandoffCoordinator, task: SpecialistTask,
-        summary: str,
-    ) -> int:
-        """Honest estimate of the tokens this task's context + output size.
 
-        Marked as an estimate everywhere it is recorded — a deterministic
-        read has no provider usage to report, so its number must never be
-        presented as a charge.
-        """
-        from ..llm import count_tokens
+class VerificationSupportSpecialist(ReadOnlySpecialist):
+    """Reads one finding's verification records and reports their quality
+    — the Batch 5D specialist, EVIDENCE-ANALYSIS ONLY.
 
-        nodes = len(coordinator.graph.nodes)
-        return count_tokens(
-            f"{task.role} {task.task_id} {summary} nodes={nodes}") + 24
+    The analysis path is the one Batch 5C built:
+    :func:`views.finding_verification_detail` (the derived status and the
+    counterevidence) plus :func:`evidence_quality.evidence_quality` per
+    verify attempt (ran, reachability, baseline control, independence,
+    conclusion-strength-vs-observations). What it files is the engine's
+    own reading of the verification records: the derived standing, the
+    counterevidence verbatim, and the deterministic unresolved questions.
+    No model text can move the result, and — the boundary that makes
+    this honest — the executor does not verify anything: the probes are
+    the VERIFY state's own subagent running its registered contract; a
+    specialist that could probe would be a second, uncontracted path to
+    target contact. Read-only: no LLM, no sandbox, no spawn.
+    """
 
-    def _deliverable(
+    role_name = "verification_support"
+    limitation = (
+        "deterministic verification-records analysis — it reads what "
+        "VERIFY recorded and grades its quality; it runs no probe and "
+        "can neither promote nor demote a finding")
+
+    def run(
         self,
         task: SpecialistTask,
-        engagement: str,
-        status: str,
-        standing: str,
-        summary: str,
-        claims: list[DeliverableClaim],
-        evidence_refs: list[str],
-        unresolved: list[str],
-        errors: list[str],
-        usage: BudgetUsage,
         record: HandoffRecord,
-    ) -> SpecialistDeliverable:
-        return SpecialistDeliverable(
-            task_id=task.task_id,
-            producer=self.role_name,
-            source_stage=task.stage,
-            status=status,
-            standing=standing,
-            summary=summary,
-            evidence_refs=evidence_refs,
-            claims=claims,
-            limitations=[
-                "deterministic engine-view assessment — it grades what the "
-                "engagement recorded, it does not test anything",
-            ],
-            unresolved=unresolved,
-            errors=errors,
-            budget=usage,
+        coordinator: HandoffCoordinator,
+    ) -> tuple[SpecialistDeliverable, BudgetUsage]:
+        engagement = coordinator.engagement_id
+        subject = record.subject_ref
+        finding = next(
+            (n for n in coordinator.graph.by_type("finding")
+             if n.get("label") == subject),
+            None,
         )
+        errors: list[str] = []
+
+        if finding is None:
+            # The finding this task is about does not exist in THIS
+            # engagement's graph. That is a fact about the task, not a
+            # failure to paper over.
+            status = "blocked"
+            standing = "unresolved"
+            summary = f"no finding {subject!r} in this engagement's graph"
+            unresolved = [
+                f"finding {subject} was not found in the engagement graph"
+            ]
+            tokens = self._estimate(coordinator, task, summary)
+            return self._deliverable(
+                task, engagement, status, standing, summary,
+                [], [], unresolved, errors,
+                BudgetUsage(tokens=tokens), record,
+            ), BudgetUsage(tokens=tokens)
+
+        detail = finding_verification_detail(subject, coordinator.graph)
+        status = "completed"
+        standing = detail["status"]
+        origin_tool = str(finding["properties"].get("tool") or "")
+
+        claims: list[DeliverableClaim] = [DeliverableClaim(
+            subject_ref=subject,
+            standing=standing,
+            note=claim_text(detail["note"], MAX_NOTE_CHARS),
+        )]
+
+        summary = (
+            f"verification standing of finding {subject}: {standing}")
+        unresolved: list[str] = []
+        attempts = [
+            n for n in coordinator.graph.by_type("verify_attempt")
+            if n.get("label") == subject
+        ]
+        if not attempts:
+            unresolved.append(
+                "no verify_attempt record exists for this finding — an "
+                "independent check never ran")
+        evidence_refs = [finding["id"]]
+        for attempt in attempts:
+            q = evidence_quality(attempt, finding_tool=origin_tool)
+            evidence_refs.append(attempt["id"])
+            # the full quality review rides one claim per attempt — the
+            # checks that passed (reachability, controls) and the ones
+            # that did not, in the operator's words
+            claims.append(DeliverableClaim(
+                subject_ref=subject,
+                standing=q.status,
+                note=claim_text(
+                    "; ".join(f"{c.name}: {c.detail}" for c in q.checks),
+                    MAX_NOTE_CHARS),
+            ))
+            for check in q.checks:
+                if check.result == CHECK_FAILED:
+                    unresolved.append(claim_text(
+                        f"{check.name}: {check.detail}", MAX_NOTE_CHARS))
+            summary += (
+                f"; attempt {q.status} ({_QUALITY_WORDS[q.strength]})")
+        # counterevidence is carried verbatim — recorded, never discarded
+        for line in detail["counterevidence"]:
+            claims.append(DeliverableClaim(
+                subject_ref=subject,
+                standing=standing,
+                note=claim_text(f"counterevidence: {line}",
+                                MAX_NOTE_CHARS),
+            ))
+
+        tokens = self._estimate(coordinator, task, summary)
+
+        return self._deliverable(
+            task, engagement, status, standing, summary,
+            claims, evidence_refs, unresolved, errors,
+            BudgetUsage(tokens=tokens), record,
+        ), BudgetUsage(tokens=tokens)
+
+
+#: quality words in the operator's words, for the deliverable summary
+_QUALITY_WORDS: "dict[str, str]" = {
+    "supported": "clean agreement with controls in place",
+    "contradicted": "the independent test disagreed",
+    "contested": "an agreeing difference with counterevidence standing",
+    "weak": "ran, but a control was missing",
+    "reachability_only": "never ran; the asset answered only reachability probes",
+    "blocked": "never ran",
+    "none": "nothing usable recorded",
+}
+
+
+# The derivation table, stated once: which registered task type each
+# state boundary derives specialist tasks from, and which role runs
+# them. Both task types are read-only (handoff.TASK_TYPES) — a boundary
+# derives analysis work only, never target-affecting work.
+_DERIVATION_BY_STATE: "dict[str, str]" = {
+    "HYPOTHESIZE": "evidence_assessment",
+    "VERIFY": "verification_analysis",
+}
+_ROLE_BY_TASK_TYPE: "dict[str, str]" = {
+    "evidence_assessment": "evidence_assessment",
+    "verification_analysis": "verification_support",
+}
 
 
 EXECUTORS: dict[str, object] = {
     "evidence_assessment": EvidenceAssessmentSpecialist(),
+    "verification_support": VerificationSupportSpecialist(),
 }
 
 
@@ -543,7 +708,7 @@ class SpecialistScheduler:
 
     MAX_ATTEMPTS = 2
     MAX_TASKS_PER_BOUNDARY = 12
-    ROLE = "evidence_assessment"  # the derivation's role
+    ROLE = "evidence_assessment"  # the HYPOTHESIZE derivation's role
 
     def __init__(
         self,
@@ -704,19 +869,25 @@ class SpecialistScheduler:
     def derive_from_records(self, state: str) -> int:
         """Schedule specialist tasks for this boundary's own records.
 
-        The deterministic rule, stated once: every ``evidence_assessment``
-        TaskAssignment registered during the ``HYPOTHESIZE`` boundary
-        becomes one ``evidence_assessment`` specialist task (identity
-        dedup keeps re-derivations free). Nothing else derives tasks —
-        this is why repeated notifications cannot create endless work.
+        The deterministic rules, stated once:
+        - every ``evidence_assessment`` TaskAssignment registered during
+          the ``HYPOTHESIZE`` boundary becomes one ``evidence_assessment``
+          specialist task;
+        - every ``verification_analysis`` TaskAssignment registered
+          during the ``VERIFY`` boundary becomes one
+          ``verification_support`` specialist task (Batch 5D).
+        Identity dedup keeps re-derivations free. Nothing else derives
+        tasks — this is why repeated notifications cannot create endless
+        work.
         """
-        if state != "HYPOTHESIZE":
+        derived_type = _DERIVATION_BY_STATE.get(state)
+        if derived_type is None:
             return 0
         created = 0
         for record in self.coordinator.records():
             if record.kind != "task_assignment":
                 continue
-            if record.task_type != "evidence_assessment":
+            if record.task_type != derived_type:
                 continue
             if record.message_id in self._tasks:
                 continue
@@ -730,7 +901,7 @@ class SpecialistScheduler:
             self.submit(SpecialistTask(
                 engagement_id=self.coordinator.engagement_id,
                 task_id=record.message_id,
-                role=self.ROLE,
+                role=_ROLE_BY_TASK_TYPE[derived_type],
                 stage=state,
             ))
             created += 1

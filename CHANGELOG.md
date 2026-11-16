@@ -1,16 +1,20 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–4 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–5 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
 `gowitness-probe` (Batch 2) — built on the existing Phase 2B adapter
 framework, structured agent handoffs with a deterministic coordinator and
-shared evidence (Batch 3, Phase 3A + 3C), and the advanced multi-agent
+shared evidence (Batch 3, Phase 3A + 3C), the advanced multi-agent
 layer above it: bounded specialist scheduling, task-scoped context, real
 checkpoint resume with shared budgets, and reviewed read-only skill packs
-(Batch 4, Phase 4A–4D). Branch `feature/tool-expansion-batch1`; nothing
-below is published yet.
+(Batch 4, Phase 4A–4D), and the exploit/verification contract layer:
+typed EXPLOIT input contracts, a registered per-category verification
+contract, recorded counterevidence with the honest `unresolved` status,
+and the read-only verification-support specialist (Batch 5, Phase
+5A–5D). Branch `feature/tool-expansion-batch1`; nothing below is
+published yet.
 
 ### New vetted adapters (Batch 2)
 
@@ -296,6 +300,72 @@ analysis.
   regressions. PostgreSQL paths NOT RUN (no PostgreSQL environment);
   real Docker/gVisor specialist paths untested (mocked suites only, by
   design on this host).
+
+### Exploit and verification contracts (Batch 5 — Phase 5A–5D)
+
+- **Exploit input/result contracts (5A, `purple/exploit_contract.py`)**: every
+  approved hypothesis builds a typed contract before EXPLOIT spawns anything —
+  engagement/target identity, the ONE target asset, derived categories, the
+  hypothesis's OWN tool list verbatim (never expanded), the Gate-2 approval reference
+  (citing the last `hypothesis_reviewed` audit entry's hash via the new
+  `AuditLog.entries()`), and the sandbox time ceiling. Refusals are structured typed
+  codes (`no_hypothesis`, `cross_engagement`, `gate2_missing`, `no_tools`,
+  `asset_out_of_scope`, `no_adapter`, `allowlist_rejected`), audited as
+  `exploit_contract_refused` and recorded as `exploit_refusal` graph nodes — a skipped
+  test is visible evidence. Historical audit events are byte-identical. The attempt
+  record gains engagement/hypothesis/approval references, input evidence node ids, a
+  structured failure classification reusing the sandbox's `SPAWN_ERROR_KIND_*` words
+  verbatim (+ `tool_exit_error` / `unknown_spawn_failure`), duration, the
+  `tool_result` audit hash for correlation, and the written limitations of
+  marker-based confirmation: a successful spawn and an exit code are neither evidence
+  of a vulnerability nor an independent check.
+- **The finding-verification contract registry (5B, `purple/verify_contract.py`)**:
+  the boolean curl probe is a REGISTERED contract scoped to `sqli` — the one category
+  it is evidence for. A contract binds category → one independent method and states
+  tool, prerequisites, expected/contradictory observations, budget (probes +
+  per-probe seconds, enforced in the fixed `curl --max-time` argv), stage (VERIFY
+  only), approval basis, and `confidence_limit` (what the method CANNOT establish),
+  recorded on every attempt. Registration fails closed: unimplemented `method_type`,
+  `unknown`/unreachable categories, duplicates, bad bounds all refuse. Production
+  starts with exactly ONE entry. The false-positive fix: a nikto/dalfox finding on
+  `?id=1` is no longer probed with the boolean-SQL method — unsupported categories
+  take an honest `not_run` ("no verification contract for category 'x'") and keep
+  only reachability evidence. Independence is enforced: a contract whose tool can
+  produce findings in its own category refuses a finding from that tool.
+- **Counterevidence and `unresolved` (5C, `purple/evidence_quality.py` + verify/views
+  changes)**: every verify_attempt records a `counterevidence` list — observations
+  that undermine its own verdict — verbatim, never discarded. On an agreeing signature
+  the verifier fetches a SECOND baseline (the contract's 4th probe): if the baseline
+  moves, content rotates and the difference may be benign — counterevidence recorded,
+  finding NOT promoted, status `unresolved` (new vocabulary word: agreeing difference
+  seen, benign explanation stands, question left open). A substantial difference
+  without a baseline no longer reads `verified`. Promotion requires agreement AND
+  zero counterevidence. The quality review derives five Strix/Shannon-style checks
+  per attempt (ran, reachability, baseline control, independence,
+  conclusion-strength-vs-observations) and quality words (`supported` /
+  `contradicted` / `contested` / `weak` / `reachability_only` / `blocked` / `none`)
+  — annotation over the status derivation, never a promotion path;
+  `finding_verification_detail` exposes counterevidence additively.
+- **The verification-support specialist (5D, `purple/specialist.py` + handoff)**:
+  new READ-ONLY task type `verification_analysis` (distinct from the state-changing
+  `verify_check`, which stays the VERIFY state's own work); the role's deterministic
+  executor reads a finding's verification records (`finding_verification_detail` +
+  `evidence_quality`) and files the derived standing, the counterevidence verbatim,
+  and the deterministic open questions. It never spawns a tool — a specialist that
+  could probe would be a second, uncontracted path to target contact. Derivation:
+  verification_analysis records registered at the VERIFY boundary become specialist
+  tasks (identity-deduped, capped at 12); checkpoint/resume covers it like every
+  other read-only task.
+- **Tests**: `tests/test_exploit_contract.py` (32), `tests/test_verify_contract.py`
+  (19), `tests/test_evidence_quality.py` (21), `tests/test_verification_support.py`
+  (14). Full suite on the branch after Batch 5: **2,710 passed / 61 skipped** (WSL2,
+  Python 3.14); the 1 failure is the SAME environmental one as before (no `ensurepip`
+  in that Python — the Docker-daemon failure passed this run), not a regression.
+  PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths
+  untested (mocked suites only, by design on this host). Honest coverage note: SQL
+  injection boolean-probing is the ONLY finding category independently verifiable
+  today; XSS, command injection, web/discovery categories are recorded and
+  reachability-checked but NOT independently verified — never labeled otherwise.
 
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 
