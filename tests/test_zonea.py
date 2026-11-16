@@ -769,10 +769,11 @@ def test_zone_a_fetchers_list_for_config():
     cfg = KryonsecConfig()
     fetchers = zone_a_fetchers(cfg)
     # keyed sources are included even without keys — they skip visibly;
-    # Phase 8 adds rdap, github, hackertarget (cloud-assets is a local pass,
-    # not a fetcher in this list)
+    # Phase 8 adds rdap, github, hackertarget; Wave 1 adds the archive
+    # module (cloud-assets is a local pass, not a fetcher in this list)
     assert {f.__name__ for f in fetchers} == {
-        "crt_sh_subdomains", "wayback_subdomains", "otx_passive_dns",
+        "crt_sh_subdomains", "wayback_subdomains", "archive_urls",
+        "otx_passive_dns",
         "ripestat_whois", "ripestat_asn", "rdap_whois", "github",
         "hackertarget_hostsearch", "shodan", "censys",
     }
@@ -815,6 +816,8 @@ def test_zone_a_fetchers_pass_keys_through():
                       lambda d, **k: _pr("crt.sh")), \
          patch.object(recon_passive, "wayback_subdomains",
                       lambda d, **k: _pr("wayback")), \
+         patch.object(recon_passive, "archive_urls",
+                      lambda d, **k: _pr("archives")), \
          patch.object(recon_passive, "otx_passive_dns",
                       lambda d: _pr("otx")), \
          patch.object(recon_passive, "ripestat_whois",
@@ -991,3 +994,214 @@ def test_sandbox_passive_fetcher_scopes_output(tmp_path):
         events = [json.loads(line) for line in f if line.strip()]
     results = [e for e in events if e["event"] == "tool_result"]
     assert [e["ok"] for e in results] == [True, False, True]
+
+
+# ---- tool-expansion Wave 1 (2026-11-16): the archive module ------------------
+
+def _cc_row(url):
+    import json as _json
+    return _json.dumps({"urlkey": "k", "timestamp": "20250101", "url": url})
+
+
+def test_commoncrawl_paths_parses_jsonl_and_scopes_hosts():
+    from unittest.mock import patch
+
+    from kryonsec.purple.zonea import commoncrawl_paths
+
+    body = "\n".join([
+        _cc_row("https://www.target-corp.com/login?next=1"),
+        _cc_row("https://api.target-corp.com/v1/users"),
+        _cc_row("https://evil.com/target-corp"),        # out of scope — dropped
+        _cc_row("not a url at all"),                    # malformed — dropped
+        '{"broken json',                                # bad row — dropped
+        "",                                             # blank — dropped
+    ]).encode()
+
+    with patch("kryonsec.purple.zonea._zone_a_fetch", return_value=body):
+        urls = commoncrawl_paths("target-corp.com")
+
+    assert urls == [
+        "https://www.target-corp.com/login?next=1",
+        "https://api.target-corp.com/v1/users",
+    ]
+
+
+def test_commoncrawl_paths_pins_the_index_and_drops_malformed_rows():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+
+    seen = {}
+
+    def fake_fetch(url, **kwargs):
+        seen["url"] = url
+        return b"garbage-not-json \n also garbage"  # unparseable rows
+
+    with patch.object(zonea, "_zone_a_fetch", fake_fetch):
+        assert zonea.commoncrawl_paths("target-corp.com") == []
+
+    # the pinned index id is part of the URL — deterministic behavior
+    assert zonea.COMMONCRAWL_INDEX in seen["url"]
+    assert seen["url"].startswith("https://index.commoncrawl.org/")
+
+
+def test_commoncrawl_paths_raises_after_retries_like_the_cdx_query():
+    """Failure semantics match wayback_paths: retries exhausted -> the
+    exception propagates to the source layer, which turns it into an
+    empty contribution (tested at the archive_urls layer)."""
+    from unittest.mock import patch
+
+    import pytest
+
+    from kryonsec.purple import zonea
+
+    with patch.object(zonea, "_zone_a_fetch",
+                      lambda url, **k: (_ for _ in ()).throw(TimeoutError())):
+        with pytest.raises(TimeoutError):
+            zonea.commoncrawl_paths("target-corp.com", retries=0)
+
+
+def test_parameter_urls_is_a_pure_deterministic_filter():
+    from kryonsec.purple.zonea import parameter_urls
+
+    urls = [
+        "https://t.com/a?id=1&x=2",
+        "https://t.com/b",                    # no query — dropped
+        "https://t.com/c?q=1#frag",           # fragment kept off the match — kept
+        "https://t.com/d?bare",               # no name=value structure — dropped
+        "https://t.com/a?id=3",               # same path+params shape — deduped
+        "https://t.com/e?page=2",
+    ]
+    assert parameter_urls(urls) == [
+        "https://t.com/a?id=1&x=2",
+        "https://t.com/c?q=1#frag",
+        "https://t.com/a?id=3",
+        "https://t.com/e?page=2",
+    ]
+
+
+def test_parameter_names_sorted_unique_capped():
+    from kryonsec.purple.zonea import parameter_names
+
+    urls = [
+        "https://t.com/a?id=1&page=2",
+        "https://t.com/b?page=3&q=x",
+        "https://t.com/c?id=4",
+    ]
+    assert parameter_names(urls) == ["id", "page", "q"]
+    assert parameter_names([]) == []
+    assert parameter_names(
+        [f"https://t.com/x?n{i}=1" for i in range(40)]
+    ) == sorted(f"n{i}" for i in range(40))[:30]  # cap slices the sorted set
+
+
+def test_archive_urls_unions_and_derives_parameters():
+    import json as _json
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+
+    # build the CDX body directly: header row + two rows
+    cdx = _json.dumps([
+        ["urlkey", "timestamp", "original"],
+        ["com,target-corp,www)/", "20200101", "https://www.target-corp.com/"],
+        ["com,target-corp)/", "20200102",
+         "https://target-corp.com/search?q=shell"],
+    ]).encode()
+    cc = "\n".join([
+        _cc_row("https://api.target-corp.com/v1?id=7"),
+        _cc_row("https://evil.com/target-corp"),
+    ]).encode()
+
+    def fake_fetch(url, **kwargs):
+        return cdx if "web.archive.org" in url else cc
+
+    with patch.object(zonea, "_zone_a_fetch", fake_fetch):
+        result = zonea.archive_urls("target-corp.com")
+
+    assert result.source == "archives"
+    # every in-scope host from BOTH archives; apex + evil dropped
+    assert result.subdomains == ["api.target-corp.com", "www.target-corp.com"]
+    # paths: scheme-less, deduped, both archives represented
+    assert result.paths == ["/", "/search?q=shell", "/v1?id=7"]
+    # the parameter derivation ran over the in-scope union
+    assert any("parameter-bearing archived URLs: 2" in n for n in result.notes)
+    assert any("archived parameter names: q, id" in n or
+               "archived parameter names: id, q" in n for n in result.notes)
+
+
+def test_archive_urls_one_archive_failing_keeps_the_other():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+
+    def fake_fetch(url, **kwargs):
+        if "web.archive.org" in url:
+            raise RuntimeError("CDX down")
+        return _cc_row("https://www.target-corp.com/x?y=1").encode()
+
+    with patch.object(zonea, "_zone_a_fetch", fake_fetch):
+        result = zonea.archive_urls("target-corp.com")
+
+    assert result.paths == ["/x?y=1"]
+    assert any("parameter-bearing archived URLs: 1" in n for n in result.notes)
+
+
+def test_archive_urls_no_urls_means_empty_not_error():
+    from unittest.mock import patch
+
+    from kryonsec.purple import zonea
+
+    with patch.object(zonea, "_zone_a_fetch", return_value=b""):
+        result = zonea.archive_urls("target-corp.com")
+
+    assert result.source == "archives"
+    assert result.subdomains == [] and result.paths == [] and result.notes == []
+
+
+def test_archive_urls_host_is_allowlisted_for_egress():
+    from kryonsec.purple.zonea import ZONE_A_ALLOWED_HOSTS
+
+    assert "index.commoncrawl.org" in ZONE_A_ALLOWED_HOSTS
+    assert "web.archive.org" in ZONE_A_ALLOWED_HOSTS
+
+
+def test_zone_a_refuses_a_non_archive_host():
+    from kryonsec.purple.zonea import ZoneAViolation, _zone_a_fetch
+
+    with pytest.raises(ZoneAViolation):
+        _zone_a_fetch("https://archive.ph/whatever")
+
+
+# ---- Wave 1: the runner integration ------------------------------------------
+
+def test_recon_passive_dedupes_archive_paths_against_wayback(tmp_path):
+    """The archive module is an ADDITIONAL source: identical path labels
+    dedupe against the wayback source's nodes at the runner."""
+    from kryonsec.purple.recon_passive import ReconPassiveSubagent
+
+    def wayback(domain):
+        from kryonsec.purple.zonea import PassiveResult
+        return PassiveResult(source="wayback", subdomains=[],
+                             paths=["/login"])
+
+    def archives(domain):
+        from kryonsec.purple.zonea import PassiveResult
+        return PassiveResult(source="archives", subdomains=["www.target-corp.com"],
+                             paths=["/login", "/search?q=1"])
+
+    graph = EngagementGraph(engagement_id="e-z")
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    cfg = KryonsecConfig(home=tmp_path)
+    sub = ReconPassiveSubagent(
+        cfg=cfg, graph=graph, audit=audit, target="target-corp.com",
+        fetchers=[wayback, archives])
+    result = sub.run()
+
+    assert result.status == "ok"
+    labels = [n["label"] for n in graph.by_type("path")]
+    assert sorted(labels) == ["/login", "/search?q=1"]
+    subs = [n["label"] for n in graph.by_type("subdomain")]
+    assert subs == ["www.target-corp.com"]
+    ok, reason = audit.verify()
+    assert ok, reason

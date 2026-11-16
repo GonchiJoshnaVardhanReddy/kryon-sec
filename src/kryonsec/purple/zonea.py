@@ -33,6 +33,7 @@ ZONE_A_ALLOWED_HOSTS = {
     "data.iana.org",  # RDAP bootstrap (Phase 8): TLD -> registry RDAP server
     "api.github.com",  # GitHub recon (Phase 8): org/repo/code search
     "api.hackertarget.com",  # DNS history (Phase 8): hostsearch
+    "index.commoncrawl.org",  # archive module (Wave 1): pinned CC index
 }
 
 # Registry RDAP servers (Phase 8): data.iana.org/rdap/dns.json maps every TLD
@@ -306,6 +307,174 @@ def wayback_subdomains(domain: str, limit: int = 200) -> PassiveResult:
         subdomains=sorted(found),
         # dedupe, cap at 100 — enough for the prompt without flooding it
         paths=list(dict.fromkeys(cleaned))[:100],
+    )
+
+
+# ---- tool-expansion Wave 1 (2026-11-16): the archive module ------------------
+# gau / waybackurls / paramspider semantics, implemented the Kryonsec way:
+# host-side Zone A modules querying THIRD-PARTY ARCHIVES — zero packets to
+# the target by construction, no sandbox image change, every URL scope-
+# filtered before it becomes evidence.
+
+# The Common Crawl index this module reads is PINNED (reviewed
+# configuration, like a pinned wordlist): a frozen crawl id makes the
+# module's behavior deterministic run-to-run. Moving to a newer index is
+# a deliberate human change to this one line, never an auto-updated feed.
+COMMONCRAWL_INDEX = "CC-MAIN-2025-05"
+
+
+def commoncrawl_paths(domain: str, limit: int = 200, retries: int = 2) -> list[str]:
+    """Query the pinned Common Crawl index for archived URLs of the domain.
+
+    JSONL rows of ``{"url": ...}``; only in-scope hosts come back. The
+    index API is slow under load — same long timeout + retry-with-backoff
+    shape as the Wayback CDX query. Any parse/network failure is an empty
+    list, never an exception upward (a failed source is a gap, not a
+    crashed state).
+    """
+    import time
+
+    url = (
+        f"https://index.commoncrawl.org/{COMMONCRAWL_INDEX}-index"
+        f"?url={urllib.parse.quote('*.' + domain, safe='')}/*"
+        f"&output=json&limit={limit}"
+    )
+    body = b""
+    for attempt in range(retries + 1):
+        try:
+            body = _zone_a_fetch(url, timeout=60)
+            break
+        except urllib.error.HTTPError as e:
+            if 500 <= e.code < 600 and attempt < retries:
+                log.info(
+                    "common crawl %d (attempt %d) — retrying", e.code, attempt + 1)
+                time.sleep(2)
+                continue
+            raise
+        except TimeoutError:
+            if attempt < retries:
+                log.info(
+                    "common crawl timed out (attempt %d) — retrying", attempt + 1)
+                time.sleep(2)
+                continue
+            raise
+    out: list[str] = []
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a malformed row is dropped, never fatal
+        candidate = row.get("url") if isinstance(row, dict) else None
+        if isinstance(candidate, str) and candidate.startswith("http"):
+            host = urllib.parse.urlparse(candidate).hostname or ""
+            if _same_domain(host, domain):
+                out.append(candidate)
+    # dedupe, keep order, cap
+    return list(dict.fromkeys(out))[:limit]
+
+
+def parameter_urls(urls: "list[str]") -> list[str]:
+    """The deterministic paramspider-equivalent filter (Wave 1).
+
+    Of archived URLs, the ones with a USABLE query string are the
+    parameter-bearing candidates — the inputs injection hypotheses are
+    formed about. Pure: a filter over URLs already fetched from
+    third-party archives; sends nothing anywhere, touches no target.
+    Fragments are dropped; order preserved; deduped.
+    """
+    out: list[str] = []
+    for url in urls:
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            continue
+        if not parsed.query:
+            continue
+        # the query must parse to at least one name=value pair — a bare
+        # "?x" with no structure is not a parameter surface
+        if not any(urllib.parse.parse_qsl(parsed.query)):
+            continue
+        out.append(url)
+    return list(dict.fromkeys(out))
+
+
+def parameter_names(urls: "list[str]", cap: int = 30) -> list[str]:
+    """Parameter NAMES seen across archived URLs (HYPOTHESIZE signal).
+
+    Deterministic read of the same data; sorted unique; capped."""
+    names: set[str] = set()
+    for url in urls:
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            continue
+        for name, _ in urllib.parse.parse_qsl(parsed.query):
+            if name:
+                names.add(name)
+    return sorted(names)[:cap]
+
+
+def archive_urls(domain: str, limit: int = 300) -> PassiveResult:
+    """Historical URL discovery from THIRD-PARTY ARCHIVES (Wave 1 source).
+
+    The gau/waybackurls/paramspider capability, as ONE Zone A module:
+    Wayback CDX + the pinned Common Crawl index, unioned and scope-
+    filtered; the parameter-bearing subset and the parameter names are
+    derived deterministically from that union (never probed). Zero
+    packets to the target — we ask the archives, not the target's
+    servers; the runner's per-source audit records this source like any
+    other. Each archive is an independent input: one failing leaves the
+    other's results intact.
+    """
+    domain = normalize_target(domain)
+
+    urls: list[str] = []
+    for fetch in (
+        ("wayback", lambda: wayback_paths(domain, limit=limit)),
+        ("commoncrawl", lambda: commoncrawl_paths(domain, limit=limit)),
+    ):
+        try:
+            urls.extend(fetch[1]())
+        except Exception:
+            # archive hiccup: that source contributes nothing — never an
+            # exception upward, the other archive still runs
+            log.warning("archive source %s failed for %s", fetch[0], domain,
+                        exc_info=True)
+
+    found: set[str] = set()
+    cleaned: list[str] = []
+    for url in urls:
+        host = urllib.parse.urlparse(url).hostname or ""
+        host = host.strip().lower().rstrip(".")
+        if not host or not _same_domain(host, domain):
+            continue
+        if host != domain:
+            found.add(host)
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        cleaned.append(path)
+
+    param_urls = parameter_urls(urls)
+    notes: list[str] = []
+    if param_urls:
+        notes.append(
+            f"parameter-bearing archived URLs: {len(param_urls)} "
+            f"(from Wayback CDX + Common Crawl {COMMONCRAWL_INDEX}; "
+            "never probed by this module)")
+        names = parameter_names(param_urls)
+        if names:
+            notes.append("archived parameter names: " + ", ".join(names))
+
+    return PassiveResult(
+        source="archives",
+        subdomains=sorted(found),
+        paths=list(dict.fromkeys(cleaned))[:100],
+        notes=notes,
     )
 
 

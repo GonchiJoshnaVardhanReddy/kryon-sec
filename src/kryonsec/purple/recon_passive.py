@@ -20,6 +20,7 @@ from .audit import AuditLog
 from .orchestrator import SubagentResult
 from .zonea import (
     PassiveResult,
+    archive_urls,
     crt_sh_subdomains,
     hackertarget_hostsearch,
     otx_passive_dns,
@@ -55,6 +56,7 @@ def zone_a_fetchers(cfg: KryonsecConfig) -> list[Callable[[str], PassiveResult]]
     return [
         crt_sh_subdomains,
         wayback_subdomains,
+        archive_urls,
         otx_passive_dns,
         ripestat_whois,
         ripestat_asn,
