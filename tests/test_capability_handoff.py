@@ -23,6 +23,7 @@ from kryonsec.purple.capability import (
     host_in_scope,
 )
 from kryonsec.purple.exploit import ExploitSubagent
+from kryonsec.purple.handoff import utc_now_iso
 from kryonsec.purple.orchestrator import SubagentResult, next_state
 from kryonsec.purple.post_exploit import PostExploitSubagent
 from kryonsec.purple.recon_passive import EngagementGraph
@@ -415,6 +416,10 @@ def approved_record(**overrides):
         "hypothesis_id": "H1", "target_host": "target-corp.com",
         "finding_id": "H1", "status": "approved",
         "verification": "verified",  # Phase 1C: eligible ⇔ both
+        # Phase 6A: bound to the test graphs' engagement ("e-pe") and
+        # stamped fresh — eligibility refuses unbound or expired records
+        "engagement_id": "e-pe",
+        "recorded_at": utc_now_iso(),
         "evidence": "os-shell session established",
         "recorded_by": "EXPLOIT_PROGRAM",
     }
