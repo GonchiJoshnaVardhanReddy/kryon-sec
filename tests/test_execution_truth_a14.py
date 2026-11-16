@@ -547,6 +547,8 @@ def test_reporting_fixes_changed_no_state_transition(tmp_path):
 
     events = [json.loads(line)["event"]
               for line in audit.path.read_text(encoding="utf-8").splitlines()]
-    assert events[:2] == ["state_enter", "exploit_plan"]
+    # Wave 2b: the jwt token producer's capture pass runs between
+    # state_enter and planning (it audits even when nothing is found)
+    assert events[:3] == ["state_enter", "jwt_tokens_captured", "exploit_plan"]
     assert events[-1] == "exploit_done"
     assert "finding_confirmed" in events
