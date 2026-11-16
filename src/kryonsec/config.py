@@ -171,8 +171,9 @@ def config_file_error(path: Path) -> str | None:
 def update_config_sections(path: Path, updates: dict[str, dict[str, object]]) -> Path:
     """Update selected TOML sections without inventing a fresh config.
 
-    Installers use this for values learned after installation (the membership
-    key and the resolved sandbox digest).  An existing malformed file is a
+    Installers use this for values learned after installation (the resolved
+    sandbox digest, and a membership key if one was supplied — inert in this
+    development build).  An existing malformed file is a
     hard error: silently treating it as an empty first-run config would erase
     the user's settings.  Parsed sections are round-tripped atomically by the
     same writer used by ``KryonsecConfig.save``.
@@ -423,9 +424,9 @@ class KryonsecConfig:
                 "censys_api_secret": self.censys_api_secret or "",
                 "github_token": self.github_token or "",
             },
-            "license": {
-                "key": self.license_key or "",
-            },
+            # No "license" section is written anymore: the development build
+            # ignores membership keys. The reader still accepts one so old
+            # config.toml files keep loading unchanged.
             "tools": {
                 "enabled": list(self.enabled_tools),
             },

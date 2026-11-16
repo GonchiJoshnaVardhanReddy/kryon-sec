@@ -369,7 +369,7 @@ for the running agent.
 | Shortcut | Action |
 |---|---|
 | **Enter / Shift+Enter** | send / insert a newline |
-| **Shift+Tab** | switch Copilot/Purple when the existing sandbox and license checks allow it |
+| **Shift+Tab** | switch Copilot/Purple when the existing sandbox checks allow it |
 | **Ctrl+P** | open the command palette (also: Rename session, Close session, Open Kryonsec Memory) |
 | **Ctrl+N** | create a real new session or engagement |
 | **Ctrl+Left / Ctrl+Right** | move between stored tabs |
@@ -668,11 +668,21 @@ set contains x86-64-only artifacts). Copilot runs anywhere Python 3.11–3.13 do
 
 ## Install
 
+> **Development build notice:** this tree is a development build in which
+> product login, beta approval, membership keys and license verification are
+> **temporarily removed** — the app runs with no account, and the wizard and
+> `kryonsec doctor` never ask for one. Old config files that still carry a
+> `[license] key` load fine; the value is ignored and can be deleted by hand.
+> The published release may differ. Every Mode B technical gate (Linux,
+> Docker, gVisor, digest-pinned image, egress, target scope, human Gates 2/3)
+> is unchanged and still enforced.
+
 Kryonsec is commercial, proprietary-licensed software. The source in this repository is
 public for review, but the **supported distribution is a built wheel served from
-[kryonsec.in](https://kryonsec.in)**, and a membership key is what unlocks it — the
-installer downloads a version-matched wheel, verifies its SHA-256, and never treats the
-GitHub tree as a distribution channel. [Request access](https://kryonsec.in) to get a key.
+[kryonsec.in](https://kryonsec.in)**. The hosted installer still verifies the download
+against the site's release gate; the *application* itself needs no account in this
+development build. [Request access](https://kryonsec.in) to get a key for the hosted
+release.
 
 ### Linux or WSL2
 
@@ -699,8 +709,9 @@ It then:
    `python3` — and warns if the only one present is a very new 3.14, where pip may have to
    compile dependencies from source and the install looks stalled)
 3. Creates a dedicated virtualenv at `~/.kryonsec/venv`
-4. Downloads the release from `kryonsec.in` with your key, and saves that key to
-   `~/.kryonsec/config.toml` so Purple Team never asks for it again
+4. Downloads the release from `kryonsec.in` (the site's download gate still applies to the
+   hosted wheel) and — if a key was supplied — saves it to `~/.kryonsec/config.toml`;
+   in this development build the app ignores that value, so it can be deleted by hand
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
 6. On the approved Purple profile, validates the selected Docker context and daemon,
    installs/registers gVisor only after consent, backs up and validates Docker JSON before
@@ -814,16 +825,15 @@ are no nested subcommands and no hidden flags.
 | `kryonsec --version` | — | prints `kryonsec 1.3.11` |
 | `kryonsec setup` | — | re-runs the setup wizard |
 | `kryonsec doctor` | `--deep`, `--strict` | read-only preflight checks; `--deep` adds a harmless network-disabled runsc smoke container; `--strict` exits non-zero unless Copilot *and* the verified Purple runtime are ready |
-| `kryonsec connect` | `--no-browser` | register this machine to your membership (opens a browser once) |
-| `kryonsec login` | `--no-browser` | sign in to a beta account (opens a browser once; no key needed) |
-| `kryonsec logout` | — | revoke this machine's token, then delete it locally |
-| `kryonsec auth [status]` | — | show how this machine is signed in (`status` is the only value) |
 | `kryonsec purple` | `--target` (required), `--id`, `--code FOLDER` | start a Purple Team engagement (Profile 2, Linux only); `--code` mounts a source folder read-only for the blue-team scanners |
 | `kryonsec memory` | `--host` (loopback-only), `--port` (default 8899), `--no-browser` | serve the read-only engagement-memory browser |
 
+(`kryonsec connect` / `login` / `logout` / `auth` are absent from this development build —
+no account is needed.)
+
 Exit codes worth knowing: `kryonsec purple` returns **2** for an invalid target or
-`--code` folder and **3** when the membership/license gate refuses Mode B (Copilot stays
-unaffected). `kryonsec memory` returns **2** and a clear message if you try to bind a
+`--code` folder. (Exit 3, formerly the membership gate, is gone in this development
+build.) `kryonsec memory` returns **2** and a clear message if you try to bind a
 non-loopback host — there is no override; use an SSH tunnel instead.
 
 ```bash
@@ -2148,8 +2158,7 @@ kryonsec/
 │   ├── secrets.py                    # 11 patterns, redact («SECRET_n») / restore / declaration
 │   ├── bedrock.py                    # Bedrock region probe + model discovery
 │   ├── openai_compatible.py          # the OpenAI-protocol provider
-│   ├── connect.py / auth.py / license.py   # membership: register, sign in, gate
-│   ├── engagement_id.py / status.py / tui.py
+│   ├── engagement_id.py / status.py / tui.py   # (membership auth removed in this dev build)
 │   ├── containers/
 │   │   └── kryonsec-seccomp.json     # seccomp profile for Zone B
 │   ├── copilot/                      # ---- Mode A ----

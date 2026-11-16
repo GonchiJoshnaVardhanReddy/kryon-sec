@@ -40,8 +40,12 @@ In addition to Copilot:
 * the selected Docker daemon must be reachable by the current user;
 * the selected daemon must list `runsc` as a registered runtime;
 * a release-matched sandbox image, pinned by registry digest;
-* a valid membership key or beta account, with this machine connected;
-* network access for membership verification, image pulls, and Zone A APIs.
+* network access for image pulls and Zone A APIs.
+
+No membership key or beta account is required in this development build — the
+login, connect, and license checks are temporarily removed from the app (the
+hosted installer's download gate still applies to the wheel it fetches). The
+published release may differ.
 
 The installer does not change Docker's default runtime. Kryonsec passes
 `--runtime runsc` only to its sandbox workload. It never falls back to `runc`.
@@ -127,6 +131,10 @@ WSL2 and the Linux installer for Purple Team.
 
 ## First run and authentication
 
+No account step exists in this development build: the wizard covers the LLM
+provider, models, agent tools, MCP servers and workspace only, and Purple
+Team starts without a key.
+
 The setup wizard has one mandatory choice: a working LLM provider. The other
 integrations are optional:
 
@@ -138,9 +146,11 @@ integrations are optional:
   configuring another provider.
 * Shodan, Censys, GitHub, PostgreSQL, and MCP servers are optional.
 
-For Purple access, run `kryonsec login` for a beta account or `kryonsec
-connect` for a membership key. The server response, not the presence of a local
-file, is what determines access. Tokens and keys are never printed in full.
+Older installs may still have a `[license] key` in `config.toml` or stale
+`license.state.json` / `auth.json` files under `~/.kryonsec/`. They load fine;
+the values are ignored. To clean them up by hand, delete the `[license]`
+section from `config.toml` and remove `~/.kryonsec/license.state.json` and
+`~/.kryonsec/auth.json` — Kryonsec never touches those files itself.
 
 ## Preflight and runtime validation
 
@@ -178,8 +188,9 @@ If an install is interrupted:
 3. rerun the same profile;
 4. use `kryonsec doctor --deep --strict` before a Purple engagement.
 
-Do not delete `~/.kryonsec` to recover. It contains configuration, auth state,
-the license cache, and engagement evidence. To uninstall Copilot, remove the
+Do not delete `~/.kryonsec` to recover. It contains configuration, possibly
+stale auth/license files left by older installs (ignored by this build), and
+engagement evidence. To uninstall Copilot, remove the
 installer-managed PATH block and the virtualenv after backing up the directory;
 delete engagement data only as a separate, deliberate operator action.
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — account/membership requirements removed (development build)
+
+The development branch no longer requires any Kryonsec account. `kryonsec
+login`, `logout`, `connect`, `auth` and the beta/membership/license gate were
+removed — the wizard, `kryonsec doctor`, Mode A and every Mode B entry point
+run with no account, no key and no license phone-home. This is a development
+build change, not a release commitment: the published release may differ.
+
+- **The Purple membership gate is gone from the app.** `license.py`,
+  `auth.py` and `connect.py` are deleted; `_run_purple` no longer calls
+  `ensure_purple_allowed` (exit code 3 no longer exists). Nothing else lost
+  its authority: the Linux/Docker/gVisor/image runtime checks, the egress
+  boundary, target scope, tool allowlists, Gates 2/3, the hash-chained audit
+  and evidence verification are all unchanged and still refuse an unsafe run.
+- **`kryonsec doctor` reports `Authentication: NOT REQUIRED — local
+  development build`** instead of the Membership row; the strict preflight
+  still exits non-zero unless the real Purple runtime rows pass.
+- **Old credentials are ignored, never deleted.** A `[license] key` section
+  in an old `config.toml` (or `KRYONSEC_LICENSE_KEY`) still loads into an
+  inert field; stale `license.state.json` / `auth.json` files are left alone.
+  New configs no longer write a `[license]` section.
+- **The installer's hosted-download gate is unchanged** (it belongs to the
+  published release); the app simply no longer consumes a saved key.
+
 ## Unreleased — Tool Expansion Batches 1–6 + Waves 1–2 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
