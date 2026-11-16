@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–6 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–6 + Wave 1 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
@@ -17,8 +17,10 @@ and the read-only verification-support specialist (Batch 5, Phase
 stamped, expiring and revocable capability records, one ordered
 consumption-time eligibility check, a one-shot consumption guard with
 crash-safe recovery, and bounded coordinator handoffs (Batch 6, Phase
-6A–6D). Branch `feature/tool-expansion-batch1`; nothing below is
-published yet.
+6A–6D), and the Wave-1 archives module — historical URL + parameter
+discovery from third-party archives as host-side Zone A sources (zero
+packets to the target, no image change). Branch
+`feature/tool-expansion-batch1`; nothing below is published yet.
 
 ### New vetted adapters (Batch 2)
 
@@ -370,6 +372,30 @@ analysis.
   injection boolean-probing is the ONLY finding category independently verifiable
   today; XSS, command injection, web/discovery categories are recorded and
   reachability-checked but NOT independently verified — never labeled otherwise.
+
+### Wave 1 — the Zone A archives module (2026-11-16, `31fa96e`)
+
+- **Historical URL + parameter discovery, host-side (`purple/zonea.py`)**: the
+  gau/waybackurls/paramspider capability as ONE Zone A source (`archive_urls`) —
+  Wayback CDX + a PINNED Common Crawl index (`COMMONCRAWL_INDEX = CC-MAIN-2025-05`,
+  reviewed configuration; a newer crawl is a deliberate one-line change, never an
+  auto-updated feed), unioned and scope-filtered to the target's own domain.
+  Parameter-bearing URLs and parameter NAMES are derived deterministically from the
+  already-fetched archive data (never probed, never sent anywhere). Zero packets to
+  the target by construction; no sandbox image change.
+- **Egress**: `ZONE_A_ALLOWED_HOSTS` gains `index.commoncrawl.org` only; the
+  redirect re-check and 20 MB body cap apply as to every other source. New source
+  wired into `recon_passive.zone_a_fetchers()`; path labels dedupe against the
+  existing wayback source at the runner.
+- **Tests**: 11 new in `tests/test_zonea.py` (JSONL parsing + scoping + caps, the
+  pinned index id in the request URL, retries-exhausted semantics matching
+  `wayback_paths`, the pure parameter filter, union + derivation, one-archive-fails
+  resilience, empty-not-error, egress allowlist membership, non-archive-host
+  refusal, runner-level dedupe vs the wayback source). Two fetcher-composition
+  tests updated consciously. Also fixes the Batch-6 clock time bomb (fixed test
+  clock vs real stamps — `_elig` now defaults to the real clock; boundary tests
+  pin stamp and clock together). Full suite: **2,759 passed / 61 skipped**; the 1
+  failure is the documented environmental ensurepip one.
 
 ### The controlled Post-Exploit lifecycle (Batch 6 — Phase 6A–6D)
 

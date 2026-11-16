@@ -217,7 +217,7 @@ feature-gated **OFF by default** · 💤 wired but dormant by design · 🗺️ 
 | Purple 10-state orchestrator (plain Python, HALT terminal) | ✅ |
 | SHA-256-chained audit chain (canonical JSON, replayable verify) | ✅ |
 | Allowlist: 57 argv templates across 5 stage groups | ✅ |
-| Zone A passive recon — 10 third-party sources, zero packets to target | ✅ |
+| Zone A passive recon — 13 third-party/local sources, zero packets to target (incl. the Wave-1 archives module) | ✅ |
 | Enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (+ sandbox-local searchsploit/nuclei-meta) | ✅ |
 | Evidence graph + per-state durable checkpoints | ✅ |
 | Independent VERIFY (boolean SQLi probe through the sandbox) | ⚙️ needs sandbox |
@@ -951,7 +951,7 @@ Two details worth calling out:
 | State | Purpose (input) | Agent | Tools / data sources | Output · audit | Next | Approval |
 |---|---|---|---|---|---|---|
 | `INIT` | Load config, validate the target into a bare in-scope domain, derive engagement id | init (deterministic) | none | validated scope + budget tracker · `engagement_created`, `state_enter` | `RECON_PASSIVE` | none — *authorization is yours*; an invalid target exits 2 before anything starts |
-| `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
+| `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, the archives module (Wayback + pinned Common Crawl, parameter mining), OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
 | `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe) **or** vetted adapters (httpx/whatweb/tls/api/nuclei/naabu/dnsx/nmap/katana/feroxbuster/gowitness probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
 | `HYPOTHESIZE` | Propose vulnerability hypotheses from the graph | hypothesizer **(LLM)** | nothing touches the target; enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (host-side), searchsploit + nuclei-meta (sandbox-local) | hypothesis nodes with confidence, CVSS vector, enrichment · `enrichment_lookup` events | `HUMAN_REVIEW` | none |
 | `HUMAN_REVIEW` | **Blocking approval** of hypotheses | **you** | none | approved/rejected sets · every decision audited; **non-TTY approves nothing** | `EXPLOIT` if ≥1 approved, else `BLUE_TEAM` | **Gate 2** |
@@ -1252,6 +1252,7 @@ query third parties only, never the target.
 |---|---|---|
 | crt.sh (certificate transparency) | subdomains, cert issuers/validity/SAN notes | no |
 | Wayback Machine (CDX API) | archived URLs → subdomains + historical paths | no |
+| Archives module (Wayback CDX + pinned Common Crawl index) | historical URL discovery — the gau/waybackurls capability as one host-side module, plus the parameter-bearing subset and parameter NAMES derived deterministically (the paramspider capability — derived from archived data, never probed) | no |
 | AlienVault OTX | passive DNS history | no |
 | RIPEstat | whois summary + ASN data | no |
 | RDAP (IANA bootstrap) | registry whois per TLD | no |
@@ -1260,6 +1261,11 @@ query third parties only, never the target.
 | Shodan | subdomain intelligence | yes |
 | Censys | host intelligence | yes |
 | cloud suffix classification | AWS/Azure/GCP asset hints | no — local, zero fetch |
+
+The archives module reads a **pinned** Common Crawl index id
+(`COMMONCRAWL_INDEX` in `zonea.py` — reviewed configuration, like a pinned wordlist):
+deterministic behavior run-to-run; moving to a newer crawl is a deliberate one-line
+change, never an auto-updated feed.
 
 CVE context (NVD, CISA KEV, EPSS, OSV, GitHub Advisories) is *not* fetched here — it
 belongs to HYPOTHESIZE enrichment, which uses the same third-party-only fetch guard.
@@ -1913,6 +1919,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Batch 4 — specialist scheduling, task context, budgets, resume, skill packs | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor specialist runs NOT exercised |
 | Batch 5 — exploit/verify contracts, counterevidence, verification-support specialist | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Batch 6 — capability lifecycle: binding, expiry, revocation, consumption guard, handoffs | ✅ code + mocked suites done on the feature branch — registries deliberately still EMPTY; PostgreSQL paths and real Docker/gVisor runs NOT exercised |
+| Wave 1 — Zone A archives module (gau/waybackurls/paramspider semantics, host-side, zero packets) | ✅ code + mocked suites done on the feature branch — no image change needed; real network calls to archives NOT exercised (mocked HTTP only) |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1949,6 +1956,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | Tool Expansion Batch 4 | 2026-11-15 | **2,621 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 96-test Batch-4 suite (`test_specialist` 66, `test_batch4_recovery` 13, `test_skills` 17); the 2 failures are the same environmental ones as Batch 1 (no `ensurepip`; Docker daemon unreachable), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor specialist paths untested |
 | Tool Expansion Batch 5 | 2026-11-16 | **2,710 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new Batch-5 suites (`test_exploit_contract` 32, `test_verify_contract` 19, `test_evidence_quality` 21, `test_verification_support` 14); 1 failure is the same environmental one (no `ensurepip` in that Python), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
 | Tool Expansion Batch 6 | 2026-11-16 | **2,748 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 38-test Batch-6 suite (`test_post_exploit_batch6`: eligibility ordering, revocation, consumption guard, interrupted-run recovery, persistence roundtrips, coordinator handoffs); 1 failure is the same environmental one (no `ensurepip` in that Python — the Docker-daemon check passed this run), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
+| Tool Expansion Wave 1 (archives) | 2026-11-16 | **2,759 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — 11 new Zone-A tests (Common Crawl parser, pinned index, parameter derivation, union/scoping/caps, egress refusals, runner dedupe); also fixes the Batch-6 clock time bomb (fixed test clock vs real stamps). 1 failure is the same environmental ensurepip one. Real archive HTTP NOT exercised (mocked only); PostgreSQL paths NOT RUN |
 
 Honest caveats:
 
