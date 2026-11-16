@@ -180,12 +180,19 @@ def _docker_context_row() -> tuple[str, str]:
             f"{detail}; DOCKER_HOST overrides context selection — unset it "
             "only if this is not the intended daemon"
         )
-    if len(context.contexts) > 1:
-        return "WARNING", (
-            f"{detail}; multiple contexts exist, and Kryonsec will not switch "
-            "between them automatically"
-        )
-    return "PASS", detail
+    # A non-default current context is an explicit pin (`docker context use`
+    # or DOCKER_CONTEXT env): Docker resolves it deterministically, and the
+    # daemon verified by the surrounding rows is exactly the one Kryonsec
+    # will use — that is unambiguous and can PASS. Ambient selection of
+    # "default" while other contexts exist stays a WARNING; Kryonsec never
+    # switches contexts itself (and Docker Desktop re-selects its own).
+    if context.name != "default" or len(context.contexts) <= 1:
+        return "PASS", detail
+    return "WARNING", (
+        f"{detail}; context selection is ambient (default) while multiple "
+        "contexts exist — run `docker context use <native-context>` to pin "
+        "it explicitly; Kryonsec will not switch between them automatically"
+    )
 
 
 def _docker_versions_row() -> tuple[str, str]:

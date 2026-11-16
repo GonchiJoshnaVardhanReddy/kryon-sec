@@ -539,6 +539,14 @@ class KryonsecConfig:
 
         # environment beats TOML (documented behavior for power users / CI)
         cfg.openai_api_key = os.environ.get("OPENAI_API_KEY") or cfg.openai_api_key
+        # KRYONSEC_SANDBOX_IMAGE follows the same rule: an explicitly set env
+        # image wins over TOML's [sandbox].image (which itself wins over the
+        # source-tree default). Absent env keeps the TOML value. Whatever is
+        # selected still has to pass the digest-pinned validation in
+        # runtime_checks.validate_image — precedence never bypasses it.
+        cfg.sandbox_image = (
+            os.environ.get("KRYONSEC_SANDBOX_IMAGE") or cfg.sandbox_image
+        )
         cfg.database_url = os.environ.get("DATABASE_URL") or cfg.database_url
         cfg.ollama_host = os.environ.get("OLLAMA_HOST") or cfg.ollama_host
         cfg.bedrock_api_key = (

@@ -3,12 +3,131 @@ skips as yellow SKIP, not red FAIL; exit code logic must stay intact."""
 
 from kryonsec.config import KryonsecConfig
 from kryonsec import doctor
+from kryonsec.purple.runtime_checks import DockerContextInfo
 
 
 def _fake_checks(monkeypatch):
     monkeypatch.setattr(doctor, "_check_storage", lambda c: (True, "OK (SQLite)"))
     monkeypatch.setattr(doctor, "_check_ollama", lambda c: (True, "OK"))
     monkeypatch.setattr(doctor, "_check_openai", lambda c: (False, "no key"))
+
+
+# ---- Docker context row (Phase 5 regression) --------------------------------
+
+def _context(info: DockerContextInfo, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.purple.runtime_checks.docker_context_info", lambda: info)
+    return doctor._docker_context_row()
+
+
+def test_explicitly_pinned_context_passes_even_with_other_contexts(monkeypatch):
+    """An explicit pin (`docker context use <name>` / DOCKER_CONTEXT env)
+    shows up as a non-default current context: Docker resolves it
+    deterministically, so an operator who pinned the native daemon gets
+    a PASS, not a permanent WARNING. Regression: every multi-context
+    host was warned regardless of the selection."""
+    info = DockerContextInfo(
+        name="kryonsec-native",
+        endpoint="unix:///var/run/docker.sock",
+        contexts=("default", "kryonsec-native"),
+    )
+    status, msg = _context(info, monkeypatch)
+    assert status == "PASS"
+    assert "kryonsec-native" in msg and "unix:///var/run/docker.sock" in msg
+
+
+def test_ambient_default_with_multiple_contexts_stays_warning(monkeypatch):
+    """Selecting nothing while other contexts exist is the ambiguous
+    case: Kryonsec does not switch contexts itself, so this stays a
+    WARNING that names the safe action."""
+    info = DockerContextInfo(
+        name="default",
+        endpoint="unix:///var/run/docker.sock",
+        contexts=("default", "kryonsec-native"),
+    )
+    status, msg = _context(info, monkeypatch)
+    assert status == "WARNING"
+    assert "docker context use" in msg
+
+
+def test_single_context_default_passes(monkeypatch):
+    info = DockerContextInfo(
+        name="default", endpoint="unix:///var/run/docker.sock",
+        contexts=("default",),
+    )
+    status, msg = _context(info, monkeypatch)
+    assert status == "PASS"
+
+
+def test_docker_host_override_stays_warning(monkeypatch):
+    info = DockerContextInfo(
+        name="kryonsec-native", endpoint="unix:///var/run/docker.sock",
+        contexts=("default", "kryonsec-native"),
+        docker_host_override=True,
+    )
+    status, msg = _context(info, monkeypatch)
+    assert status == "WARNING"
+    assert "DOCKER_HOST" in msg
+
+
+def test_context_inspection_error_fails(monkeypatch):
+    info = DockerContextInfo(error="docker CLI request failed")
+    status, msg = _context(info, monkeypatch)
+    assert status == "FAIL"
+
+
+# ---- provider key vs configuration state (Phase 4 regression) ---------------
+
+def _wide_console(monkeypatch) -> None:
+    """rich wraps narrow table cells mid-phrase, interleaving other
+    columns' text between the halves of a wrapped phrase; render on a
+    fixed wide console so row text stays on one line."""
+    from rich.console import Console
+
+    monkeypatch.setattr(doctor, "console", Console(width=240))
+
+
+def test_missing_openai_key_fails_the_provider_row_not_configuration(
+        monkeypatch, tmp_path, capsys):
+    """A valid config with provider=openai but no key anywhere: the
+    OpenAI row must report the missing key honestly while the
+    Configuration row still PASSes — the two states are distinct."""
+    import re
+    from kryonsec.config import config_path, write_config
+
+    write_config(config_path(tmp_path), {
+        "llm": {"provider": "openai"},
+    })
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _wide_console(monkeypatch)
+    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    assert "valid TOML" in out
+    assert "OPENAI_API_KEY not set" in out
+
+
+def test_invalid_toml_names_the_config_fault_and_reports_the_key_state(
+        monkeypatch, tmp_path, capsys):
+    """The real WSL2 failure sequence: a corrupted config file made the
+    file-stored key invisible, so doctor showed BOTH 'invalid TOML' and
+    'OPENAI_API_KEY not set'. The Configuration row must name the TOML
+    fault as the cause; the provider row may only report the key state
+    it can actually see (env), never claim readiness."""
+    import re
+    from kryonsec.config import config_path
+
+    config_path(tmp_path).write_text(
+        '[llm]\nprovider = "openai"\nopenai_api_key = "sk-file-only"\n'
+        "max_tokens = 100tokens = 2\n",  # fused line, the observed damage
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _wide_console(monkeypatch)
+    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    assert "invalid TOML" in out
+    assert "OPENAI_API_KEY not set" in out
+    assert "sk-file-only" not in out  # never echo a key value
 
 
 def test_doctor_non_linux_renders_skip_not_fail(monkeypatch, tmp_path, capsys):

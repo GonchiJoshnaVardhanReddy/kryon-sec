@@ -265,6 +265,75 @@ def test_runtime_smoke_uses_runsc_entrypoint_and_cleans_up(monkeypatch):
     assert calls[-1][0][:2] == ["rm", "--force"]
 
 
+def test_runtime_smoke_pids_cap_covers_runsc_background_tasks(monkeypatch, tmp_path):
+    """Phase 6 regression (WSL2): at --pids-limit 32 bash's fork for the
+    entrypoint's output-wrapping jq was rejected intermittently — the
+    kernel logged "fork rejected by pids controller" in the container's
+    scope on every failure, and runsc counts its own sentry/gofer/shim
+    tasks in that same cgroup. Failures were cap-independent across
+    64m-2g of memory, so the trigger is the pids ceiling, not memory.
+    The probe now pins the measured-clean cap (64, clean over 40
+    consecutive runs) so a tight doctor probe cannot flake, while
+    staying tighter than the real engagement runtime's cap."""
+    calls = []
+
+    def fake(args, timeout=PROBE_TIMEOUT_S):
+        calls.append(args)
+        if args[0] == "create":
+            return type("Result", (), {"returncode": 0, "stdout": "name", "stderr": ""})()
+        if args[0] == "inspect":
+            return type("Result", (), {"returncode": 0, "stdout": "runsc\n", "stderr": ""})()
+        if args[0] == "start":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[0] == "rm":
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(runtime_checks.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runtime_checks, "_run_docker", fake)
+    ok, detail = runtime_checks.runtime_smoke_test("image@sha256:abc")
+    assert ok, detail
+    create = calls[0]
+    # the measured pids cap — clean over 40 consecutive runs
+    assert create[create.index("--pids-limit") + 1] == "64"
+    # the memory cap stays deliberately tight; it was never the trigger
+    assert create[create.index("--memory") + 1] == "64m"
+    # and the probe still stays tighter than the real engagement runtime
+    from kryonsec.config import KryonsecConfig
+    from kryonsec.purple.sandbox import KaliSandbox
+
+    real = KaliSandbox(
+        cfg=KryonsecConfig(home=tmp_path),
+        seccomp_profile=tmp_path / "nope.json",
+    )._docker_argv(["nmap", "-p", "1", "example.com"])
+    assert int(create[create.index("--pids-limit") + 1]) < int(
+        real[real.index("--pids-limit") + 1])
+
+
+def test_egress_password_guidance_names_both_remedies(monkeypatch):
+    """doctor's egress row must tell the operator how to actually close
+    the non-interactive sudo gap — a fresh `sudo -v` cache in the same
+    terminal OR a scoped NOPASSWD rule — because the runner programs the
+    firewall with the same `sudo -n` at engagement start. It must never
+    hint at a weaker fallback. Regression: newer sudo builds word the
+    refusal as "interactive authentication is required", which the old
+    message match missed, so the actionable guidance never rendered."""
+    class Refused:
+        returncode = 1
+        stderr = "sudo: interactive authentication is required"
+        stdout = ""
+
+    monkeypatch.setattr(runtime_checks.sys, "platform", "linux")
+    monkeypatch.setattr(runtime_checks.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(runtime_checks.subprocess, "run",
+                        lambda *a, **k: Refused())
+    ok, detail = runtime_checks.egress_firewall_ok()
+    assert not ok
+    assert "sudo -v" in detail
+    assert "NOPASSWD" in detail
+
+
 def test_runtime_smoke_gives_start_a_cold_start_timeout(monkeypatch):
     """Genuine 1E.1 pre-flight catch on WSL2: the FIRST `runsc` start of
     the 9.35 GB sandbox image exceeded the 10 s probe timeout, so
