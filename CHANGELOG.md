@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — Tool Expansion Batches 1–6 + Wave 1 (feature branch, not released)
+## Unreleased — Tool Expansion Batches 1–6 + Waves 1–2 (feature branch, not released)
 
 Six new vetted RECON_ACTIVE adapters — `naabu-probe`, `dnsx-probe`,
 `katana-probe` (Batch 1), then `nmap-probe`, `feroxbuster-probe`,
@@ -19,7 +19,9 @@ consumption-time eligibility check, a one-shot consumption guard with
 crash-safe recovery, and bounded coordinator handoffs (Batch 6, Phase
 6A–6D), and the Wave-1 archives module — historical URL + parameter
 discovery from third-party archives as host-side Zone A sources (zero
-packets to the target, no image change). Branch
+packets to the target, no image change), and the Wave-2b JWT token
+producer — an offline analyzer that feeds the previously-gated
+jwt_tool lane from captured evidence. Branch
 `feature/tool-expansion-batch1`; nothing below is published yet.
 
 ### New vetted adapters (Batch 2)
@@ -372,6 +374,41 @@ analysis.
   injection boolean-probing is the ONLY finding category independently verifiable
   today; XSS, command injection, web/discovery categories are recorded and
   reachability-checked but NOT independently verified — never labeled otherwise.
+
+### Wave 2b — the JWT token producer + offline analyzer (2026-11-16, `556a564`)
+
+- **The gated lane gets its input (`purple/jwt_tokens.py`, code only)**: jwt_tool
+  was allowlisted (`["{token}"]`) but unreachable — nothing produced its input.
+  The producer is a pure host-side module: it scans the evidence graph's
+  OBSERVED-evidence nodes (api observations, endpoint metadata, candidate
+  findings, notes, path labels) for JWT-shaped strings, accepts only tokens whose
+  header decodes to JSON with a string `alg` (a lookalike that does not decode is
+  not a token), and records one `jwt_token` node per token (label = SHA-256
+  fingerprint; the raw token stays in node properties — engagement data that
+  never leaves the machine). One audited capture event carries counts only,
+  never token bytes. LLM-authored nodes (hypotheses/plans) are deliberately NOT
+  scanned: a token feeding a tool must come from observed evidence, never from
+  prompt text. Bounded: 64 KB per string, 16 new tokens per pass.
+- **Offline analysis, never verification**: `inspect_token()` reads what a token
+  says about itself (alg, kid, iss, sub, jti, exp/iat/nbf as ISO strings,
+  staleness notes against the caller's clock). It never verifies a signature,
+  never contacts anything, and never calls a token "valid".
+- **EXPLOIT wiring**: the capture pass runs once per EXPLOIT entry (a capture
+  failure never kills the state); `build_argv()` builds the fixed argv
+  `["jwt_tool", <token>]` only when a token was captured; the no-token path is
+  byte-identical to the historical pinned skip plus a precise audited
+  `jwt_input_missing` event. jwt_tool joins `_NEVER_CONFIRMS` consciously —
+  offline token analysis is an observation, never a confirmed finding.
+- **Tests**: 15 new (`tests/test_jwt_tokens.py`: decode strictness, claim
+  reading with pinned clocks, collection caps/idempotence/oversized-skips/
+  LLM-node exclusion, count-only audit) + 3 integration (`tests/test_exploit.py`:
+  captured token → Layer-2-valid argv, unchanged no-token skip, capture-failure
+  resilience). `test_execution_truth_a14`'s audit-order assertion updated
+  consciously. Full suite: **2,779 passed / 61 skipped**; the 1 failure is the
+  documented environmental ensurepip one. Honest limit: a real sandbox jwt_tool
+  run NOT exercised (FakeSandbox). **wafw00f** (the other Wave-2 half) is
+  DEFERRED — it needs a sandbox image rebuild + a new pinned digest, a
+  maintainer decision.
 
 ### Wave 1 — the Zone A archives module (2026-11-16, `31fa96e`)
 

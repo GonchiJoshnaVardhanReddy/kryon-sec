@@ -1388,7 +1388,9 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `sslscan`, `testssl.sh` | RECON_ACTIVE | sandbox | legacy TLS lane (skipped while `tls-probe` is registered) | ⚙️ sandbox |
 | `/opt/kryonsec/openapi_probe.py` | RECON_ACTIVE | sandbox | baked OpenAPI inspection (skipped while `api-probe` is registered) | ⚙️ sandbox |
 | `nuclei` (legacy path) | EXPLOIT | sandbox | template scanning against **the exact template-tree root only**, Gate-2 approved per hypothesis | ⚙️ sandbox |
-| `sqlmap`, `nikto`, `ffuf`, `gobuster`, `wfuzz`, `dalfox`, `commix`, `ssrfmap`, `arjun`, `tplmap`, `graphql-cop`, `jwt_tool`, `kr` | EXPLOIT | sandbox | approved-hypothesis exploitation | ⚙️ sandbox |
+| `sqlmap`, `nikto`, `ffuf`, `gobuster`, `wfuzz`, `dalfox`, `commix`, `ssrfmap`, `arjun`, `tplmap`, `graphql-cop` | EXPLOIT | sandbox | approved-hypothesis exploitation | ⚙️ sandbox |
+| `jwt_tool` | EXPLOIT | sandbox | offline token analysis of a CAPTURED JWT (Wave 2b producer scans the evidence graph; no token → audited skip) | ⚙️ sandbox |
+| `kr` | EXPLOIT | sandbox | allowlisted but dormant — needs a baked `.kx` route wordlist (audited skip until then) | ⚙️ sandbox |
 | `curl`, `wget` | EXPLOIT / VERIFY | sandbox | controlled requests; curl powers the independent boolean probe | ⚙️ sandbox |
 
 ### C. Offline lookup utilities
@@ -1920,6 +1922,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Batch 5 — exploit/verify contracts, counterevidence, verification-support specialist | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Batch 6 — capability lifecycle: binding, expiry, revocation, consumption guard, handoffs | ✅ code + mocked suites done on the feature branch — registries deliberately still EMPTY; PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Wave 1 — Zone A archives module (gau/waybackurls/paramspider semantics, host-side, zero packets) | ✅ code + mocked suites done on the feature branch — no image change needed; real network calls to archives NOT exercised (mocked HTTP only) |
+| Wave 2b — JWT token producer + offline analyzer (code only; feeds the gated jwt_tool lane from captured evidence) | ✅ code + mocked suites done on the feature branch — no image change; wafw00f (the other Wave-2 half) DEFERRED — needs a sandbox image rebuild + new pinned digest, a maintainer decision |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1957,6 +1960,7 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | Tool Expansion Batch 5 | 2026-11-16 | **2,710 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new Batch-5 suites (`test_exploit_contract` 32, `test_verify_contract` 19, `test_evidence_quality` 21, `test_verification_support` 14); 1 failure is the same environmental one (no `ensurepip` in that Python), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
 | Tool Expansion Batch 6 | 2026-11-16 | **2,748 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 38-test Batch-6 suite (`test_post_exploit_batch6`: eligibility ordering, revocation, consumption guard, interrupted-run recovery, persistence roundtrips, coordinator handoffs); 1 failure is the same environmental one (no `ensurepip` in that Python — the Docker-daemon check passed this run), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
 | Tool Expansion Wave 1 (archives) | 2026-11-16 | **2,759 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — 11 new Zone-A tests (Common Crawl parser, pinned index, parameter derivation, union/scoping/caps, egress refusals, runner dedupe); also fixes the Batch-6 clock time bomb (fixed test clock vs real stamps). 1 failure is the same environmental ensurepip one. Real archive HTTP NOT exercised (mocked only); PostgreSQL paths NOT RUN |
+| Tool Expansion Wave 2b (JWT producer) | 2026-11-16 | **2,779 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — 18 new tests (extraction/decode strictness, offline claim reading with pinned clocks, graph collection caps + idempotence + LLM-node exclusion, captured-token → argv integration, no-token skip unchanged). 1 failure is the same environmental ensurepip one. No image change; real sandbox jwt_tool run NOT exercised (FakeSandbox) |
 
 Honest caveats:
 
