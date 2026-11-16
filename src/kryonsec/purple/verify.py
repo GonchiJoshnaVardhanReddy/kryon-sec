@@ -47,6 +47,7 @@ from .views import (
     VERIFICATION_DISAGREED,
     VERIFICATION_INCONCLUSIVE,
     VERIFICATION_NOT_RUN,
+    VERIFICATION_UNRESOLVED,
     VERIFICATION_VERIFIED,
 )
 
@@ -286,6 +287,8 @@ class VerifySubagent:
         # verification (v1.1.1 regression)
         base_out = self._curl(url, timeout_s=budget)
         baseline_used = base_out is not None
+        counterevidence: list[str] = []
+        baseline2_len: "int | None" = None
         if baseline_used:
             responses_differ = (
                 true_out != false_out
@@ -294,7 +297,32 @@ class VerifySubagent:
             )
             # the baseline method ran its full course: agreement or a real
             # contradiction — both are conclusions an independent test made
+            if responses_differ:
+                # The agreement is not yet a conclusion: content that
+                # ROTATES between requests can produce exactly this
+                # signature (first baseline A, true A, false B). One more
+                # baseline fetch tests the benign explanation — if the
+                # baseline itself moves, the observed difference may be
+                # rotation, not the injected boolean. This is
+                # counterevidence GATHERING: the observation that
+                # contradicts the claim is recorded on the attempt, the
+                # claim is NOT promoted, and the question stays open.
+                base2_out = self._curl(url, timeout_s=budget)
+                baseline2_len = len(base2_out) if base2_out is not None else None
+                if base2_out is not None and base2_out != base_out:
+                    counterevidence.append(
+                        "a second baseline fetch differed from the first — "
+                        "content rotates between requests, so the observed "
+                        "true/false difference may be rotation, not the "
+                        "injected boolean")
+            else:
+                counterevidence.append(
+                    "the true injection and the false injection matched the "
+                    "baseline equally — the injected boolean was not "
+                    "executed as SQL")
             status = (VERIFICATION_VERIFIED if responses_differ
+                      and not counterevidence
+                      else VERIFICATION_UNRESOLVED if responses_differ
                       else VERIFICATION_DISAGREED)
         else:
             # no baseline possible — fall back to plain difference, but
@@ -304,8 +332,13 @@ class VerifySubagent:
             responses_differ = abs(len(true_out) - len(false_out)) > max(
                 32, int(0.02 * max(len(true_out), len(false_out)))
             )
-            status = (VERIFICATION_VERIFIED if responses_differ
+            status = (VERIFICATION_UNRESOLVED if responses_differ
                       else VERIFICATION_INCONCLUSIVE)
+            if responses_differ:
+                counterevidence.append(
+                    "no baseline could be fetched — dynamic content cannot "
+                    "be ruled out, so a response difference alone is not "
+                    "evidence the injected boolean executed")
 
         attempt_node = self.graph.add_node(
             node_type="verify_attempt",
@@ -320,6 +353,13 @@ class VerifySubagent:
                 "true_len": len(true_out),
                 "false_len": len(false_out),
                 "baseline_len": len(base_out) if baseline_used else None,
+                # the confirmation fetch (second baseline) — when it
+                # differed from the first, its length records the rotation
+                "baseline2_len": baseline2_len,
+                # Batch 5C: counterevidence the check itself observed —
+                # recorded, never discarded; non-empty means the verdict
+                # does NOT promote (the question stays open)
+                "counterevidence": counterevidence,
                 # Batch 5B: the registered contract this check ran under —
                 # its identity, its budget, and what the method cannot
                 # establish, recorded with the result it produced
@@ -355,8 +395,10 @@ class VerifySubagent:
                     "finding_id": finding_id,
                     "reason": refused[0],
                 })
-        if responses_differ:
-            # the finding node gains independent confirmation
+        if responses_differ and not counterevidence:
+            # the finding node gains independent confirmation — ONLY when
+            # the check observed no counterevidence: a verdict with a
+            # standing benign explanation does not promote the finding
             for n in self.graph.by_type("finding"):
                 if n["label"] == finding_id:
                     n["properties"]["verified"] = True

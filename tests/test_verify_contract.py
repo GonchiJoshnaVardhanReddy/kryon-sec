@@ -102,7 +102,7 @@ def test_the_sqli_boolean_probe_is_registered():
     assert contract.tool == "curl"          # independent of sqlmap
     assert contract.stage == VERIFY_STAGE
     assert contract.approval == VERIFY_APPROVAL_BASIS
-    assert contract.max_probes == 3         # true + false + baseline
+    assert contract.max_probes == 4         # true + false + baseline + confirmation
     assert contract.max_probe_seconds == 30
     assert any("numeric query parameter" in p for p in contract.prerequisites)
     assert contract.expected_observation.strip()

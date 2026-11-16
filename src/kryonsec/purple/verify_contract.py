@@ -213,7 +213,7 @@ SQLI_BOOLEAN_CONTRACT = VerificationContract(
         "injected into",
         "the finding was produced by a tool other than curl itself",
     ),
-    max_probes=3,
+    max_probes=4,   # true + false + baseline + baseline-confirmation (5C)
     max_probe_seconds=30,
     expected_observation=(
         "the true injection (AND 1=1) matches the baseline while the "

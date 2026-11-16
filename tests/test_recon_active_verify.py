@@ -518,8 +518,8 @@ def test_verify_confirms_when_responses_differ(tmp_path):
     result = sub.run()
 
     assert result.status == "ok"
-    # three fetches: true + false + baseline (no injection)
-    assert len(sub.sandbox.calls) == 3
+    # four fetches: true + false + baseline + baseline confirmation (5C)
+    assert len(sub.sandbox.calls) == 4
     verify_nodes = graph.by_type("verify_attempt")
     assert len(verify_nodes) == 1
     assert verify_nodes[0]["properties"]["verified"] is True
@@ -600,9 +600,9 @@ def test_verify_retries_http_reset_over_https(tmp_path):
 
     sub = VerifySubagent(cfg, graph, audit, "target-corp.com", HttpResetSandbox())
     sub.run()
-    # 6 fetches total: true + false + baseline, each retried over https
-    # after the http 56
-    assert len(sub.sandbox.urls) == 6
+    # 8 fetches total: true + false + baseline + confirmation, each
+    # retried over https after the http 56
+    assert len(sub.sandbox.urls) == 8
     # every http probe was immediately followed by an https retry
     for i, u in enumerate(sub.sandbox.urls):
         if u.startswith("http://"):
@@ -694,7 +694,7 @@ def test_verify_baseline_keeps_query_string(tmp_path):
 
     sub = VerifySubagent(cfg, graph, audit, "target-corp.com", BaselineSandbox())
     sub.run()
-    assert len(sub.sandbox.urls) == 3  # true + false + baseline
+    assert len(sub.sandbox.urls) == 4  # true + false + baseline + confirmation
     assert graph.by_type("finding")[0]["properties"]["verified"] is True
 
 
