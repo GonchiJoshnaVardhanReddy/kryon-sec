@@ -14,6 +14,16 @@ stays authoritative). A blocked check (scope refusal, missing probe
 parameter, failed spawn) keeps its actual blocking reason and is never
 described as disproven or safe. The finding is linked to its check by a
 verified_by lineage edge between node ids.
+
+Batch 5B: the method a category is verified with is a REGISTERED
+contract (``verify_contract.py``), not a hardcoded branch. A finding is
+probed only when its category has a contract — the boolean probe is
+evidence for SQL injection and for nothing else, so other categories
+are no longer probed with it (that was a false-positive factory).
+An unsupported category keeps its honest ``not_run`` with the real
+reason and its reachability evidence; the contract's tool must differ
+from the finding's own tool (independence); the contract's budget and
+confidence limit travel with every attempt record.
 """
 
 from __future__ import annotations
@@ -29,6 +39,10 @@ from .exploit import compose_url
 from .orchestrator import SubagentResult
 from .recon_passive import EngagementGraph
 from .sandbox import KaliSandbox
+from .verify_contract import (
+    finding_category,
+    verification_contract_for,
+)
 from .views import (
     VERIFICATION_DISAGREED,
     VERIFICATION_INCONCLUSIVE,
@@ -96,15 +110,17 @@ class VerifySubagent:
             n for n in self.graph.by_type("finding")
             if n["properties"].get("confirmed", True)
         ]
+        from .verify_contract import FINDING_VERIFICATION_CONTRACTS
         self.audit.write({
             "event": "verify_plan",
             "findings_to_verify": len(findings),
             "method": "independent curl boolean probe (AND 1=1 vs AND 1=2)",
+            "contracts": sorted(FINDING_VERIFICATION_CONTRACTS),
         })
 
         verified = 0
         for f in findings:
-            verified += self._verify_one(f["label"])
+            verified += self._verify_one(f)
 
         self.audit.write({
             "event": "verify_done",
@@ -121,8 +137,16 @@ class VerifySubagent:
                 return "https"
         return "http"
 
-    def _verify_one(self, finding_id: str) -> int:
-        """Independently check one finding. Returns 1 if verified."""
+    def _verify_one(self, finding: dict) -> int:
+        """Independently check one finding. Returns 1 if verified.
+
+        Batch 5B: the method comes from the finding category's REGISTERED
+        contract. No contract — the category is unsupported, the finding
+        keeps its honest ``not_run`` (plus whatever reachability evidence
+        the secondary probes can supply), and nothing is probed with a
+        method that would not be evidence for it.
+        """
+        finding_id = finding["label"]
         # the finding's hypothesis supplies the URL
         hyp = next(
             (n for n in self.graph.by_type("hypothesis")
@@ -130,6 +154,8 @@ class VerifySubagent:
         )
         if hyp is None:  # pragma: no cover — findings always have one
             return 0
+        category = finding_category(finding)
+        contract = verification_contract_for(category)
         asset = hyp["properties"].get("target_asset", "")
         # subdomain-aware like EXPLOIT: '/webmail/x' means webmail.<target> —
         # without this the probe hits the wrong vhost on the main host
@@ -147,20 +173,70 @@ class VerifySubagent:
                 label=finding_id,
                 properties={"status": VERIFICATION_NOT_RUN,
                             "verified": False, "method": "n/a",
+                            "category": category,
                             "reason": "asset outside engagement scope"},
+            )
+            return 0
+
+        if contract is None:
+            # Unsupported category: no registered method is evidence for
+            # it, so nothing is probed with one. Gather what SECONDARY
+            # evidence exists (asset reachable / TLS up) — honest
+            # reachability evidence that never marks a finding verified.
+            secondary = self._secondary_probes(url)
+            reason = (
+                f"no verification contract for category '{category}'")
+            self.audit.write({
+                "event": "verify_skipped",
+                "finding_id": finding_id,
+                "category": category,
+                "reason": reason,
+            })
+            self.graph.add_node(
+                node_type="verify_attempt",
+                label=finding_id,
+                properties={"status": VERIFICATION_NOT_RUN,
+                            "verified": False, "method": "n/a",
+                            "category": category,
+                            "reason": reason,
+                            "secondary_evidence": secondary},
+            )
+            return 0
+
+        # Independence: the verification tool must differ from the tool
+        # that produced the finding — re-running the finding's own tool
+        # is a repeat, not an independent check.
+        origin_tool = str(finding["properties"].get("tool") or "")
+        if origin_tool == contract.tool:
+            reason = ("verification tool is the finding's own tool "
+                      f"({contract.tool!r}) — not independent")
+            self.audit.write({
+                "event": "verify_skipped",
+                "finding_id": finding_id,
+                "category": category,
+                "reason": reason,
+            })
+            self.graph.add_node(
+                node_type="verify_attempt",
+                label=finding_id,
+                properties={"status": VERIFICATION_NOT_RUN,
+                            "verified": False, "method": "n/a",
+                            "category": category,
+                            "reason": reason},
             )
             return 0
 
         probes = _boolean_probe_urls(url)
         if probes is None:
-            # No numeric query parameter to boolean-probe. Gather what
-            # SECONDARY evidence exists (asset reachable / TLS up) with
-            # tools other than curl — honest reachability evidence, but
-            # it never marks a finding "verified" by itself.
+            # The contract's numeric-parameter prerequisite is unmet.
+            # Gather what SECONDARY evidence exists (asset reachable /
+            # TLS up) with tools other than curl — honest reachability
+            # evidence, but it never marks a finding "verified" by itself.
             secondary = self._secondary_probes(url)
             self.audit.write({
                 "event": "verify_skipped",
                 "finding_id": finding_id,
+                "category": category,
                 "reason": "no numeric query parameter to probe",
             })
             self.graph.add_node(
@@ -168,19 +244,24 @@ class VerifySubagent:
                 label=finding_id,
                 properties={"status": VERIFICATION_NOT_RUN,
                             "verified": False, "method": "n/a",
+                            "category": category,
                             "reason": "no numeric query parameter",
                             "secondary_evidence": secondary},
             )
             return 0
 
         true_url, false_url = probes
+        # the contract's budget bounds every probe, enforced in the fixed
+        # argv (curl --max-time) — see _curl
+        budget = contract.max_probe_seconds
         # run all three curls through the sandbox + allowlist (fixed argv)
-        true_out = self._curl(true_url)
-        false_out = self._curl(false_url)
+        true_out = self._curl(true_url, timeout_s=budget)
+        false_out = self._curl(false_url, timeout_s=budget)
         if true_out is None or false_out is None:
             self.audit.write({
                 "event": "verify_skipped",
                 "finding_id": finding_id,
+                "category": category,
                 "reason": "curl probes failed to run",
             })
             self.graph.add_node(
@@ -188,6 +269,7 @@ class VerifySubagent:
                 label=finding_id,
                 properties={"status": VERIFICATION_NOT_RUN,
                             "verified": False, "method": "curl boolean",
+                            "category": category,
                             "reason": "probe run failed"},
             )
             return 0
@@ -202,7 +284,7 @@ class VerifySubagent:
         # error / default view), and then true_out == base_out could never
         # hold — every genuine boolean-SQLi finding would "fail"
         # verification (v1.1.1 regression)
-        base_out = self._curl(url)
+        base_out = self._curl(url, timeout_s=budget)
         baseline_used = base_out is not None
         if baseline_used:
             responses_differ = (
@@ -238,6 +320,18 @@ class VerifySubagent:
                 "true_len": len(true_out),
                 "false_len": len(false_out),
                 "baseline_len": len(base_out) if baseline_used else None,
+                # Batch 5B: the registered contract this check ran under —
+                # its identity, its budget, and what the method cannot
+                # establish, recorded with the result it produced
+                "category": category,
+                "contract": {
+                    "category": contract.category,
+                    "method": contract.method,
+                    "tool": contract.tool,
+                    "stage": contract.stage,
+                    "max_probe_seconds": contract.max_probe_seconds,
+                },
+                "confidence_limit": contract.confidence_limit,
             },
         )
         # Phase 1C lineage: finding --verified_by--> its independent check,
@@ -319,23 +413,37 @@ class VerifySubagent:
             }
         return evidence
 
-    def _curl(self, url: str) -> str | None:
-        """Run one curl via the sandbox. None = the run itself failed."""
-        result = self._spawn_tool("curl", ["curl", "-sS", "--max-time", "30", url])
+    def _curl(self, url: str, timeout_s: "int | None" = None) -> str | None:
+        """Run one curl via the sandbox. None = the run itself failed.
+
+        ``timeout_s`` is the contract's per-probe budget, enforced in the
+        fixed argv (curl ``--max-time``) — the tool self-bounds at the
+        contract's number."""
+        seconds = str(timeout_s) if timeout_s else "30"
+        result = self._spawn_tool(
+            "curl", ["curl", "-sS", "--max-time", seconds, url],
+            timeout_s=timeout_s)
         if result is not None and result.exit_code == 56 and url.startswith("http://"):
             # https-only target and EXPLOIT never discovered it (no curl
             # hypothesis ran) — retry over https
             result = self._spawn_tool(
                 "curl",
-                ["curl", "-sS", "--max-time", "30",
+                ["curl", "-sS", "--max-time", seconds,
                  "https://" + url[len("http://"):]],
-            )
+                timeout_s=timeout_s)
         if result is None or not result.ok:
             return None
         return result.stdout
 
-    def _spawn_tool(self, tool: str, argv: list[str]):
-        """One allowlisted sandbox spawn; returns SpawnResult or None."""
+    def _spawn_tool(self, tool: str, argv: list[str],
+                    timeout_s: "int | None" = None):
+        """One allowlisted sandbox spawn; returns SpawnResult or None.
+
+        ``timeout_s`` is accepted so callers can pass a contract budget
+        through, but the budget is enforced in the fixed argv itself
+        (curl's ``--max-time``) — the same fixed-template enforcement
+        EXPLOIT uses — so the spawn call shape is unchanged for every
+        sandbox."""
         try:
             self.allowlist.validate(argv[0], argv)
             self.allowlist.check_blocklist(argv)
