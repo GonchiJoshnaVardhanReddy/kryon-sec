@@ -71,6 +71,7 @@ from .recon_passive import (
 from .views import (
     ATTEMPT_CONFIRMED,
     ATTEMPT_INCONCLUSIVE,
+    ATTEMPT_TOOL_ERROR,
     attempt_outcome,
     claim_text,
     verification_status,
@@ -843,6 +844,13 @@ class StageBoundaryRecorder:
                 result_status = "completed"
             elif outcome == ATTEMPT_INCONCLUSIVE:
                 result_status = "inconclusive"
+            elif outcome == ATTEMPT_TOOL_ERROR:
+                # Phase 2 (2026-11-17): an interrupted check is a FAILED
+                # task — it started and did not complete — never an
+                # inconclusive one (which reads as a clean no-finding
+                # run). It is registered, with the honest status, so the
+                # attempt is on the coordinator's record either way.
+                result_status = "failed"
             else:
                 # not-run / unrecorded: no record is invented for work
                 # that never produced an outcome

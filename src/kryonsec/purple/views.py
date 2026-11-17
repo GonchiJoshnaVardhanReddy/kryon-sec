@@ -39,6 +39,7 @@ __all__ = [
     "ATTEMPT_NONE",
     "ATTEMPT_NOTES",
     "ATTEMPT_NOT_RUN",
+    "ATTEMPT_TOOL_ERROR",
     "ATTEMPT_UNRECORDED",
     "BASIS_NOTES",
     "BASIS_PROPOSED",
@@ -267,24 +268,31 @@ def relationship_basis(node: dict, graph: EngagementGraph) -> str:
 # performed (A13 D1).
 
 ATTEMPT_CONFIRMED = "confirmed"        # the tool ran; its output had the marker
-ATTEMPT_INCONCLUSIVE = "inconclusive"  # the tool ran; the marker was absent
+ATTEMPT_INCONCLUSIVE = "inconclusive"  # the tool ran to completion; the marker was absent
+ATTEMPT_TOOL_ERROR = "tool-error"      # the tool ran but exited nonzero — the check did not complete
 ATTEMPT_NOT_RUN = "not-run"            # the record says the process never started
 ATTEMPT_UNRECORDED = "unrecorded"      # no record either way
 ATTEMPT_NONE = "none"                  # no attempt at all for this hypothesis
 
 #: Every outcome, weakest first. This is also the comparison order when one
 #: hypothesis has several attempts: the best one recorded wins, so a second
-#: tool that could not start never undoes a first that ran.
+#: tool that could not start never undoes a first that ran. tool-error sits
+#: below inconclusive: an interrupted check establishes even less than a
+#: completed one that found nothing.
 _ATTEMPT_ORDER: tuple[str, ...] = (
     ATTEMPT_NONE,
     ATTEMPT_NOT_RUN,
     ATTEMPT_UNRECORDED,
+    ATTEMPT_TOOL_ERROR,
     ATTEMPT_INCONCLUSIVE,
     ATTEMPT_CONFIRMED,
 )
 
-#: The outcomes that mean a tool really ran against the target.
-OUTCOMES_RUN = frozenset({ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED})
+#: The outcomes that mean a tool really ran against the target. tool-error
+#: IS a run — a killed/partial tool touched the target — but its evidence
+#: is incomplete, which the note below says in plain words.
+OUTCOMES_RUN = frozenset({
+    ATTEMPT_TOOL_ERROR, ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED})
 
 # What each outcome means, in the operator's words. The two that did not run
 # are deliberately not phrased as results: nothing was checked, so there is
@@ -297,6 +305,11 @@ ATTEMPT_NOTES: dict[str, str] = {
     ATTEMPT_UNRECORDED: (
         "an attempt was recorded, but the engagement did not record whether "
         "the tool started"
+    ),
+    ATTEMPT_TOOL_ERROR: (
+        "a test started but did not complete (the tool exited with an "
+        "error) — whatever it printed is partial evidence, not a clean "
+        "result"
     ),
     ATTEMPT_INCONCLUSIVE: (
         "a test ran and did not confirm it — a test that found nothing is "
@@ -319,6 +332,16 @@ def attempt_outcome(node: dict) -> str:
     if properties.get("confirmed"):
         return ATTEMPT_CONFIRMED
     if properties.get("ok") is True:
+        # a nonzero exit is NOT a completed check: it is an interrupted
+        # one (Phase 2, 2026-11-17 — exit 137 at the sandbox cap and
+        # curl 18 on a truncated response both used to read as
+        # "inconclusive", i.e. a clean no-finding run). Records from
+        # before exit codes were stored read as inconclusive, exactly
+        # as before.
+        exit_code = properties.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) \
+                and exit_code != 0:
+            return ATTEMPT_TOOL_ERROR
         return ATTEMPT_INCONCLUSIVE
     if properties.get("ok") is False:
         return ATTEMPT_NOT_RUN
