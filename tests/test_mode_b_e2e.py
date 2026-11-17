@@ -597,7 +597,14 @@ def test_scenario_g_gate3_post_exploit_dormant(tmp_path, monkeypatch):
 
     assert "POST_EXPLOIT" not in run.completed
     assert run.approver_calls == [], "Gate 3 approver was consulted"
-    assert not [e for e in run.events if "post_exploit" in str(e.get("event"))]
+    # Phase 3 (2026-11-17): the dormancy skip is itself audited now —
+    # the ONE post_exploit event allowed here, precisely because it
+    # records that the gate never ran. Any gate/claim/decision event
+    # would be a bypass.
+    post_exploit_events = [e for e in run.events
+                           if "post_exploit" in str(e.get("event"))]
+    assert [e["event"] for e in post_exploit_events] == \
+        ["post_exploit_skipped_dormant"]
 
     # The transition table itself: only shell_obtained AND approved moves
     # to POST_EXPLOIT; either missing goes to VERIFY.

@@ -491,6 +491,18 @@ def test_zone_b_blocked_becomes_a_notice():
     assert "sandbox unavailable" in render(ui)
 
 
+def test_post_exploit_dormant_skip_becomes_a_notice():
+    """Phase 3 (2026-11-17): EXPLOIT -> VERIFY with no POST_EXPLOIT stop
+    is a deliberate dormant skip — the console says so, so an operator
+    can tell it from a forgotten phase."""
+    ui = make_ui()
+    ui.on_audit({"event": "post_exploit_skipped_dormant",
+                 "reason": "no shell/session capability detected"})
+    out = render(ui)
+    assert "post-exploit skipped" in out
+    assert "no shell/session capability" in out
+
+
 def test_allowlist_rejection_is_shown_as_skipped():
     ui = make_ui()
     ui.on_audit({"event": "passive_sandbox_rejected_by_allowlist",

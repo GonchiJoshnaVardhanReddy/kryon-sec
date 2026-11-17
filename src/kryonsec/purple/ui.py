@@ -625,6 +625,14 @@ class PurpleUI:
         elif event == "zone_b_blocked":
             self.on_notice(
                 f"Zone B blocked — {entry.get('reason', 'sandbox unavailable')}")
+        elif event == "post_exploit_skipped_dormant":
+            # Phase 3 (2026-11-17): the EXPLOIT -> VERIFY routing with no
+            # POST_EXPLOIT stop is now an audited fact. The console says
+            # WHY the phase did not run, so an operator can tell a
+            # deliberate dormant skip from a forgotten phase.
+            self.on_notice(
+                "post-exploit skipped — no shell/session capability "
+                "detected (dormant by design)")
 
         # Batch 4: specialist scheduler + budget events. Read-only
         # progress, one line each, every field defaulted — the scheduler's

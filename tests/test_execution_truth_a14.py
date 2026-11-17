@@ -571,5 +571,10 @@ def test_reporting_fixes_changed_no_state_transition(tmp_path):
     # Wave 2b: the jwt token producer's capture pass runs between
     # state_enter and planning (it audits even when nothing is found)
     assert events[:3] == ["state_enter", "jwt_tokens_captured", "exploit_plan"]
-    assert events[-1] == "exploit_done"
+    # Phase 3 (2026-11-17): the run now ends with the post-exploit
+    # dormancy skip — the EXPLOIT -> VERIFY routing with no
+    # POST_EXPLOIT stop is an audited fact with its reason, not a
+    # silence (was: events[-1] == "exploit_done").
+    assert events[-1] == "post_exploit_skipped_dormant"
+    assert "exploit_done" in events
     assert "finding_confirmed" in events
