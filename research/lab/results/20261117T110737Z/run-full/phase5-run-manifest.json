@@ -1,0 +1,106 @@
+{
+  "mode": "full",
+  "target": "juice-shop.lab",
+  "engagement_id": "lab-p5-full-20261117T110737Z",
+  "approval_provenance": "automation-injected (non-human)",
+  "gate3_post_exploit": "always refused (no post-exploitation)",
+  "outcome": "completed",
+  "states_entered": [
+    "RECON_PASSIVE",
+    "RECON_ACTIVE",
+    "HYPOTHESIZE",
+    "HUMAN_REVIEW",
+    "EXPLOIT",
+    "VERIFY",
+    "BLUE_TEAM",
+    "REPORT"
+  ],
+  "wall_s": 912.6,
+  "llm": {
+    "provider": "openai",
+    "chat_model": "gpt-6-astra",
+    "disable_gate": "not set",
+    "calls_audited": 2,
+    "total_tokens_provider_reported": 4832,
+    "token_source": "REAL (provider-reported usage objects)",
+    "cost_known_usd": 0.13353,
+    "cost_unpriced_calls": 0,
+    "cost_note": "cost summed ONLY over calls the provider's cost map could price; unpriced calls are unknown, never guessed"
+  },
+  "hypotheses": {
+    "proposed": 4,
+    "approved": 4,
+    "approved_ids": [
+      "H1",
+      "H2",
+      "H3",
+      "H4"
+    ],
+    "rejected": 0
+  },
+  "tools": {
+    "spawns": 10,
+    "results": 10,
+    "by_tool": {
+      "subfinder": 1,
+      "amass": 1,
+      "assetfinder": 1,
+      "curl": 4,
+      "nuclei": 1,
+      "wget": 2
+    },
+    "tool_failures": 6
+  },
+  "findings": {
+    "confirmed": 0,
+    "verified": 0,
+    "verification_failed": 0
+  },
+  "report_written": true,
+  "audit_chain": {
+    "events": 227,
+    "head_hash": "d0513193b054df3a2d7eb8325ae2ebdde94e9c66a8182a8f53201ec8b21bd810",
+    "verified": true,
+    "error": null
+  },
+  "lab": {
+    "reset_before_run": true,
+    "plumbing": {
+      "ok": true,
+      "summary": "10/10 passed",
+      "all_real": true,
+      "total_checks": 10,
+      "exit_code": 0,
+      "stdout_tail": "ress.establish - ok\nPASS egress.verify_before_spawns - ok\nPASS target.http_get_200 - exit=0 status='200'\nPASS target.app_version - {\"version\":\"20.4.0-SNAPSHOT\"}\nPASS dns.pinned_resolver_serves_lab_record - exit=0 NOERROR=True answer_10.213.43.10=True\nPASS egress.unrelated_destination_dropped - exit=28 (28 = dropped at the boundary)\nPASS egress.resolver_port80_dropped - exit=28\nPASS egress.public_resolver_dns_dropped - exit=9 (must NOT get a NOERROR answer)\nPASS egress.verify_after_spawns - ok\nPASS egress.release - ok\nresults written: /mnt/d/project/kryon-sec/research/lab/plumbing-results.json\n",
+      "stderr_tail": ""
+    },
+    "dns_started_at_before": "2026-11-17T11:07:39.641062348Z",
+    "dns_started_at_after": "2026-11-17T11:07:39.641062348Z",
+    "dns_recreated_mid_run": false,
+    "template_host_pin": {
+      "ok": true,
+      "attempts": 1
+    }
+  },
+  "honest_note": "infrastructure success is NOT detection performance; missed/false-positive scoring happens in Phase 6 against ground-truth/juice-shop-v20.4.0-challenges.yml (118 challenges), never from this manifest",
+  "graph": {
+    "nodes": 50,
+    "edges": 29,
+    "by_type": {
+      "target": 1,
+      "osint_note": 2,
+      "adapter_attempt": 10,
+      "service": 1,
+      "dns_resolution": 1,
+      "web_endpoint": 1,
+      "tech_fingerprint": 1,
+      "path": 11,
+      "api_observation": 1,
+      "vuln_candidate": 5,
+      "screenshot": 1,
+      "hypothesis": 4,
+      "exploit_attempt": 7,
+      "remediation": 4
+    }
+  }
+}

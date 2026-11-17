@@ -1,0 +1,119 @@
+key,name,category,difficulty,verdict,reason,cited_node_ids,cited_node_labels,n_evidence_hits
+passwordHashLeakChallenge,Password Hash Leak,Sensitive Data Exposure,2,MISSED,no evidence matched the surface,-,-,0
+restfulXssChallenge,API-only XSS,XSS,3,OUT_OF_SCOPE,clientSide: solve condition is the payload EXECUTING in a browser — the agent has no browser; a stored payload would still be unverifiable here,-,-,0
+accessLogDisclosureChallenge,Access Log,Observability Failures,4,MISSED,no evidence matched the surface,-,-,0
+registerAdminChallenge,Admin Registration,Improper Input Validation,3,MISSED,no evidence matched the surface,-,-,0
+adminSectionChallenge,Admin Section,Broken Access Control,2,MISSED,no evidence matched the surface,-,-,0
+fileWriteChallenge,Arbitrary File Write,Vulnerable Components,6,MISSED,no evidence matched the surface,-,-,0
+resetPasswordBjoernOwaspChallenge,Bjoern''s Favorite Pet,Broken Authentication,3,OUT_OF_SCOPE,osintExternal: requires OSINT on the OWASP founder's personal data — outside the target,-,-,0
+tokenSaleChallenge,Blockchain Hype,Security through Obscurity,5,MISSED,no evidence matched the surface,-,-,0
+nftUnlockChallenge,NFT Takeover,Sensitive Data Exposure,2,MISSED,no evidence matched the surface,-,-,0
+nftMintChallenge,Mint the Honey Pot,Improper Input Validation,3,MISSED,no evidence matched the surface,-,-,0
+web3WalletChallenge,Wallet Depletion,Miscellaneous,6,MISSED,no evidence matched the surface,-,-,0
+web3SandboxChallenge,Web3 Sandbox,Broken Access Control,1,MISSED,no evidence matched the surface,-,-,0
+rceChallenge,Blocked RCE DoS,Insecure Deserialization,5,OUT_OF_SCOPE,DoS: the payload is an infinite/long loop that occupies the server — DoS is excluded from the approved scope,-,-,0
+captchaBypassChallenge,CAPTCHA Bypass,Broken Anti Automation,3,MISSED,no evidence matched the surface,-,-,0
+changePasswordBenderChallenge,Change Bender''s Password,Broken Authentication,5,MISSED,solve requires Bender's actual password from outside the run's evidence; a bender@ regex would double-credit ghostLogin,-,-,0
+christmasSpecialChallenge,Christmas Special,Injection,4,MISSED,no evidence matched the surface,-,-,0
+usernameXssChallenge,CSP Bypass,XSS,4,OUT_OF_SCOPE,clientSide: requires the payload to execute client-side in a rendered page,-,-,0
+persistedXssUserChallenge,Client-side XSS Protection,XSS,3,OUT_OF_SCOPE,clientSide: requires the payload to execute in ANOTHER user's browser session,-,-,0
+directoryListingChallenge,Confidential Document,Sensitive Data Exposure,1,OBSERVED,evidence node(s) match the challenge surface (observed != solved),53e7c231-1373-4d5c-ad49-8eb5b414287d;0fb8813f-7d6c-4c4b-b32c-dab421102ad3;a731a729-faa4-442c-902e-a353198e645f,/ftp;H2:curl;H2:wget,3
+localXssChallenge,DOM XSS,XSS,1,OUT_OF_SCOPE,clientSide: DOM XSS — requires a browser to execute the payload,-,-,0
+dbSchemaChallenge,Database Schema,Injection,3,MISSED,no evidence matched the surface,-,-,0
+deprecatedInterfaceChallenge,Deprecated Interface,Security Misconfiguration,2,MISSED,no evidence matched the surface,-,-,0
+easterEggLevelOneChallenge,Easter Egg,Broken Access Control,4,MISSED,no evidence matched the surface,-,-,0
+emailLeakChallenge,Email Leak,Sensitive Data Exposure,5,MISSED,no evidence matched the surface,-,-,0
+emptyUserRegistration,Empty User Registration,Improper Input Validation,2,MISSED,no evidence matched the surface,-,-,0
+ephemeralAccountantChallenge,Ephemeral Accountant,Injection,4,MISSED,no evidence matched the surface,-,-,0
+errorHandlingChallenge,Error Handling,Security Misconfiguration,1,MISSED,no evidence matched the surface,-,-,0
+manipulateClockChallenge,Expired Coupon,Improper Input Validation,4,MISSED,no evidence matched the surface,-,-,0
+extraLanguageChallenge,Extra Language,Broken Anti Automation,5,OUT_OF_SCOPE,"clientSide: the hidden language is activated client-side (Angular locale handling), not by a server request the agent can make",-,-,0
+feedbackChallenge,Five-Star Feedback,Broken Access Control,2,MISSED,no evidence matched the surface,-,-,0
+forgedCouponChallenge,Forged Coupon,Cryptographic Issues,6,MISSED,no evidence matched the surface,-,-,0
+forgedFeedbackChallenge,Forged Feedback,Broken Access Control,3,MISSED,a feedback regex would over-credit feedbackChallenge (same surface); the forgery itself leaves no distinctive token,-,-,0
+forgedReviewChallenge,Forged Review,Broken Access Control,3,MISSED,a review regex would credit ordinary review activity; the forgery leaves no distinctive token,-,-,0
+jwtForgedChallenge,Forged Signed JWT,Vulnerable Components,6,MISSED,no evidence matched the surface,-,-,0
+forgottenDevBackupChallenge,Forgotten Developer Backup,Sensitive Data Exposure,4,MISSED,no evidence matched the surface,-,-,0
+forgottenBackupChallenge,Forgotten Sales Backup,Sensitive Data Exposure,4,MISSED,no evidence matched the surface,-,-,0
+typosquattingAngularChallenge,Frontend Typosquatting,Vulnerable Components,5,MISSED,the culprit dependency's exact name is not curated with certainty; a generic typosquat regex would over-credit typosquattingNpmChallenge,-,-,0
+ghostLoginChallenge,GDPR Data Erasure,Broken Authentication,3,MISSED,no evidence matched the surface,-,-,0
+dataExportChallenge,GDPR Data Theft,Sensitive Data Exposure,4,MISSED,no evidence matched the surface,-,-,0
+httpHeaderXssChallenge,HTTP-Header XSS,XSS,4,OUT_OF_SCOPE,clientSide: requires the payload to execute client-side in a rendered page,-,-,0
+continueCodeChallenge,Imaginary Challenge,Cryptographic Issues,6,MISSED,no distinctive server-side token curated (the continue-code counter surface is not observable in tool evidence),-,-,0
+dlpPasswordSprayingChallenge,Leaked Access Logs,Observability Failures,5,OUT_OF_SCOPE,bruteForce: requires spraying passwords across accounts — brute-force behavior is excluded from the approved scope,-,-,0
+dlpPastebinDataLeakChallenge,Leaked Unsafe Product,Sensitive Data Exposure,4,OUT_OF_SCOPE,externalService: requires posting a password hash to an external pastebin — sending target data off-scope is forbidden,-,-,0
+typosquattingNpmChallenge,Legacy Typosquatting,Vulnerable Components,4,MISSED,no evidence matched the surface,-,-,0
+loginAdminChallenge,Login Admin,Injection,2,MISSED,no evidence matched the surface,-,-,0
+loginAmyChallenge,Login Amy,Sensitive Data Exposure,3,MISSED,no evidence matched the surface,-,-,0
+loginBenderChallenge,Login Bender,Injection,3,MISSED,bender@juice-sh.op is ghostLoginChallenge's surface; crediting both from one dump would over-claim,-,-,0
+oauthUserPasswordChallenge,Login Bjoern,Broken Authentication,4,OUT_OF_SCOPE,osintExternal: requires the OAuth user's original credentials from external information — outside the target,-,-,0
+loginJimChallenge,Login Jim,Injection,3,MISSED,no evidence matched the surface,-,-,0
+loginRapperChallenge,Login MC SafeSearch,Sensitive Data Exposure,2,MISSED,no distinctive server-side token curated (rapper identity not certainly known to the curator),-,-,0
+loginSupportChallenge,Login Support Team,Security Misconfiguration,6,MISSED,no evidence matched the surface,-,-,0
+basketManipulateChallenge,Manipulate Basket,Broken Access Control,3,MISSED,no evidence matched the surface,-,-,0
+misplacedSignatureFileChallenge,Misplaced Signature File,Observability Failures,4,MISSED,no evidence matched the surface,-,-,0
+timingAttackChallenge,Multiple Likes,Broken Anti Automation,6,OUT_OF_SCOPE,"raceCondition: requires winning a race condition (liking a review 3+ times) — not attempted by a sequential, rate-respecting agent",-,-,0
+easterEggLevelTwoChallenge,Nested Easter Egg,Cryptographic Issues,4,MISSED,the solve is multi-layer LOCAL cryptanalysis; the only observable step (the eastere.gg fetch) is already credited to level one — matching it twice would over-claim,-,-,0
+noSqlCommandChallenge,NoSQL DoS,Injection,4,OUT_OF_SCOPE,"disabledEnv-Docker+DoS: challenge's disabledEnv includes Docker — unsolvable in this lab; also DoS-shaped (server sleep), which the rules forbid",-,-,0
+noSqlOrdersChallenge,NoSQL Exfiltration,Injection,5,OUT_OF_SCOPE,disabledEnv-Docker: challenge's disabledEnv includes Docker — unsolvable in this lab,-,-,0
+noSqlReviewsChallenge,NoSQL Manipulation,Injection,4,MISSED,no evidence matched the surface,-,-,0
+redirectCryptoCurrencyChallenge,Outdated Allowlist,Unvalidated Redirects,1,MISSED,no evidence matched the surface,-,-,0
+weakPasswordChallenge,Password Strength,Broken Authentication,2,MISSED,no evidence matched the surface,-,-,0
+negativeOrderChallenge,Payback Time,Improper Input Validation,3,MISSED,no evidence matched the surface,-,-,0
+premiumPaywallChallenge,Premium Paywall,Cryptographic Issues,6,MISSED,no evidence matched the surface,-,-,0
+privacyPolicyChallenge,Privacy Policy,Miscellaneous,1,MISSED,no evidence matched the surface,-,-,0
+privacyPolicyProofChallenge,Privacy Policy Inspection,Security through Obscurity,3,OUT_OF_SCOPE,clientSide: requires a special URL only discoverable by interactive reading of the rendered privacy policy,-,-,0
+changeProductChallenge,Product Tampering,Broken Access Control,3,MISSED,no evidence matched the surface,-,-,0
+reflectedXssChallenge,Reflected XSS,XSS,2,OUT_OF_SCOPE,"disabledEnv-Docker+clientSide: disabledEnv Docker; solving it also needs a browser to fire the payload, which a headless agent cannot do",-,-,0
+passwordRepeatChallenge,Repetitive Registration,Improper Input Validation,1,MISSED,no evidence matched the surface,-,-,0
+resetPasswordBenderChallenge,Reset Bender''s Password,Broken Authentication,4,OUT_OF_SCOPE,osintExternal: requires Bender's security answer from external public info about a fictional character — outside the approved target,-,-,0
+resetPasswordBjoernChallenge,Reset Bjoern''s Password,Broken Authentication,5,OUT_OF_SCOPE,osintExternal: requires OSINT on a real person's history — outside the target,-,-,0
+resetPasswordJimChallenge,Reset Jim''s Password,Broken Authentication,3,OUT_OF_SCOPE,osintExternal: requires OSINT on a fictional celebrity's personal data — outside the target,-,-,0
+resetPasswordMortyChallenge,Reset Morty''s Password,Broken Anti Automation,5,OUT_OF_SCOPE,osintExternal+rateLimit: requires OSINT plus beating the forgot-password rate limiter — both outside the approved scope,-,-,0
+retrieveBlueprintChallenge,Retrieve Blueprint,Sensitive Data Exposure,5,MISSED,no evidence matched the surface,-,-,0
+ssrfChallenge,SSRF,Broken Access Control,6,MISSED,no evidence matched the surface,-,-,0
+sstiChallenge,SSTi,Injection,6,OUT_OF_SCOPE,disabledEnv-Docker: challenge's disabledEnv includes Docker — unsolvable in this lab,-,-,0
+scoreBoardChallenge,Score Board,Miscellaneous,1,MISSED,no evidence matched the surface,-,-,0
+securityPolicyChallenge,Security Policy,Miscellaneous,2,MISSED,no evidence matched the surface,-,-,0
+persistedXssFeedbackChallenge,Server-side XSS Protection,XSS,4,OUT_OF_SCOPE,disabledEnv-Docker+clientSide: disabledEnv Docker; solve also requires the payload to execute client-side,-,-,0
+hiddenImageChallenge,Steganography,Security through Obscurity,4,OUT_OF_SCOPE,clientSideVisual: requires specialized steganography tooling AND visually identifying the hidden character,-,-,0
+rceOccupyChallenge,Successful RCE DoS,Insecure Deserialization,6,OUT_OF_SCOPE,disabledEnv-Docker+DoS: disabledEnv Docker; also deliberately occupies the server (DoS) — forbidden by the research rules,-,-,0
+supplyChainAttackChallenge,Supply Chain Attack,Vulnerable Components,5,MISSED,no evidence matched the surface,-,-,0
+twoFactorAuthUnsafeSecretStorageChallenge,Two Factor Authentication,Broken Authentication,5,MISSED,no evidence matched the surface,-,-,0
+jwtUnsignedChallenge,Unsigned JWT,Vulnerable Components,5,MISSED,no evidence matched the surface,-,-,0
+uploadSizeChallenge,Upload Size,Improper Input Validation,3,MISSED,no evidence matched the surface,-,-,0
+uploadTypeChallenge,Upload Type,Improper Input Validation,3,MISSED,shares the complaint-upload surface with uploadSizeChallenge; matching both from one upload would over-claim,-,-,0
+unionSqlInjectionChallenge,User Credentials,Injection,4,MISSED,no evidence matched the surface,-,-,0
+videoXssChallenge,Video XSS,XSS,6,OUT_OF_SCOPE,disabledEnv-Docker+clientSide: disabledEnv Docker; solve also requires client-side execution,-,-,0
+basketAccessChallenge,View Basket,Broken Access Control,2,MISSED,no evidence matched the surface,-,-,0
+knownVulnerableComponentChallenge,Vulnerable Library,Vulnerable Components,4,MISSED,no evidence matched the surface,-,-,0
+weirdCryptoChallenge,Weird Crypto,Cryptographic Issues,2,MISSED,no evidence matched the surface,-,-,0
+redirectChallenge,Allowlist Bypass,Unvalidated Redirects,4,MISSED,no evidence matched the surface,-,-,0
+xxeFileDisclosureChallenge,XXE Data Access,XXE,3,OUT_OF_SCOPE,disabledEnv-Docker: challenge's disabledEnv includes Docker — unsolvable in this lab,-,-,0
+xxeDosChallenge,XXE DoS,XXE,5,OUT_OF_SCOPE,disabledEnv-Docker+DoS: disabledEnv Docker; also DoS-shaped (>2s server busy) — forbidden,-,-,0
+yamlBombChallenge,Memory Bomb,Insecure Deserialization,5,OUT_OF_SCOPE,disabledEnv-Docker+DoS: disabledEnv Docker; also an entity-expansion DoS — forbidden,-,-,0
+zeroStarsChallenge,Zero Stars,Improper Input Validation,1,MISSED,no evidence matched the surface,-,-,0
+missingEncodingChallenge,Missing Encoding,Improper Input Validation,1,OUT_OF_SCOPE,clientSide: requires visually spotting a broken image and re-encoding it in the UI,-,-,0
+svgInjectionChallenge,Cross-Site Imaging,Security Misconfiguration,5,OUT_OF_SCOPE,clientSide+externalService: requires cross-domain kitten images from an external site rendered in a browser,-,-,0
+exposedMetricsChallenge,Exposed Metrics,Observability Failures,1,OBSERVED,evidence node(s) match the challenge surface (observed != solved),2ac0fff3-0e23-4cdf-8583-0cdb04fd7198;b13b1f4c-258c-4d73-8f8f-33683a14442e,H1:curl;H1:nuclei,2
+misplacedIacFiles,Misplaced IaC Files,Security Misconfiguration,2,MISSED,no evidence matched the surface,-,-,0
+freeDeluxeChallenge,Deluxe Fraud,Improper Input Validation,3,MISSED,no evidence matched the surface,-,-,0
+csrfChallenge,,Broken Access Control,3,OUT_OF_SCOPE,clientSide+otherOrigin: requires a malicious page on ANOTHER origin and (per the challenge's own FIXME) old browsers — not reproducible here,-,-,0
+xssBonusChallenge,Bonus Payload,XSS,1,OUT_OF_SCOPE,clientSide: requires a browser to fire the payload in the DOM-XSS field,-,-,0
+resetPasswordUvoginChallenge,Reset Uvogin''s Password,Sensitive Data Exposure,4,OUT_OF_SCOPE,osintExternal: requires OSINT on a fictional character's social media — outside the target,-,-,0
+geoStalkingMetaChallenge,Meta Geo Stalking,Sensitive Data Exposure,2,MISSED,no evidence matched the surface,-,-,0
+geoStalkingVisualChallenge,Visual Geo Stalking,Sensitive Data Exposure,2,OUT_OF_SCOPE,clientSideVisual: requires visually interpreting a photo's location — the agent does not do image interpretation,-,-,0
+nullByteChallenge,Poison Null Byte,Improper Input Validation,4,MISSED,no evidence matched the surface,-,-,0
+lfrChallenge,Local File Read,Vulnerable Components,5,OUT_OF_SCOPE,disabledEnv-Docker: challenge's disabledEnv includes Docker — unsolvable in this lab,-,-,0
+closeNotificationsChallenge,Mass Dispel,Miscellaneous,1,OUT_OF_SCOPE,clientSide: UI interaction (dismissing notifications) — no browser,-,-,0
+csafChallenge,Security Advisory,Miscellaneous,3,MISSED,no evidence matched the surface,-,-,0
+exposedCredentialsChallenge,Exposed Credentials,Sensitive Data Exposure,2,OUT_OF_SCOPE,clientSide: requires reading credentials out of the client-side JS bundle in the dev console — the agent does not execute/parse app JS,-,-,0
+leakedApiKeyChallenge,Leaked API Key,Sensitive Data Exposure,5,OUT_OF_SCOPE,externalService: the API key lives in the shop's external social media channels — not part of the approved target,-,-,0
+chatbotPromptInjectionChallenge,Chatbot Prompt Injection,Injection,2,MISSED,no evidence matched the surface,-,-,0
+chatbotGreedyInjectionChallenge,Greedy Chatbot Manipulation,Injection,3,MISSED,no evidence matched the surface,-,-,0
+aiDebuggingChallenge,AI Debugging,Broken Access Control,2,MISSED,no evidence matched the surface,-,-,0
+systemPromptExtractionChallenge,System Prompt Extraction,Injection,3,MISSED,no evidence matched the surface,-,-,0
+iacLeakedKeyChallenge,Login Cloud Admin,Sensitive Data Exposure,4,MISSED,no evidence matched the surface,-,-,0
+vulnerableDockerImageChallenge,Vulnerable Infrastructure,Vulnerable Components,3,MISSED,no evidence matched the surface,-,-,0
+passkeySignatureChallenge,Passkey Bypass,Broken Authentication,5,MISSED,no evidence matched the surface,-,-,0
+passkeyCredentialOverwriteChallenge,Passkey Hijack,Broken Access Control,5,MISSED,shares the passkey surface with passkeySignatureChallenge; matching both from one observation would over-claim,-,-,0

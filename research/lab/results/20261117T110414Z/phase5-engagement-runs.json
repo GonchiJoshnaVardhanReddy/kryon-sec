@@ -1,0 +1,24 @@
+{
+  "when": "20261117T110414Z",
+  "target": "juice-shop.lab",
+  "modes_requested": [
+    "full"
+  ],
+  "runs": [
+    {
+      "mode": "full",
+      "engagement_id": "lab-p5-full-20261117T110414Z",
+      "label": "FAILED",
+      "stage": "plumbing_check",
+      "detail": {
+        "ok": false,
+        "summary": "10/10 passed",
+        "exit_code": 0,
+        "stdout_tail": "ress.establish - ok\nPASS egress.verify_before_spawns - ok\nPASS target.http_get_200 - exit=0 status='200'\nPASS target.app_version - {\"version\":\"20.4.0-SNAPSHOT\"}\nPASS dns.pinned_resolver_serves_lab_record - exit=0 NOERROR=True answer_10.213.43.10=True\nPASS egress.unrelated_destination_dropped - exit=28 (28 = dropped at the boundary)\nPASS egress.resolver_port80_dropped - exit=28\nPASS egress.public_resolver_dns_dropped - exit=9 (must NOT get a NOERROR answer)\nPASS egress.verify_after_spawns - ok\nPASS egress.release - ok\nresults written: /mnt/d/project/kryon-sec/research/lab/plumbing-results.json\n",
+        "stderr_tail": ""
+      }
+    }
+  ],
+  "approval_note": "full runs are automation-injected (non-human) approvals; Gate 3 always refused",
+  "honest_note": "infrastructure success is NOT detection performance; scoring is Phase 6 against the recorded ground truth"
+}

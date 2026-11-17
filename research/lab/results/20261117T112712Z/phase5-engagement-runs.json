@@ -1,0 +1,17 @@
+{
+  "when": "20261117T112712Z",
+  "target": "juice-shop.lab",
+  "modes_requested": [
+    "llm-off"
+  ],
+  "runs": [
+    {
+      "mode": "llm-off",
+      "label": "FAILED",
+      "stage": "harness",
+      "detail": "ValueError: authorizing 'github.com': resolution failed ([Errno -3] Temporary failure in name resolution)"
+    }
+  ],
+  "approval_note": "full runs are automation-injected (non-human) approvals; Gate 3 always refused",
+  "honest_note": "infrastructure success is NOT detection performance; scoring is Phase 6 against the recorded ground truth"
+}

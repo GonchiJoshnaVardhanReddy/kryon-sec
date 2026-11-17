@@ -198,4 +198,6 @@ The digest-pinned references used by `lab-up.sh` live in `images/`.
   evidence) and is never shared between runs.
 - Full teardown incl. images: `docker rmi` the pinned references above.
 - Re-verify after any change: `KRYONSEC_HOME=/home/dev/.kryonsec-selftest
-  ~/venvs/kryonsec-batch1/bin/python plumbing_check.py` → must be 9/9.
+  ~/venvs/kryonsec-batch1/bin/python plumbing_check.py` → every check
+  REAL (the check list grows between phases; the invariant is "all
+  REAL", not a fixed count — 10/10 as of 2026-11-17).
