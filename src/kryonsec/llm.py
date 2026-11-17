@@ -371,6 +371,83 @@ class LlmUnavailable(RuntimeError):
     """No LLM provider could serve the request."""
 
 
+# ---- real provider-usage capture (Phase 5 research) --------------------------
+# Every completion _complete() makes appends its provider-reported usage here,
+# so the LLM engagement states can accrue REAL token/cost figures instead of
+# local estimates. Bounded: only the most recent records are kept — a caller
+# attributes its call window by draining the records appended during that
+# window, never by walking history.
+_usage_log: list[dict] = []
+_USAGE_LOG_LIMIT = 64
+
+
+def _append_usage_record(record: dict) -> None:
+    _usage_log.append(record)
+    if len(_usage_log) > _USAGE_LOG_LIMIT:
+        del _usage_log[:-_USAGE_LOG_LIMIT]
+
+
+def usage_log() -> list[dict]:
+    """Captured provider-usage records, oldest first (a defensive copy)."""
+    return list(_usage_log)
+
+
+def clear_usage_log() -> None:
+    """Forget captured usage (tests; keeps per-state attribution exact)."""
+    _usage_log.clear()
+
+
+def llm_disabled() -> bool:
+    """KRYONSEC_DISABLE_LLM=1 means: make zero LLM calls — the LLM-off
+    baseline control. The live call sites raise LlmUnavailable instead, so
+    the affected states fail AUDITED (hypothesize_failed /
+    blue_team_failed), never silently."""
+    return os.environ.get("KRYONSEC_DISABLE_LLM", "").strip().lower() not in (
+        "", "0", "false", "no")
+
+
+def _capture_usage(model: str, resp: Any) -> None:
+    """Record REAL provider-reported usage for one completed call.
+
+    A response without a usage object records nothing (the caller falls
+    back to its clearly-labelled local estimate); a model the cost map
+    cannot price records cost=None — unknown, never invented.
+    """
+    try:
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total = getattr(usage, "total_tokens", None)
+        if total is None:
+            if prompt_tokens is None or completion_tokens is None:
+                return
+            total = prompt_tokens + completion_tokens
+        record = {
+            "model": model,  # kryonsec's id, not the routed one
+            "routed_model": getattr(resp, "model", None),
+            "prompt_tokens": (
+                int(prompt_tokens) if prompt_tokens is not None else None),
+            "completion_tokens": (
+                int(completion_tokens)
+                if completion_tokens is not None else None),
+            "total_tokens": int(total),
+            "cost_usd": None,
+        }
+        try:
+            import litellm
+
+            cost = litellm.completion_cost(completion_response=resp)
+            if cost is not None:
+                record["cost_usd"] = float(cost)
+        except Exception:
+            pass  # unpriced model — cost stays unknown
+        _append_usage_record(record)
+    except Exception as e:  # usage capture must never break a good call
+        log.debug("usage capture failed (ignored): %s", e)
+
+
 def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: Any) -> str:
     """Call litellm.completion; return the assistant text.
 
@@ -411,6 +488,7 @@ def _complete(cfg: KryonsecConfig, model: str, messages: list[dict], **kwargs: A
         # may quote the Authorization header back at us.
         log.warning("LLM call failed for %s: %s", model, scrub_secrets(str(e)))
         raise
+    _capture_usage(model, resp)
     try:
         return resp.choices[0].message.content or ""
     except (AttributeError, IndexError) as e:
@@ -722,6 +800,8 @@ def chat(
     allowed upstream when no local model is up — but it still takes the local
     route when one is, and it never gets the same-provider retry.
     """
+    if llm_disabled():
+        raise LlmUnavailable("LLM disabled by KRYONSEC_DISABLE_LLM")
     if local_only:
         # Try the local model; a dead local is a hard error, not a fallback.
         try:
@@ -803,6 +883,25 @@ def chat(
     raise LlmUnavailable(
         f"no {hosted.label} model answered — {provider_reason(last_error)}"
     )
+
+
+def chat_with_usage(
+    cfg: KryonsecConfig,
+    messages: list[dict],
+    model: str,
+    **kwargs: Any,
+) -> tuple[str, list[dict]]:
+    """chat() plus the REAL usage records this call appended.
+
+    Returns (text, records): the provider-usage records appended during
+    THIS call — zero when the call failed or the provider sent no usage
+    object, more than one when a fallback or repair retry also completed.
+    Every record's token counts are provider-reported (REAL); cost_usd is
+    present only when the provider's cost map could price the model.
+    """
+    start = len(_usage_log)
+    text = chat(cfg, messages, model, **kwargs)
+    return text, _usage_log[start:]
 
 
 def compaction_model_for(cfg: KryonsecConfig, secrets_present: bool) -> str:
