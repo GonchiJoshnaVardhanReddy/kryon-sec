@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
+# PEP 639 (license as an SPDX string) needs setuptools >= 77; older
+# setuptools would treat the string `license` as an error.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +10,14 @@ version = "1.3.11"
 description = "Single-user CLI cybersecurity platform: conversational copilot + deterministic purple-team engine"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" }
+# PEP 639 SPDX string form. Empirically verified against setuptools>=77
+# (Phase 7 preflight): the old table form `license = { text = "Proprietary" }`
+# still builds but emits a SetuptoolsDeprecationWarning on every build
+# (removal deadline 2027-Feb-18), the bare string "Proprietary" is rejected
+# outright because it is not a valid SPDX expression, and
+# "LicenseRef-Proprietary" builds cleanly to `License-Expression:
+# LicenseRef-Proprietary`. Guarded by tests/test_packaging.py.
+license = "LicenseRef-Proprietary"
 dependencies = [
     "litellm>=1.40",
     "pydantic>=2.6",

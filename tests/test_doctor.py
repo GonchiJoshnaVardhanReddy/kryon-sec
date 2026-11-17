@@ -205,3 +205,40 @@ def test_doctor_no_provider_at_all_is_a_failure(monkeypatch, tmp_path, capsys):
     rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
     assert rc == 1
     assert "FAIL — Profile 1" in capsys.readouterr().out
+
+
+# ---- fresh-machine default provider honesty (Phase 7) -----------------------
+
+def test_fresh_machine_names_the_builtin_default_it_checked(monkeypatch, tmp_path, capsys):
+    """No config file yet: doctor still checks the BUILT-IN default
+    provider (openai), which fails with no key. A reader who never
+    configured anything must not read that FAIL as a mistake they made —
+    the row has to say the checked provider is the built-in default and
+    point at `kryonsec setup`."""
+    import re
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(doctor, "_check_storage", lambda c: (True, "OK (SQLite)"))
+    _wide_console(monkeypatch)
+    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    assert rc == 1  # an unconfigured fresh machine is not yet usable — honest
+    assert "OPENAI_API_KEY not set" in out
+    assert "built-in default" in out
+    assert "kryonsec setup" in out
+
+
+def test_configured_openai_failure_does_not_claim_builtin_default(monkeypatch, tmp_path, capsys):
+    """When a config file actually selected openai, the failure is about
+    the user's own key — the 'built-in default' note must not appear, or
+    it would accuse the user of a choice they did not make."""
+    from kryonsec.config import config_path, write_config
+
+    write_config(config_path(tmp_path), {"llm": {"provider": "openai"}})
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _wide_console(monkeypatch)
+    rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "built-in default" not in out
+    assert "OPENAI_API_KEY not set" in out

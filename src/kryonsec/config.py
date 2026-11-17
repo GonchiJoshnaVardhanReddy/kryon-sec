@@ -254,6 +254,13 @@ class KryonsecConfig:
     )
 
     # --- LLM routing (spec §7.1) ---
+    # Built-in default BEFORE `kryonsec setup` has run — NOT a recommendation.
+    # A fresh machine with no config file fails the OpenAI row in
+    # `kryonsec doctor` on purpose; doctor now says the default is being
+    # checked and points at `kryonsec setup` (local Ollama needs no key).
+    # Do not silently switch this default to ollama instead: a machine
+    # without Ollama installed would then fail a row it never chose, which
+    # is exactly as confusing in the other direction.
     provider: str = "openai"  # "openai" | "ollama" | "bedrock" | "openai_compatible"
     general_chat_model: str = "ollama/llama3.1"
     general_search_model: str = "gpt-4o-mini"

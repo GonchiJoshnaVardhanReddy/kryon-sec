@@ -107,3 +107,50 @@ def test_nuclei_manifest_not_orphaned_under_the_parent_key():
         "adapter would still load the purple one and the parent copy "
         "would ship needlessly"
     )
+
+
+def _build_requires() -> list[str]:
+    with PYPROJECT.open("rb") as fh:
+        data = tomllib.load(fh)
+    return data["build-system"]["requires"]
+
+
+def test_license_uses_the_pep639_spdx_string_form():
+    """Phase 7 (verified empirically against setuptools>=77): the
+    deprecated ``license = { text = ... }`` table builds but warns on
+    every build with a 2027-Feb-18 removal deadline, and the bare string
+    ``"Proprietary"`` fails the build outright because it is not a valid
+    SPDX expression. The working form is the LicenseRef- string, which
+    produces ``License-Expression: LicenseRef-Proprietary`` in wheel
+    metadata."""
+    with PYPROJECT.open("rb") as fh:
+        data = tomllib.load(fh)
+    license_value = data["project"]["license"]
+    assert isinstance(license_value, str), (
+        "license must be a PEP 639 SPDX string; the "
+        "{ text = ... } table form is deprecated in setuptools and "
+        "scheduled for removal (2027-Feb-18)"
+    )
+    assert license_value.startswith("LicenseRef-"), (
+        f"license {license_value!r} is not a valid SPDX expression — "
+        "bare non-SPDX names such as 'Proprietary' fail the build "
+        "(verified with setuptools>=77); use 'LicenseRef-...'"
+    )
+
+
+def test_build_system_requires_setuptools_77_for_pep639_license():
+    """The SPDX string form of ``license`` is only understood by
+    setuptools >= 77; an older build pin turns the fix above back into a
+    build error."""
+    for requirement in _build_requires():
+        if isinstance(requirement, str) and requirement.startswith("setuptools>="):
+            major = int(requirement.split(">=")[1].split(".")[0])
+            assert major >= 77, (
+                "PEP 639 license strings need setuptools >= 77 in "
+                f"build-system.requires (found {requirement})"
+            )
+            return
+    raise AssertionError(
+        "build-system.requires does not pin setuptools>=77; the PEP 639 "
+        "license string would fail on older setuptools"
+    )
