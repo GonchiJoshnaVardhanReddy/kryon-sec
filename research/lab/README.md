@@ -4,15 +4,24 @@ Disposable, operator-owned Docker lab for the Phase 2–6 experiments.
 Infrastructure only lives here; security-tool runs happen only against
 the operator-approved scope below.
 
-## Status (2026-11-17 — Phase 4 complete)
+## Status (2026-11-17 — Phases 5–6 complete)
 
 - Scope: **APPROVED** by the operator (with the Nuclei template hosts).
-- Plumbing: **GREEN — 9/9 REAL checks** (`plumbing_check.py`, results in
-  `plumbing-results.json`): the approved target is reachable through
-  Kryonsec's REAL path (EgressGate → KaliSandbox runsc spawn), the
-  pinned resolver serves the lab record, unrelated destinations are
-  dropped at the network layer, and the boundary verifies before and
-  after spawns and releases cleanly.
+- Plumbing: **GREEN — all REAL checks** (`plumbing_check.py`, results in
+  `plumbing-results.json`; 10 checks as of 2026-11-17): the approved
+  target is reachable through Kryonsec's REAL path (EgressGate →
+  KaliSandbox runsc spawn), the pinned resolver serves the lab record,
+  unrelated destinations are dropped at the network layer, and the
+  boundary verifies before and after spawns and releases cleanly.
+- Phases 5–6 (real engagements + missed/FP scoring): **COMPLETE** —
+  one full engagement + one LLM-off baseline through the REAL product
+  path (`_run_purple`), both audit-chain-verified, plus deterministic
+  scoring against the 118-challenge ground truth. Headline: full run
+  **2 OBSERVED / 0 CONFIRMED / 0 false positives / 78 in-scope MISSED**,
+  baseline **1 / 0 / 0 / 79**; REAL provider-billed LLM usage recorded
+  (2 calls, 4,832 tokens, $0.13353). Full detail, method, egress-gate
+  and sudoers implications, and honest interpretation:
+  **`PHASE5-6-REPORT.md`** in this directory.
 - Phase 4 (per-tool REAL-path runs): **COMPLETE — 11 REAL runs all
   exit 0 + 1 SKIPPED, 0 harness failures** in the final recorded run
   `results/20261117T095324Z/phase4-tool-runs.json` (naabu, nmap, dnsx,
