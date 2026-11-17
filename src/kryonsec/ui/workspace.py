@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable
 from ..config import KryonsecConfig
 from ..copilot.session import GeneralSession
 from ..secrets import redact
+from . import questions as _questions
 from .session_store import EngagementStore, EngagementTab, SessionStore, SessionTab
 from .state import (
     ApprovalGate,
@@ -39,6 +40,15 @@ log = logging.getLogger(__name__)
 
 class OperationCancelled(Exception):
     """Raised from an observation callback at a safe boundary."""
+
+
+# Purple commands that stay usable while an engagement is running.  A
+# question in plain text also stays usable (it is routed before this gate).
+# Deliberately EXCLUDED: /mode (its handler clears self.busy, which would
+# lie about an active engagement) and /rename (Phase 2) and /engage.
+_PURPLE_BUSY_SAFE: frozenset[str] = frozenset(
+    {"/help", "/quit", "/exit", "/sessions", "/report", "quit", "exit", "q"}
+)
 
 
 @dataclass
@@ -114,6 +124,14 @@ class WorkspaceController:
         self.mode_holder = ["copilot"]
         self.notice = ""
         self.busy = False
+        # True for the whole life of a live engagement run — set when the
+        # worker starts, cleared when it ends.  Unlike `busy` it is never
+        # touched by the /mode presentation hack, so it is the honest
+        # "is an engagement running" answer used to refuse /engage.
+        self.engagement_running = False
+        # One question may be answered at a time; a second is refused with
+        # a notice rather than queued or dropped silently.
+        self._question_in_flight = False
         self.stop_requested = False
         self.approval: ApprovalGate | None = None
         self.transient: dict[int, list[DisplayMessage]] = {}
@@ -231,31 +249,42 @@ class WorkspaceController:
         self._changed("tabs")
 
     def rename_session(self, index: int, name: str) -> bool:
-        """Give one Copilot session a display title.
+        """Give one tab a display title — Mode A sessions and Mode B tabs.
 
-        Renaming changes presentation only: the stored message history,
-        record id, and timestamps are untouched. ``EngagementTab`` titles in
-        Mode B derive from immutable engagement records, so rename is scoped
-        to Mode A. Returns True when the rename was applied.
+        Renaming changes presentation only.  Mode A: the stored message
+        history, record id, and timestamps are untouched.  Mode B: the
+        engagement id, the recorded target, and every audit event are
+        untouched; the title is stored as display_title.json beside the
+        audit chain.  Returns True when the rename was applied.
         """
-        if self.mode != "copilot":
-            self.notify(
-                "Engagement tabs keep their immutable identifiers; only Copilot sessions can be renamed."
-            )
-            return False
-        if not (0 <= index < len(self.sessions)):
-            return False
         cleaned = " ".join(str(name or "").split())
         if not cleaned:
-            self.notify("Session name cannot be empty.")
+            self.notify("Name cannot be empty.")
             return False
-        tab = self.sessions[index]
+        if self.mode == "copilot":
+            if not (0 <= index < len(self.sessions)):
+                return False
+            tab = self.sessions[index]
+            tab.custom_title = cleaned[:120]
+            if tab.session.messages:
+                try:
+                    self.session_store.save(tab)
+                except Exception as exc:
+                    self.notify(f"Renamed in view, but storage failed: {safe(exc, 200)}")
+            self._changed("tabs")
+            return True
+        if not (0 <= index < len(self.engagements)):
+            return False
+        tab = self.engagements[index]
         tab.custom_title = cleaned[:120]
-        if tab.session.messages:
+        if tab.path is not None:
             try:
-                self.session_store.save(tab)
+                if not self.engagement_store.rename(tab.engagement_id, tab.custom_title):
+                    self.notify("Renamed in view, but the engagement folder could not be updated.")
             except Exception as exc:
                 self.notify(f"Renamed in view, but storage failed: {safe(exc, 200)}")
+        # A live engagement tab has no directory yet; the title rides in
+        # memory and is re-stored when the run finishes (start_engagement).
         self._changed("tabs")
         return True
 
@@ -344,8 +373,10 @@ class WorkspaceController:
     async def switch_mode(self) -> None:
         from ..tui import set_mode
 
-        if self.busy:
-            self.notify("Mode switching is disabled until the active operation reaches a safe boundary.")
+        if self.busy or self.engagement_running:
+            self.notify(
+                "Mode switching is disabled until the active operation reaches a safe boundary."
+            )
             return
         target = "purple" if self.mode == "copilot" else "copilot"
         notice_holder = [self.notice]
@@ -385,7 +416,25 @@ class WorkspaceController:
         value = (text or "").strip()
         if not value:
             return
+        command = value.lower()
+        # A plain sentence while an engagement view is open is a read-only
+        # question about that engagement.  It never starts, stops, or
+        # changes an engagement, and it is deliberately allowed while the
+        # engagement is busy: the worker thread keeps running.
+        if (
+            self.mode == "purple"
+            and self.purple_view is not None
+            and not command.startswith("/")
+            and command not in ("quit", "exit", "q")
+        ):
+            await self._answer_purple_question(value)
+            return
         if self.busy:
+            # A small allowlist of purple commands stays available while an
+            # engagement runs; everything else waits for a safe boundary.
+            if self.mode == "purple" and command in _PURPLE_BUSY_SAFE:
+                await self._dispatch_purple(value)
+                return
             self.notify("The current operation is still running.")
             return
         self.busy = True
@@ -432,6 +481,17 @@ class WorkspaceController:
             return
         if command == "/workspace":
             self._add_transient("system", str(self.cfg.workspace))
+            return
+        if command == "/rename" or command.startswith("/rename "):
+            name = text.partition(" ")[2].strip()
+            if not name:
+                self._add_transient(
+                    "system",
+                    "Use /rename <new name> to title the current session "
+                    "(Ctrl+P → Rename opens a dialog).",
+                )
+                return
+            self.rename_session(self.session_index, name)
             return
         if command.startswith("/cve "):
             await self._command_cve(text[5:].strip())
@@ -674,6 +734,45 @@ class WorkspaceController:
 
     # ---- Purple dispatch ----------------------------------------------
 
+    async def _answer_purple_question(self, question: str) -> None:
+        """Answer one read-only question about the open engagement.
+
+        This cannot start an engagement, run a tool, or change the workflow:
+        it reads only the presentation snapshot the state object already
+        reduced from real audit events, and asks the chat model to explain
+        it with no tools attached.  Serialized: one answer at a time, and
+        a second question is refused with an honest notice.
+        """
+        view = self.purple_view
+        if view is None:
+            return
+        if self._question_in_flight:
+            view.on_notice(
+                "One question at a time — the previous answer is still being prepared."
+            )
+            self._changed("activity")
+            return
+        self._question_in_flight = True
+        try:
+            view.add_question(question)
+            snapshot = view.snapshot()
+            self._changed("activity")
+            try:
+                answer = await asyncio.to_thread(
+                    _questions.answer_question, self.cfg, snapshot, question
+                )
+            except Exception as exc:
+                # Presentation must never break the engagement; the
+                # deterministic summary is still a real, bounded answer.
+                answer = (
+                    f"(local summary — the answer helper failed: {type(exc).__name__})\n"
+                    + _questions.engagement_plain_summary(snapshot)
+                )
+            view.add_answer(question, answer)
+        finally:
+            self._question_in_flight = False
+        self._changed("activity")
+
     async def _dispatch_purple(self, text: str) -> None:
         command = text.lower()
         if command in ("/quit", "/exit", "exit", "quit", "q"):
@@ -682,15 +781,59 @@ class WorkspaceController:
         if command == "/help":
             self._add_transient(
                 "system",
-                "Purple Team: type an authorized target to start. /mode returns to Copilot. /quit exits.",
+                "Purple Team: /engage <target> to start · ask any question in plain text · "
+                "/report [open] · /sessions · /mode · /quit. While an engagement runs: "
+                "questions, /help, /report, /sessions and /quit still work.",
             )
             return
         if command == "/mode":
+            if self.engagement_running:
+                # Never let the busy-clearing hack below run while a worker
+                # thread is live: switching modes mid-engagement would
+                # orphan the run's presentation state.
+                self.notify(
+                    "An engagement is still running; wait for it to finish before switching modes."
+                )
+                return
             self.busy = False
             await self.switch_mode()
             return
         if command.startswith("/theme"):
             await self._handle_theme(text)
+            return
+        if command == "/engage" or command.startswith("/engage "):
+            target = text.partition(" ")[2].strip()
+            if self.engagement_running:
+                self.notify(
+                    "An engagement is already running; wait for it to finish, then use /engage again."
+                )
+                return
+            if not target:
+                self._add_transient(
+                    "system", "Use /engage <authorized target> to start a new engagement."
+                )
+                return
+            await self.start_engagement(target)
+            return
+        if command == "/report" or command.startswith("/report "):
+            await self._show_report(text)
+            return
+        if command == "/rename" or command.startswith("/rename "):
+            name = text.partition(" ")[2].strip()
+            if self.engagement_index is None:
+                self._add_transient(
+                    "system", "Open an engagement tab first — there is nothing to rename."
+                )
+                return
+            if not name:
+                self._add_transient(
+                    "system",
+                    "Use /rename <new name> to title the current engagement tab "
+                    "(Ctrl+P → Rename opens a dialog). The engagement id and its "
+                    "record stay untouched.",
+                )
+                return
+            self.rename_session(self.engagement_index, name)
             return
         if command == "/sessions":
             try:
@@ -704,7 +847,45 @@ class WorkspaceController:
         if command.startswith("/"):
             self._add_transient("system", "That command is not available in Purple Team mode.")
             return
+        # Plain text with no engagement view open starts an engagement
+        # (the placeholder screen's documented behaviour).  With a view
+        # open, plain text never reaches here — submit() routes it to the
+        # read-only question path instead.
         await self.start_engagement(text.strip())
+
+    async def _show_report(self, text: str) -> None:
+        """Tell the operator where the report is, optionally open it."""
+        view = self.purple_view
+        path = (view.report_path if view is not None else None) or ""
+        parts = text.split()
+        want_open = len(parts) > 1 and parts[1].lower() == "open"
+        if not path:
+            self._add_transient("system", "No report has been saved for this engagement yet.")
+            return
+        if want_open:
+            opened = await asyncio.to_thread(self._open_report_in_browser, path)
+            if not opened:
+                self._add_transient(
+                    "system", f"Could not open the report; it is saved at: {path}"
+                )
+                return
+            self._add_transient("system", f"Opened report: {path}")
+            return
+        self._add_transient("system", f"Report saved at: {path}")
+
+    @staticmethod
+    def _open_report_in_browser(target: str) -> bool:
+        """Open one saved report file; a failure is reported, never faked."""
+        try:
+            import webbrowser
+            from pathlib import Path
+
+            path = Path(target).expanduser().resolve()
+            if not path.is_file():
+                return False
+            return bool(webbrowser.open(path.as_uri()))
+        except Exception:
+            return False
 
     async def start_engagement(self, target: str) -> None:
         # The runner performs the authoritative target, license, sandbox, and
@@ -757,21 +938,35 @@ class WorkspaceController:
                 log.exception("full-screen Purple engagement failed")
                 return 1
 
-        code = await asyncio.to_thread(worker)
+        self.engagement_running = True
         try:
-            refreshed = await asyncio.to_thread(self.engagement_store.list_tabs)
-        except Exception:
-            refreshed = []
-        for record in refreshed:
-            if record.engagement_id == engagement_id:
-                self.engagements[0] = record
-                break
-        if view.outcome is None and code != 0:
-            view.finish("failed", halt_reason=f"exit_{code}")
-        if self.engagements:
-            self.engagements[0].status = view.outcome or "running"
-            self.engagements[0].last_state = view.current_state
-        self._changed("purple")
+            code = await asyncio.to_thread(worker)
+            try:
+                refreshed = await asyncio.to_thread(self.engagement_store.list_tabs)
+            except Exception:
+                refreshed = []
+            for record in refreshed:
+                if record.engagement_id == engagement_id:
+                    # An operator-given display title survives the run: the
+                    # refreshed record is re-read from disk, so re-apply it
+                    # and re-store it now that the directory exists.
+                    previous_title = self.engagements[0].custom_title
+                    if previous_title:
+                        record.custom_title = previous_title
+                        try:
+                            self.engagement_store.rename(engagement_id, previous_title)
+                        except Exception:
+                            pass
+                    self.engagements[0] = record
+                    break
+            if view.outcome is None and code != 0:
+                view.finish("failed", halt_reason=f"exit_{code}")
+            if self.engagements:
+                self.engagements[0].status = view.outcome or "running"
+                self.engagements[0].last_state = view.current_state
+            self._changed("purple")
+        finally:
+            self.engagement_running = False
 
     def load_engagement_view(self, tab: EngagementTab) -> None:
         view = _LivePurpleState(

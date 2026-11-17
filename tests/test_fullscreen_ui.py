@@ -698,13 +698,81 @@ def test_rename_screen_prepopulates_and_confirms(workspace):
     asyncio.run(scenario())
 
 
-def test_rename_refused_in_purple_mode(workspace, monkeypatch):
-    monkeypatch.setattr(
-        "kryonsec.purple.runner.sandbox_available", lambda image: (True, "test")
-    )
+def test_rename_engagement_tab_display_title_only(workspace):
+    """Phase 2: engagement tabs get an operator display title.
+
+    The rename is presentation-only: the engagement id, the recorded
+    target, and the audit chain bytes are untouched; the title is stored
+    beside the chain and read back by the store.
+    """
+    import json
+
+    from kryonsec.ui.session_store import EngagementTab
+
     workspace.mode_holder[0] = "purple"
-    assert workspace.rename_session(0, "nope") is False
-    assert "immutable" in workspace.notice
+    engagement_dir = workspace.cfg.home / "engagements" / "abcd1234"
+    engagement_dir.mkdir(parents=True)
+    audit_path = engagement_dir / "audit.jsonl"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "event": "engagement_created",
+                "target": "example.com",
+                "timestamp": "2026-11-18T00:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audit_before = audit_path.read_bytes()
+    tab = EngagementTab(
+        engagement_id="abcd1234", target="example.com", path=engagement_dir
+    )
+    workspace.engagements = [tab]
+    workspace.engagement_index = 0
+
+    assert workspace.rename_session(0, "Web app check") is True
+    assert tab.custom_title == "Web app check"
+    assert tab.title == "Web app check"
+    # immutable identifiers and the chain are untouched
+    assert tab.engagement_id == "abcd1234"
+    assert tab.target == "example.com"
+    assert audit_path.read_bytes() == audit_before
+    # the title is stored beside the chain and read back on the next load
+    stored = (engagement_dir / "display_title.json").read_text(encoding="utf-8")
+    assert "Web app check" in stored
+    reloaded = EngagementStore(workspace.cfg).list_tabs()
+    assert reloaded[0].custom_title == "Web app check"
+    assert reloaded[0].target == "example.com"
+
+
+def test_rename_engagement_without_directory_keeps_view_title(workspace):
+    """A live tab (no folder yet) takes the title in memory only."""
+    from kryonsec.ui.session_store import EngagementTab
+
+    workspace.mode_holder[0] = "purple"
+    tab = EngagementTab(engagement_id="livebeef", target="example.com", path=None)
+    workspace.engagements = [tab]
+    workspace.engagement_index = 0
+    assert workspace.rename_session(0, "Running check") is True
+    assert tab.custom_title == "Running check"
+    assert not (workspace.cfg.home / "engagements").exists()
+
+
+def test_rename_engagement_empty_name_refused(workspace):
+    from kryonsec.ui.session_store import EngagementTab
+
+    workspace.mode_holder[0] = "purple"
+    tab = EngagementTab(engagement_id="abcd1234", target="example.com", path=None)
+    workspace.engagements = [tab]
+    workspace.engagement_index = 0
+    assert workspace.rename_session(0, "   ") is False
+    assert tab.custom_title is None
+
+
+def test_rename_engagement_unknown_index_refused(workspace):
+    workspace.mode_holder[0] = "purple"
+    assert workspace.rename_session(3, "nope") is False
 
 
 # ---- session closing -----------------------------------------------------

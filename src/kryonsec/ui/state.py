@@ -193,6 +193,11 @@ class PurpleWorkspaceState:
         self.outcome: str | None = None
         self.halt_reason: str | None = None
         self.report_path: str | None = None
+        # Operator Q&A about this engagement (Phase 1).  Entries are dicts
+        # {"q": ..., "a": ...}; both values are already redacted/bounded by
+        # add_question/add_answer.  Kept separate from `notices` because a
+        # 4000-character answer is too big for the 300-char notice channel.
+        self.qa: list[dict[str, str]] = []
         self.started_at = time.monotonic()
         self.finished_at: float | None = None
         self._running: dict[str, PurpleToolRow] = {}
@@ -307,6 +312,13 @@ class PurpleWorkspaceState:
                     "Post-exploitation approval: "
                     + ("approved" if entry.get("approved") else "denied")
                 )
+            elif event == "report_written":
+                path = safe(entry.get("path"), 240)
+                self.report_path = path or self.report_path
+                self.on_notice(f"✓ Report saved: {path or 'location not recorded'}")
+            elif event == "report_failed":
+                reason = safe(entry.get("reason"), 200) or "reason not recorded"
+                self.on_notice(f"! Report save failed — {reason}")
             with self._lock:
                 self._snapshot_graph_locked()
         except Exception:
@@ -326,6 +338,29 @@ class PurpleWorkspaceState:
         if record.levelno >= logging.WARNING:
             self.on_notice(record.getMessage())
 
+    def add_question(self, question: str) -> None:
+        """Record one operator question; add_answer matches by its text."""
+        value = safe(question, 400)
+        with self._lock:
+            self.qa.append({"q": value, "a": ""})
+            self.qa = self.qa[-8:]
+
+    def add_answer(self, question: str, answer: str) -> None:
+        """Attach an answer to the most recent matching question."""
+        with self._lock:
+            target = None
+            for entry in reversed(self.qa):
+                if entry["q"] == safe(question, 400):
+                    target = entry
+                    break
+            if target is None:
+                # The question rolled out of the 8-slot window; keep the
+                # answer as its own one-sided entry so nothing is lost.
+                target = {"q": safe(question, 400), "a": ""}
+                self.qa.append(target)
+                self.qa = self.qa[-8:]
+            target["a"] = safe(answer, 4000)
+
     def finish(
         self,
         outcome: str,
@@ -336,7 +371,12 @@ class PurpleWorkspaceState:
         with self._lock:
             self.outcome = outcome
             self.halt_reason = safe(halt_reason, 220) if halt_reason else None
-            self.report_path = safe(report_path, 240) if report_path else None
+            # An already-known report path survives a finish that does not
+            # name one (the audited report_written event set it earlier);
+            # finish reports an outcome, it never un-writes a report.
+            self.report_path = (
+                safe(report_path, 240) if report_path else self.report_path
+            )
             self.finished_at = time.monotonic()
             if outcome in {"failed", "halted"} and self.current_state:
                 self.failed_states.add(self.current_state)
@@ -370,6 +410,7 @@ class PurpleWorkspaceState:
                 ],
                 "activity": [dict(row) for row in self.activity[-20:]],
                 "notices": list(self.notices[-8:]),
+                "qa": [dict(entry) for entry in self.qa],
                 "findings": list(self.findings[-6:]),
                 "counts": dict(self.counts),
                 "outcome": self.outcome,

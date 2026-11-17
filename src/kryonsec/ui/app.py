@@ -40,6 +40,7 @@ from textual.widgets.option_list import Option
 
 from .. import __version__
 from ..config import KryonsecConfig
+from ..purple.hypothesis_plain import plain_explanation
 from .state import (
     AGENT_LABELS,
     PURPLE_STATES,
@@ -695,6 +696,18 @@ class KryonsecApp(App[None]):
             return
         rows = self.controller.copilot_tools()
         if not rows:
+            # Thinking is real work with nothing to show yet — an honest
+            # line beats a silent pane.  While an approval waits, the
+            # approval dialog is the state; "thinking" would be a lie.
+            if self.controller.busy and self.controller.approval is None:
+                widget.display = True
+                widget.update(
+                    Text(
+                        " ● thinking — the assistant is working; no tool is running",
+                        style="dim",
+                    )
+                )
+                return
             widget.display = False
             return
         widget.display = True
@@ -776,9 +789,21 @@ class KryonsecApp(App[None]):
         text.append(mode, style=f"bold {self.tokens.text}")
         text.append(sep, style="dim")
         if controller.mode == "copilot":
-            model = str(self.cfg.general_chat_model)
-            label = f"{controller.provider_label()} / {model}" if wide else model
-            text.append(_short(label, 34 if wide else 20), style=self.tokens.text)
+            running_tool = next(
+                (row for row in controller.copilot_tools() if row.status == "running"),
+                None,
+            )
+            if controller.busy and running_tool is not None:
+                # Mirror of the Mode B segment: what is running right now.
+                text.append(f"● {running_tool.name}", style=self.tokens.running)
+            elif controller.busy and controller.approval is None:
+                # Between tool calls the assistant is reasoning — say so
+                # instead of a bare "working".
+                text.append("● thinking…", style=self.tokens.running)
+            else:
+                model = str(self.cfg.general_chat_model)
+                label = f"{controller.provider_label()} / {model}" if wide else model
+                text.append(_short(label, 34 if wide else 20), style=self.tokens.text)
         elif wide:
             # live identity of what the engine is doing right now
             view = controller.purple_view
@@ -884,17 +909,26 @@ class KryonsecApp(App[None]):
 
     def action_rename_session(self, index: int | None = None) -> None:
         controller = self.controller
-        if controller.mode != "copilot":
-            controller.notify(
-                "Engagement tabs keep their immutable identifiers; only Copilot sessions can be renamed."
-            )
-            self._refresh_notice()
-            return
         if index is None:
-            index = controller.session_index
-        if not (0 <= index < len(controller.sessions)):
+            index = (
+                controller.session_index
+                if controller.mode == "copilot"
+                else controller.engagement_index
+            )
+        if index is None:
             return
-        tab = controller.sessions[index]
+        if controller.mode == "copilot":
+            if not (0 <= index < len(controller.sessions)):
+                return
+            tab = controller.sessions[index]
+            current = tab.custom_title or tab.title
+            self.push_screen(RenameScreen(current), self._rename_result(index))
+            return
+        # Mode B: a display title is presentation-only. The engagement id,
+        # the recorded target, and the audit chain are never touched.
+        if not (0 <= index < len(controller.engagements)):
+            return
+        tab = controller.engagements[index]
         current = tab.custom_title or tab.title
         self.push_screen(RenameScreen(current), self._rename_result(index))
 
@@ -1027,6 +1061,8 @@ class KryonsecApp(App[None]):
             text.append("  PURPLE TEAM\n", style=f"bold {self.tokens.text}")
             text.append("  deterministic, bounded, human-approved testing\n\n", style="dim")
             text.append("  Type an authorized target below to begin.\n", style=self.tokens.muted)
+            text.append("  /engage <target> starts one explicitly; plain text here starts one too.\n", style="dim")
+            text.append("  Once an engagement is open, ask questions in plain text at any time.\n", style="dim")
             text.append("  Approvals and sandbox checks remain fail-closed.\n", style="dim")
             return text
         snapshot = view.snapshot()
@@ -1141,6 +1177,24 @@ class KryonsecApp(App[None]):
             if tool.get("detail"):
                 text.append("  outcome  ", style="dim")
                 text.append(f"{_short(tool['detail'], 200)}\n", style="dim")
+
+        qa = snapshot.get("qa") or []
+        if qa:
+            text.append("\n  QUESTIONS & ANSWERS\n", style=f"bold {self.tokens.text}")
+            text.append(
+                "  read-only: a question never starts, stops, or changes the engagement\n",
+                style="dim",
+            )
+            for entry in qa:
+                text.append("  Q ", style="bold")
+                text.append(f"{_short(str(entry.get('q') or ''), 200)}\n", style=self.tokens.text)
+                answer = str(entry.get("a") or "")
+                if answer:
+                    text.append("  A ", style=f"bold {self.tokens.success}")
+                    text.append(f"{_short(answer, 2000)}\n", style=self.tokens.text)
+                else:
+                    text.append("  A ", style="dim")
+                    text.append("preparing the answer…\n", style="dim")
 
         notices = snapshot["notices"]
         if notices:

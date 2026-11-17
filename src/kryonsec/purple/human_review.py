@@ -16,6 +16,7 @@ from typing import Callable
 
 from .audit import AuditLog
 from .context import normalize_line
+from .hypothesis_plain import plain_explanation
 from .hypothesize import (
     BASIS_NOTES,
     MAX_RELATIONSHIP_CHARS,
@@ -92,6 +93,11 @@ def _approval_panel(index: int, total: int, hypothesis: dict,
     rationale = str(p.get("rationale", "") or "").strip()
     if rationale:
         facts.add_row("Evidence", rationale)
+    # Phase 5 (2026-11-18): the same deterministic plain-English explainer
+    # the full-screen approval screen uses.  Formatting only — the
+    # hypothesis dict, its label (the approval key), and the gate's
+    # contract are untouched.
+    facts.add_row("In plain words", plain_explanation(hypothesis))
 
     body = Group(
         Text("GATE 2 · HUMAN_REVIEW · active testing only", style="bold yellow"),

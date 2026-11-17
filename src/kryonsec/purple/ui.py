@@ -549,7 +549,9 @@ class PurpleUI:
         """Record an operator-facing terminal outcome for the live workspace."""
         self.outcome = outcome
         self.halt_reason = halt_reason
-        self.report_path = report_path
+        # Same rule as the presentation state: finish never un-writes a
+        # report the audited report_written event already named.
+        self.report_path = report_path or self.report_path
         self._refresh()
 
     def _state_line(self, state: str) -> None:
@@ -633,6 +635,17 @@ class PurpleUI:
             self.on_notice(
                 "post-exploit skipped — no shell/session capability "
                 "detected (dormant by design)")
+        elif event == "report_written":
+            # Phase 4 UI feedback: the operator hears the report landed
+            # the moment the audited event says so, with the real path.
+            path = str(entry.get("path") or "")[:240]
+            if path:
+                self.report_path = path
+                self.on_notice(f"✓ Report saved: {path[:200]}")
+        elif event == "report_failed":
+            self.on_notice(
+                "! Report save failed — "
+                + (str(entry.get("reason") or "reason not recorded")[:200]))
 
         # Batch 4: specialist scheduler + budget events. Read-only
         # progress, one line each, every field defaulted — the scheduler's
