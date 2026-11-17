@@ -1,0 +1,40 @@
+{
+  "summary": {
+    "when": "20261117T092712Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "naabu",
+      "engagement": "lab-p4-naabu",
+      "label": "REAL",
+      "note": "product discovery port list, rate 100",
+      "argv": [
+        "naabu",
+        "-host",
+        "juice-shop.lab",
+        "-r",
+        "10.213.44.1",
+        "-p",
+        "21,22,25,53,80,110,143,443,445,1433,3306,3389,5432,6379,8080,8443,9200,27017",
+        "-rate",
+        "100",
+        "-silent",
+        "-duc"
+      ],
+      "duration_s": 3.69,
+      "exit_code": 0,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 18,
+      "error_excerpt": "",
+      "excerpt": "juice-shop.lab:80\n",
+      "output_format": "text",
+      "evidence_files": []
+    }
+  ]
+}

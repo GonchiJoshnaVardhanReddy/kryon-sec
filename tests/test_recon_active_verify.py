@@ -178,6 +178,10 @@ class MultiToolSandbox:
 
     def __init__(self):
         self.tools = []
+        # the naabu/dnsx lanes derive -r from the egress policy
+        # (TEST-NET-1 fixture — clearly fake)
+        self.egress_policy = type(
+            "P", (), {"dns_resolvers": ("192.0.2.53",)})()
 
     def spawn(self, argv):
         self.tools.append(argv[0])
@@ -303,10 +307,10 @@ def test_web_plan_gowitness_arg_is_exactly_the_template(tmp_path):
 
     for tool, argv in sub._web_plan({80}):
         if tool == "gowitness":
-            assert argv == ["gowitness", "scan", "website",
-                            "--url", "http://t.com:80/",
+            assert argv == ["gowitness", "scan", "single",
+                            "-u", "http://t.com:80/",
                             "--screenshot-path", "/evidence",
-                            "--no-console", "--disable-db"]
+                            "--chrome-path", "/usr/bin/chromium", "-q"]
 
 
 def test_recon_active_openapi_endpoints_become_path_nodes(tmp_path):

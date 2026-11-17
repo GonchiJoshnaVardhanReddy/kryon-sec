@@ -22,16 +22,20 @@ WHY AN ADAPTER AT ALL (Batch 2 evaluation):
       an audited evidence event the legacy path cannot carry.
     - The screenshot itself is the evidence: the PNG lands in the rw
       ``/evidence`` mount (the engagement folder), NOT in tool
-      output. ``--disable-db`` is not optional — the container rootfs
-      is read-only, so gowitness's SQLite result DB cannot exist; the
-      PNG file IS the record, and the graph node says where to find it.
+      output. gowitness 3.x writes NO result database unless a
+      ``--write-*`` flag is passed — the template passes none, so the
+      read-only rootfs needs nothing special; the PNG file IS the
+      record, and the graph node says where to find it.
 
 NO NEW AGGRESSION: the template is byte-identical to the shipped
-Layer-2 entry — ``scan website`` against the ONE scope-validated base
-URL, screenshots into the FIXED ``/evidence`` mount, console output
-suppressed, result DB disabled. No delay/scalarize/custom-flags
-surface exists to widen: anything else is a conscious code change in
-the repo, auditable in git, never caller input.
+Layer-2 entry — ``scan single -u`` against the ONE scope-validated
+base URL, screenshots into the FIXED ``/evidence`` mount, console
+output silenced with ``-q``, the browser pinned to the image's OWN
+chromium binary via ``--chrome-path`` (gowitness 3.x otherwise
+downloads a browser at runtime, which the egress gate correctly
+drops). No delay/scalarize/custom-flags surface exists to widen:
+anything else is a conscious code change in the repo, auditable in
+git, never caller input.
 
 DUPLICATE AVOIDANCE: one probe per check. The registered
 gowitness-probe adapter REPLACES the legacy ``gowitness`` web-plan
@@ -79,9 +83,18 @@ SCREENSHOT_DIR = "/evidence"
 #: allowlist.py ACTIVE_RECON_TEMPLATES, so the adapter argv and the
 #: legacy plan entry are byte-identical. Lockstep is asserted by tests
 #: that render the adapter argv against the SHIPPED Layer-2 template.
+#: gowitness 3.2.2 (the pinned image's version) removed the v2-era
+#: ``scan website`` subcommand and the ``--no-console``/``--disable-db``
+#: flags — the old shape died at startup with a Usage banner (found
+#: live, Phase-4 lab 2026-11-17). The v3 shape is ``scan single -u``;
+#: v3 writes no result DB unless a --write-* flag is passed (none is),
+#: ``-q`` silences console chatter, and ``--chrome-path`` pins the
+#: image's own chromium (no runtime browser download — the gate drops
+#: those). ``{url}`` is the template's only placeholder.
 GOWITNESS_PROBE_TEMPLATE: tuple[str, ...] = (
-    "scan", "website", "--url", "{url}",
-    "--screenshot-path", SCREENSHOT_DIR, "--no-console", "--disable-db",
+    "scan", "single", "-u", "{url}",
+    "--screenshot-path", SCREENSHOT_DIR,
+    "--chrome-path", "/usr/bin/chromium", "-q",
 )
 
 

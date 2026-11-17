@@ -4,7 +4,7 @@ Disposable, operator-owned Docker lab for the Phase 2–6 experiments.
 Infrastructure only lives here; security-tool runs happen only against
 the operator-approved scope below.
 
-## Status (2026-11-16)
+## Status (2026-11-17 — Phase 4 complete)
 
 - Scope: **APPROVED** by the operator (with the Nuclei template hosts).
 - Plumbing: **GREEN — 9/9 REAL checks** (`plumbing_check.py`, results in
@@ -13,8 +13,66 @@ the operator-approved scope below.
   pinned resolver serves the lab record, unrelated destinations are
   dropped at the network layer, and the boundary verifies before and
   after spawns and releases cleanly.
+- Phase 4 (per-tool REAL-path runs): **COMPLETE — 11 REAL runs all
+  exit 0 + 1 SKIPPED, 0 harness failures** in the final recorded run
+  `results/20261117T095324Z/phase4-tool-runs.json` (naabu, nmap, dnsx,
+  httpx, whatweb, katana, feroxbuster, gowitness, api-probe,
+  openapi_probe, nuclei; tls-probe SKIPPED — the approved target serves
+  plain HTTP only). These are RUNNABILITY records only: detection
+  performance is NOT measured here (that is Phase 5–6, scored against
+  ground truth).
+- Phase 4 also produced four REAL product fixes + one lab-harness
+  hardening, all verified live against the real binaries (details in
+  the tool-drift section below):
+  dnsx `-r {resolver}` + output shape, naabu `-r {resolver}` + `-duc`,
+  gowitness `scan single` (v3 CLI) + `--chrome-path` (image chromium),
+  katana `-duc`; harness records FAILED rows instead of crashing and
+  verifies the DNS pin step after SIGHUP.
 - WebGoat: **PREPARED, scope pending** (second lab IP + DNS record; no
   tool may touch it until its scope is separately approved).
+
+## Phase 4 tool-drift findings (all found LIVE through the real path)
+
+Every fix below was driven by a REAL run failing (or phoning home)
+under the gate, then verified by a REAL run succeeding:
+
+1. **dnsx 1.3.1** — `-d` is now a brute-force flag needing `-w`; the
+   legacy shape died at startup. Also ignores resolv.conf and queries
+   a HARDCODED public-resolver list without `-r` (queries the gate
+   drops; proved by the empty dnsmasq delta), and its output flags
+   changed shape (`-resp-only -nc` for bare-IP lines). Template now:
+   `-l {target} -r {resolver} -resp-only -silent -duc -nc`.
+2. **naabu 2.x** — same hardcoded-resolver behavior as dnsx: a domain
+   target died with "no valid ipv4 or ipv6 targets were found" (IP
+   target worked; zero lab-resolver queries without `-r`). Also
+   phones `api.pdtm.sh` without `-duc`. Template now carries
+   `-r {resolver}` + `-duc`; verified live (domain target resolves
+   through the pinned resolver, port 80 found, zero pdtm queries).
+3. **gowitness 3.2.2** — the v2-era `scan website` subcommand and the
+   `--no-console` / `--disable-db` flags no longer exist (Usage banner
+   at startup). v3 writes no result DB unless `--write-*` is passed.
+   It DOWNLOADS a Chrome binary at runtime by default — the gate drops
+   that — so the template pins the image's own chromium
+   (`--chrome-path /usr/bin/chromium`, verified present in the pinned
+   image). Verified live: exit 0, real 1280×577 JPEG in `/evidence`.
+4. **katana** — no `-duc` meant one `api.pdtm.sh` DNS query per run
+   (the gate dropped the connect). Template now carries `-duc`;
+   verified live (zero pdtm queries).
+5. **Not fixable in argv (recorded, connects dropped by the gate):**
+   feroxbuster checks `api.github.com` for a newer release (one DNS
+   query + one dropped connect per run); gowitness's chromium attempts
+   a handful of Google lookups (`update/fonts/accounts.*.google*`) at
+   launch (all non-target connects dropped; the screenshot is
+   unaffected).
+
+Lab-harness notes (same date): a WSL DNS flake made the host-side
+template-host rotation check fail mid-run — the product refused to
+authorize (correct, fail-closed) and the harness now records a FAILED
+row instead of crashing; the DNS-pin step verifies its records took
+effect after SIGHUP; the lab DNS container was recreated twice from
+the outside (09:40:24, 09:58:21 — `lab-up.sh`-style recreate, pinned
+template-host records reset each time; recorded runs were NOT affected
+— the pin runs at sequence start).
 
 ## Approved scope (as applied to `/home/dev/.kryonsec-selftest/config.toml`)
 

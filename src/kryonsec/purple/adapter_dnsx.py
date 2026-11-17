@@ -20,13 +20,16 @@ WHY AN ADAPTER AT ALL (Batch 1 evaluation):
       parsing that the legacy path cannot carry.
     - TEXT output contract, NOT ``-json``: the shipped Layer-2
       ``dnsx`` template in allowlist.py (the one the legacy plan also
-      runs) is the fixed ``-d {target} -silent`` shape the
-      registry-compiled allowlist must stay in lockstep with, and the
-      field shapes of dnsx's JSON could not be verified against the
-      real binary from this development environment. ``-silent`` lines
-      are bare IPv4 addresses (or ``host [TYPE] ip`` in some builds) —
-      deterministic and parseable with a strict, defensive parser:
-      "text parsing as actually supported".
+      runs) is the fixed
+      ``-l {target} -r {resolver} -resp-only -silent -duc -nc`` shape
+      the registry-compiled allowlist must stay in lockstep with.
+      ``-resp-only -silent`` lines are bare IPv4 addresses — verified
+      live against the real 1.3.1 binary through the gate (plain
+      ``-silent`` prints the bare DOMAIN, ``-resp`` brackets the IP,
+      and default output carries ANSI colors; all three unparseable,
+      hence the flags). The ``{resolver}`` value is the egress
+      policy's pinned DNS resolver, derived by product code — never
+      caller-invented. "text parsing as actually verified".
 
 DUPLICATE AVOIDANCE: one probe per check. The registered dnsx-probe
 adapter REPLACES the legacy ``dnsx`` discovery entry (deterministic
@@ -35,10 +38,11 @@ rule): when the adapter runs, the legacy entry is omitted from the
 plan — the two never both resolve the same domain in one state.
 
 NO NEW AGGRESSION: the template is exactly the shipped legacy shape —
-no additional flags, no brute-force lists, no record-type iteration.
-The egress boundary stays target-scope (resolving the target's names
-sends packets to the target's resolvers — dnsx lives in Zone B by
-design, not in passive recon).
+no brute-force lists (``-d`` is refused at Layer 2 since 1.3.1 made it
+brute-force input), no record-type iteration, no OOB callbacks. The
+``-duc``/``-nc`` flags remove an update phone-home and color escapes
+the gate would not carry anyway. The egress boundary stays
+target-scope: DNS reaches ONLY the policy's pinned resolver.
 
 Every parse is DEFENSIVE: a line that is not a bare IPv4 or the
 annotated ``host [TYPE] ip`` shape is skipped and counted; octets are
@@ -73,12 +77,22 @@ DNSX_ADAPTER_ID = ADAPTER_ID
 TOOL_EXECUTABLE = "dnsx"
 
 #: the fixed argv template — EXACTLY the shipped ``dnsx`` entry in
-#: allowlist.py ACTIVE_RECON_TEMPLATES (``-d {target} -silent``), so the
-#: adapter argv and the legacy plan entry are byte-identical. Lockstep
-#: is asserted by tests that render the adapter argv against the
-#: SHIPPED Layer-2 template.
+#: allowlist.py ACTIVE_RECON_TEMPLATES, so the adapter argv and the
+#: legacy plan entry are byte-identical. Lockstep is asserted by tests
+#: that render the adapter argv against the SHIPPED Layer-2 template.
+#:
+#: ``{resolver}`` is REQUIRED and carries the egress policy's pinned
+#: DNS resolver (comma-joined when several) — the caller derives it
+#: from ``sandbox.egress_policy.dns_resolvers``; a caller cannot invent
+#: a resolver any more than a target (the {resolver} charset admits
+#: only IP-ish text). Verified live against the real dnsx 1.3.1 binary
+#: through the gate (Phase-4 lab, 2026-11-16): without ``-r`` the tool
+#: queries a hardcoded public-resolver list the gate drops; with
+#: ``-resp-only -nc`` the output is bare-IP lines the parser reads.
 DNSX_PROBE_TEMPLATE: tuple[str, ...] = (
-    "-d", "{target}", "-silent",
+    "-l", "{target}",
+    "-r", "{resolver}",
+    "-resp-only", "-silent", "-duc", "-nc",
 )
 
 

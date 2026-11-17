@@ -20,12 +20,24 @@ WHY AN ADAPTER AT ALL (Batch 1 evaluation):
       per-line parsing that the legacy path cannot carry.
     - TEXT output contract, NOT ``-json``: the shipped Layer-2
       ``naabu`` template in allowlist.py (the one the legacy plan also
-      runs) is the fixed ``-host/-p/-rate/-silent`` shape the
+      runs) is the fixed ``-host/-r/-p/-rate/-silent/-duc`` shape the
       registry-compiled allowlist must stay in lockstep with, and the
       field shapes of naabu's JSON could not be verified against the
       real binary from this development environment. ``-silent`` lines
       are ``host:port`` pairs — deterministic and parseable with a
       strict, defensive parser: "text parsing as actually supported".
+
+DNS PARITY WITH DNSX (Phase-4 lab 2026-11-17): naabu 2.x has the
+same resolver behavior as dnsx 1.3.1 — without ``-r`` it ignores
+resolv.conf and queries its own HARDCODED list of public resolvers
+(found live: zero dnsmasq queries for a domain target, then the run
+died with "Could not run enumeration: no valid ipv4 or ipv6 targets
+were found"; an IP target was unaffected). The template therefore
+carries ``-r {resolver}`` with the egress policy's pinned resolver,
+derived by the lane from the sandbox policy — never caller-invented.
+A policy that pins no resolvers fails the lane CLOSED (same rule as
+the dnsx lane: the entry is omitted/refused, never faked). ``-duc``
+stops the pdtm.sh update phone-home.
 
 NO NEW AGGRESSION: the discovery lane pins ``params`` to the SAME
 constants the legacy plan entry uses — ``ports=RECON_PORTS`` (the
@@ -77,14 +89,15 @@ NAABU_ADAPTER_ID = ADAPTER_ID
 TOOL_EXECUTABLE = "naabu"
 
 #: the fixed argv template — EXACTLY the shipped ``naabu`` entry in
-#: allowlist.py ACTIVE_RECON_TEMPLATES (``-host/-p/-rate/-silent``), so
-#: the adapter argv and the legacy plan entry are byte-identical once
-#: the discovery lane fills ``{ports}`` and ``{rate}`` with the SAME
-#: pinned constants the legacy entry uses. Lockstep is asserted by
-#: tests that render the adapter argv against the SHIPPED Layer-2
-#: template.
+#: allowlist.py ACTIVE_RECON_TEMPLATES (``-host/-r/-p/-rate/-silent/
+#: -duc``), so the adapter argv and the legacy plan entry are
+#: byte-identical once the discovery lane fills ``{resolver}``,
+#: ``{ports}`` and ``{rate}`` with the SAME pinned values the legacy
+#: entry uses. Lockstep is asserted by tests that render the adapter
+#: argv against the SHIPPED Layer-2 template.
 NAABU_PROBE_TEMPLATE: tuple[str, ...] = (
-    "-host", "{target}", "-p", "{ports}", "-rate", "{rate}", "-silent",
+    "-host", "{target}", "-r", "{resolver}", "-p", "{ports}",
+    "-rate", "{rate}", "-silent", "-duc",
 )
 
 
@@ -93,9 +106,10 @@ def make_naabu_probe_adapter():
 
     A factory (not a module constant) keeps the import graph light and
     lets each caller own its instance; the definition itself is fully
-    determined — same registry identity everywhere. ``{ports}`` and
-    ``{rate}`` are the template's placeholders; the discovery lane is
-    the deterministic caller that pins them.
+    determined — same registry identity everywhere. ``{resolver}``,
+    ``{ports}`` and ``{rate}`` are the template's placeholders; the
+    discovery lane is the deterministic caller that pins them (the
+    resolver from the egress policy, the rest from source constants).
     """
     from .adapters import ModeBToolAdapter
 

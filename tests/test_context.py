@@ -483,6 +483,10 @@ class _FakeSandbox:
 
     def __init__(self):
         self.tools = []
+        # the naabu/dnsx lanes derive -r from the egress policy
+        # (TEST-NET-1 fixture — clearly fake)
+        self.egress_policy = type(
+            "P", (), {"dns_resolvers": ("192.0.2.53",)})()
 
     def spawn(self, argv):
         self.tools.append(argv[0])

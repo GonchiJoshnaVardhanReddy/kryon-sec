@@ -63,18 +63,20 @@ def test_blocklist_allows_normal_argv(allow):
     ("amass", ["amass", "enum", "-passive", "-d", "target.com"]),
     ("assetfinder", ["assetfinder", "-silent", "target.com"]),
     # active recon
-    ("naabu", ["naabu", "-host", "target.com", "-p", "80,443", "-rate", "100", "-silent"]),
+    ("naabu", ["naabu", "-host", "target.com", "-r", "192.0.2.53",
+               "-p", "80,443", "-rate", "100", "-silent", "-duc"]),
     ("httpx", ["httpx", "-u", "http://target.com/", "-silent", "-status-code", "-title", "-tech-detect"]),
     ("rustscan", ["rustscan", "-a", "target.com", "-p", "80,443", "--no-banner", "-t", "2000"]),
     ("whatweb", ["whatweb", "-a", "3", "--no-errors", "--color=never", "http://target.com/"]),
-    ("katana", ["katana", "-u", "http://target.com/", "-d", "2", "-silent"]),
+    ("katana", ["katana", "-u", "http://target.com/", "-d", "2", "-silent", "-duc"]),
     ("hakrawler", ["hakrawler", "-url", "http://target.com/", "-depth", "3"]),
     ("feroxbuster", ["feroxbuster", "-u", "http://target.com/FUZZ",
                      "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt",
                      "-t", "5", "--timeout", "30"]),
     ("sslscan", ["sslscan", "--no-failed", "--sleep", "100", "target.com"]),
     ("testssl.sh", ["testssl.sh", "--batch", "--severity=high", "--no-color", "https://target.com/"]),
-    ("dnsx", ["dnsx", "-d", "target.com", "-silent"]),
+    ("dnsx", ["dnsx", "-l", "target.com", "-r", "192.0.2.53",
+              "-resp-only", "-silent", "-duc", "-nc"]),
     # exploit specialists
     ("dalfox", ["dalfox", "url", "http://target.com/?q=1", "--silence"]),
     ("commix", ["commix", "--url", "http://target.com/?id=1", "--batch"]),
@@ -102,8 +104,9 @@ def test_blocklist_allows_normal_argv(allow):
     ("checkov", ["checkov", "-d", "/code"]),
     ("hadolint", ["hadolint", "/code/Dockerfile"]),
     # Phase 8 active recon: screenshots, DNS brute-force, API discovery
-    ("gowitness", ["gowitness", "scan", "website", "--url", "http://target.com:8080/",
-                   "--screenshot-path", "/evidence", "--no-console", "--disable-db"]),
+    ("gowitness", ["gowitness", "scan", "single", "-u", "http://target.com:8080/",
+                   "--screenshot-path", "/evidence",
+                   "--chrome-path", "/usr/bin/chromium", "-q"]),
     ("massdns", ["massdns", "-r", "/usr/share/seclists/Miscellaneous/dns-resolvers.txt",
                  "-t", "A", "-o", "S", "-w", "/tmp/massdns.out",
                  "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"]),
@@ -149,7 +152,7 @@ def test_passive_templates_require_passive_flag(allow):
 
 def test_depth_rejects_out_of_range(allow):
     with pytest.raises(AllowlistViolation):
-        allow.validate("katana", ["katana", "-u", "http://target.com/", "-d", "9", "-silent"])
+        allow.validate("katana", ["katana", "-u", "http://target.com/", "-d", "9", "-silent", "-duc"])
 
 
 def test_port_rejects_non_numeric(allow):
@@ -190,17 +193,20 @@ def test_embedded_alternation_rejects_unknown_choice(allow):
 
 def test_gowitness_screenshot_path_is_pinned_to_evidence(allow):
     """Screenshots go to the rw /evidence mount ONLY — any other path
-    (e.g. /tmp, or a host path) must be rejected."""
+    (e.g. /tmp, or a host path) must be rejected. The browser is pinned
+    to the image's own chromium binary — any other --chrome-path value
+    (a download URL trick, another binary) must be rejected too."""
     with pytest.raises(AllowlistViolation):
         allow.validate("gowitness", [
-            "gowitness", "scan", "website", "--url", "http://target.com/",
-            "--screenshot-path", "/tmp", "--no-console", "--disable-db"])
+            "gowitness", "scan", "single", "-u", "http://target.com/",
+            "--screenshot-path", "/tmp",
+            "--chrome-path", "/usr/bin/chromium", "-q"])
     with pytest.raises(AllowlistViolation):
-        # --disable-db is required: the rootfs is read-only, a SQLite
-        # result DB would crash the run
+        # the chrome-path value is a FIXED literal from the image
         allow.validate("gowitness", [
-            "gowitness", "scan", "website", "--url", "http://target.com/",
-            "--screenshot-path", "/evidence", "--no-console"])
+            "gowitness", "scan", "single", "-u", "http://target.com/",
+            "--screenshot-path", "/evidence",
+            "--chrome-path", "/tmp/evil-chrome", "-q"])
 
 
 def test_massdns_rejects_arbitrary_wordlist(allow):

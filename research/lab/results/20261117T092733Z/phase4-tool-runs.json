@@ -1,0 +1,41 @@
+{
+  "summary": {
+    "when": "20261117T092733Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "gowitness",
+      "engagement": "lab-p4-gowitness",
+      "label": "REAL",
+      "note": "screenshot into /evidence",
+      "argv": [
+        "gowitness",
+        "scan",
+        "single",
+        "-u",
+        "http://juice-shop.lab/",
+        "--screenshot-path",
+        "/evidence",
+        "--chrome-path",
+        "/usr/bin/chromium",
+        "-q"
+      ],
+      "duration_s": 8.85,
+      "exit_code": 0,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 164,
+      "error_excerpt": "",
+      "excerpt": "2026/11/17 09:27:39 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated\n2026/11/17 09:27:39 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated\n",
+      "output_format": "text",
+      "evidence_files": [
+        "http---juice-shop.lab-.jpeg"
+      ]
+    }
+  ]
+}

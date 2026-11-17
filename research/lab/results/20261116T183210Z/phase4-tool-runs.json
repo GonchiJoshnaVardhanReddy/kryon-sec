@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "when": "20261116T183210Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "dnsx",
+      "engagement": "lab-p4-dnsx",
+      "label": "REAL",
+      "note": "domain resolution",
+      "argv": [
+        "dnsx",
+        "-d",
+        "juice-shop.lab",
+        "-silent"
+      ],
+      "duration_s": 6.08,
+      "exit_code": 1,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 72,
+      "error_excerpt": "",
+      "excerpt": "[\u001b[1;31mFTL\u001b[0m] missing wordlist(w) flag required with domain(d) input\n",
+      "output_format": "text",
+      "evidence_files": []
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "summary": {
+    "when": "20261117T095244Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "katana",
+      "engagement": "lab-p4-katana",
+      "label": "REAL",
+      "note": "crawl depth 2",
+      "argv": [
+        "katana",
+        "-u",
+        "http://juice-shop.lab/",
+        "-d",
+        "2",
+        "-silent",
+        "-duc"
+      ],
+      "duration_s": 21.39,
+      "exit_code": 0,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 325,
+      "error_excerpt": "",
+      "excerpt": "http://juice-shop.lab/\nhttp://juice-shop.lab/scripts.js\nhttp://juice-shop.lab/rolldown-runtime-kqx1xuJ_.js\nhttp://juice-shop.lab/styles.css\nhttp://juice-shop.lab/polyfills.js\nhttp://juice-shop.lab/chunk-CE5v8pBj.js\nhttp://juice-shop.lab/chunk-CajNVifV.js\nhttp://juice-shop.lab/chunk-3CyVWL1v.js\nhttp://juice-shop.lab/main.js\n",
+      "output_format": "text",
+      "evidence_files": []
+    }
+  ]
+}

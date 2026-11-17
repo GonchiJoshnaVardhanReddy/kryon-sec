@@ -95,7 +95,8 @@ _PORT_RE = re.compile(
 # naabu -silent lines: "host:port"
 _NAABU_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]+):(?P<port>\d+)$")
 
-# dnsx -silent lines: "domain [A] 1.2.3.4" or bare "1.2.3.4"
+# dnsx -resp-only -silent lines: bare "1.2.3.4" (the template shape;
+# plain -silent of dnsx 1.3.1 prints the bare DOMAIN, unparseable)
 _IP_RE = re.compile(r"\b(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b")
 
 # httpx: "http://host:port/ [200] [title] [tech1,tech2]"
@@ -259,6 +260,29 @@ class ReconActiveSubagent:
         self.spawn_retries = max(0, min(int(getattr(
             cfg, "adapter_spawn_retries", 1)), 1))
 
+    # ---- the egress policy's pinned DNS resolvers ------------------------
+
+    def _pinned_dns_resolvers(self) -> "tuple[str, ...]":
+        """The DNS resolvers the egress boundary allows (dport 53), as
+        plain strings, in policy order.
+
+        dnsx 1.3.1 ignores resolv.conf and defaults to a HARDCODED list
+        of public resolvers when ``-r`` is absent (libs/dnsx
+        DefaultResolvers) — queries the gate correctly drops in every
+        pinned-resolver policy (found live, Phase-4 lab 2026-11-16).
+        Every dnsx argv therefore carries ``-r`` with EXACTLY these
+        policy-pinned resolvers, derived from the sandbox's egress
+        policy — never caller-invented. Empty when the sandbox carries
+        no egress policy (unit-test fakes) or the policy pins no
+        resolvers; callers fail closed on that (a resolver-less dnsx
+        run cannot resolve anything).
+        """
+        policy = getattr(self.sandbox, "egress_policy", None)
+        if policy is None:
+            return ()
+        return tuple(str(r) for r in (
+            getattr(policy, "dns_resolvers", None) or ()))
+
     # ---- plan construction (deterministic, no LLM input) -----------------
 
     def _discovery_plan(self, use_nmap_adapter: bool = False,
@@ -282,10 +306,28 @@ class ReconActiveSubagent:
                           self.target]),
             )
         if not use_naabu_adapter:
-            plan.append(("naabu", ["naabu", "-host", self.target, "-p",
-                                   RECON_PORTS, "-rate", "100", "-silent"]))
+            resolvers = self._pinned_dns_resolvers()
+            if resolvers:
+                plan.append(("naabu", ["naabu", "-host", self.target,
+                                       "-r", ",".join(resolvers),
+                                       "-p", RECON_PORTS, "-rate", "100",
+                                       "-silent", "-duc"]))
+            # no pinned resolvers -> the entry is OMITTED, never faked,
+            # the same rule as dnsx: naabu 2.x without -r queries its
+            # hardcoded public resolvers (queries the gate drops), so a
+            # resolver-less spawn would be a known-doomed run.
         if not use_dnsx_adapter:
-            plan.append(("dnsx", ["dnsx", "-d", self.target, "-silent"]))
+            resolvers = self._pinned_dns_resolvers()
+            if resolvers:
+                plan.append(("dnsx", ["dnsx", "-l", self.target,
+                                      "-r", ",".join(resolvers),
+                                      "-resp-only", "-silent", "-duc",
+                                      "-nc"]))
+            # no pinned resolvers -> the entry is OMITTED, never faked:
+            # dnsx 1.3.1 without -r queries its hardcoded public
+            # resolvers, which the gate drops — a spawn would be a
+            # known-doomed run. The omission is visible in the plan
+            # counts; the state ends with less evidence, honestly.
         return plan
 
     def _httpx_adapter(self):
@@ -502,7 +544,7 @@ class ReconActiveSubagent:
                                          base]))
             if not use_katana_adapter:
                 plan.append(("katana", ["katana", "-u", base, "-d", "2",
-                                        "-silent"]))
+                                        "-silent", "-duc"]))
             if not use_ferox_adapter:
                 plan.append(("feroxbuster",
                              ["feroxbuster", "-u",
@@ -516,9 +558,9 @@ class ReconActiveSubagent:
                              ["/opt/kryonsec/openapi_probe.py", base]))
             if not use_gowitness_adapter:
                 plan.append(("gowitness",
-                             ["gowitness", "scan", "website", "--url",
+                             ["gowitness", "scan", "single", "-u",
                               base, "--screenshot-path", "/evidence",
-                              "--no-console", "--disable-db"]))
+                              "--chrome-path", "/usr/bin/chromium", "-q"]))
             if port in TLS_PORTS and not use_tls_adapter:
                 plan.append(("sslscan",
                              ["sslscan", "--no-failed", "--sleep", "100",
@@ -821,7 +863,9 @@ class ReconActiveSubagent:
                 # the screenshot itself is the evidence — in the rw /evidence
                 # mount (engagement folder), not in tool output. A graph node
                 # records that it was taken (and where to find it).
-                url = argv[argv.index("--url") + 1] if "--url" in argv else self.target
+                # gowitness 3.x's flag is `-u` (the v2-era `--url` no longer
+                # exists in the shipped template)
+                url = argv[argv.index("-u") + 1] if "-u" in argv else self.target
                 self.graph.add_node(
                     node_type="screenshot",
                     label=url,
@@ -1354,8 +1398,10 @@ class ReconActiveSubagent:
         ports), and a plan built afterwards reports the successful run
         as ``covered`` post-hoc via its fresh adapter_attempt node.
         The rendered argv is byte-identical to the legacy entry: the
-        lane pins ``ports`` to RECON_PORTS and ``rate`` to 100 —
-        never caller input. Parsed ports merge into ``open_ports``
+        lane pins ``resolver`` (from the egress policy — a policy with
+        no pinned resolvers is refused, never faked), ``ports`` to
+        RECON_PORTS and ``rate`` to 100 — never caller input. Parsed
+        ports merge into ``open_ports``
         (legacy parity: the adapter adds NO graph nodes of its own;
         the run's ``adapter_attempt`` node is the evidence).
         Preparation refusals and execution refusals are AUDITED as
@@ -1367,10 +1413,18 @@ class ReconActiveSubagent:
         from .adapter_naabu import parse_naabu_lines, record_naabu_evidence
 
         try:
+            resolvers = self._pinned_dns_resolvers()
+            if not resolvers:
+                raise AdapterError(
+                    "policy pins no DNS resolvers — naabu cannot resolve "
+                    "a domain target without one (naabu 2.x otherwise "
+                    "queries its hardcoded public resolvers, which the "
+                    "gate drops); nothing spawned")
             prepared = prepare_adapter_run(
                 self.adapter_registry, adapter.adapter_id,
                 target=self.target,
-                params={"ports": RECON_PORTS, "rate": "100"})
+                params={"ports": RECON_PORTS, "rate": "100",
+                        "resolver": ",".join(resolvers)})
         except AdapterError as e:
             # Phase 2B.7: the ONLY progress line the lane emits —
             # prepare refusals never reach execute_adapter's own
@@ -1451,9 +1505,17 @@ class ReconActiveSubagent:
         from .adapter_dnsx import parse_dnsx_lines, record_dnsx_evidence
 
         try:
+            resolvers = self._pinned_dns_resolvers()
+            if not resolvers:
+                raise AdapterError(
+                    "policy pins no DNS resolvers — dnsx cannot resolve "
+                    "without one (dnsx 1.3.1 otherwise queries its "
+                    "hardcoded public resolvers, which the gate drops); "
+                    "nothing spawned")
             prepared = prepare_adapter_run(
                 self.adapter_registry, adapter.adapter_id,
-                target=self.target)
+                target=self.target,
+                params={"resolver": ",".join(resolvers)})
         except AdapterError as e:
             # Phase 2B.7: the ONLY progress line the lane emits —
             # prepare refusals never reach execute_adapter's own

@@ -5,8 +5,9 @@ MOCKED tests (the default, huge majority): a duck-typed sandbox double
 returns canned SpawnResults — no process, no packets, no screenshots.
 They pin the contract: explicit registration (single + combined
 RECON_ACTIVE registry), the byte-identical fixed template (the rw
-``/evidence`` mount pinned, console output suppressed, result DB
-disabled — no delay/no header knobs), URL scope/preparation refusals,
+``/evidence`` mount pinned, console silenced with ``-q``, the browser
+pinned to the image's own chromium — no delay/no header knobs),
+URL scope/preparation refusals,
 gate + sandbox + egress enforcement, honest failure classification,
 no host fallback, the NO-TEXT-CONTRACT rule (the exit code is the
 truth — gowitness console chatter is never interpreted), deterministic
@@ -78,6 +79,8 @@ BASE = "http://target-corp.com:8080/"
 class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
     the REAL enforcement lives inside the sandbox's own spawn)."""
+
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
 
 
 class FakeSandbox:
@@ -175,12 +178,12 @@ def test_combined_recon_active_registry_carries_gowitness_probe():
 def test_fixed_template_rendering():
     """The adapter argv is EXACTLY the legacy plan entry's argv: same
     subcommand, same scope-validated base, same pinned rw evidence
-    mount, console suppressed, result DB disabled."""
+    mount, console silenced, browser pinned to the image's chromium."""
     reg = production_registry()
     prep = _prep(reg)
-    assert prep.argv == ["gowitness", "scan", "website", "--url", BASE,
+    assert prep.argv == ["gowitness", "scan", "single", "-u", BASE,
                          "--screenshot-path", SCREENSHOT_DIR,
-                         "--no-console", "--disable-db"]
+                         "--chrome-path", "/usr/bin/chromium", "-q"]
     assert prep.target == BASE
     assert prep.target_kind == "url"
 
@@ -189,7 +192,10 @@ def test_template_is_byte_identical_to_the_shipped_layer2_template():
     """The adapter adds NO flag the shipped gowitness entry does not
     carry: the argv it renders validates against the SHIPPED Layer-2
     template unchanged, and no delay/header/scalarize knob can ever
-    appear."""
+    appear. (gowitness 3.2.2 removed ``scan website`` and the
+    ``--no-console``/``--disable-db`` flags — the shipped template
+    follows the real binary, verified live; ``--chrome-path`` pins the
+    image's OWN chromium so no runtime browser download can happen.)"""
     from kryonsec.purple.allowlist import (ACTIVE_RECON_TEMPLATES,
                                            ToolAllowlist)
 
@@ -197,17 +203,20 @@ def test_template_is_byte_identical_to_the_shipped_layer2_template():
         list(ACTIVE_RECON_TEMPLATES["gowitness"])
     shipped = ToolAllowlist(dict(ACTIVE_RECON_TEMPLATES))
     shipped.validate(TOOL_EXECUTABLE,
-                     ["gowitness", "scan", "website", "--url", BASE,
+                     ["gowitness", "scan", "single", "-u", BASE,
                       "--screenshot-path", SCREENSHOT_DIR,
-                      "--no-console", "--disable-db"])
+                      "--chrome-path", "/usr/bin/chromium", "-q"])
     # the screenshot directory is the FIXED rw evidence mount — never
     # caller input
     assert SCREENSHOT_DIR == "/evidence"
     flags = [a for a in GOWITNESS_PROBE_TEMPLATE if a.startswith("-")]
-    assert flags == ["--url", "--screenshot-path", "--no-console",
-                     "--disable-db"]
+    assert flags == ["-u", "--screenshot-path", "--chrome-path", "-q"]
+    # the ONLY chrome-path value is the image's own binary — the
+    # template can never be pointed elsewhere
+    i = GOWITNESS_PROBE_TEMPLATE.index("--chrome-path")
+    assert GOWITNESS_PROBE_TEMPLATE[i + 1] == "/usr/bin/chromium"
     for forbidden in ("--delay", "--chrome-wss", "--viewport",
-                      "--chrome-path", "--disable-javascript",
+                      "--disable-javascript",
                       "--user-agent", "--header"):
         assert forbidden not in GOWITNESS_PROBE_TEMPLATE, forbidden
 
@@ -585,9 +594,9 @@ def test_adapter_mode_screenshots_once_never_both(tmp_path):
     cmdl = [argv for argv, _t in spawned]
     runs = _gowitness_runs(cmdl)
     assert len(runs) == 1
-    assert runs[0] == ["gowitness", "scan", "website", "--url", BASE,
-                       "--screenshot-path", "/evidence", "--no-console",
-                       "--disable-db"]
+    assert runs[0] == ["gowitness", "scan", "single", "-u", BASE,
+                       "--screenshot-path", "/evidence",
+                       "--chrome-path", "/usr/bin/chromium", "-q"]
     nodes = graph.by_type("screenshot")
     assert len(nodes) == 1
     node = nodes[0]
@@ -631,9 +640,9 @@ def test_planner_selected_screenshot_runs_with_the_pinned_argv(tmp_path):
     assert result.status == "ok"
     runs = _gowitness_runs([argv for argv, _t in spawned])
     assert len(runs) == 1
-    assert runs[0] == ["gowitness", "scan", "website", "--url", BASE,
-                       "--screenshot-path", "/evidence", "--no-console",
-                       "--disable-db"]
+    assert runs[0] == ["gowitness", "scan", "single", "-u", BASE,
+                       "--screenshot-path", "/evidence",
+                       "--chrome-path", "/usr/bin/chromium", "-q"]
     events = _events(audit)
     decided = next(e for e in events if e["event"] == "planning_decided")
     # one plain-http base: 7 eligible checks selected (httpx, whatweb,

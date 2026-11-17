@@ -68,6 +68,10 @@ from kryonsec.purple.tool_planner import ToolCapabilityCatalog, \
 
 TARGET = "target-corp.com"
 
+# fixture resolver for the {resolver} template variable — TEST-NET-1,
+# clearly fake, matching the _ARG_PATTERNS["resolver"] charset
+_RESOLVER = "192.0.2.53"
+
 
 # ---- harmless fakes ------------------------------------------------------------
 
@@ -75,6 +79,16 @@ TARGET = "target-corp.com"
 class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
     the REAL enforcement lives inside the sandbox's own spawn)."""
+
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
+
+
+class _StubEgressPolicyNoResolvers:
+    """The same stub with NO pinned resolvers — the state the naabu
+    lane must fail CLOSED on (naabu 2.x without -r queries its
+    hardcoded public resolvers, which the gate drops)."""
+
+    dns_resolvers = ()
 
 
 class FakeSandbox:
@@ -162,22 +176,42 @@ def test_combined_recon_active_registry_carries_naabu_probe():
 # ---- 2. correct fixed command rendering + byte-identical lockstep ---------------
 
 def test_fixed_template_rendering():
-    """The lane pins ports/rate to the SAME constants the legacy
+    """The lane pins resolver/ports/rate to the SAME values the legacy
     discovery entry uses; the rendered argv is byte-identical to it."""
     reg = production_registry()
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
-    assert prep.argv == ["naabu", "-host", TARGET, "-p", RECON_PORTS,
-                         "-rate", "100", "-silent"]
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
+    assert prep.argv == ["naabu", "-host", TARGET, "-r", _RESOLVER,
+                         "-p", RECON_PORTS, "-rate", "100", "-silent",
+                         "-duc"]
     assert prep.target == TARGET
     assert prep.target_kind == "domain"
+
+
+def test_resolver_param_is_required_and_validated():
+    """{resolver} is a REQUIRED template variable and its value is
+    validated: missing -> refusal; option-shaped ('-w') -> refusal
+    (option injection); non-IP charset -> Layer-2 refusal. The resolver
+    slot can never smuggle a flag or a port spec."""
+    reg = production_registry()
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                            params={"resolver": "-w"})
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                            params={"resolver": "evil; rm -rf /"})
 
 
 def test_template_is_byte_identical_to_the_shipped_layer2_template():
     """The adapter adds NO flag the legacy naabu entry does not carry:
     the argv it renders validates against the SHIPPED Layer-2 template
-    unchanged, and no extra switches can ever appear."""
+    unchanged, and no extra switches can ever appear. (-r carries the
+    policy's pinned resolver and -duc silences the pdtm.sh update
+    phone-home — the shipped template follows the real binary,
+    verified live.)"""
     from kryonsec.purple.allowlist import (ACTIVE_RECON_TEMPLATES,
                                            ToolAllowlist)
 
@@ -185,11 +219,12 @@ def test_template_is_byte_identical_to_the_shipped_layer2_template():
         list(ACTIVE_RECON_TEMPLATES["naabu"])
     shipped = ToolAllowlist(dict(ACTIVE_RECON_TEMPLATES))
     shipped.validate(TOOL_EXECUTABLE,
-                     ["naabu", "-host", TARGET, "-p", RECON_PORTS,
-                      "-rate", "100", "-silent"])
+                     ["naabu", "-host", TARGET, "-r", _RESOLVER,
+                      "-p", RECON_PORTS, "-rate", "100", "-silent",
+                      "-duc"])
     # the template carries EXACTLY the legacy flag set — nothing extra
     flags = [a for a in NAABU_PROBE_TEMPLATE if a.startswith("-")]
-    assert flags == ["-host", "-p", "-rate", "-silent"]
+    assert flags == ["-host", "-r", "-p", "-rate", "-silent", "-duc"]
 
 
 # ---- 3. identification ------------------------------------------------------------
@@ -213,7 +248,7 @@ def test_placeholders_and_option_shaped_values_refused():
     # a domain adapter without the engagement target is refused
     with pytest.raises(AdapterError):
         prepare_adapter_run(reg, ADAPTER_ID, target="   ",
-                            params={"ports": RECON_PORTS, "rate": "100"})
+                            params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     # the template's placeholders REQUIRE explicit params (the lane
     # pins them) — all-or-nothing, never defaults
     with pytest.raises(AdapterError):
@@ -225,17 +260,18 @@ def test_placeholders_and_option_shaped_values_refused():
     with pytest.raises(AdapterError):
         prepare_adapter_run(
             reg, ADAPTER_ID, target=TARGET,
-            params={"ports": RECON_PORTS, "rate": "100", "extra": "x"})
+            params={"ports": RECON_PORTS, "rate": "100", "extra": "x",
+            "resolver": _RESOLVER})
     # option-shaped caller input is refused (option injection): no
     # value may begin with '-'
     with pytest.raises(AdapterError):
         prepare_adapter_run(
             reg, ADAPTER_ID, target="-host",
-            params={"ports": RECON_PORTS, "rate": "100"})
+            params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     with pytest.raises(AdapterError):
         prepare_adapter_run(
             reg, ADAPTER_ID, target=TARGET,
-            params={"ports": "-p", "rate": "100"})
+            params={"ports": "-p", "rate": "100", "resolver": _RESOLVER})
 
 
 # ---- 5. missing gate/authorization where required -------------------------------------
@@ -254,7 +290,7 @@ def test_gated_variant_refused_without_grant(tmp_path):
     reg.register(exploit_variant)
     prep = prepare_adapter_run(
         reg, "naabu-gated", target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""),
                       egress_policy=_StubEgressPolicy())
     audit = AuditLog(Path("tmp") / "gate_a.jsonl")
@@ -272,7 +308,7 @@ def test_missing_sandbox_no_host_fallback(tmp_path):
     audit = AuditLog(tmp_path / "a.jsonl")
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     for bad in (None, object()):          # none + no-spawn blob
         record = execute_adapter(reg, prep, sandbox=bad, audit=audit)
         assert record.executed is False and record.outcome == "refused"
@@ -287,7 +323,7 @@ def test_no_egress_boundary_refused(tmp_path):
     audit = AuditLog(tmp_path / "a.jsonl")
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     unegressed = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""))
     record = execute_adapter(reg, prep, sandbox=unegressed, audit=audit)
     assert record.executed is False and record.outcome == "refused"
@@ -304,7 +340,7 @@ def test_tool_timeout_is_an_honest_failure(tmp_path):
     graph = _graph()
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=False, exit_code=-1, stdout="",
                                   error="tool exceeded 120s sandbox timeout"),
                       egress_policy=_StubEgressPolicy())
@@ -326,7 +362,7 @@ def test_nonzero_exit_is_not_success(tmp_path):
     graph = _graph()
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=False, exit_code=1, stdout="",
                                   error="host unreachable"),
                       egress_policy=_StubEgressPolicy())
@@ -383,7 +419,7 @@ def test_record_evidence_refuses_without_attempt_node(tmp_path):
     registry = production_registry()
     prep = prepare_adapter_run(
         registry, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     record = execute_adapter(registry, prep,
                              sandbox=FakeSandbox(egress_policy=None),
                              audit=audit)
@@ -405,7 +441,7 @@ def test_evidence_is_legacy_parity_no_graph_nodes(tmp_path):
     registry = production_registry()
     prep = prepare_adapter_run(
         registry, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     stdout = "target-corp.com:8080\ntarget-corp.com:443\n"
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=stdout),
                       egress_policy=_StubEgressPolicy())
@@ -442,7 +478,7 @@ def test_zero_port_run_is_an_honest_inconclusive(tmp_path):
     registry = production_registry()
     prep = prepare_adapter_run(
         registry, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""),
                       egress_policy=_StubEgressPolicy())
     record, output = execute_adapter(
@@ -465,7 +501,7 @@ def test_open_port_is_recon_evidence_never_confirmation(tmp_path):
     graph = _graph()
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0,
                                   stdout="target-corp.com:8080"),
                       egress_policy=_StubEgressPolicy())
@@ -548,8 +584,9 @@ def test_adapter_mode_scans_naabu_once_never_both(tmp_path):
     cmdl = [argv for argv, _t in spawned]
     runs = [a for a in cmdl if a and a[0] == "naabu"]
     assert len(runs) == 1
-    assert runs[0] == ["naabu", "-host", TARGET, "-p", RECON_PORTS,
-                       "-rate", "100", "-silent"]
+    assert runs[0] == ["naabu", "-host", TARGET, "-r", _RESOLVER,
+                       "-p", RECON_PORTS, "-rate", "100", "-silent",
+                       "-duc"]
     # the port the adapter found drove the stage-2 base: one web probe
     # against http://target-corp.com:8080/
     web = [a for a in cmdl if a and a[0] == "httpx-toolkit"]
@@ -581,6 +618,36 @@ def test_empty_registry_falls_back_legacy_deterministically(tmp_path):
     assert [a for a in cmdl if a and a[0] == "naabu"] != []
     assert graph.by_type("adapter_attempt") == []
     assert "recon_active_naabu_adapter" not in _event_names(audit)
+
+
+def test_legacy_lane_omits_naabu_without_pinned_resolvers(tmp_path):
+    """No pinned resolvers -> the legacy naabu entry is OMITTED, never
+    faked into a doomed spawn (naabu 2.x without -r queries its
+    hardcoded public resolvers, which the gate drops). The state still
+    completes — honestly with less evidence."""
+    sandbox = FakeSandbox(script=_script_discovery_and_web,
+                          egress_policy=_StubEgressPolicyNoResolvers())
+    result, spawned, graph, audit = _recon(sandbox, AdapterRegistry(),
+                                           tmp_path)
+    assert result.status == "ok"
+    cmdl = [argv for argv, _t in spawned]
+    assert [a for a in cmdl if a and a[0] == "naabu"] == []
+
+
+def test_adapter_lane_refuses_without_pinned_resolvers(tmp_path):
+    """The naabu-probe lane with no pinned resolvers is an AUDITED
+    refusal (nothing spawned), never a doomed run, never fatal to the
+    state."""
+    sandbox = FakeSandbox(script=_script_discovery_and_web,
+                          egress_policy=_StubEgressPolicyNoResolvers())
+    result, spawned, graph, audit = _recon(sandbox, recon_active_registry(),
+                                           tmp_path)
+    assert result.status == "ok"
+    cmdl = [argv for argv, _t in spawned]
+    assert [a for a in cmdl if a and a[0] == "naabu"] == []
+    failures = [e for e in _events(audit)
+                if e.get("event") == "recon_active_adapter_failure"]
+    assert any(f.get("adapter") == "naabu-probe" for f in failures)
 
 
 # ---- 14. planner integration (covered post-hoc) ----------------------------------------------
@@ -656,7 +723,7 @@ def test_gates_untouched_by_adapter_path(tmp_path):
     graph = _graph()
     prep = prepare_adapter_run(
         reg, ADAPTER_ID, target=TARGET,
-        params={"ports": RECON_PORTS, "rate": "100"})
+        params={"ports": RECON_PORTS, "rate": "100", "resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0,
                                   stdout="target-corp.com:8080"),
                       egress_policy=_StubEgressPolicy())
@@ -752,7 +819,9 @@ def test_real_naabu_probe_lab_it():
     try:
         prep = prepare_adapter_run(
             reg, ADAPTER_ID, target=lab,
-            params={"ports": RECON_PORTS, "rate": "100"})
+            params={"ports": RECON_PORTS, "rate": "100",
+                    "resolver": ",".join(
+                        str(r) for r in (policy.dns_resolvers or ()))})
         record, output = execute_adapter(reg, prep, sandbox=sbx,
                                          audit=audit, graph=graph,
                                          full_output=True)

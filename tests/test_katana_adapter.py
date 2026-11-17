@@ -80,6 +80,8 @@ class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
     the REAL enforcement lives inside the sandbox's own spawn)."""
 
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
+
 
 class FakeSandbox:
     """Duck-typed sandbox double carrying the attributes the adapter
@@ -175,7 +177,7 @@ def test_combined_recon_active_registry_carries_katana_probe():
 def test_fixed_template_rendering():
     reg = production_registry()
     prep = _prep(reg)
-    assert prep.argv == ["katana", "-u", BASE, "-d", "2", "-silent"]
+    assert prep.argv == ["katana", "-u", BASE, "-d", "2", "-silent", "-duc"]
     assert prep.target == BASE
     assert prep.target_kind == "url"
     rebuilt = [BASE if a == "{url}"
@@ -196,10 +198,10 @@ def test_template_is_byte_identical_to_the_shipped_layer2_template():
         list(ACTIVE_RECON_TEMPLATES["katana"])
     shipped = ToolAllowlist(dict(ACTIVE_RECON_TEMPLATES))
     shipped.validate(TOOL_EXECUTABLE,
-                     ["katana", "-u", BASE, "-d", "2", "-silent"])
+                     ["katana", "-u", BASE, "-d", "2", "-silent", "-duc"])
     # the template carries EXACTLY the legacy flag set — nothing extra
     flags = [a for a in KATANA_PROBE_TEMPLATE if a.startswith("-")]
-    assert flags == ["-u", "-d", "-silent"]
+    assert flags == ["-u", "-d", "-silent", "-duc"]
     for forbidden in ("-json", "-jc", "-kf", "-proxy", "-headers",
                       "-header", "-body", "-form", "-c", "-rl", "-w",
                       "-H", "-o"):
@@ -636,7 +638,7 @@ def test_adapter_mode_crawls_katana_once_never_both(tmp_path):
     cmdl = [argv for argv, _t in spawned]
     runs = _katana_runs(cmdl)
     assert len(runs) == 1
-    assert runs[0] == ["katana", "-u", BASE, "-d", "2", "-silent"]
+    assert runs[0] == ["katana", "-u", BASE, "-d", "2", "-silent", "-duc"]
     nodes = graph.by_type("path")
     assert {n["label"] for n in nodes} == \
         {":8080/admin?page=1", ":8080/login"}
@@ -681,7 +683,7 @@ def test_planner_selected_crawl_runs_with_the_pinned_argv(tmp_path):
     assert result.status == "ok"
     runs = _katana_runs([argv for argv, _t in spawned])
     assert len(runs) == 1
-    assert runs[0] == ["katana", "-u", BASE, "-d", "2", "-silent"]
+    assert runs[0] == ["katana", "-u", BASE, "-d", "2", "-silent", "-duc"]
     events = _events(audit)
     decided = next(e for e in events if e["event"] == "planning_decided")
     # one plain-http base: 7 eligible checks selected (httpx, whatweb,

@@ -74,6 +74,9 @@ _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
     "hostport": re.compile(r"^[A-Za-z0-9._-]+:\d{1,5}$"),
     "token": re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"),
     "term": re.compile(r"^[A-Za-z0-9 .:+,-]+$"),
+    # comma-separated resolver addresses (IPv4/IPv6) — dnsx -r. No '-' in
+    # the charset, so an option can never hide in a resolver slot.
+    "resolver": re.compile(r"^[0-9A-Fa-f:.]+(,[0-9A-Fa-f:.]+)*$"),
 }
 
 # {…} segments inside an argument (may be the whole argument)
@@ -135,11 +138,27 @@ PASSIVE_TOOL_TEMPLATES: dict[str, list[str]] = {
 ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     # -sT (connect scan): gVisor grants no raw sockets — SYN scan is impossible
     "nmap": ["-Pn", "-sT", "-sV", "-sC", "--max-rate", "{rate}", "-p", "{ports}", "{target}"],
-    "naabu": ["-host", "{target}", "-p", "{ports}", "-rate", "{rate}", "-silent"],
+    # naabu 2.x (the image's version) has the same DNS behavior as dnsx
+    # 1.3.1: without `-r` it ignores resolv.conf and queries its own
+    # HARDCODED public-resolver list — queries the gate correctly drops
+    # in every pinned-resolver policy, and the run dies with "Could not
+    # run enumeration: no valid ipv4 or ipv6 targets were found" for a
+    # domain target (found live, Phase-4 lab 2026-11-17: zero dnsmasq
+    # queries, IP target unaffected). So `-r` carries the policy's
+    # pinned resolver — filled by product code from the egress policy,
+    # never caller-invented ({resolver} accepts only IP-ish charset).
+    # `-duc` stops the pdtm.sh update phone-home (same choice as the
+    # dnsx/httpx/nuclei templates).
+    "naabu": ["-host", "{target}", "-r", "{resolver}", "-p", "{ports}",
+              "-rate", "{rate}", "-silent", "-duc"],
     "httpx": ["-u", "{url}", "-silent", "-status-code", "-title", "-tech-detect"],
     "rustscan": ["-a", "{target}", "-p", "{ports}", "--no-banner", "-t", "2000"],
     "whatweb": ["-a", "{1|2|3}", "--no-errors", "--color=never", "{url}"],
-    "katana": ["-u", "{url}", "-d", "{depth}", "-silent"],
+    # -duc stops the pdtm.sh update phone-home (found live 2026-11-17:
+    # katana without it queries api.pdtm.sh once per run — the gate
+    # drops the connect, but the query is unnecessary external
+    # metadata; same choice as the dnsx/naabu/httpx/nuclei templates).
+    "katana": ["-u", "{url}", "-d", "{depth}", "-silent", "-duc"],
     "hakrawler": ["-url", "{url}", "-depth", "{depth}"],
     "feroxbuster": ["-u", "{urlfuzz}", "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"],
     # ProjectDiscovery httpx under its REAL Kali binary name. Kali's
@@ -157,14 +176,43 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     ],
     "sslscan": ["--no-failed", "--sleep", "{rate}", "{target}"],
     "testssl.sh": ["--batch", "--severity={low|medium|high|critical}", "--no-color", "{url}"],
-    "dnsx": ["-d", "{target}", "-silent"],
+    # dnsx resolves the target's names. dnsx 1.3.1 (the version in the
+    # pinned image) made `-d` a BRUTE-FORCE input that requires -w; plain
+    # resolution of a host list is `-l` (file or comma separated or
+    # stdin). The legacy `-d` shape now dies at startup with
+    # "missing wordlist(w) flag required with domain(d) input" — found
+    # live in the Phase-4 lab experiments (2026-11-16). Without `-r`,
+    # dnsx ignores resolv.conf and queries a HARDCODED list of public
+    # resolvers (libs/dnsx DefaultResolvers: 1.1.1.1, 8.8.8.8, Quad9,
+    # OpenDNS …) that the egress gate correctly drops in every
+    # pinned-resolver policy — so `-r` carries the policy's pinned
+    # resolver (filled by product code from the egress policy, never
+    # caller-invented; {resolver} accepts only IP-ish charset, so no
+    # option can hide in the slot). `-resp-only` makes the silent output
+    # bare-IP lines — the exact shape the dnsx parsers read (1.3.1's
+    # plain -silent prints the bare DOMAIN; -resp prints "host [A]
+    # [ip]" with the ip bracketed; both unparseable). `-duc` stops the
+    # pdtm.sh update phone-home and `-nc` the ANSI colors (same choice
+    # as the httpx/nuclei templates; verified live against the real
+    # binary through the gate: 1 query to the pinned resolver, bare-IP
+    # output, zero pdtm queries).
+    "dnsx": ["-l", "{target}", "-r", "{resolver}", "-resp-only",
+             "-silent", "-duc", "-nc"],
     # gowitness (Phase 8): headless-Chrome screenshots into the rw /evidence
-    # mount. --disable-db: the rootfs is read-only — no SQLite result DB,
-    # the PNG itself is the evidence. NOT in the default web plan's first
-    # stage; it runs per discovered web port.
+    # mount. gowitness 3.2.2 (the version in the pinned image) REMOVED
+    # the v2-era `scan website` subcommand and the `--no-console` /
+    # `--disable-db` flags — the old shape died at startup with a Usage
+    # banner (found live, Phase-4 lab 2026-11-17). The v3 shape is
+    # `scan single -u <url>`; v3 writes NO result database unless a
+    # --write-* flag is passed (the read-only rootfs needs nothing
+    # special), `-q` silences console chatter, and `--chrome-path`
+    # pins the image's OWN chromium binary — without it gowitness 3.x
+    # downloads a browser at runtime, which the egress gate correctly
+    # drops. NOT in the default web plan's first stage; it runs per
+    # discovered web port.
     "gowitness": [
-        "scan", "website", "--url", "{url}",
-        "--screenshot-path", "/evidence", "--no-console", "--disable-db",
+        "scan", "single", "-u", "{url}", "--screenshot-path", "/evidence",
+        "--chrome-path", "/usr/bin/chromium", "-q",
     ],
     # massdns (Phase 8): brute-force DNS resolution with the image's FIXED
     # wordlist + resolvers. Allowlisted but NOT in the default plan — dnsx

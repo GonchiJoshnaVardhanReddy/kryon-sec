@@ -671,7 +671,10 @@ class _FakeSandbox:
     def __init__(self, script):
         self._script = script
         self.spawned = []
-        self.egress_policy = object()
+        # dns_resolvers: the dnsx lane derives its -r value from the
+        # egress policy (TEST-NET-1 fixture — clearly fake)
+        self.egress_policy = type("P", (), {"dns_resolvers":
+                                            ("192.0.2.53",)})()
         self.timeout_s = 330
         self.image = "kryonsec/sandbox@sha256:" + "ab" * 32
 

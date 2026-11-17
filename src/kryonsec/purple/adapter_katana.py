@@ -79,13 +79,16 @@ KATANA_ADAPTER_ID = ADAPTER_ID
 TOOL_EXECUTABLE = "katana"
 
 #: the fixed argv template — EXACTLY the shipped ``katana`` entry in
-#: allowlist.py ACTIVE_RECON_TEMPLATES (``-u/-d/-silent``), so the
+#: allowlist.py ACTIVE_RECON_TEMPLATES (``-u/-d/-silent/-duc``), so the
 #: adapter argv and the legacy plan entry are byte-identical once the
 #: lane fills ``{depth}`` with the SAME pinned constant (``2``) the
 #: legacy entry uses. Lockstep is asserted by tests that render the
-#: adapter argv against the SHIPPED Layer-2 template.
+#: adapter argv against the SHIPPED Layer-2 template. ``-duc`` stops
+#: the pdtm.sh update phone-home (found live, Phase-4 lab
+#: 2026-11-17: one api.pdtm.sh query per run without it — the gate
+#: drops the connect, the query is unnecessary external metadata).
 KATANA_PROBE_TEMPLATE: tuple[str, ...] = (
-    "-u", "{url}", "-d", "{depth}", "-silent",
+    "-u", "{url}", "-d", "{depth}", "-silent", "-duc",
 )
 
 #: the pinned crawl depth the lane passes (the legacy plan entry's

@@ -123,7 +123,7 @@ def test_docker_argv_mounts_evidence_dir_read_write(tmp_path):
     cfg = KryonsecConfig(home=tmp_path)
     s = KaliSandbox(cfg=cfg, evidence_dir="/opt/eng/evidence",
                     seccomp_profile=tmp_path / "n.json")
-    argv = s._docker_argv(["gowitness", "scan", "website"])
+    argv = s._docker_argv(["gowitness", "scan", "single"])
     # the engagement evidence folder is the ONLY rw mount, at the FIXED
     # /evidence path (gowitness screenshots land there)
     assert argv[argv.index("-v") + 1] == "/opt/eng/evidence:/evidence:rw"

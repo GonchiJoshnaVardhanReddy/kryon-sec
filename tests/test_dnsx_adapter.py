@@ -66,6 +66,9 @@ from kryonsec.purple.tool_planner import PlannerBudget, \
     ToolCapabilityCatalog, ToolPlanner
 
 TARGET = "target-corp.com"
+# fixture resolver for the {resolver} template variable — TEST-NET-1,
+# clearly fake, matching the _ARG_PATTERNS["resolver"] charset
+_RESOLVER = "192.0.2.53"
 
 
 # ---- harmless fakes ------------------------------------------------------------
@@ -73,7 +76,17 @@ TARGET = "target-corp.com"
 
 class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
-    the REAL enforcement lives inside the sandbox's own spawn)."""
+    the REAL enforcement lives inside the sandbox's own spawn). Carries
+    the pinned-resolver tuple the dnsx lane derives -r from."""
+
+    dns_resolvers = (_RESOLVER,)
+
+
+class _StubEgressPolicyNoResolvers(_StubEgressPolicy):
+    """The same stub with NO pinned resolvers — the state the dnsx
+    lanes must fail closed on (dnsx 1.3.1 cannot resolve without -r)."""
+
+    dns_resolvers = ()
 
 
 class FakeSandbox:
@@ -162,23 +175,46 @@ def test_combined_recon_active_registry_carries_dnsx_probe():
 
 def test_fixed_template_rendering():
     reg = production_registry()
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
-    assert prep.argv == ["dnsx", "-d", TARGET, "-silent"]
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
+    assert prep.argv == ["dnsx", "-l", TARGET, "-r", _RESOLVER,
+                         "-resp-only", "-silent", "-duc", "-nc"]
     assert prep.target == TARGET
     assert prep.target_kind == "domain"
+
+
+def test_resolver_param_is_required_and_validated():
+    """{resolver} is a REQUIRED template variable and its value is
+    validated: missing -> refusal; option-shaped ('-w') -> refusal
+    (option injection); non-IP charset -> Layer-2 refusal. The resolver
+    slot can never smuggle a flag or a wordlist."""
+    reg = production_registry()
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                            params={"resolver": "-w"})
+    with pytest.raises(AdapterError):
+        prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                            params={"resolver": "evil; rm -rf /"})
 
 
 def test_template_is_byte_identical_to_the_shipped_layer2_template():
     """The adapter adds NO flag the legacy dnsx entry does not carry:
     the argv it renders validates against the SHIPPED Layer-2 template
-    unchanged, and no JSON/list/extra switches can ever appear."""
+    unchanged, and no JSON/wordlist/brute-force switches can ever
+    appear. (dnsx 1.3.1: ``-d`` is brute-force and needs ``-w``;
+    resolution is ``-l``; ``-r`` carries the policy's pinned resolver —
+    the shipped template follows the real binary, verified live.)"""
     from kryonsec.purple.allowlist import (ACTIVE_RECON_TEMPLATES,
                                            ToolAllowlist)
 
     assert list(DNSX_PROBE_TEMPLATE) == list(ACTIVE_RECON_TEMPLATES["dnsx"])
     shipped = ToolAllowlist(dict(ACTIVE_RECON_TEMPLATES))
-    shipped.validate(TOOL_EXECUTABLE, ["dnsx", "-d", TARGET, "-silent"])
-    for forbidden in ("-json", "-w", "-l", "-resp", "-recon", "-c"):
+    shipped.validate(TOOL_EXECUTABLE,
+                     ["dnsx", "-l", TARGET, "-r", _RESOLVER,
+                      "-resp-only", "-silent", "-duc", "-nc"])
+    for forbidden in ("-json", "-w", "-d", "-resp", "-recon", "-c"):
         assert forbidden not in DNSX_PROBE_TEMPLATE, forbidden
 
 
@@ -206,7 +242,8 @@ def test_domain_target_required_and_option_shaped_values_refused():
     # option-shaped caller input is refused (option injection): no
     # value may begin with '-'
     with pytest.raises(AdapterError):
-        prepare_adapter_run(reg, ADAPTER_ID, target="-d")
+        prepare_adapter_run(reg, ADAPTER_ID, target="-d",
+                            params={"resolver": _RESOLVER})
     # unexpected params are refused — the template is all-or-nothing
     with pytest.raises(AdapterError):
         prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
@@ -227,7 +264,8 @@ def test_gated_variant_refused_without_grant(tmp_path):
            "risk": "active"})
     reg = AdapterRegistry()
     reg.register(exploit_variant)
-    prep = prepare_adapter_run(reg, "dnsx-gated", target=TARGET)
+    prep = prepare_adapter_run(reg, "dnsx-gated", target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout="1.2.3.4"),
                       egress_policy=_StubEgressPolicy())
     audit = AuditLog(Path("tmp") / "gate_a.jsonl")
@@ -243,7 +281,8 @@ def test_gated_variant_refused_without_grant(tmp_path):
 def test_missing_sandbox_no_host_fallback(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     for bad in (None, object()):          # none + no-spawn blob
         record = execute_adapter(reg, prep, sandbox=bad, audit=audit)
         assert record.executed is False and record.outcome == "refused"
@@ -256,7 +295,8 @@ def test_missing_sandbox_no_host_fallback(tmp_path):
 def test_no_egress_boundary_refused(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     unegressed = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""))
     record = execute_adapter(reg, prep, sandbox=unegressed, audit=audit)
     assert record.executed is False and record.outcome == "refused"
@@ -271,7 +311,8 @@ def test_tool_timeout_is_an_honest_failure(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=False, exit_code=-1, stdout="",
                                   error="tool exceeded 120s sandbox timeout"),
                       egress_policy=_StubEgressPolicy())
@@ -292,7 +333,8 @@ def test_nonzero_exit_is_not_success(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=False, exit_code=1, stdout="",
                                   error="no such host"),
                       egress_policy=_StubEgressPolicy())
@@ -351,7 +393,8 @@ def test_record_evidence_refuses_without_attempt_node(tmp_path):
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
     registry = production_registry()
-    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     record = execute_adapter(registry, prep,
                              sandbox=FakeSandbox(egress_policy=None),
                              audit=audit)
@@ -371,7 +414,8 @@ def test_evidence_mapping_is_legacy_shape_and_idempotent(tmp_path):
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
     registry = production_registry()
-    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     stdout = "203.0.113.7\n203.0.113.8\n"
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=stdout),
                       egress_policy=_StubEgressPolicy())
@@ -422,7 +466,8 @@ def test_zero_resolution_run_is_an_honest_inconclusive(tmp_path):
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
     registry = production_registry()
-    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(registry, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""),
                       egress_policy=_StubEgressPolicy())
     record, output = execute_adapter(
@@ -445,7 +490,8 @@ def test_resolution_is_recon_evidence_never_confirmation(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout="203.0.113.7"),
                       egress_policy=_StubEgressPolicy())
     record, _output = execute_adapter(reg, prep, sandbox=sbx, audit=audit,
@@ -528,7 +574,8 @@ def test_adapter_mode_resolves_dnsx_once_never_both(tmp_path):
     cmdl = [argv for argv, _t in spawned]
     runs = [a for a in cmdl if a and a[0] == "dnsx"]
     assert len(runs) == 1
-    assert runs[0] == ["dnsx", "-d", TARGET, "-silent"]
+    assert runs[0] == ["dnsx", "-l", TARGET, "-r", _RESOLVER,
+                       "-resp-only", "-silent", "-duc", "-nc"]
     nodes = graph.by_type("dns_resolution")
     assert len(nodes) == 1
     assert nodes[0]["label"] == TARGET
@@ -552,8 +599,9 @@ def test_adapter_renders_the_lane_pinned_discovery_argv(tmp_path):
     cmdl = [argv for argv, _t in spawned]
     naabu_runs = [a for a in cmdl if a and a[0] == "naabu"]
     assert len(naabu_runs) == 1
-    assert naabu_runs[0] == ["naabu", "-host", TARGET, "-p", RECON_PORTS,
-                             "-rate", "100", "-silent"]
+    assert naabu_runs[0] == ["naabu", "-host", TARGET, "-r", _RESOLVER,
+                             "-p", RECON_PORTS, "-rate", "100", "-silent",
+                             "-duc"]
 
 
 def test_empty_registry_falls_back_legacy_deterministically(tmp_path):
@@ -569,6 +617,36 @@ def test_empty_registry_falls_back_legacy_deterministically(tmp_path):
         for e in nodes)                       # legacy excerpt nodes only
     assert graph.by_type("adapter_attempt") == []
     assert "recon_active_dnsx_adapter" not in _event_names(audit)
+
+
+def test_legacy_lane_omits_dnsx_without_pinned_resolvers(tmp_path):
+    """No pinned resolvers -> the legacy dnsx entry is OMITTED, never
+    faked into a doomed spawn (dnsx 1.3.1 without -r queries its
+    hardcoded public resolvers, which the gate drops). The state still
+    completes — honestly with less evidence."""
+    sandbox = FakeSandbox(script=_script_discovery_and_web,
+                          egress_policy=_StubEgressPolicyNoResolvers())
+    result, spawned, graph, audit = _recon(sandbox, AdapterRegistry(),
+                                           tmp_path)
+    assert result.status == "ok"
+    cmdl = [argv for argv, _t in spawned]
+    assert [a for a in cmdl if a and a[0] == "dnsx"] == []
+
+
+def test_adapter_lane_refuses_without_pinned_resolvers(tmp_path):
+    """The dnsx-probe lane with no pinned resolvers is an AUDITED
+    refusal (nothing spawned), never a doomed run, never fatal to the
+    state."""
+    sandbox = FakeSandbox(script=_script_discovery_and_web,
+                          egress_policy=_StubEgressPolicyNoResolvers())
+    result, spawned, graph, audit = _recon(sandbox, recon_active_registry(),
+                                           tmp_path)
+    assert result.status == "ok"
+    cmdl = [argv for argv, _t in spawned]
+    assert [a for a in cmdl if a and a[0] == "dnsx"] == []
+    failures = [e for e in _events(audit)
+                if e.get("event") == "recon_active_adapter_failure"]
+    assert any(f.get("adapter") == "dnsx-probe" for f in failures)
 
 
 # ---- 14. planner integration (covered post-hoc; domain pairing) ------------------------------
@@ -681,7 +759,8 @@ def test_gates_untouched_by_adapter_path(tmp_path):
     reg = production_registry()
     audit = AuditLog(tmp_path / "a.jsonl")
     graph = _graph()
-    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET)
+    prep = prepare_adapter_run(reg, ADAPTER_ID, target=TARGET,
+                               params={"resolver": _RESOLVER})
     sbx = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout="203.0.113.7"),
                       egress_policy=_StubEgressPolicy())
     record = execute_adapter(reg, prep, sandbox=sbx, audit=audit, graph=graph)
@@ -774,7 +853,10 @@ def test_real_dnsx_probe_lab_it():
     graph = EngagementGraph(engagement_id="dnsx-it")
     graph.add_node("target", lab, {})
     try:
-        prep = prepare_adapter_run(reg, ADAPTER_ID, target=lab)
+        prep = prepare_adapter_run(
+            reg, ADAPTER_ID, target=lab,
+            params={"resolver": ",".join(
+                str(r) for r in (policy.dns_resolvers or ()))})
         record, output = execute_adapter(reg, prep, sandbox=sbx,
                                          audit=audit, graph=graph,
                                          full_output=True)

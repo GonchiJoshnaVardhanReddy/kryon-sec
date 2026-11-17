@@ -1,0 +1,38 @@
+{
+  "summary": {
+    "when": "20261117T085741Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "dnsx",
+      "engagement": "lab-p4-dnsx",
+      "label": "REAL",
+      "note": "domain resolution (pinned resolver, -resp-only)",
+      "argv": [
+        "dnsx",
+        "-l",
+        "juice-shop.lab",
+        "-r",
+        "10.213.44.1",
+        "-resp-only",
+        "-silent",
+        "-duc",
+        "-nc"
+      ],
+      "duration_s": 0.99,
+      "exit_code": 0,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 13,
+      "error_excerpt": "",
+      "excerpt": "10.213.43.10\n",
+      "output_format": "text",
+      "evidence_files": []
+    }
+  ]
+}
