@@ -24,6 +24,11 @@ ALLOWED_TOOLS=(
     "feroxbuster" "sslscan" "testssl.sh" "dnsx"
     # active recon (Phase 8): screenshots, DNS brute-force, API discovery
     "gowitness" "massdns" "/opt/kryonsec/openapi_probe.py"
+    # active recon (Phase 4 expansion, 2026-11-17): WAF fingerprinting,
+    # content discovery, DNS enumeration (resolver-pinned), SMB/NetBIOS
+    # (port-gated: only planned when 139/445 is observed open)
+    "wafw00f" "dirsearch" "dnsenum" "fierce" "nbtscan" "smbmap" \
+    "enum4linux-ng"
     # vetted TLS/API baseline adapters (Phase 2B.5): baked wrapper
     # scripts, fixed argv = [script, url]. tls_probe.py owns the image's
     # real testssl binary (/usr/bin/testssl) with frozen flags;
@@ -54,6 +59,11 @@ ALLOWED_TOOLS=(
     "semgrep" "bandit" "gitleaks" "trivy" "checkov" "hadolint"
     # blue-team SBOM/dependency scanners (Phase 8)
     "syft" "osv-scanner" "grype"
+    # blue-team binary/forensics dir-mode scanners (Phase 4): /code
+    # read-only mount only (dir-mode tools; file-granular binary tools
+    # stay UNALLOWLISTED until the {file} slot exists — Dockerfile note;
+    # terrascan deferred: no Kali package — Dockerfile note)
+    "checksec" "exiftool"
     # image-side extras kept from the original image (not host-allowlisted
     # today, harmless here — the HOST allowlist is the authoritative gate)
     "python3" "kube-bench"

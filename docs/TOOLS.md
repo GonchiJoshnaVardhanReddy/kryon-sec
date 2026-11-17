@@ -120,6 +120,53 @@ full-range scan against a third party is exactly what spec §9.1 fears.
 **`nmap` uses `-sT` (connect scan) on purpose.** gVisor grants no raw sockets,
 so the default SYN scan dies with *"Couldn't open a raw socket"*.
 
+### Adapter probes over six legacy entries (Tool Expansion Batches 1–2)
+
+RECON_ACTIVE can run six of the entries above through the Phase 2B adapter
+framework instead of the bare stdout pipe: `naabu` (port discovery), `dnsx`
+(DNS resolution), `nmap` (service scan), `katana` (web crawling),
+`feroxbuster` (content discovery), and `gowitness` (screenshots). When the
+matching adapter is registered (`naabu-probe`, `dnsx-probe`, `nmap-probe`,
+`katana-probe`, `feroxbuster-probe`, `gowitness-probe`), it **replaces** the
+legacy entry deterministically — one probe per check, never both. The adapter
+runs the **same binary with the same argv shape** (byte-identical templates,
+lockstep-tested against this table): the lane pins `ports=RECON_PORTS` and
+`rate=100` for naabu and nmap, nothing for dnsx, `depth=2` for katana, and
+nothing for feroxbuster/gowitness — the exact constants the legacy plan uses,
+never caller input. The `feroxbuster` adapter's `-u` argument is the
+FUZZ-marker URL, composed deterministically by the adapter framework from the
+scope-validated base (`base.rstrip('/') + '/FUZZ'` — the same composition the
+legacy entry applies); the lane can never point the fuzzing at a different
+origin than the base it was given.
+
+What the adapter adds over the legacy parse:
+
+- a structured `adapter_attempt` run record on the evidence graph (argv, exit
+  code, excerpts, provenance) and its own audit event per lane;
+- bounded, defensive per-line parsing (`host:port` / IPs / bare URLs / feroxbuster
+  status-URL lines) with a hard observation cap and honest malformed-line counts;
+- `not_verified` everywhere: an open port, a resolved IP, a crawled path, a
+  busted directory, and a screenshot are facts about the target — never
+  findings. `naabu-probe` still feeds the shared `open_ports` set and adds
+  **no** graph nodes of its own (legacy parity); `dnsx-probe` emits the one
+  legacy-shape `dns_resolution` node; `nmap-probe` emits the legacy-shape
+  `service` nodes (same shape the legacy parse produces — it REUSES the legacy
+  TEXT parser, lockstep by construction); `katana-probe` and
+  `feroxbuster-probe` emit legacy-shape `path` nodes tagged with adapter
+  provenance (first-wins dedupe by label); `gowitness-probe` emits the one
+  legacy-shape `screenshot` node per successful run — there is NO text
+  contract to parse, the exit code is the truth, and a refused/failed run
+  records NO node;
+- the discovery lanes (`nmap-probe`, `naabu-probe`, `dnsx-probe`) run
+  **before** the optional planner and are not planner-gated (the plan needs
+  their observed ports); `katana-probe`, `feroxbuster-probe`, and
+  `gowitness-probe` are planner-gated like every other web lane. With the
+  planner off, behavior is otherwise identical to the fixed plan.
+
+These adapters need no allowlist or image change: `naabu`, `dnsx`, `nmap`,
+`katana`, `feroxbuster`, and `gowitness` were already allowlisted and baked
+into the pinned sandbox image.
+
 ---
 
 ## 3. Exploit — only operator-approved hypotheses
@@ -305,3 +352,17 @@ accepted an argument ending in `\n`.
 On top of the allowlist, the joined argv is checked against destructive
 patterns and rejected if matched: `rm -rf`, `dd if=`, `DROP TABLE`, `mkfs`,
 `shred`, and fork bombs. This is re-checked host-side.
+
+---
+
+## Note on the agent handoff layer (Batch 3)
+
+Tool Expansion Batch 3 added **no tools, no allowlist entries and no image
+change**. What it added is a structured exchange *between* the states: typed,
+de-duplicated handoff messages with a deterministic coordinator
+(`purple/handoff.py`, `purple/coordinator.py`) and a `handoff_records` table
+(migration `0003`, purple storage only). The coordinator is a data exchange —
+it runs after a state completes, reads the evidence graph, and never decides a
+transition, launches a tool, or grants an approval. See the
+[structured handoffs section](../README.md#structured-handoffs-between-the-states-batch-3)
+in the README for the full contract.

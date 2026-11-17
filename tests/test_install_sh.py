@@ -478,13 +478,20 @@ def _offline_pip_wheel() -> Path:
 
     CPython normally bundles one under ensurepip; Debian/Ubuntu move it to
     /usr/share/python-wheels instead, which is why both are checked.
+    The ensurepip MODULE itself can be absent (Debian splits it into the
+    python3.x-venv package — a distro upgrade can take it away), so the
+    import must degrade to the Debian directory instead of crashing the
+    helper; when neither source has a wheel the test skips by design.
     """
-    import ensurepip
-
-    directories = [
-        Path(ensurepip.__file__).resolve().parent / "_bundled",
-        Path("/usr/share/python-wheels"),
-    ]
+    directories = []
+    try:
+        import ensurepip
+    except ImportError:  # Debian/Ubuntu without python3.x-venv
+        pass
+    else:
+        directories.append(
+            Path(ensurepip.__file__).resolve().parent / "_bundled")
+    directories.append(Path("/usr/share/python-wheels"))
     for directory in directories:
         wheels = sorted(directory.glob("pip-*.whl"))
         if wheels:

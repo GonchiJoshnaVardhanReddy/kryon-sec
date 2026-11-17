@@ -56,6 +56,8 @@ class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
     the REAL enforcement lives inside the sandbox's own spawn)."""
 
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
+
 
 class FakeSandbox:
     """Duck-typed sandbox double carrying the attributes the adapter

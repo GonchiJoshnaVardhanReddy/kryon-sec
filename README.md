@@ -217,12 +217,14 @@ feature-gated **OFF by default** · 💤 wired but dormant by design · 🗺️ 
 | Purple 10-state orchestrator (plain Python, HALT terminal) | ✅ |
 | SHA-256-chained audit chain (canonical JSON, replayable verify) | ✅ |
 | Allowlist: 57 argv templates across 5 stage groups | ✅ |
-| Zone A passive recon — 10 third-party sources, zero packets to target | ✅ |
+| Zone A passive recon — 13 third-party/local sources, zero packets to target (incl. the Wave-1 archives module) | ✅ |
 | Enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (+ sandbox-local searchsploit/nuclei-meta) | ✅ |
 | Evidence graph + per-state durable checkpoints | ✅ |
 | Independent VERIFY (boolean SQLi probe through the sandbox) | ⚙️ needs sandbox |
 | Blue-team code scanners (`--code`, read-only mount) | ⚙️ needs sandbox |
 | Vetted web adapters (httpx/whatweb/tls/api/searchsploit-term/nuclei probes) | 🧪 12/12 lab IT |
+| Batch 1 adapter probes (naabu/dnsx/katana) — same sandbox+allowlist path | 🧪 mocked suites green; lab ITs armed, not run |
+| Batch 2 adapter probes (nmap/feroxbuster/gowitness) — same sandbox+allowlist path | 🧪 mocked suites green; lab ITs armed, not run |
 | Nuclei hash-pinned template manifest + sandbox-side gate (2B.8) | 🧪 enforced, fail-closed |
 | Zone B egress boundary (per-engagement bridge, DOCKER-USER/INPUT allow-only) | ⚙️ needs Docker host + `sudo -n` helper |
 | Deterministic tool planner (2B.6) | 🚧 OFF unless enabled |
@@ -367,7 +369,7 @@ for the running agent.
 | Shortcut | Action |
 |---|---|
 | **Enter / Shift+Enter** | send / insert a newline |
-| **Shift+Tab** | switch Copilot/Purple when the existing sandbox and license checks allow it |
+| **Shift+Tab** | switch Copilot/Purple when the existing sandbox checks allow it |
 | **Ctrl+P** | open the command palette (also: Rename session, Close session, Open Kryonsec Memory) |
 | **Ctrl+N** | create a real new session or engagement |
 | **Ctrl+Left / Ctrl+Right** | move between stored tabs |
@@ -666,11 +668,21 @@ set contains x86-64-only artifacts). Copilot runs anywhere Python 3.11–3.13 do
 
 ## Install
 
+> **Development build notice:** this tree is a development build in which
+> product login, beta approval, membership keys and license verification are
+> **temporarily removed** — the app runs with no account, and the wizard and
+> `kryonsec doctor` never ask for one. Old config files that still carry a
+> `[license] key` load fine; the value is ignored and can be deleted by hand.
+> The published release may differ. Every Mode B technical gate (Linux,
+> Docker, gVisor, digest-pinned image, egress, target scope, human Gates 2/3)
+> is unchanged and still enforced.
+
 Kryonsec is commercial, proprietary-licensed software. The source in this repository is
 public for review, but the **supported distribution is a built wheel served from
-[kryonsec.in](https://kryonsec.in)**, and a membership key is what unlocks it — the
-installer downloads a version-matched wheel, verifies its SHA-256, and never treats the
-GitHub tree as a distribution channel. [Request access](https://kryonsec.in) to get a key.
+[kryonsec.in](https://kryonsec.in)**. The hosted installer still verifies the download
+against the site's release gate; the *application* itself needs no account in this
+development build. [Request access](https://kryonsec.in) to get a key for the hosted
+release.
 
 ### Linux or WSL2
 
@@ -697,8 +709,9 @@ It then:
    `python3` — and warns if the only one present is a very new 3.14, where pip may have to
    compile dependencies from source and the install looks stalled)
 3. Creates a dedicated virtualenv at `~/.kryonsec/venv`
-4. Downloads the release from `kryonsec.in` with your key, and saves that key to
-   `~/.kryonsec/config.toml` so Purple Team never asks for it again
+4. Downloads the release from `kryonsec.in` (the site's download gate still applies to the
+   hosted wheel) and — if a key was supplied — saves it to `~/.kryonsec/config.toml`;
+   in this development build the app ignores that value, so it can be deleted by hand
 5. Adds `~/.kryonsec/venv/bin` to your `PATH` (in `.bashrc`, idempotent)
 6. On the approved Purple profile, validates the selected Docker context and daemon,
    installs/registers gVisor only after consent, backs up and validates Docker JSON before
@@ -812,16 +825,15 @@ are no nested subcommands and no hidden flags.
 | `kryonsec --version` | — | prints `kryonsec 1.3.11` |
 | `kryonsec setup` | — | re-runs the setup wizard |
 | `kryonsec doctor` | `--deep`, `--strict` | read-only preflight checks; `--deep` adds a harmless network-disabled runsc smoke container; `--strict` exits non-zero unless Copilot *and* the verified Purple runtime are ready |
-| `kryonsec connect` | `--no-browser` | register this machine to your membership (opens a browser once) |
-| `kryonsec login` | `--no-browser` | sign in to a beta account (opens a browser once; no key needed) |
-| `kryonsec logout` | — | revoke this machine's token, then delete it locally |
-| `kryonsec auth [status]` | — | show how this machine is signed in (`status` is the only value) |
 | `kryonsec purple` | `--target` (required), `--id`, `--code FOLDER` | start a Purple Team engagement (Profile 2, Linux only); `--code` mounts a source folder read-only for the blue-team scanners |
 | `kryonsec memory` | `--host` (loopback-only), `--port` (default 8899), `--no-browser` | serve the read-only engagement-memory browser |
 
+(`kryonsec connect` / `login` / `logout` / `auth` are absent from this development build —
+no account is needed.)
+
 Exit codes worth knowing: `kryonsec purple` returns **2** for an invalid target or
-`--code` folder and **3** when the membership/license gate refuses Mode B (Copilot stays
-unaffected). `kryonsec memory` returns **2** and a clear message if you try to bind a
+`--code` folder. (Exit 3, formerly the membership gate, is gone in this development
+build.) `kryonsec memory` returns **2** and a clear message if you try to bind a
 non-loopback host — there is no override; use an SSH tunnel instead.
 
 ```bash
@@ -949,8 +961,8 @@ Two details worth calling out:
 | State | Purpose (input) | Agent | Tools / data sources | Output · audit | Next | Approval |
 |---|---|---|---|---|---|---|
 | `INIT` | Load config, validate the target into a bare in-scope domain, derive engagement id | init (deterministic) | none | validated scope + budget tracker · `engagement_created`, `state_enter` | `RECON_PASSIVE` | none — *authorization is yours*; an invalid target exits 2 before anything starts |
-| `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
-| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe) **or** vetted adapters (httpx/whatweb/tls/api/nuclei probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
+| `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, the archives module (Wayback + pinned Common Crawl, parameter mining), OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
+| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe; Phase 4 adds wafw00f, dirsearch per web base, resolver-pinned dnsenum/fierce, port-gated nbtscan/smbmap/enum4linux-ng) **or** vetted adapters (httpx/whatweb/tls/api/nuclei/naabu/dnsx/nmap/katana/feroxbuster/gowitness probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
 | `HYPOTHESIZE` | Propose vulnerability hypotheses from the graph | hypothesizer **(LLM)** | nothing touches the target; enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (host-side), searchsploit + nuclei-meta (sandbox-local) | hypothesis nodes with confidence, CVSS vector, enrichment · `enrichment_lookup` events | `HUMAN_REVIEW` | none |
 | `HUMAN_REVIEW` | **Blocking approval** of hypotheses | **you** | none | approved/rejected sets · every decision audited; **non-TTY approves nothing** | `EXPLOIT` if ≥1 approved, else `BLUE_TEAM` | **Gate 2** |
 | `EXPLOIT` | Execute **approved hypotheses only** | exploit (deterministic, LLM parses output) | `EXPLOIT` allowlist (sqlmap, nuclei, ffuf, gobuster, wfuzz, dalfox, commix, ssrfmap, arjun, tplmap, nikto, …); every nuclei run needs per-hypothesis approval | exploit_attempt nodes, exit codes, evidence · `tool_spawn/tool_result`, `capability_recorded` | `POST_EXPLOIT` only if shell detected **and** separately approved; else `VERIFY` | Gate-2 approval per hypothesis (+ **Gate 3** if a shell is claimed) |
@@ -995,6 +1007,210 @@ verification contract, and a shell-producing tool, all reviewed, plus your opera
 approval. The report states this dormancy explicitly rather than implying a capability
 that isn't there.
 
+### Structured handoffs between the states (Batch 3)
+
+The states exchange typed messages through a deterministic coordinator
+(`purple/handoff.py` + `purple/coordinator.py`). This is **data exchange along the
+existing workflow — it never decides a transition.** The ten-state orchestrator stays
+the only transition authority; the recorder runs *after* a state completes and derives
+its records from the graph, so a record can describe what finished but cannot trigger
+EXPLOIT, POST_EXPLOIT, a network request or a tool launch. It makes no LLM call and
+touches no tool.
+
+What it gives the loop:
+
+- **Typed contracts.** Eight message kinds (task assignment, evidence reference,
+  observation, task result, blocked task, human-approval request, verification result,
+  completion summary) with engagement id, source/destination, correlation id,
+  hypothesis/finding/evidence refs, and bounded sanitized content — one line, capped,
+  redacted *before* capping. `extra="forbid"` means no message schema accepts an
+  `approved` field: an agent cannot claim a human decision it did not receive. The only
+  approval-shaped message is a *request* addressed to the human, and `requires_approval`
+  is derived from the task type's safety class, never declared by the caller.
+- **Deterministic dedup.** Stable content-addressed identities: a re-dispatch of known
+  work never creates a second record — it returns one word from a closed outcome set
+  (`already_completed`, `in_progress`, `safe_retry`, `needs_approval`, `failed`,
+  `inconclusive`, …) that says what the known record means. Outcomes are never invented.
+- **State-changing work never re-runs silently.** A failed or inconclusive exploit test
+  or verification probe is not re-run because a dispatcher asked twice: `retry()` is
+  refused until the task goes back through a recorded human approval. Read-only work
+  (recon sweeps, blue-team scans) may retry freely.
+- **Shared evidence stays in the one graph.** Links are node ids plus a
+  `produced`/`consumed` role into the engagement graph — never copies of raw output.
+  A record citing evidence that does not exist in the live graph is refused; another
+  engagement's evidence is unreachable.
+- **Persistence through the existing storage layer.** One `handoff_records` row per
+  record (migration `0003`, purple storage only), replaced per engagement in a single
+  transaction — checkpointed at every state boundary, persisted at HALT, replayed
+  idempotently, restored coordinators re-deduplicate. Storage failures are audited and
+  reported, never fatal to the engagement.
+- **Progress you can watch.** Every boundary appends a `handoff_progress` event
+  (counts by status and task type) to the audit chain, which is what the terminal UI
+  and the event stream read.
+
+Gate 2 and Gate 3 are untouched: the Gate 2 outcome is *recorded* as a task result and
+one assignment per approved hypothesis — registered after the transition, as data, never
+as the reason EXPLOIT runs.
+
+### Specialist scheduling, task context, budgets and skills (Batch 4)
+
+The layer above the coordinator (`purple/specialist.py`, `purple/task_context.py`,
+`purple/deliverables.py`, `purple/skills.py`). Deterministic Python throughout — the
+scheduler runs inside the same single-threaded state boundary, after a state completed,
+with no new authority. It can never trigger the next state, enter EXPLOIT/POST_EXPLOIT,
+launch a tool or touch the network. No new LLM calls at the boundaries; no allowlist or
+image change.
+
+- **Six roles, honestly described.** `recon_analysis`, `hypothesis_analysis`,
+  `evidence_assessment`, `verification_support`, `defensive_recommendation`,
+  `reporting` — capability descriptions, not agents. Two have deterministic executors
+  today: evidence assessment (reads the engine's own view of a hypothesis and grades it
+  with the engine's standing vocabulary, never model prose) and — Batch 5D —
+  verification support (reads a finding's verification records and grades their
+  QUALITY — evidence analysis only; it runs no probe, and can neither promote nor
+  demote a finding). A role whose real implementation would be an LLM state says so
+  and is **deferred — never improvised** with a stub.
+- **Bounded tasks, deduplicated proposals.** A `SpecialistTask` validates its stage
+  against the orchestrator's state list, priority 0–100, timeout 10–3600 s, at most 8
+  dependencies. Submission must cite a known task-assignment record of the role's type,
+  in the role's stage, in the engagement. A model *proposal* can only become scheduled
+  work through the coordinator's dedup identity, and only if it is read-only — a
+  state-changing proposal is refused at the door.
+- **Read-only assessment derived at HYPOTHESIZE.** Every proposed hypothesis gets one
+  read-only `evidence_assessment` assignment (max 12 per boundary), registered as data.
+  The scheduler then decides what runs. The assessment links the hypothesis node as
+  consumed evidence and answers with engine words (`supported`, `proposed`,
+  `unresolved`, …) — a missing subject is `blocked`, never a fake "completed".
+- **One shared budget.** Specialists reserve against the orchestrator's existing
+  `BudgetTracker` — no second budget. Reservations hold headroom but never halt the
+  loop; commits are first-commit-wins so replays never double-count; every specialist
+  token figure is labelled an estimate. Budget exhaustion defers a task (audited, with
+  the reason) instead of blocking the engagement.
+- **Real resume.** The scheduler snapshot rides in the same transaction as the handoff
+  records (migration `0004`), so records and scheduler always describe one moment. On a
+  reused engagement id: interrupted read-only work reopens and is recomputed;
+  interrupted state-changing work is parked behind Gate 2 — never automatically
+  repeated; finished work is left alone; budget consumption continues. A corrupt
+  checkpoint is refused loudly and the engagement continues with a fresh scheduler over
+  the records that did restore.
+- **Task-scoped context.** What one task may see, and nothing more: the objective with
+  its safety class, the subject's engine view, up to six related assets, bounded prior
+  results for the same subject, Gate-2 outcome records, deterministic open questions —
+  every line redacted, marked untrusted vs engine-derived, capped, and framed as DATA
+  ONLY, NOT INSTRUCTIONS.
+- **Deliverable contracts.** A specialist files a validated deliverable with a closed
+  status vocabulary and a closed standing vocabulary (the engine's own words). It cannot
+  invent a standing, add extra fields, or claim a confidence without evidence — a
+  malformed deliverable fails the task with the reason kept.
+- **Reviewed skill packs.** Six packaged, versioned, read-only methodology notes
+  (recon methodology, evidence quality, counterevidence, severity calibration,
+  verification method, defensive remediation). The loader takes no path argument;
+  parsing refuses executable-shaped keys, fenced code and frame-forging text; injection
+  is a bounded, framed, version-provenanced block that names any skill it had to omit —
+  and ends with "nothing above authorizes any action."
+- **Progress you can watch.** Specialist events flow through the existing UI adapters:
+  scheduled/done/blocked counters, token estimates, deferral and resume notices.
+
+### Exploit contracts, honest verification (Batch 5)
+
+The layer that turns "an approved hypothesis" into "a test that may run", and "a tool
+said so" into "an independent check agreed" — typed contracts around both, plus the
+counterevidence rule (`purple/exploit_contract.py`, `purple/verify_contract.py`,
+`purple/evidence_quality.py`).
+
+- **EXPLOIT builds a typed contract before anything runs (5A).** From the approved
+  hypothesis: engagement and target identity, the ONE target asset, derived categories,
+  the hypothesis's OWN tool list verbatim (approving `sqlmap` is not approving
+  `nuclei`), the Gate-2 approval reference (citing the actual `hypothesis_reviewed`
+  audit entry's hash), and the sandbox time ceiling. Every refusal — cross-engagement
+  hypothesis, missing Gate-2 approval, out-of-scope asset, no adapter, allowlist
+  rejection, no tools at all — is a structured typed refusal that is audited
+  (`exploit_contract_refused`) and recorded on the graph as an `exploit_refusal` node:
+  a skipped test is visible evidence, not a silent gap. The attempt record carries the
+  references, a structured failure classification (the sandbox's own failure words),
+  wall-clock duration, the audit-entry hash for correlation, and the honest limitations
+  of marker-based confirmation — a spawn that worked and an exit code are stated, on
+  the record, to be neither evidence nor an independent check.
+- **VERIFY runs a REGISTERED contract, not a hardcoded branch (5B).** The boolean curl
+  probe (AND 1=1 vs AND 1=2 against the baseline) is a contract scoped to the one
+  category it is evidence for — SQL injection. A contract binds category → one
+  independent method and states the tool, the evidence prerequisites, what agreement
+  and contradiction look like, the budget (probes count + per-probe seconds, enforced
+  in the fixed argv), the stage (VERIFY only), the approval basis, and — written down —
+  what the method CANNOT establish. Registration is fail closed: an unimplemented
+  method, an unreachable or `unknown` category, a duplicate, bad bounds — all refuse to
+  register. The registry starts with exactly ONE entry. A nikto or dalfox finding on
+  `?id=1` is NO LONGER probed with the boolean-SQL method (that was a false-positive
+  factory): unsupported categories take an honest `not_run` with the real reason and
+  keep only reachability evidence. The contract's tool must differ from the finding's
+  own tool — a repeat is not an independent check.
+- **Counterevidence is recorded, never discarded; contested verdicts read
+  `unresolved` (5C).** On an agreeing boolean signature the verifier fetches one more
+  baseline: if the baseline itself moves between requests, content rotates, and the
+  observed difference may be rotation, not the injection — that observation is
+  RECORDED on the attempt (`counterevidence`), the finding is NOT promoted, and the
+  status reads `unresolved`: the question is left open, never settled either way by a
+  word. A substantial difference without a baseline no longer reads `verified` at all.
+  Disagreement and the no-baseline weakness are recorded the same way. Only agreement
+  WITH zero counterevidence promotes a finding.
+- **The evidence-quality review (5C).** Five Strix/Shannon-style checks per verify
+  attempt, derived from the record's own fields — ran, reachability (up to and
+  including "inapplicable: outside engagement scope"), baseline control, independence,
+  and conclusion-strength-vs-observations (a stored status word the evidence does not
+  derive is flagged and ignored). Quality words: `supported` / `contradicted` /
+  `contested` / `weak` / `reachability_only` / `blocked` / `none`. It is an annotation
+  layer over the status derivation — never a promotion path.
+- **The verification-support specialist (5D) reads, never probes.** A new read-only
+  task type (`verification_analysis`), derived from registered records at the VERIFY
+  boundary: the specialist files the derived standing, the counterevidence verbatim,
+  and the deterministic open questions — no sandbox, no spawn, no promotion. A
+  specialist that could probe would be a second, uncontracted path to target contact.
+  Checkpoint/resume covers it like every other read-only task.
+
+### The controlled Post-Exploit lifecycle (Batch 6)
+
+Phases 1B–1D proved a capability claim, verified it independently, and gated it. Batch 6
+finishes the record's LIFE — where it may live, how long it lives, how it dies, and what
+consuming it means (`purple/capability.py`, `purple/post_exploit.py`,
+`purple/coordinator.py`).
+
+- **Records are bound, stamped, and mortal (6A).** Every claimed record carries the
+  engagement that claimed it (`engagement_id`) and the moment it was claimed
+  (`recorded_at`). Eligibility is ONE ordered, pure, fail-closed check
+  (`capability_eligibility`) every consumer re-derives at consumption time: consumed →
+  revoked → approved → independently verified → bound to THIS engagement → in scope →
+  fresh → its attempt still exists, matches the tool, and still confirms. Six hours after
+  the stamp the record expires (`CAPABILITY_MAX_AGE_S`): a capability is a statement about
+  a shell that existed at a moment in time, never a standing authorization. Unbound legacy
+  records are refused, not grandfathered; a missing, unparseable or future stamp is never
+  read as fresh.
+- **Revocation is recorded, never deleted (6A).** The audited kill switch
+  (`revoke_capability`) flips a record to the one-way `revoked` status in place — the same
+  direct write the Gate 3 decision uses — with a `capability_revoked` audit entry carrying
+  the previous status. Revoked records are refused everywhere; re-revoking is an idempotent
+  no-op; unknown or malformed nodes refuse.
+- **The producer registry has a front door, and it is still empty (6A).**
+  `register_capability_parser()` is the reviewed-configuration entry point: bounded names
+  (≤64 chars, no control characters), callable parsers, deliberate overwrite on
+  re-registration (mirroring the verification-contract registry). The shipped registry
+  stays EMPTY — asserted as data by test — so POST_EXPLOIT remains dormant exactly as
+  before: activation stays a separately reviewed, human-approved, lab-validated decision.
+- **Gate 3's approval becomes bounded handoff data (6B).** The EXPLOIT boundary derives
+  one `post_exploit_enum` task assignment per Gate-3-approved record — capped at three,
+  identity-deduped on replay, approval requirement re-derived from the state-changing task
+  type — registered after the transition as a record of what was authorized; the
+  orchestrator alone routes. Fixed: the POST_EXPLOIT boundary counted engagement notes
+  (a node type that state never writes) and always reported zero — it now counts the
+  `post_exploit_evidence` nodes the state actually produced.
+- **Consumption is one-shot (6C).** The subagent no longer hand-rolls its checks; it
+  re-derives eligibility at consumption time with the graph's engagement id and the real
+  clock, then marks the eligible record `consumed_at` at the START of the run (audited
+  `capability_consumed`). A crash mid-plan leaves the record consumed: a re-run REFUSES it
+  instead of silently replaying state-changing enumeration. Recovery is a fresh claim from
+  fresh evidence — and the tests prove both the refusal and that recovery path. A
+  save/reload roundtrip through the engagement store preserves both the consumption guard
+  and eligibility.
+
 ### The evidence ladder
 
 Findings are never just *"the scanner said so."* Every finding climbs three rungs:
@@ -1021,9 +1237,11 @@ makes it feel like a researcher's workflow rather than a scanner dump.
 
 Two honest nuances the graph carries everywhere: exploit *references* (searchsploit
 hits, matching nuclei templates) are recorded with status `not_verified` — a public
-exploit existing is context, not proof. And verification can honestly end
-`disagreed` or `inconclusive`; a blocked check is `not_run` with a real reason, never
-disguised as a pass.
+exploit existing is context, not proof. And verification can honestly end `disagreed`,
+`inconclusive` — or `unresolved`, when the check saw an agreeing difference but
+counterevidence stands that a benign cause could produce the same difference (recorded
+verbatim, never discarded). A blocked check is `not_run` with a real reason, never
+disguised as a pass; a verdict with standing counterevidence never promotes.
 
 ---
 
@@ -1044,6 +1262,7 @@ query third parties only, never the target.
 |---|---|---|
 | crt.sh (certificate transparency) | subdomains, cert issuers/validity/SAN notes | no |
 | Wayback Machine (CDX API) | archived URLs → subdomains + historical paths | no |
+| Archives module (Wayback CDX + pinned Common Crawl index) | historical URL discovery — the gau/waybackurls capability as one host-side module, plus the parameter-bearing subset and parameter NAMES derived deterministically (the paramspider capability — derived from archived data, never probed) | no |
 | AlienVault OTX | passive DNS history | no |
 | RIPEstat | whois summary + ASN data | no |
 | RDAP (IANA bootstrap) | registry whois per TLD | no |
@@ -1052,6 +1271,11 @@ query third parties only, never the target.
 | Shodan | subdomain intelligence | yes |
 | Censys | host intelligence | yes |
 | cloud suffix classification | AWS/Azure/GCP asset hints | no — local, zero fetch |
+
+The archives module reads a **pinned** Common Crawl index id
+(`COMMONCRAWL_INDEX` in `zonea.py` — reviewed configuration, like a pinned wordlist):
+deterministic behavior run-to-run; moving to a newer crawl is a deliberate one-line
+change, never an auto-updated feed.
 
 CVE context (NVD, CISA KEV, EPSS, OSV, GitHub Advisories) is *not* fetched here — it
 belongs to HYPOTHESIZE enrichment, which uses the same third-party-only fetch guard.
@@ -1155,6 +1379,9 @@ policy-violating configuration is refused at registration — never defaulted to
 | `api-probe` | read-only API inspection | RECON_ACTIVE | sandbox | base URL → headers/CORS/OPTIONS/OpenAPI notes | GET/OPTIONS only, ≤7 requests, redirects never followed | 🧪 lab IT |
 | `nuclei-probe` | manifest-driven template scan | RECON_ACTIVE | sandbox | in-scope URL → vuln candidates | templates chosen **by the manifest**, gate-enforced | 🧪 lab IT |
 | `searchsploit-term` | offline ExploitDB lookup | HYPOTHESIZE | sandbox | sanitized term → exploit references | informational only, results `not_verified` | 🧪 lab IT |
+| `naabu-probe` | TCP port discovery (Batch 1) | RECON_ACTIVE | sandbox | domain → open ports (merged into the shared port set, no own nodes) | pinned `ports=RECON_PORTS`, `rate=100`; replaces the legacy naabu entry; not planner-gated | 🧪 mocked suite green · lab IT armed, not run |
+| `dnsx-probe` | DNS resolution (Batch 1) | RECON_ACTIVE | sandbox | domain → one legacy-shape `dns_resolution` node | replaces the legacy dnsx entry; not planner-gated | 🧪 mocked suite green · lab IT armed, not run |
+| `katana-probe` | web crawl (Batch 1) | RECON_ACTIVE | sandbox | base URL → legacy-shape `path` nodes | pinned `depth=2`; replaces the legacy katana entry; planner-gated | 🧪 mocked suite green · lab IT armed, not run |
 
 ### B. Fixed-plan allowlist tools (deterministic plans)
 
@@ -1167,11 +1394,17 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `dnsx`, `massdns` | RECON_ACTIVE | sandbox | DNS resolution/enumeration | ⚙️ sandbox |
 | `httpx`, `httpx-toolkit` | RECON_ACTIVE | sandbox | HTTP probing of discovered hosts | ⚙️ sandbox |
 | `katana`, `hakrawler`, `feroxbuster` | RECON_ACTIVE | sandbox | crawling/content discovery | ⚙️ sandbox |
+| `wafw00f` | RECON_ACTIVE | sandbox | WAF fingerprinting (`-a` all signatures) per web base | ⚙️ sandbox |
+| `dirsearch` | RECON_ACTIVE | sandbox | content discovery (same baked common.txt wordlist; not recursive — feroxbuster's lane) | ⚙️ sandbox |
+| `dnsenum`, `fierce` | RECON_ACTIVE | sandbox | DNS enumeration — **omitted, never faked, when no resolver is pinned** (same rule as dnsx/naabu) | ⚙️ sandbox |
+| `nbtscan`, `smbmap`, `enum4linux-ng` | RECON_ACTIVE | sandbox | NetBIOS/SMB enumeration — **port-gated**: planned only when discovery observed 139/445 open (honest empty plan on a web-only scope); `nbtscan` additionally carries the target's RESOLVED IP (it rejects hostnames) and is omitted when nothing resolved | ⚙️ sandbox |
 | `gowitness` | RECON_ACTIVE | sandbox | screenshots → `/evidence` | ⚙️ sandbox |
 | `sslscan`, `testssl.sh` | RECON_ACTIVE | sandbox | legacy TLS lane (skipped while `tls-probe` is registered) | ⚙️ sandbox |
 | `/opt/kryonsec/openapi_probe.py` | RECON_ACTIVE | sandbox | baked OpenAPI inspection (skipped while `api-probe` is registered) | ⚙️ sandbox |
 | `nuclei` (legacy path) | EXPLOIT | sandbox | template scanning against **the exact template-tree root only**, Gate-2 approved per hypothesis | ⚙️ sandbox |
-| `sqlmap`, `nikto`, `ffuf`, `gobuster`, `wfuzz`, `dalfox`, `commix`, `ssrfmap`, `arjun`, `tplmap`, `graphql-cop`, `jwt_tool`, `kr` | EXPLOIT | sandbox | approved-hypothesis exploitation | ⚙️ sandbox |
+| `sqlmap`, `nikto`, `ffuf`, `gobuster`, `wfuzz`, `dalfox`, `commix`, `ssrfmap`, `arjun`, `tplmap`, `graphql-cop` | EXPLOIT | sandbox | approved-hypothesis exploitation | ⚙️ sandbox |
+| `jwt_tool` | EXPLOIT | sandbox | offline token analysis of a CAPTURED JWT (Wave 2b producer scans the evidence graph; no token → audited skip) | ⚙️ sandbox |
+| `kr` | EXPLOIT | sandbox | allowlisted but dormant — needs a baked `.kx` route wordlist (audited skip until then) | ⚙️ sandbox |
 | `curl`, `wget` | EXPLOIT / VERIFY | sandbox | controlled requests; curl powers the independent boolean probe | ⚙️ sandbox |
 
 ### C. Offline lookup utilities
@@ -1194,6 +1427,8 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `osv-scanner` | dependency vulns (needs egress) | ✅ baked |
 | `grype` | SBOM vuln matching (needs egress) | ✅ baked |
 | `hadolint` | Dockerfile lint — conditional on a Dockerfile existing | optional in image |
+| `checksec` | ELF hardening audit in dir mode (`--dir=/code`) | ✅ baked |
+| `exiftool` | file metadata walk (`-r -q /code`); metadata is inventory, never findings | ✅ baked |
 | `kube-bench` | **deliberately NOT in the plan** — it audits a live node's kubelet, not a code folder | n/a |
 
 ### E. Allowlisted but not plan-registered (dormant / optional binaries)
@@ -1204,6 +1439,7 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `GetNPUsers.py`, `GetUserSPNs.py`, `GetADUsers.py`, `findDelegation.py`, `bloodhound-python` | AD collection, excluded until a shell producer exists | 💤 dormant |
 | `dig`, `nc`, `ncat`, `openssl`, `http` | VERIFY secondary **reachability** probes — never mark a finding verified | ✅ |
 | `bandit`, `gitleaks`, `trivy`, `syft`, `grype`, `osv-scanner` (as templates) | same binaries as category D | ✅ |
+| `gdb`, `radare2`, `binwalk`, `xxd`, `strings`/`objdump` (binutils), `steghide`, `foremost`, `ROPgadget`, `ropper` | installed in the image but **NOT allowlisted** — every one needs a FILE argument and the fixed-argv grammar has no `{file}` slot yet (dir-mode tools like checksec work; file-granular ones stay unreachable at both layers until that slot is consciously designed) | 💤 dormant in image, unreachable |
 
 Also in the image but **never agent-registered**: `checkov`, `graphql-cop`, `semgrep`,
 `hadolint`, `kube-bench` are optional installs — their absence is an audited spawn
@@ -1547,6 +1783,7 @@ Copilot fallback database.
 | `ltm_engagement_summaries` | B | sanitized summaries — the only engagement data Mode A can read |
 | `engagement_secret_map` | B | `«SECRET_n»` → secret mappings (Fernet-encrypted at rest) |
 | `checkpoints` | B | engagement checkpoints |
+| `handoff_records` | B | structured agent-handoff records (Batch 3; one row per record, unique per engagement + identity) |
 
 Schema changes go through versioned migrations (`src/kryonsec/migrations/`), never ad-hoc
 DDL. Redis (ephemeral cache) and MinIO (evidence object storage) exist in the spec but are
@@ -1697,6 +1934,12 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | TLS + API probes with bounded summaries (2B.5) | ✅ done |
 | Deterministic tool planner (2B.6) | ✅ done — **feature-gated OFF** |
 | Honest failures + bounded infra retries (2B.7) | ✅ done |
+| Tool Expansion Batch 1 — naabu/dnsx/katana adapter probes | ✅ code + mocked suites done — real-gVisor lab ITs armed, **NOT RUN on the Windows dev host** |
+| Batch 4 — specialist scheduling, task context, budgets, resume, skill packs | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor specialist runs NOT exercised |
+| Batch 5 — exploit/verify contracts, counterevidence, verification-support specialist | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor runs NOT exercised |
+| Batch 6 — capability lifecycle: binding, expiry, revocation, consumption guard, handoffs | ✅ code + mocked suites done on the feature branch — registries deliberately still EMPTY; PostgreSQL paths and real Docker/gVisor runs NOT exercised |
+| Wave 1 — Zone A archives module (gau/waybackurls/paramspider semantics, host-side, zero packets) | ✅ code + mocked suites done on the feature branch — no image change needed; real network calls to archives NOT exercised (mocked HTTP only) |
+| Wave 2b — JWT token producer + offline analyzer (code only; feeds the gated jwt_tool lane from captured evidence) | ✅ code + mocked suites done on the feature branch — no image change; wafw00f (the other Wave-2 half) landed in Phase 4 (allowlisted, image rebuilt + digest-pinned, real-path verified) |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |
@@ -1729,6 +1972,12 @@ All numbers below are **dated snapshots**, not permanent claims — CI re-runs o
 | v1.3.10 release CI | 2026-11-10 | 2,128 passed / 8 skipped (Python 3.11, 3.12, 3.13) |
 | Phase 2B.8 completion | 2026-11 | 2,328 passed / 55 skipped locally; **12/12 real adapter lab ITs** and **2/2 full-engagement e2e lab ITs** against the digest-pinned image `sha256:d759cef7d0b3…f85` |
 | v1.3.11 preflight | 2026-11-14/15 | **2,331 passed / 55 skipped** locally (Python 3.11); CI green on 3.11/3.12/3.13 at the release-prep commit |
+| Tool Expansion Batch 1 | 2026-11-15 | **2,401 passed / 58 skipped** in a WSL2 Ubuntu venv (Python 3.14) — the 2 failures are environmental (no `ensurepip` in that Python; no docker group access), not code. The 3 new opt-in lab ITs (naabu/dnsx/katana through real Docker+gVisor) stay NOT RUN on this host |
+| Tool Expansion Batch 4 | 2026-11-15 | **2,621 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 96-test Batch-4 suite (`test_specialist` 66, `test_batch4_recovery` 13, `test_skills` 17); the 2 failures are the same environmental ones as Batch 1 (no `ensurepip`; Docker daemon unreachable), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor specialist paths untested |
+| Tool Expansion Batch 5 | 2026-11-16 | **2,710 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new Batch-5 suites (`test_exploit_contract` 32, `test_verify_contract` 19, `test_evidence_quality` 21, `test_verification_support` 14); 1 failure is the same environmental one (no `ensurepip` in that Python), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
+| Tool Expansion Batch 6 | 2026-11-16 | **2,748 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — includes the new 38-test Batch-6 suite (`test_post_exploit_batch6`: eligibility ordering, revocation, consumption guard, interrupted-run recovery, persistence roundtrips, coordinator handoffs); 1 failure is the same environmental one (no `ensurepip` in that Python — the Docker-daemon check passed this run), not code. PostgreSQL paths NOT RUN (no PostgreSQL environment); real Docker/gVisor paths untested |
+| Tool Expansion Wave 1 (archives) | 2026-11-16 | **2,759 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — 11 new Zone-A tests (Common Crawl parser, pinned index, parameter derivation, union/scoping/caps, egress refusals, runner dedupe); also fixes the Batch-6 clock time bomb (fixed test clock vs real stamps). 1 failure is the same environmental ensurepip one. Real archive HTTP NOT exercised (mocked only); PostgreSQL paths NOT RUN |
+| Tool Expansion Wave 2b (JWT producer) | 2026-11-16 | **2,779 passed / 61 skipped** on the feature branch (WSL2, Python 3.14) — 18 new tests (extraction/decode strictness, offline claim reading with pinned clocks, graph collection caps + idempotence + LLM-node exclusion, captured-token → argv integration, no-token skip unchanged). 1 failure is the same environmental ensurepip one. No image change; real sandbox jwt_tool run NOT exercised (FakeSandbox) |
 
 Honest caveats:
 
@@ -1768,8 +2017,14 @@ What Kryonsec is **not** (yet), stated plainly:
 Roadmap, in the order I actually want them:
 
 1. **Publish v1.3.11** once the release decision is made (sequence in [Release and versioning](#release-and-versioning)).
-2. **Phase 3 — multi-agent intelligence:** structured handoffs between specialist agents,
-   shared memory/context, checkpoint/recovery, cost/token management, and specialist skills.
+2. **Phase 3 — multi-agent intelligence:** built on the feature branch — structured
+   handoffs between specialist agents with a deterministic coordinator and shared
+   evidence (Batch 3), then bounded specialist scheduling, task-scoped context, real
+   checkpoint resume with shared budgets, and reviewed read-only skill packs (Batch 4,
+   see [the 10-state loop](#the-10-state-loop-and-the-two-human-gates)). The LLM-backed
+   specialist roles are described and deferred, not yet real LLM workers; the remaining
+   Phase 4 work (independent exploit verification contracts) is the prerequisite chain
+   for activating POST_EXPLOIT.
 3. **Phase 4 — independent exploit verification:** deeper verification contracts, which is
    also the prerequisite chain for activating POST_EXPLOIT.
 4. **Interactsh and Burp Community** — both need listening services and callback traffic,
@@ -1910,8 +2165,7 @@ kryonsec/
 │   ├── secrets.py                    # 11 patterns, redact («SECRET_n») / restore / declaration
 │   ├── bedrock.py                    # Bedrock region probe + model discovery
 │   ├── openai_compatible.py          # the OpenAI-protocol provider
-│   ├── connect.py / auth.py / license.py   # membership: register, sign in, gate
-│   ├── engagement_id.py / status.py / tui.py
+│   ├── engagement_id.py / status.py / tui.py   # (membership auth removed in this dev build)
 │   ├── containers/
 │   │   └── kryonsec-seccomp.json     # seccomp profile for Zone B
 │   ├── copilot/                      # ---- Mode A ----
@@ -1944,6 +2198,7 @@ kryonsec/
 │   │   ├── adapters.py               #   vetted adapter registry + prepared runs
 │   │   ├── adapter_nuclei.py / adapter_tls.py / adapter_api.py
 │   │   ├── adapter_httpx.py / adapter_whatweb.py / adapter_searchsploit.py
+│   │   ├── adapter_naabu.py / adapter_dnsx.py / adapter_katana.py   # Batch 1 probes
 │   │   ├── nuclei_manifest.json      #   1,605 reviewed templates, sha256-pinned
 │   │   ├── tool_planner.py           #   optional planner (OFF by default)
 │   │   ├── allowlist.py              #   57 argv templates, 5 stage groups

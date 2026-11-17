@@ -26,6 +26,7 @@ from .hypothesize import (
 )
 from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
+from ._text import clean_excerpt
 # A15/D3: the duplicate relation is REPORT's, not a second opinion written
 # here. Importing the pass (not a copy of it) is what keeps the prompt from
 # telling the model a pair is one issue that the report then treats as two.
@@ -55,6 +56,18 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     ("syft", ["syft", "scan", "/code", "-o", "json"]),
     ("osv-scanner", ["osv-scanner", "-r", "/code", "--format", "json"]),
     ("grype", ["grype", "dir:/code", "-o", "json"]),
+    # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
+    # the same read-only /code mount. checksec audits every ELF's
+    # hardening; exiftool prints file metadata.
+    # File-granular binary tools (gdb/radare2/binwalk/…) stay dormant —
+    # see the Dockerfile Phase 4 note.
+    # terrascan DEFERRED: no Kali package in the 2026-11 kali-rolling
+    # snapshot (apt-cache Candidate: ABSENT — verified in-image), and a
+    # plan entry naming an absent binary is a guaranteed tool-error row.
+    # Same situation as checkov; revisit with the GitHub-release pinning
+    # path if ever needed.
+    ("checksec", ["checksec", "--dir=/code"]),
+    ("exiftool", ["exiftool", "-r", "-q", "/code"]),
 ]
 HADOLINT_PLAN_ENTRY = ("hadolint", ["hadolint", "/code/Dockerfile"])
 
@@ -70,6 +83,10 @@ _FINDING_COUNT_RES: dict[str, list[re.Pattern[str]]] = {
     "trivy": [re.compile(r"Total:\s*(\d+)")],
     "checkov": [re.compile(r"Failed checks:\s*(\d+)")],
     "hadolint": [re.compile(r"^/code/Dockerfile:", re.MULTILINE)],
+    # Phase 4 (checksec/exiftool/terrascan) is deliberately NOT here
+    # yet: the counters are added only against the REAL output shapes
+    # captured in the Phase-4 lab runs (the same rule that keeps syft
+    # uncounted) — a guessed regex counts nothing honestly.
 }
 
 
@@ -182,7 +199,13 @@ def run_code_scanners(
             "tool": tool,
             "exit_code": result.exit_code,
             "stdout_chars": len(result.stdout),
-            "excerpt": result.stdout[:MAX_SCANNER_EXCERPT],
+            # excerpt hygiene is the SAME contract as the recon
+            # excerpts: checksec colors its whole table and no flag
+            # exists to turn that off for the dir mode (verified from
+            # its own help in the Phase 4b run; --format=csv/json is
+            # the FUTURE hook for honest counters, not adopted now —
+            # a format switch would need its own real-path round)
+            "excerpt": clean_excerpt(result.stdout)[:MAX_SCANNER_EXCERPT],
         }
         count = _count_findings(tool, result.stdout)
         if count is not None:
@@ -353,6 +376,11 @@ def generate_remediations(cfg: KryonsecConfig, prompt: str) -> RemediationSet:
     Instructor when available; JSON prompt + validation otherwise,
     with one repair retry (same shape as HYPOTHESIZE).
     """
+    from ..llm import LlmUnavailable, llm_disabled
+
+    if llm_disabled():
+        raise LlmUnavailable("LLM disabled by KRYONSEC_DISABLE_LLM")
+
     system = (
         "You are the blue-team engine of a purple-team engagement. "
         "You write defensive recommendations: concrete fixes and detection "
@@ -452,8 +480,50 @@ class BlueTeamSubagent:
     def _default_llm(self, prompt: str) -> RemediationSet:
         return generate_remediations(self.cfg, prompt)
 
-    def _record_budget(self, prompt: str, result: RemediationSet) -> None:
+    def _audit_usage(self, records: list[dict]) -> None:
+        """Audit the REAL usage of this state's LLM calls (chain-visible).
+
+        Same rule as HYPOTHESIZE: tokens are always provider-reported;
+        cost_usd appears only when the provider's cost map could price
+        the model — absent means unknown, never invented.
+        """
+        for r in records:
+            event = {
+                "event": "llm_usage",
+                "state": "BLUE_TEAM",
+                "model": r.get("model"),
+                "routed_model": r.get("routed_model"),
+                "prompt_tokens": r.get("prompt_tokens"),
+                "completion_tokens": r.get("completion_tokens"),
+                "total_tokens": r.get("total_tokens"),
+            }
+            if r.get("cost_usd") is not None:
+                event["cost_usd"] = r.get("cost_usd")
+            self.audit.write(event)
+
+    def _record_budget(
+        self, prompt: str, result: RemediationSet | None,
+        usage_records: list[dict] | None = None,
+    ) -> None:
+        """Accrue the engagement budget (spec §4.3) — same rule as
+        HYPOTHESIZE: REAL provider-reported usage when available, the
+        clearly-labelled local estimate as fallback, and a failed state
+        accrues only what its attempts actually reported."""
+        records = list(usage_records or [])
+        self._audit_usage(records)
         if self.budget is None:
+            return
+        real = [r for r in records if r.get("total_tokens") is not None]
+        if real:
+            self.budget.record_usage(
+                sum(int(r["total_tokens"]) for r in real),
+                sum(
+                    float(r["cost_usd"]) for r in records
+                    if r.get("cost_usd") is not None),
+                estimate=False,
+            )
+            return
+        if result is None:  # failed state and nothing real to report
             return
         from ..llm import count_tokens
 
@@ -487,10 +557,18 @@ class BlueTeamSubagent:
                 })
                 log.warning("blue-team scanners failed: %s", e)
 
+        # Same drain rule as HYPOTHESIZE: the sequential orchestrator makes
+        # this state's LLM delta unambiguous.
+        from ..llm import usage_log
+
+        usage_start = len(usage_log())
+        prompt: str | None = None
+        remediation_set: RemediationSet | None = None
         try:
             prompt = render_blue_team_prompt(self.graph)
             remediation_set = self.llm_fn(prompt)
         except Exception as e:
+            self._record_budget(prompt, None, usage_log()[usage_start:])
             self.audit.write({
                 "event": "blue_team_failed",
                 "error": str(e)[:200],
@@ -498,7 +576,8 @@ class BlueTeamSubagent:
             log.warning("BLUE_TEAM failed: %s", e)
             return SubagentResult(status="failed")
 
-        self._record_budget(prompt, remediation_set)
+        self._record_budget(
+            prompt, remediation_set, usage_log()[usage_start:])
 
         for r in remediation_set.remediations:
             node = self.graph.add_node(

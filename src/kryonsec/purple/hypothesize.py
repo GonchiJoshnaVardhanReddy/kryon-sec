@@ -292,6 +292,11 @@ def propose_hypotheses_with_model(
     substitution — so it returns None rather than naming a configured
     model that may not be the one that ran.
     """
+    from ..llm import LlmUnavailable, llm_disabled
+
+    if llm_disabled():
+        raise LlmUnavailable("LLM disabled by KRYONSEC_DISABLE_LLM")
+
     system = (
         "You are the hypothesis engine of a purple-team engagement. "
         "You propose vulnerability hypotheses from recon data. "
@@ -414,11 +419,54 @@ class HypothesizeSubagent:
         self._model_used = model
         return result
 
-    def _record_budget(self, prompt: str, result: HypothesisSet) -> None:
-        """Approximate token accounting (prompt + response); provider
-        usage objects never reach this layer. Better an honest estimate
-        than a budget guard that can only ever trip on wall-clock."""
+    def _audit_usage(self, records: list[dict]) -> None:
+        """Audit the REAL usage of this state's LLM calls (chain-visible).
+
+        One llm_usage event per captured record. Token counts are always
+        provider-reported; cost_usd appears only when the provider's cost
+        map could price the model — absent means unknown, never invented.
+        """
+        for r in records:
+            event = {
+                "event": "llm_usage",
+                "state": "HYPOTHESIZE",
+                "model": r.get("model"),
+                "routed_model": r.get("routed_model"),
+                "prompt_tokens": r.get("prompt_tokens"),
+                "completion_tokens": r.get("completion_tokens"),
+                "total_tokens": r.get("total_tokens"),
+            }
+            if r.get("cost_usd") is not None:
+                event["cost_usd"] = r.get("cost_usd")
+            self.audit.write(event)
+
+    def _record_budget(
+        self, prompt: str, result: HypothesisSet | None,
+        usage_records: list[dict] | None = None,
+    ) -> None:
+        """Accrue the engagement budget (spec §4.3).
+
+        REAL provider-reported usage (estimate=False) when the provider
+        told us the token counts; the local token count stays the fallback
+        and is visible as an estimate. A failed state accrues only what
+        its attempts actually reported — a completed-but-invalid reply is
+        still real spend.
+        """
+        records = list(usage_records or [])
+        self._audit_usage(records)
         if self.budget is None:
+            return
+        real = [r for r in records if r.get("total_tokens") is not None]
+        if real:
+            self.budget.record_usage(
+                sum(int(r["total_tokens"]) for r in real),
+                sum(
+                    float(r["cost_usd"]) for r in records
+                    if r.get("cost_usd") is not None),
+                estimate=False,
+            )
+            return
+        if result is None:  # failed state and nothing real to report
             return
         from ..llm import count_tokens
 
@@ -435,12 +483,24 @@ class HypothesizeSubagent:
         # last run's model must not be attributed to this run's nodes
         self._model_used = None
 
+        # Drain the REAL provider usage appended during this state's LLM
+        # call(s). The orchestrator is sequential, so nothing else makes
+        # LLM calls between here and the call — the delta belongs to this
+        # state.
+        from ..llm import usage_log
+
+        usage_start = len(usage_log())
+        prompt: str | None = None
+        hypothesis_set: HypothesisSet | None = None
         try:
             prompt = render_hypothesize_prompt(self.graph)
             hypothesis_set = self.llm_fn(prompt)
         except Exception as e:
             # A dead LLM fails the state; it must never halt the engagement
-            # silently — the audit records exactly why.
+            # silently — the audit records exactly why. Attempts that DID
+            # complete before the failure are still real spend: audit and
+            # accrue them.
+            self._record_budget(prompt, None, usage_log()[usage_start:])
             self.audit.write({
                 "event": "hypothesize_failed",
                 "error": str(e)[:200],
@@ -448,7 +508,8 @@ class HypothesizeSubagent:
             log.warning("HYPOTHESIZE failed: %s", e)
             return SubagentResult(status="failed")
 
-        self._record_budget(prompt, hypothesis_set)
+        self._record_budget(
+            prompt, hypothesis_set, usage_log()[usage_start:])
 
         for h in hypothesis_set.hypotheses:
             # A hypothesis is what a model guessed, not something the

@@ -52,6 +52,12 @@ kryonsec = [
     # caught in the v1.3.11 release preflight, guarded by
     # tests/test_packaging.py).
     "purple/nuclei_manifest.json",
+    # The specialist skill packs (Batch 4D) are reviewed, read-only
+    # markdown knowledge the skills registry loads from the package —
+    # same rule as the nuclei manifest: they MUST ship in the wheel, and
+    # the pattern carries the DIRECTORY (a bare glob here resolves
+    # against src/kryonsec/ and matches nothing).
+    "purple/skills/*.md",
     # The memory browser's page, style and scripts, plus the brand mark and
     # the two fonts it serves. These must ship in the wheel: `kryonsec memory`
     # reads them off disk at request time, and a wheel without them would

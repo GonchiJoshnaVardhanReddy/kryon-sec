@@ -42,3 +42,9 @@ SESSION-NOTES*.md
 CODEFIX.md
 docs/TOOL-EXPANSION-*.md
 _smoke.txt
+tmp/
+
+# regenerable lab fixtures: the harness pulls a real ELF out of the
+# pinned image on every blue-team run (research/lab/phase4b_tool_verify.py,
+# fixture_code_dir) — the binary is a distro artifact, not evidence
+research/lab/results/*/code-fixture/elf-sample

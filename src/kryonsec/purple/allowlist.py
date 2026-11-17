@@ -13,7 +13,9 @@ test in tests/test_allowlist.py keeps the two lists from drifting.
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 
 
 def is_program_name(name: str) -> bool:
@@ -74,6 +76,9 @@ _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
     "hostport": re.compile(r"^[A-Za-z0-9._-]+:\d{1,5}$"),
     "token": re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"),
     "term": re.compile(r"^[A-Za-z0-9 .:+,-]+$"),
+    # comma-separated resolver addresses (IPv4/IPv6) — dnsx -r. No '-' in
+    # the charset, so an option can never hide in a resolver slot.
+    "resolver": re.compile(r"^[0-9A-Fa-f:.]+(,[0-9A-Fa-f:.]+)*$"),
 }
 
 # {…} segments inside an argument (may be the whole argument)
@@ -135,11 +140,27 @@ PASSIVE_TOOL_TEMPLATES: dict[str, list[str]] = {
 ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     # -sT (connect scan): gVisor grants no raw sockets — SYN scan is impossible
     "nmap": ["-Pn", "-sT", "-sV", "-sC", "--max-rate", "{rate}", "-p", "{ports}", "{target}"],
-    "naabu": ["-host", "{target}", "-p", "{ports}", "-rate", "{rate}", "-silent"],
+    # naabu 2.x (the image's version) has the same DNS behavior as dnsx
+    # 1.3.1: without `-r` it ignores resolv.conf and queries its own
+    # HARDCODED public-resolver list — queries the gate correctly drops
+    # in every pinned-resolver policy, and the run dies with "Could not
+    # run enumeration: no valid ipv4 or ipv6 targets were found" for a
+    # domain target (found live, Phase-4 lab 2026-11-17: zero dnsmasq
+    # queries, IP target unaffected). So `-r` carries the policy's
+    # pinned resolver — filled by product code from the egress policy,
+    # never caller-invented ({resolver} accepts only IP-ish charset).
+    # `-duc` stops the pdtm.sh update phone-home (same choice as the
+    # dnsx/httpx/nuclei templates).
+    "naabu": ["-host", "{target}", "-r", "{resolver}", "-p", "{ports}",
+              "-rate", "{rate}", "-silent", "-duc"],
     "httpx": ["-u", "{url}", "-silent", "-status-code", "-title", "-tech-detect"],
     "rustscan": ["-a", "{target}", "-p", "{ports}", "--no-banner", "-t", "2000"],
     "whatweb": ["-a", "{1|2|3}", "--no-errors", "--color=never", "{url}"],
-    "katana": ["-u", "{url}", "-d", "{depth}", "-silent"],
+    # -duc stops the pdtm.sh update phone-home (found live 2026-11-17:
+    # katana without it queries api.pdtm.sh once per run — the gate
+    # drops the connect, but the query is unnecessary external
+    # metadata; same choice as the dnsx/naabu/httpx/nuclei templates).
+    "katana": ["-u", "{url}", "-d", "{depth}", "-silent", "-duc"],
     "hakrawler": ["-url", "{url}", "-depth", "{depth}"],
     "feroxbuster": ["-u", "{urlfuzz}", "-w", SECLISTS_WEB, "-t", "5", "--timeout", "30"],
     # ProjectDiscovery httpx under its REAL Kali binary name. Kali's
@@ -157,14 +178,43 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     ],
     "sslscan": ["--no-failed", "--sleep", "{rate}", "{target}"],
     "testssl.sh": ["--batch", "--severity={low|medium|high|critical}", "--no-color", "{url}"],
-    "dnsx": ["-d", "{target}", "-silent"],
+    # dnsx resolves the target's names. dnsx 1.3.1 (the version in the
+    # pinned image) made `-d` a BRUTE-FORCE input that requires -w; plain
+    # resolution of a host list is `-l` (file or comma separated or
+    # stdin). The legacy `-d` shape now dies at startup with
+    # "missing wordlist(w) flag required with domain(d) input" — found
+    # live in the Phase-4 lab experiments (2026-11-16). Without `-r`,
+    # dnsx ignores resolv.conf and queries a HARDCODED list of public
+    # resolvers (libs/dnsx DefaultResolvers: 1.1.1.1, 8.8.8.8, Quad9,
+    # OpenDNS …) that the egress gate correctly drops in every
+    # pinned-resolver policy — so `-r` carries the policy's pinned
+    # resolver (filled by product code from the egress policy, never
+    # caller-invented; {resolver} accepts only IP-ish charset, so no
+    # option can hide in the slot). `-resp-only` makes the silent output
+    # bare-IP lines — the exact shape the dnsx parsers read (1.3.1's
+    # plain -silent prints the bare DOMAIN; -resp prints "host [A]
+    # [ip]" with the ip bracketed; both unparseable). `-duc` stops the
+    # pdtm.sh update phone-home and `-nc` the ANSI colors (same choice
+    # as the httpx/nuclei templates; verified live against the real
+    # binary through the gate: 1 query to the pinned resolver, bare-IP
+    # output, zero pdtm queries).
+    "dnsx": ["-l", "{target}", "-r", "{resolver}", "-resp-only",
+             "-silent", "-duc", "-nc"],
     # gowitness (Phase 8): headless-Chrome screenshots into the rw /evidence
-    # mount. --disable-db: the rootfs is read-only — no SQLite result DB,
-    # the PNG itself is the evidence. NOT in the default web plan's first
-    # stage; it runs per discovered web port.
+    # mount. gowitness 3.2.2 (the version in the pinned image) REMOVED
+    # the v2-era `scan website` subcommand and the `--no-console` /
+    # `--disable-db` flags — the old shape died at startup with a Usage
+    # banner (found live, Phase-4 lab 2026-11-17). The v3 shape is
+    # `scan single -u <url>`; v3 writes NO result database unless a
+    # --write-* flag is passed (the read-only rootfs needs nothing
+    # special), `-q` silences console chatter, and `--chrome-path`
+    # pins the image's OWN chromium binary — without it gowitness 3.x
+    # downloads a browser at runtime, which the egress gate correctly
+    # drops. NOT in the default web plan's first stage; it runs per
+    # discovered web port.
     "gowitness": [
-        "scan", "website", "--url", "{url}",
-        "--screenshot-path", "/evidence", "--no-console", "--disable-db",
+        "scan", "single", "-u", "{url}", "--screenshot-path", "/evidence",
+        "--chrome-path", "/usr/bin/chromium", "-q",
     ],
     # massdns (Phase 8): brute-force DNS resolution with the image's FIXED
     # wordlist + resolvers. Allowlisted but NOT in the default plan — dnsx
@@ -175,18 +225,140 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     ],
     # OpenAPI/API discovery (Phase 8): baked probe script, fixed argv
     f"{SANDBOX_SCRIPT_DIR}/openapi_probe.py": ["{url}"],
+    # ---- Phase 4 expansion (2026-11-17) — HexStrike-review feasible set ----
+    # WAF fingerprinting: -a checks EVERY signature (no early-stop
+    # guess), --no-color for parseable output. Read-only HTTP probes
+    # against the approved base URL, bounded by the entrypoint cap.
+    "wafw00f": ["-a", "--no-color", "{url}"],
+    # Content discovery: the SAME baked SecLists common.txt wordlist the
+    # feroxbuster entry uses, 10 threads, per-request timeout, no ANSI.
+    # NOT recursive (-r absent): recursion is feroxbuster's lane.
+    "dirsearch": ["-u", "{url}", "-w", SECLISTS_WEB, "-t", "10",
+                  "--timeout=30", "--no-color"],
+    # DNS enumeration: --dnsserver carries the policy's PINNED resolver
+    # (the same never-caller-invented rule as dnsx/naabu — a run against
+    # hardcoded public resolvers is a known-doomed spawn, so plan code
+    # OMITS the entry when no resolver is pinned). --enum is the bounded
+    # standard record sweep (NS/SOA/MX/A + BIND version); no wordlist
+    # brute-force here (dnsrecon territory, and unbounded time).
+    "dnsenum": ["--dnsserver", "{resolver}", "--enum", "{target}"],
+    # fierce DNS recon: --dns-servers pins the resolver (same rule);
+    # --domain takes the scope target ({term} charset covers hostnames).
+    # fierce's own recursion is bounded by its zero-max default OFF —
+    # the shipped template pins no --wide/--depth extensions.
+    "fierce": ["--domain", "{term}", "--dns-servers", "{resolver}"],
+    # NetBIOS/SMB enumeration (Phase 4): PORT-GATED — plan code only
+    # builds these entries when discovery OBSERVED 139/445 open. -t 2000
+    # bounds nbtscan's per-address response wait (Kali's nbtscan 1.7.2
+    # takes MILLISECONDS here — verified from its real usage output,
+    # default 1000; the earlier -w flag does not exist in this build and
+    # exited 2 with usage text in the Phase 4b lab run). The {target}
+    # slot for nbtscan carries the target's RESOLVED IP — nbtscan 1.7.2
+    # rejects hostnames ("Error: ... is not an IP address or address
+    # range.", verified live) and the plan omits the row when discovery
+    # resolved nothing. smbmap's --no-banner/--no-color/--no-update are
+    # REAL flags (verified from the tool's own help): banner, color
+    # codes and the "Working on it" spinner are stripped at the source,
+    # keeping stdout parseable. enum4linux-ng -A is its
+    # simple-enumeration sweep (users/shares/policies, no credential
+    # brute) — it has NO no-color flag, so its excerpt is cleaned
+    # host-side (clean_excerpt).
+    "nbtscan": ["-t", "2000", "{target}"],
+    "smbmap": ["-H", "{target}", "--no-banner", "--no-color", "--no-update"],
+    "enum4linux-ng": ["-A", "{target}"],
 }
+
+# ---- exploit templates --------------------------------------------------------
+
+# The reviewed, hash-pinned nuclei template manifest (Phase 2B.8 — the same
+# file the sandbox image bakes to /opt/kryonsec/nuclei_manifest.json and the
+# entrypoint gate re-verifies at execution time). The EXPLOIT lane's nuclei
+# template is BUILT from it: the manifest is the single source of truth, and
+# a manifest change IS an allowlist change (test_nuclei_policy.py asserts the
+# two agree with the adapter's frozen template).
+_NUCLEI_MANIFEST_PATH = Path(__file__).with_name("nuclei_manifest.json")
+
+
+def nuclei_manifest_template_args() -> tuple[str, ...]:
+    """Every reviewed template as flat ``(-t, path)`` argv pairs.
+
+    Reads the reviewed, hash-pinned manifest — the ONLY template inventory
+    any product nuclei run may carry. The full baked tree is NEVER
+    selectable: Phase 2B.7 audited it and found unsafe subtrees, and the
+    Phase-1 lab engagement (lab-p5-full-20261117T110737Z) proved the full
+    tree cannot even complete inside the sandbox's 300s cap — 11,143
+    templates loaded, 262 with runtime errors, killed at the cap.
+    """
+    data = json.loads(_NUCLEI_MANIFEST_PATH.read_text(encoding="utf-8"))
+    paths = sorted(data.get("templates") or {})
+    if not paths:
+        raise RuntimeError(
+            "nuclei_manifest.json carries no reviewed templates — "
+            "nuclei execution stays disabled (fail closed)")
+    return tuple(arg for path in paths for arg in ("-t", path))
+
+
+#: rendered once at import — the manifest is pinned, the pairs are frozen
+_NUCLEI_TEMPLATE_ARGS: tuple[str, ...] = nuclei_manifest_template_args()
+
+
+def render_exploit_template(tool: str, **slots: str) -> "list[str] | None":
+    """Render ``EXPLOIT_TEMPLATES[tool]``, filling ``{slot}`` placeholders.
+
+    The renderer build_argv uses for the tools whose templates are built
+    here (nuclei: manifest-pinned; wget: bounded retries) — the rendered
+    argv and the Layer-2 template are then the SAME list, so the two
+    cannot drift. Unknown slots are left untouched (there are none by
+    construction).
+    """
+    template = EXPLOIT_TEMPLATES.get(tool)
+    if template is None:
+        return None
+    rendered: list[str] = []
+    for arg in template:
+        for name, value in slots.items():
+            arg = arg.replace("{" + name + "}", value)
+        rendered.append(arg)
+    return rendered
+
 
 # Exploit/testing tools (spec §4.7; masscan intentionally absent)
 EXPLOIT_TEMPLATES: dict[str, list[str]] = {
-    "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
+    # nuclei (Phase 1, 2026-11-17): the reviewed manifest ONLY — never the
+    # full baked tree. The legacy full-tree selection died twice over in the
+    # lab engagement: (1) 11,143 UNREVIEWED templates with 262 runtime
+    # errors behind a Gate-2 approval that could not have reviewed them,
+    # (2) killed at the sandbox's 300s cap (exit 137 — gVisor reports the
+    # entrypoint timeout's SIGKILL as 137, not coreutils' 124; proven with
+    # a zero-memory `sleep 400` run) before finishing, while nuclei's own
+    # external IP-check phoned home and marked the target unresponsive.
+    # The flags are the RECON_ACTIVE probe's proven safety set (frozen
+    # literals, adapter_nuclei.py): -etags intrusive (never a self-declared
+    # intrusive template), -silent/-nc (match lines only, no ANSI), -ni
+    # (NO interactsh/OAST), -duc (no update check), -or (no raw
+    # request/response dumps), -rl 20 -c 10 (bounded rate/concurrency),
+    # -retries 1, and -mt 2m — nuclei's own graceful max-time so the run
+    # COMPLETES inside the 300s cap instead of being killed.
+    "nuclei": [
+        "-u", "{url}", *_NUCLEI_TEMPLATE_ARGS,
+        "-etags", "intrusive", "-silent", "-nc", "-ni", "-duc", "-or",
+        "-rl", "20", "-c", "10", "-timeout", "30", "-retries", "1",
+        "-mt", "2m",
+    ],
     "sqlmap": [
         "-u", "{url}", "--batch", "--risk={1|2}", "--level={1|2|3}",
         "--technique={B|E|U|T|Q}", "--timeout={30|60|120}", "--threads={1|2|3|4}",
     ],
     "nikto": ["-h", "{url}", "-timeout", "30", "-maxtime", "120"],
     "curl": ["-sS", "--max-time", "30", "{url}"],
-    "wget": ["-q", "-O", "-", "--timeout=30", "{url}"],
+    # wget (Phase 1, 2026-11-17): bounded retries. wget's DEFAULT -t 20
+    # burned 266s inside the sandbox on the lab /ftp response (the server
+    # closes the body 12 bytes short of Content-Length; every retry hit
+    # the same quirk). -t 3 with --waitretry=2 caps the worst case near
+    # 30s of transfer attempts — a truncated response is still captured
+    # content, and the failure is honestly classified downstream.
+    "wget": ["-q", "-O", "-", "--timeout=30", "-t", "3", "--waitretry=2",
+             "{url}"],
     # ffuf/gobuster/wfuzz: directory fuzzing with the sandbox's common wordlist.
     # {urlfuzz}: the URL carries the FUZZ position marker.
     "ffuf": ["-w", SECLISTS_WEB, "-u", "{urlfuzz}", "-t", "5", "-maxtime", "120"],
@@ -276,6 +448,18 @@ BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
     "syft": ["scan", "/code", "-o", "json"],
     "osv-scanner": ["-r", "/code", "--format", "json"],
     "grype": ["dir:/code", "-o", "json"],
+    # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
+    # the read-only /code mount. File-GRANULAR binary tools (gdb/
+    # radare2/binwalk/xxd/strings/objdump/ROPgadget/ropper/steghide/
+    # foremost) are installed in the image but deliberately NOT
+    # allowlisted: the grammar has no {file} slot yet, and inventing
+    # one later is a conscious, reviewed change (Dockerfile note).
+    # terrascan deferred: no Kali package (Dockerfile note).
+    # checksec's dir mode audits every ELF's hardening in one run.
+    "checksec": ["--dir=/code"],
+    # exiftool -r walks /code printing file metadata (any file type);
+    # -q keeps per-file warnings out of the evidence excerpt.
+    "exiftool": ["-r", "-q", "/code"],
 }
 
 # Historical name kept (tests / callers import it): the union of everything

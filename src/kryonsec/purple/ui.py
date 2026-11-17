@@ -39,6 +39,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .orchestrator import STATES
+from .exploit_contract import tool_exit_note
 from ..ui.events import BackendEventAdapter, UIEventBus
 from ..ui.theme import resolve_theme, terminal_capabilities
 
@@ -434,6 +435,16 @@ class PurpleUI:
         self._running: dict[str, PurpleToolEvent] = {}
         self.notices: list[str] = []
         self.errors = 0
+        # Batch 4: specialist progress, from the scheduler's own audit
+        # events (never recomputed — the audit chain is the source).
+        # ``done`` counts completed tasks; ``blocked`` counts tasks the
+        # scheduler parked; ``tokens`` is the accumulated ESTIMATE the
+        # events carried, so the number can never be mistaken for a
+        # provider charge.
+        self.specialist_scheduled = 0
+        self.specialist_done = 0
+        self.specialist_blocked = 0
+        self.specialist_tokens = 0
         self._live: Live | None = None
         self._live_wanted = False
         # No terminal, no live region. A piped or CI run still has to be
@@ -569,12 +580,29 @@ class PurpleUI:
         if event == "tool_spawn":
             self._begin(entry.get("tool", ""), state)
         elif event == "tool_result":
-            self._finish(
-                entry.get("tool", ""),
-                ok=bool(entry.get("ok")),
-                error=entry.get("error") or "",
-                summary=self._result_summary(entry),
-            )
+            # Truth about tool results (Phase 1, 2026-11-17): ok=True
+            # means "the spawn worked", NOT "the tool succeeded" — a
+            # tool can run and still die at the sandbox cap (137) or eat
+            # a truncated response (curl 18). A nonzero exit is a FAILED
+            # row with the honest reason, never a COMPLETED one.
+            _ok = bool(entry.get("ok"))
+            try:
+                _code = int(entry.get("exit_code") or 0)
+            except (TypeError, ValueError):
+                _code = 0
+            if _ok and _code != 0:
+                self._finish(
+                    entry.get("tool", ""), ok=False,
+                    error=tool_exit_note(entry.get("tool") or "",
+                                         _code) or f"exit {_code}",
+                    summary=self._result_summary(entry),
+                )
+            else:
+                self._finish(
+                    entry.get("tool", ""), ok=_ok,
+                    error=entry.get("error") or "",
+                    summary=self._result_summary(entry),
+                )
         elif event == "passive_source_start":
             self._begin(entry.get("source", ""), state)
         elif event == "passive_source_ok":
@@ -597,8 +625,93 @@ class PurpleUI:
         elif event == "zone_b_blocked":
             self.on_notice(
                 f"Zone B blocked — {entry.get('reason', 'sandbox unavailable')}")
+        elif event == "post_exploit_skipped_dormant":
+            # Phase 3 (2026-11-17): the EXPLOIT -> VERIFY routing with no
+            # POST_EXPLOIT stop is now an audited fact. The console says
+            # WHY the phase did not run, so an operator can tell a
+            # deliberate dormant skip from a forgotten phase.
+            self.on_notice(
+                "post-exploit skipped — no shell/session capability "
+                "detected (dormant by design)")
+
+        # Batch 4: specialist scheduler + budget events. Read-only
+        # progress, one line each, every field defaulted — the scheduler's
+        # audit events are the only source, so nothing here re-derives
+        # task state. Unknown fields render as blanks, never as errors.
+        self._handle_specialist_event(event, entry)
 
         self._refresh()
+
+    def _handle_specialist_event(self, event: str, entry: dict) -> None:
+        """Specialist/budget audit events -> counters and one-line notices.
+
+        Assigned / running / completed / blocked / duplicate / recovery /
+        budget-deferred: exactly the read-only progress the console is
+        allowed to show. A task id renders short; an estimate renders as
+        an estimate.
+        """
+        if event == "specialist_submitted":
+            self.specialist_scheduled += 1
+            self.on_notice(
+                f"specialist {entry.get('role', '?')} assigned "
+                f"({entry.get('stage', '')})")
+        elif event == "specialist_duplicate_suppressed":
+            self.on_notice("duplicate specialist task suppressed")
+        elif event == "specialist_started":
+            self.on_notice(
+                f"specialist {entry.get('role', '?')} running "
+                f"{entry.get('task_id', '')[:16]}")
+        elif event == "specialist_completed":
+            self.specialist_done += 1
+            tokens = entry.get("tokens_estimated")
+            suffix = (
+                f", ~{tokens} tokens (est.)" if isinstance(tokens, int) and tokens
+                else "")
+            self.on_notice(
+                f"specialist {entry.get('role', '?')} completed — standing: "
+                f"{entry.get('standing', '?')}{suffix}")
+        elif event == "specialist_deliverable":
+            refs = entry.get("evidence_refs")
+            if isinstance(refs, list) and refs:
+                self.on_notice(
+                    f"deliverable evidence: {', '.join(str(r) for r in refs[:3])}")
+        elif event in ("specialist_failed", "specialist_timeout"):
+            self.specialist_blocked += 1
+            self.on_notice(
+                f"specialist {entry.get('role', '?')} "
+                f"{'failed' if event == 'specialist_failed' else 'timed out'}: "
+                f"{str(entry.get('error') or entry.get('task_id') or '')[:80]}")
+        elif event == "specialist_cancelled":
+            self.specialist_blocked += 1
+            self.on_notice("specialist task cancelled")
+        elif event == "specialist_budget_deferred":
+            self.on_notice(
+                "specialist work deferred — budget bound reached "
+                f"({entry.get('reason', 'exhausted')})")
+        elif event == "specialist_progress":
+            tokens = entry.get("tokens_estimated")
+            if isinstance(tokens, int) and tokens >= 0:
+                self.specialist_tokens = tokens
+            status = entry.get("by_status")
+            if isinstance(status, dict):
+                blocked = sum(
+                    v for k, v in status.items()
+                    if isinstance(v, int) and k in (
+                        "blocked", "failed", "inconclusive", "cancelled",
+                        "needs_approval"))
+                self.specialist_blocked = max(
+                    self.specialist_blocked, blocked)
+        elif event in ("specialist_resume_detected", "specialist_resumed",
+                       "specialist_resume_partial"):
+            self.on_notice(
+                "specialist state resumed from the previous run")
+        elif event == "specialist_resume_gated":
+            self.on_notice(
+                "interrupted state-changing task parked behind Gate 2 "
+                "(needs approval)")
+        elif event == "specialist_resume_reopened":
+            self.on_notice(
+                "interrupted read-only specialist task reopened")
 
     def _result_summary(self, entry: dict) -> str | None:
         if not entry.get("ok"):
@@ -920,6 +1033,9 @@ class PurpleUI:
             ("Hypotheses", counts["hypotheses"]),
             ("Findings", counts["findings"]),
             ("Errors", counts["errors"]),
+            ("Specialists", self.specialist_scheduled),
+            ("Tasks done", self.specialist_done),
+            ("~Tokens", self.specialist_tokens),
         ]
         for i in range(0, len(items), 3):
             row: list[str] = []
@@ -930,6 +1046,8 @@ class PurpleUI:
                 elif label == "Findings" and value:
                     style = f"[{STYLE_FAIL}]"
                 row.append(label)
+                # a token figure here is always the specialist estimate —
+                # the "~" and the label say so
                 row.append(f"{style}{value}[/]" if style else str(value))
             while len(row) < 6:
                 row.append("")

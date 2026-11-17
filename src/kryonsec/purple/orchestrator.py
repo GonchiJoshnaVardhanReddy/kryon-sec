@@ -38,6 +38,22 @@ class BudgetTracker:
     used_tokens: int = 0
     used_cost_usd: float = 0.0
     elapsed_s: float = 0.0
+    # Batch 4C: how much of ``used_*`` is an ESTIMATE rather than
+    # provider-reported usage. The LLM call sites that count tokens
+    # locally accrue here too, and their figures must be visible as
+    # estimates — never presented as charges.
+    estimated_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    # Batch 4C: headroom held for pending specialist work. A reservation
+    # counts against NEW reservations (so overlapping work cannot
+    # over-commit the ceiling) but NOT against the loop's exhausted()
+    # guard — an estimate of work not yet done must never halt an
+    # engagement that has spent nothing.
+    reservations: dict[str, tuple[int, float]] = field(default_factory=dict)
+    # Keys whose usage has already been committed, with the amounts. A
+    # replayed commit of the same key is ignored — the first outcome
+    # stands — so retries and checkpoint replay can never double-count.
+    committed: dict[str, tuple[int, float]] = field(default_factory=dict)
     # wall-clock accounting start — set on first check, not on __init__,
     # so a tracker built long before run() still measures the run
     _started_at: float | None = None
@@ -54,10 +70,166 @@ class BudgetTracker:
             or self.used_cost_usd >= self.max_cost_usd
         )
 
-    def record_usage(self, tokens: int, cost_usd: float = 0.0) -> None:
-        """LLM call sites accrue their usage here (spec §4.3 budget guard)."""
+    @property
+    def reserved_tokens(self) -> int:
+        return sum(tokens for tokens, _cost in self.reservations.values())
+
+    @property
+    def reserved_cost_usd(self) -> float:
+        return sum(cost for _tokens, cost in self.reservations.values())
+
+    def record_usage(self, tokens: int, cost_usd: float = 0.0,
+                     *, estimate: bool = True) -> None:
+        """LLM call sites accrue their usage here (spec §4.3 budget guard).
+
+        ``estimate`` marks HOW the numbers were obtained: the default is
+        the honest one for every current caller (they count tokens
+        locally), and a provider-usage call site passes ``estimate=False``
+        so its figures are not labelled as estimates.
+        """
+        tokens = max(0, int(tokens))
+        cost_usd = max(0.0, float(cost_usd))
         self.used_tokens += tokens
         self.used_cost_usd += cost_usd
+        if estimate:
+            self.estimated_tokens += tokens
+            self.estimated_cost_usd += cost_usd
+
+    # -- reservations (Batch 4C) ----------------------------------------------
+
+    def reserve(self, key: str, tokens: int = 0, cost_usd: float = 0.0) -> bool:
+        """Hold headroom for pending work named by ``key``.
+
+        Refused (False, never raised) when the committed total — actual
+        usage plus existing reservations plus this request — would pass a
+        ceiling. Idempotent per key: re-reserving work that already holds
+        headroom (or already committed) succeeds without double-counting.
+        """
+        if not isinstance(key, str) or not key:
+            return False
+        if key in self.reservations or key in self.committed:
+            return True
+        tokens = max(0, int(tokens))
+        cost_usd = max(0.0, float(cost_usd))
+        if self.used_tokens + self.reserved_tokens + tokens > self.max_tokens:
+            return False
+        if (
+            self.used_cost_usd + self.reserved_cost_usd + cost_usd
+            > self.max_cost_usd
+        ):
+            return False
+        self.reservations[key] = (tokens, cost_usd)
+        return True
+
+    def release(self, key: str) -> None:
+        """Give back a reservation that will not convert (deferral,
+        cancellation, a claim lost to a race). Committed usage is never
+        touched by a release — work already accounted stays accounted.
+        """
+        self.reservations.pop(key, None)
+
+    def commit(self, key: str, tokens: int = 0, cost_usd: float = 0.0,
+               *, estimate: bool = False) -> None:
+        """Convert a reservation into actual usage.
+
+        Idempotent per key: the FIRST commit of a key records its usage
+        and every later commit of the same key is ignored, so a retried
+        task or a replayed checkpoint cannot double-count. The
+        reservation's full headroom is released regardless of how much of
+        it the actual usage used.
+
+        ``estimate`` marks how the numbers were obtained (the same rule
+        as :meth:`record_usage`): estimated figures are also visible in
+        the estimated counters, never presented as charges.
+        """
+        if not isinstance(key, str) or not key:
+            return
+        if key in self.committed:
+            return
+        tokens = max(0, int(tokens))
+        cost_usd = max(0.0, float(cost_usd))
+        self.committed[key] = (tokens, cost_usd)
+        self.reservations.pop(key, None)
+        self.used_tokens += tokens
+        self.used_cost_usd += cost_usd
+        if estimate:
+            self.estimated_tokens += tokens
+            self.estimated_cost_usd += cost_usd
+
+    # -- persistence (Batch 4C: consumption survives a restart) ----------------
+
+    def budget_snapshot(self) -> dict:
+        """A JSON-safe copy of this tracker's consumption state."""
+        return {
+            "used_tokens": self.used_tokens,
+            "used_cost_usd": self.used_cost_usd,
+            "estimated_tokens": self.estimated_tokens,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "reservations": {
+                key: [tokens, cost]
+                for key, (tokens, cost) in self.reservations.items()
+            },
+            "committed": {
+                key: [tokens, cost]
+                for key, (tokens, cost) in self.committed.items()
+            },
+        }
+
+    def restore_budget(self, data: dict) -> None:
+        """Reinstate persisted consumption. Refuses (loudly) a malformed
+        snapshot — a corrupt budget payload is a checkpoint problem, and
+        starting from zero would be the silent reset this exists to
+        prevent.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("budget snapshot must be an object")
+
+        def _num(value: object, what: str, minimum: float = 0.0) -> float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"budget snapshot {what} must be a number")
+            if value < minimum:
+                raise ValueError(f"budget snapshot {what} must be >= {minimum}")
+            return float(value)
+
+        used_tokens = int(_num(data.get("used_tokens", 0), "used_tokens"))
+        used_cost = _num(data.get("used_cost_usd", 0), "used_cost_usd")
+        estimated_tokens = int(
+            _num(data.get("estimated_tokens", 0), "estimated_tokens"))
+        estimated_cost = _num(
+            data.get("estimated_cost_usd", 0), "estimated_cost_usd")
+
+        def _pairs(raw: object, what: str) -> dict[str, tuple[int, float]]:
+            if raw is None:
+                return {}
+            if not isinstance(raw, dict):
+                raise ValueError(f"budget snapshot {what} must be an object")
+            pairs: dict[str, tuple[int, float]] = {}
+            for key, value in raw.items():
+                if not isinstance(key, str) or not key:
+                    raise ValueError(
+                        f"budget snapshot {what} has an invalid key")
+                if (not isinstance(value, (list, tuple))
+                        or len(value) != 2
+                        or isinstance(value[0], bool)
+                        or isinstance(value[1], bool)
+                        or not isinstance(value[0], (int, float))
+                        or not isinstance(value[1], (int, float))):
+                    raise ValueError(
+                        f"budget snapshot {what}[{key!r}] is not an "
+                        "[tokens, cost] pair")
+                tokens, cost = value
+                if tokens < 0 or cost < 0:
+                    raise ValueError(
+                        f"budget snapshot {what}[{key!r}] is negative")
+                pairs[key] = (int(tokens), float(cost))
+            return pairs
+
+        self.reservations = _pairs(data.get("reservations"), "reservations")
+        self.committed = _pairs(data.get("committed"), "committed")
+        self.used_tokens = used_tokens
+        self.used_cost_usd = used_cost
+        self.estimated_tokens = estimated_tokens
+        self.estimated_cost_usd = estimated_cost
 
 
 def next_state(state: str, result: SubagentResult) -> str:
@@ -109,6 +281,17 @@ class PurpleOrchestrator:
     # (Phase 4.3). Notified, never consulted: it cannot influence a
     # transition, and a listener that raises is logged and ignored.
     on_state_complete: Callable[[str], None] | None = None
+    # The Batch-3 handoff coordinator, when one is wired (the runner sets
+    # it; tests may leave it None). Never consulted by the loop — it is
+    # carried so the CLI can persist the records at the end of the run,
+    # exactly like the graph. Data exchange, never transition authority.
+    handoff_coordinator: object | None = None
+    # Batch 4A: the specialist scheduler, when one is wired. Same contract
+    # as the coordinator above: carried so the runner can checkpoint it at
+    # the state boundary and the CLI can persist it at the end — and so
+    # the scheduler's boundary work can be driven from ``_notify``'s
+    # listener side, never from the transition decision itself.
+    specialist_scheduler: object | None = None
 
     def run(self) -> list[str]:
         """Run the loop to HALT. Returns the list of completed states."""

@@ -1,0 +1,2 @@
+{"argv":["assetfinder","-silent","juice-shop.lab"],"event":"tool_spawn","hash":"3771385a05833fe4d8a120b7472d3106a56c89a3bc4ba05b86ffd2f144f02379","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","run":"assetfinder","ts":"2026-11-17T12:23:36+00:00"}
+{"error":"","event":"tool_result","exit_code":2,"hash":"b857a7cb4f34f92f7740a34cf99ba51786bbe7da42cd027e4a02a88b9460d28f","ok":true,"output_chars":120,"prev_hash":"3771385a05833fe4d8a120b7472d3106a56c89a3bc4ba05b86ffd2f144f02379","run":"assetfinder","truncated":false,"ts":"2026-11-17T12:23:37+00:00"}

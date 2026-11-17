@@ -37,9 +37,12 @@ from kryonsec.purple.views import (
     ATTEMPT_CONFIRMED,
     ATTEMPT_INCONCLUSIVE,
     ATTEMPT_NONE,
+    ATTEMPT_NOTES,
     ATTEMPT_NOT_RUN,
+    ATTEMPT_TOOL_ERROR,
     ATTEMPT_UNRECORDED,
     OUTCOMES_RUN,
+    _ATTEMPT_ORDER,
     attempt_names,
     attempt_outcome,
     exploit_status,
@@ -104,8 +107,17 @@ def _attempt(graph, label, **props):
 @pytest.mark.parametrize("props,expected", [
     # the tool ran and its own output carried the marker
     ({"ok": True, "confirmed": True}, ATTEMPT_CONFIRMED),
-    # the tool ran; the marker was absent — a check that proved nothing,
-    # which is not the same as a check that found nothing
+    # the tool ran to completion; the marker was absent — a check that
+    # proved nothing, which is not the same as a check that found nothing
+    ({"ok": True, "confirmed": False, "exit_code": 0}, ATTEMPT_INCONCLUSIVE),
+    # a nonzero exit is an INTERRUPTED check, not a clean no-finding run
+    # (Phase 2: exit 137 at the sandbox cap, curl 18 truncated response)
+    ({"ok": True, "confirmed": False, "exit_code": 137}, ATTEMPT_TOOL_ERROR),
+    ({"ok": True, "confirmed": False, "exit_code": 18}, ATTEMPT_TOOL_ERROR),
+    # a confirmed marker is evidence even when the exit is not clean —
+    # evidence the tool printed before dying stays evidence
+    ({"ok": True, "confirmed": True, "exit_code": 137}, ATTEMPT_CONFIRMED),
+    # records written before exit codes were stored keep the old reading
     ({"ok": True, "confirmed": False}, ATTEMPT_INCONCLUSIVE),
     # the process never started: `ok` is the sandbox's verdict on spawn
     ({"ok": False, "confirmed": False}, ATTEMPT_NOT_RUN),
@@ -136,9 +148,18 @@ def test_confirmed_alone_is_proof_the_process_started():
 
 
 def test_only_a_run_counts_as_execution():
-    assert OUTCOMES_RUN == {ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED}
+    assert OUTCOMES_RUN == {
+        ATTEMPT_TOOL_ERROR, ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED}
     assert ATTEMPT_NOT_RUN not in OUTCOMES_RUN
     assert ATTEMPT_UNRECORDED not in OUTCOMES_RUN
+    # a crashed check is a run, but ranks BELOW a completed one: the
+    # best-attempt selection must prefer an inconclusive over a tool-error
+    assert _ATTEMPT_ORDER.index(ATTEMPT_TOOL_ERROR) \
+        < _ATTEMPT_ORDER.index(ATTEMPT_INCONCLUSIVE) \
+        < _ATTEMPT_ORDER.index(ATTEMPT_CONFIRMED)
+    # and every word an operator can see has a plain-English note
+    for word in _ATTEMPT_ORDER:
+        assert ATTEMPT_NOTES[word], word
 
 
 def test_attempt_labels_belong_to_their_hypothesis_by_id_prefix():
@@ -547,6 +568,13 @@ def test_reporting_fixes_changed_no_state_transition(tmp_path):
 
     events = [json.loads(line)["event"]
               for line in audit.path.read_text(encoding="utf-8").splitlines()]
-    assert events[:2] == ["state_enter", "exploit_plan"]
-    assert events[-1] == "exploit_done"
+    # Wave 2b: the jwt token producer's capture pass runs between
+    # state_enter and planning (it audits even when nothing is found)
+    assert events[:3] == ["state_enter", "jwt_tokens_captured", "exploit_plan"]
+    # Phase 3 (2026-11-17): the run now ends with the post-exploit
+    # dormancy skip — the EXPLOIT -> VERIFY routing with no
+    # POST_EXPLOIT stop is an audited fact with its reason, not a
+    # silence (was: events[-1] == "exploit_done").
+    assert events[-1] == "post_exploit_skipped_dormant"
+    assert "exploit_done" in events
     assert "finding_confirmed" in events

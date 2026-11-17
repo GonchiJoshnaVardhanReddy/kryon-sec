@@ -71,6 +71,8 @@ class _StubEgressPolicy:
     """Duck-typed egress-policy stub (the executor only needs presence;
     the REAL enforcement lives inside the sandbox's own spawn)."""
 
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
+
 
 class FakeSandbox:
     """Duck-typed sandbox double carrying the attributes the adapter
@@ -155,12 +157,13 @@ def test_production_registry_registers_whatweb_probe_explicitly():
         empty.get(ADAPTER_ID)
 
 
-def test_combined_recon_active_registry_carries_both_web_adapters():
+def test_combined_recon_active_registry_carries_all_eleven_adapters():
     reg = recon_active_registry()
     assert reg.adapter_ids() == (
-        "api-probe", "httpx-probe", "nuclei-probe", "tls-probe",
-        "whatweb-probe")
-    # all three stay RECON_ACTIVE-only; none mounted a gate
+        "api-probe", "dnsx-probe", "feroxbuster-probe", "gowitness-probe",
+        "httpx-probe", "katana-probe", "naabu-probe", "nmap-probe",
+        "nuclei-probe", "tls-probe", "whatweb-probe")
+    # all eleven stay RECON_ACTIVE-only; none mounted a gate
     for adapter in reg.list_adapters():
         assert adapter.stages == ("RECON_ACTIVE",)
         assert adapter.approvals == ()
@@ -553,7 +556,9 @@ def test_fingerprint_is_recon_evidence_never_confirmation(tmp_path):
 
 def test_no_host_execution_in_adapter_modules():
     for mod in ("adapter_httpx.py", "adapter_whatweb.py",
-                "adapter_nuclei.py", "adapters.py"):
+                "adapter_nuclei.py", "adapter_dnsx.py",
+                "adapter_naabu.py", "adapter_katana.py",
+                "adapters.py"):
         source = Path("src/kryonsec/purple") / mod
         text = source.read_text(encoding="utf-8")
         assert "subprocess" not in text, mod
@@ -621,19 +626,26 @@ def test_adapter_mode_probes_whatweb_once_never_both(tmp_path):
     assert list(runs) == ["1"]
     assert "--no-errors" in runs["1"] and "--color=never" in runs["1"]
     fps = graph.by_type("tech_fingerprint")
-    assert len(fps) == 1
+    # Phase 4: wafw00f produces its OWN tech_fingerprint node per base —
+    # the count under test is the whatweb lane's, exactly one per base
+    wafps = [f for f in fps if f["properties"]["source"] == "wafw00f"]
+    assert len(wafps) == 1
+    assert len(fps) - len(wafps) == 1
     assert fps[0]["properties"]["source"] == "whatweb"
     assert fps[0]["properties"]["adapter"] == ADAPTER_ID
     # the httpx adapter side of the combined registry still runs its
     # lane — and its web_endpoint evidence is SEPARATE from the
-    # whatweb tech_fingerprint evidence (the nuclei-probe adapter, the
-    # third member, runs its vuln-check lane separately too)
+    # whatweb tech_fingerprint evidence (the nuclei-probe and api-probe
+    # adapters run their own lanes, and the Batch 1 discovery/crawl
+    # probes run theirs: naabu + dnsx in discovery, katana per base)
     runs_toolkt = [a for a in cmdl if a and a[0] == "httpx-toolkit"]
     runs_legacy_httpx = [a for a in cmdl if a and a[0] == "httpx"]
     assert runs_legacy_httpx == []
     assert len(runs_toolkt) == 1
     assert len(graph.by_type("web_endpoint")) == 1
-    assert len(graph.by_type("adapter_attempt")) == 4
+    # 10 attempt nodes: httpx, whatweb, api, nuclei, katana, gowitness,
+    # feroxbuster (web lanes) + nmap, naabu, dnsx (discovery lanes)
+    assert len(graph.by_type("adapter_attempt")) == 10
     names = _event_names(audit)
     assert "recon_active_whatweb_adapter" in names
     assert "recon_active_adapter_failure" not in names

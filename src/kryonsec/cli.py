@@ -3,9 +3,6 @@
 Usage:
   kryonsec          start the interactive CLI (Copilot mode)
   kryonsec doctor   run preflight checks
-  kryonsec login    sign in to a beta account (browser once, no key)
-  kryonsec logout   revoke this machine's token and forget it
-  kryonsec auth     show how this machine is signed in
   kryonsec --version
 """
 
@@ -866,9 +863,9 @@ def _run_purple(
     # the console shows what is running as it runs, so the inventory is no
     # longer printed anywhere. STATES is imported where it is used, below.
     from .engagement_id import is_valid_engagement_id
-    from .license import LicenseError, ensure_purple_allowed
     from .purple.runner import (
         persist_graph,
+        persist_handoffs,
         record_engagement_ending,
         safe_exception_type,
         safe_halt_code,
@@ -922,23 +919,11 @@ def _run_purple(
             return 2
         code_folder = str(code_path.resolve())
 
-    # The membership gate. It lives here, at the one function both Purple
-    # entry points (`kryonsec purple` and the /mode toggle) share, so neither
-    # can be the one that forgets. Copilot mode never reaches this and stays
-    # free.
-    #
-    # Placed AFTER the argument checks above and BEFORE sandbox_available
-    # below, which is the only gap where both things hold: a bad --id or
-    # --code is answered instantly and locally instead of costing a network
-    # round trip, and the path-traversal guard can never be masked by a
-    # licensing problem — and nothing has run a container or touched the
-    # target yet.
-    try:
-        ensure_purple_allowed(cfg)
-    except LicenseError as e:
-        _error(f"Purple Team is not available: {e}")
-        _notice("Copilot mode is free and unaffected — just run `kryonsec`.")
-        return 3
+    # No membership gate in this development build: Purple Team needs no
+    # account, key, or phone-home here. Everything technical below is still
+    # authoritative — sandbox availability, the Linux/Docker/gVisor runtime
+    # checks, egress, target scope, Gates 2/3 — none of which a login ever
+    # was part of.
 
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     if not sandbox_ok:
@@ -1073,6 +1058,21 @@ def _run_purple(
             _notice(
                 "graph memory not saved — the engagement itself is complete "
                 "(audit chain, evidence and report are on disk); see the debug log"
+            )
+
+        # Batch 3: the handoff records get the same end-of-run persist and
+        # the same failure shape — reported to the operator, never fatal,
+        # never silent. The engagement's own record (audit chain,
+        # evidence, report, graph) is complete either way.
+        # Batch 4C: the specialist scheduler's snapshot rides along in the
+        # same write, so a later run of this id can resume from it.
+        coordinator = getattr(orch, "handoff_coordinator", None)
+        scheduler = getattr(orch, "specialist_scheduler", None)
+        if coordinator is not None and not persist_handoffs(
+                cfg, engagement_id, coordinator, audit, scheduler=scheduler):
+            _notice(
+                "handoff records not saved — the engagement record itself "
+                "is complete; see the debug log"
             )
 
         # Read after persist_graph, not before: a crash while saving the
@@ -1311,42 +1311,6 @@ def _elapsed_text(orch: "Any") -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _offer_connect(cfg: KryonsecConfig) -> None:
-    """Mention the one-time connect step, once per machine.
-
-    Purple Team requires a registered machine, so the honest moment to raise
-    it is before a member hits the refusal — but only once. Declining is
-    remembered: a prompt that comes back every launch is one people learn to
-    ignore. `kryonsec connect` is always there if they change their mind.
-    """
-    from .license import load_state, member_email, save_state
-
-    if not cfg.license_key or member_email(cfg):
-        return
-    state = load_state(cfg)
-    # No terminal (piped, CI, detached) means no question to ask.
-    if state.get("connect_offered") or not sys.stdin.isatty():
-        return
-
-    state["connect_offered"] = True
-    save_state(cfg, state)
-
-    console.print(
-        "\n[dim]This machine is not connected to your membership yet. "
-        "Purple Team needs that; Copilot mode does not.[/dim]"
-    )
-    try:
-        answer = input(
-            "  Connect now? This opens a browser once. [Y/n] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        console.print("")
-        return
-    if answer in ("", "y", "yes"):
-        from .connect import connect
-
-        connect(cfg)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="kryonsec", description=__doc__)
     parser.add_argument("--version", action="version", version=f"kryonsec {__version__}")
@@ -1366,31 +1330,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
-
-    connect = sub.add_parser(
-        "connect",
-        help="register this machine to your membership (opens a browser once)")
-    connect.add_argument(
-        "--no-browser", dest="open_browser", action="store_false",
-        help="print the link instead of opening a browser (headless boxes)")
-
-    login = sub.add_parser(
-        "login",
-        help="sign in to a beta account (opens a browser once; no key needed)")
-    login.add_argument(
-        "--no-browser", dest="open_browser", action="store_false",
-        help="print the link instead of opening a browser (headless boxes)")
-
-    sub.add_parser(
-        "logout",
-        help="sign this machine out: revoke the token, then delete it here")
-
-    auth = sub.add_parser(
-        "auth",
-        help="show how this machine is signed in, and whether access is live")
-    auth.add_argument(
-        "what", nargs="?", default="status", choices=["status"],
-        help="only `status` for now; `kryonsec auth status`")
 
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
@@ -1452,38 +1391,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    if args.command == "connect":
-        from .connect import connect
-
-        try:
-            return connect(cfg, open_browser=args.open_browser)
-        except KeyboardInterrupt:
-            # Ctrl+C while waiting on the browser. Nothing was written, so
-            # saying so is the whole message.
-            console.print("\n[yellow]cancelled — nothing was changed[/yellow]")
-            return 1
-
-    if args.command == "login":
-        from .auth import login
-
-        try:
-            return login(cfg, open_browser=args.open_browser)
-        except KeyboardInterrupt:
-            console.print(
-                "\n[yellow]cancelled — nothing was stored on this machine[/yellow]"
-            )
-            return 1
-
-    if args.command == "logout":
-        from .auth import logout
-
-        return logout(cfg)
-
-    if args.command == "auth":
-        from .auth import status
-
-        return status(cfg)
-
     # first run without a config -> wizard before the chat loop
     from .config import config_path
 
@@ -1507,7 +1414,8 @@ def main(argv: list[str] | None = None) -> int:
         if not config_path(cfg.home).is_file():
             return 0  # aborted before writing — nothing to start
 
-    _offer_connect(cfg)
+    # No connect/membership offer in this development build — the app runs
+    # without any account.
 
     # A supported interactive terminal gets the persistent full-screen
     # workspace. Pipes, CI, and legacy encodings keep the readable fallback.

@@ -202,6 +202,63 @@ class Checkpoint(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class HandoffRecordRow(Base):
+    """One coordinator record (Batch 3, Phase 3A).
+
+    ``payload`` holds the whole record (the origin message, its lifecycle
+    status, results and evidence links — ids only, never raw tool output).
+    The identity columns exist so the dedup identity is queryable and, via
+    the unique constraint, impossible to double-write: the same
+    engagement + identity twice is a storage-level refusal, matching the
+    coordinator's own dedup.
+    """
+
+    __tablename__ = "handoff_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "engagement_id", "identity_key",
+            name="uq_handoff_records_identity",
+        ),
+        Index("ix_handoff_records_engagement", "engagement_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    engagement_id: Mapped[str] = mapped_column(String(36))
+    identity_key: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(_json())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class HandoffSchedulerRow(Base):
+    """The specialist scheduler's checkpoint, one row per engagement
+    (Batch 4C).
+
+    ``payload`` is the scheduler's whole JSON snapshot — the scheduled
+    tasks, per-role consumption, the event ledger and the shared budget's
+    consumption — written through the same replace-in-one-transaction
+    save as ``handoff_records``. Restoring it re-creates the scheduler
+    exactly as it was, without re-running anything it already did.
+
+    ``engagement_id`` is String(64) (this table is new; engagement ids
+    are 1-64 chars) — the older ``handoff_records`` column is String(36)
+    and stays as shipped.
+    """
+
+    __tablename__ = "handoff_scheduler"
+    __table_args__ = (
+        Index("ix_handoff_scheduler_engagement", "engagement_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    engagement_id: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(_json())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
 GENERAL_TABLES = [GeneralSession, GeneralUserLtm, SystemKnowledge]
 PURPLE_TABLES = [
     StmNode,
@@ -210,4 +267,6 @@ PURPLE_TABLES = [
     LtmEngagementSummary,
     EngagementSecretMap,
     Checkpoint,
+    HandoffRecordRow,
+    HandoffSchedulerRow,
 ]

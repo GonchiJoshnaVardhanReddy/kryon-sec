@@ -1,0 +1,31 @@
+[92mENUM4LINUX - next generation (v1.3.10)[0m
+
+ ==========================
+|    Target Information    |
+ ==========================
+[94m[*] Target ........... juice-shop.lab[0m
+[94m[*] Username ......... ''[0m
+[94m[*] Random Username .. 'btubjvgb'[0m
+[94m[*] Password ......... ''[0m
+[94m[*] Timeout .......... 10 second(s)[0m
+
+ =======================================
+|    Listener Scan on juice-shop.lab    |
+ =======================================
+[94m[*] Checking LDAP[0m
+[91m[-] Could not connect to LDAP on 389/tcp: connection refused[0m
+[94m[*] Checking LDAPS[0m
+[91m[-] Could not connect to LDAPS on 636/tcp: connection refused[0m
+[94m[*] Checking SMB[0m
+[91m[-] Could not connect to SMB on 445/tcp: connection refused[0m
+[94m[*] Checking SMB over NetBIOS[0m
+[91m[-] Could not connect to SMB over NetBIOS on 139/tcp: connection refused[0m
+
+ =============================================================
+|    NetBIOS Names and Workgroup/Domain for juice-shop.lab    |
+ =============================================================
+[91m[-] Could not get NetBIOS names information via 'nmblookup': timed out[0m
+
+[93m[!] Aborting remainder of tests since neither SMB nor LDAP are accessible[0m
+
+Completed after 10.01 seconds

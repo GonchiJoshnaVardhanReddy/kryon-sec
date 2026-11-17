@@ -20,7 +20,18 @@ from .. import __version__
 from ..secrets import redact
 from . import runtime_checks
 from .audit import AuditLog
-from .orchestrator import HALT, PurpleOrchestrator, SubagentResult
+from .coordinator import HandoffCoordinator, StageBoundaryRecorder
+from .orchestrator import (
+    BudgetTracker,
+    HALT,
+    PurpleOrchestrator,
+    SubagentResult,
+)
+from .specialist import (
+    SpecialistError,
+    SpecialistScheduler,
+    recover_for_resume,
+)
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +62,11 @@ STATE_INFO: dict[str, dict[str, str]] = {
         "does": "scan the target (packets to target)",
         "tools": "nmap, naabu, dnsx, httpx, whatweb, katana, feroxbuster, "
                  "openapi_probe, gowitness (screenshots → /evidence), "
-                 "sslscan, testssl.sh",
+                 "sslscan, testssl.sh; vetted adapter probes where "
+                 "registered: httpx-probe, whatweb-probe, tls-probe, "
+                 "api-probe, nuclei-probe (web) + naabu-probe, "
+                 "dnsx-probe (discovery), katana-probe (crawl) — same "
+                 "binaries, same fixed argv, one probe per check",
         "zone": "B (sandbox)",
     },
     "HYPOTHESIZE": {
@@ -206,6 +221,29 @@ def start_engagement(
         "run_id": new_run_id(),
     })
     graph = EngagementGraph(engagement_id=engagement_id)
+
+    # Batch 3 (Phase 3A): the coordinator for structured handoffs. It
+    # shares the graph (the one evidence store — links are node ids,
+    # never copies) and the audit chain (its events reach the UI through
+    # the ordinary observers). The boundary recorder derives records from
+    # the graph at each state boundary; the orchestrator alone decides
+    # transitions, so a record can describe what finished but never
+    # trigger the next state.
+    coordinator = HandoffCoordinator(
+        engagement_id=engagement_id, graph=graph, audit=audit)
+
+    # Batch 4A/4C: the ONE engagement budget, created here explicitly so
+    # the specialist scheduler and the LLM states accrue against the same
+    # tracker (previously the orchestrator's default). Then the
+    # specialist-layer resume: a reused engagement id with prior
+    # handoff/scheduler rows restores its records, scheduler and budget
+    # consumption, and the recovery pass decides what may re-run —
+    # read-only work reopens, state-changing work with an unknown outcome
+    # goes back behind the human gate, never silently re-executed.
+    budget = BudgetTracker()
+    coordinator, scheduler = resume_specialists(
+        cfg, engagement_id, coordinator, audit, budget)
+    boundary = StageBoundaryRecorder(coordinator)
 
     sandbox_ok, sandbox_reason = sandbox_available(cfg.sandbox_image)
     audit.write({
@@ -466,6 +504,7 @@ def start_engagement(
 
     orch = PurpleOrchestrator(
         engagement_id=engagement_id,
+        budget=budget,
         execution_allowed=True,
         subagent_loader=loader,
     )
@@ -477,8 +516,44 @@ def start_engagement(
     # chain and the config are all built here. It runs on the same
     # single-threaded loop as everything else, so the snapshot cannot race a
     # subagent still writing to the graph.
-    orch.on_state_complete = lambda state: checkpoint_graph(
-        cfg, engagement_id, graph, audit, state)
+    #
+    # Batch 3: the same boundary now also derives the state's handoff
+    # records (best-effort, never a transition input) and checkpoints
+    # them, each step reported, never fatal, never silent — the loop's
+    # ordering is: graph checkpoint, boundary handoffs, handoff
+    # checkpoint, then the orchestrator picks the next state.
+    def _on_state_complete(state: str) -> None:
+        checkpoint_graph(cfg, engagement_id, graph, audit, state)
+        boundary.on_state_complete(state)
+        # Batch 4A: the specialist scheduler's boundary pass — derive this
+        # state's tasks, check timeouts, run what is ready. It runs AFTER
+        # the boundary recorder (the records it schedules must exist) and
+        # BEFORE the checkpoint (so the checkpoint captures the tasks this
+        # boundary actually ran). Never a transition input, and never
+        # fatal: a scheduler failure is audited and the loop continues.
+        try:
+            scheduler.on_boundary(state)
+        except Exception as exc:
+            audit.write({
+                "event": "specialist_boundary_failed",
+                "state": state,
+                "error": _safe_error(exc, cfg),
+            })
+            log.warning(
+                "engagement %s: specialist boundary after %s failed: %s",
+                engagement_id, state, exc, exc_info=True,
+            )
+        checkpoint_handoffs(
+            cfg, engagement_id, coordinator, audit, state,
+            scheduler=scheduler)
+
+    orch.on_state_complete = _on_state_complete
+    # Carried for the end-of-run persist (the CLI reads it the way it
+    # reads the graph); the loop itself never consults it.
+    orch.handoff_coordinator = coordinator
+    # Batch 4A: same contract as the coordinator above — carried for the
+    # CLI's end-of-run persist, never consulted by the loop.
+    orch.specialist_scheduler = scheduler
 
     return orch, audit, graph
 
@@ -669,6 +744,265 @@ def checkpoint_graph(
         "edges": edges,
     })
     return True
+
+
+def checkpoint_handoffs(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    coordinator: HandoffCoordinator,
+    audit: AuditLog,
+    state: str,
+    *,
+    scheduler: "SpecialistScheduler | None" = None,
+) -> bool:
+    """Write the handoff records to engagement storage mid-run (Batch 3).
+
+    The same shape as :func:`checkpoint_graph`, for the same reason: the
+    records are written at the state boundary, where nothing is mid-write,
+    so an interruption costs at most the records the state that was
+    running would have added. ``save_handoffs`` replaces the engagement's
+    rows in a single transaction, so a crash part-way leaves the previous
+    checkpoint intact — and replaying the save writes the same rows, not
+    new ones.
+
+    Batch 4C: when ``scheduler`` is given, its snapshot is checkpointed
+    in the SAME transaction, so the records and the scheduler's task
+    state always describe the same moment.
+
+    This is not resume by itself: ``load_handoffs`` restores the records,
+    and a restored coordinator de-duplicates whatever it is given, so a
+    replayed boundary cannot double-record work. ``resume_specialists``
+    (at engagement start) is what reads these checkpoints back.
+
+    Failure policy: **reported, never fatal, never silent** — the event
+    lands in the chain as ``handoff_checkpoint_failed`` and the loop
+    continues. A handoff record is never worth an engagement.
+
+    Returns True when the checkpoint was written.
+    """
+    from ..storage import get_purple_session, init_purple_db
+    from .handoff_store import save_handoffs
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            count = save_handoffs(
+                session, engagement_id, coordinator, scheduler=scheduler)
+    except Exception as exc:
+        # Deliberately broad, like checkpoint_graph's: everything that can
+        # go wrong here has the same outcome (no handoff checkpoint) and
+        # the same handling (say so).
+        detail = f"{type(exc).__name__}: {exc}"
+        _announce(audit, {
+            "event": "handoff_checkpoint_failed",
+            "engagement_id": engagement_id,
+            "state": state,
+            "error": _safe_error(exc, cfg),
+        })
+        log.warning(
+            "engagement %s: handoff checkpoint after %s failed: %s",
+            engagement_id, state, detail, exc_info=True,
+        )
+        return False
+
+    _announce(audit, {
+        "event": "handoff_checkpoint_written",
+        "engagement_id": engagement_id,
+        "state": state,
+        "records": count,
+    })
+    return True
+
+
+def persist_handoffs(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    coordinator: HandoffCoordinator | None,
+    audit: AuditLog,
+    *,
+    scheduler: "SpecialistScheduler | None" = None,
+) -> bool:
+    """Write the handoff records once, after the loop reaches HALT.
+
+    The end-of-run counterpart of :func:`persist_graph`, with the same
+    contract: the engagement is already over by the time this runs, so a
+    storage problem here cannot undo any of it — the failure is written
+    to the chain as ``handoff_persist_failed`` (append-only, so it stays),
+    logged, and returned so the CLI can tell the operator.
+
+    A ``None`` coordinator (an engagement wired without one, or a test
+    harness) persists nothing and reports success — there is simply
+    nothing to store.
+
+    Returns True when the records were stored.
+    """
+    if coordinator is None:
+        return True
+
+    from ..storage import get_purple_session, init_purple_db
+    from .handoff_store import save_handoffs
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            count = save_handoffs(
+                session, engagement_id, coordinator, scheduler=scheduler)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        audit.write({
+            "event": "handoff_persist_failed",
+            "engagement_id": engagement_id,
+            "error": _safe_error(exc, cfg),
+        })
+        log.warning(
+            "engagement %s: handoff records not persisted: %s",
+            engagement_id, detail, exc_info=True,
+        )
+        return False
+
+    audit.write({
+        "event": "handoff_persisted",
+        "engagement_id": engagement_id,
+        "records": count,
+    })
+    log.info(
+        "engagement %s: handoff records persisted (%d)",
+        engagement_id, count,
+    )
+    return True
+
+
+def resume_specialists(
+    cfg: KryonsecConfig,
+    engagement_id: str,
+    coordinator: HandoffCoordinator,
+    audit: AuditLog,
+    budget: BudgetTracker,
+) -> tuple[HandoffCoordinator, SpecialistScheduler]:
+    """Restore prior specialist state for a reused engagement id
+    (Batch 4C).
+
+    When engagement storage already holds handoff rows for this id — a
+    previous run of the SAME engagement id, interrupted or finished —
+    they are restored, along with the scheduler snapshot and the budget
+    consumption that goes with them, and the recovery pass decides what
+    may re-run:
+
+    * read-only work that was mid-flight reopens (``blocked``), claimable
+      again at its own stage boundary — its result is recomputed, never
+      assumed;
+    * state-changing work with an unknown outcome is parked behind
+      Gate 2 (``needs_approval``) — never automatically repeated;
+    * completed, cancelled, already-gated work is left exactly as it was,
+      and task identities keep their attempt counts.
+
+    A corrupted or incompatible checkpoint is refused loudly — audited as
+    ``specialist_resume_failed`` — and the engagement continues with a
+    FRESH scheduler over the records that did restore: never silent,
+    never fatal, never half-interpreted. Scope and approval metadata live
+    in the restored records themselves and are never rewritten here.
+
+    Specialist-layer only, by design: the ten-state loop itself does not
+    resume (documented Batch 5/6 limitation) — a resumed engagement
+    replays its boundaries, and the identity dedup makes that replay
+    free.
+    """
+    from ..storage import get_purple_session, init_purple_db
+    from .handoff_store import load_handoffs, load_scheduler_payload
+
+    fresh = SpecialistScheduler(coordinator, audit, budget=budget)
+
+    try:
+        init_purple_db(cfg)
+        with get_purple_session(cfg) as session:
+            restored = load_handoffs(
+                session, engagement_id,
+                graph=coordinator.graph, audit=audit)
+    except Exception as exc:
+        # Unreadable storage is a resume REFUSAL, not an engagement
+        # failure: say so in the chain and start fresh.
+        audit.write({
+            "event": "specialist_resume_failed",
+            "reason": "storage_unreadable",
+            "error": _safe_error(exc, cfg),
+        })
+        log.warning(
+            "engagement %s: specialist resume refused (storage): %s",
+            engagement_id, exc, exc_info=True,
+        )
+        return coordinator, fresh
+
+    if not restored.records():
+        # No prior records: a genuinely fresh engagement. Nothing to
+        # restore, nothing to announce.
+        return coordinator, fresh
+
+    audit.write({
+        "event": "specialist_resume_detected",
+        "engagement_id": engagement_id,
+        "records": len(restored.records()),
+    })
+    coordinator = restored
+    recovery = recover_for_resume(coordinator, audit)
+
+    try:
+        with get_purple_session(cfg) as session:
+            payload = load_scheduler_payload(session, engagement_id)
+    except Exception as exc:
+        # The records are in; the scheduler snapshot is what is broken.
+        # Refuse exactly that, keep the records, start a fresh scheduler
+        # over them — never half-interpret a checkpoint.
+        audit.write({
+            "event": "specialist_resume_failed",
+            "reason": "scheduler_checkpoint_unusable",
+            "error": str(exc)[:200],
+        })
+        log.warning(
+            "engagement %s: scheduler checkpoint refused: %s",
+            engagement_id, exc, exc_info=True,
+        )
+        return coordinator, SpecialistScheduler(
+            coordinator, audit, budget=budget)
+
+    if payload is None:
+        # Records without a scheduler snapshot: the records are the
+        # identity base, restored; the scheduler starts fresh and
+        # re-derives at the next boundary (identity-deduped, so nothing
+        # is re-run).
+        audit.write({
+            "event": "specialist_resume_partial",
+            "reason": "no scheduler checkpoint",
+            "recovered": recovery,
+        })
+        return coordinator, SpecialistScheduler(
+            coordinator, audit, budget=budget)
+
+    try:
+        scheduler = SpecialistScheduler.from_dict(
+            payload, coordinator=coordinator, audit=audit, budget=budget)
+    except (SpecialistError, ValueError) as exc:
+        # A scheduler snapshot this build cannot read: refuse it, keep
+        # the records, start fresh — never half-interpret a checkpoint.
+        audit.write({
+            "event": "specialist_resume_failed",
+            "reason": "scheduler_checkpoint_unusable",
+            "error": str(exc)[:200],
+        })
+        log.warning(
+            "engagement %s: scheduler checkpoint refused: %s",
+            engagement_id, exc, exc_info=True,
+        )
+        return coordinator, SpecialistScheduler(
+            coordinator, audit, budget=budget)
+
+    audit.write({
+        "event": "specialist_resumed",
+        "engagement_id": engagement_id,
+        "tasks": len(scheduler.tasks()),
+        "budget_used_tokens": budget.used_tokens,
+        "recovered": recovery,
+    })
+    return coordinator, scheduler
 
 
 # ---- engagement lifecycle (Phase 4.2) -------------------------------------

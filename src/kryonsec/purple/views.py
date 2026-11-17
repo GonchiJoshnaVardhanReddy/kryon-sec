@@ -39,6 +39,7 @@ __all__ = [
     "ATTEMPT_NONE",
     "ATTEMPT_NOTES",
     "ATTEMPT_NOT_RUN",
+    "ATTEMPT_TOOL_ERROR",
     "ATTEMPT_UNRECORDED",
     "BASIS_NOTES",
     "BASIS_PROPOSED",
@@ -53,6 +54,7 @@ __all__ = [
     "VERIFICATION_INCONCLUSIVE",
     "VERIFICATION_NOTES",
     "VERIFICATION_NOT_RUN",
+    "VERIFICATION_UNRESOLVED",
     "VERIFICATION_VERIFIED",
     "asset_key",
     "attempt_names",
@@ -266,24 +268,31 @@ def relationship_basis(node: dict, graph: EngagementGraph) -> str:
 # performed (A13 D1).
 
 ATTEMPT_CONFIRMED = "confirmed"        # the tool ran; its output had the marker
-ATTEMPT_INCONCLUSIVE = "inconclusive"  # the tool ran; the marker was absent
+ATTEMPT_INCONCLUSIVE = "inconclusive"  # the tool ran to completion; the marker was absent
+ATTEMPT_TOOL_ERROR = "tool-error"      # the tool ran but exited nonzero — the check did not complete
 ATTEMPT_NOT_RUN = "not-run"            # the record says the process never started
 ATTEMPT_UNRECORDED = "unrecorded"      # no record either way
 ATTEMPT_NONE = "none"                  # no attempt at all for this hypothesis
 
 #: Every outcome, weakest first. This is also the comparison order when one
 #: hypothesis has several attempts: the best one recorded wins, so a second
-#: tool that could not start never undoes a first that ran.
+#: tool that could not start never undoes a first that ran. tool-error sits
+#: below inconclusive: an interrupted check establishes even less than a
+#: completed one that found nothing.
 _ATTEMPT_ORDER: tuple[str, ...] = (
     ATTEMPT_NONE,
     ATTEMPT_NOT_RUN,
     ATTEMPT_UNRECORDED,
+    ATTEMPT_TOOL_ERROR,
     ATTEMPT_INCONCLUSIVE,
     ATTEMPT_CONFIRMED,
 )
 
-#: The outcomes that mean a tool really ran against the target.
-OUTCOMES_RUN = frozenset({ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED})
+#: The outcomes that mean a tool really ran against the target. tool-error
+#: IS a run — a killed/partial tool touched the target — but its evidence
+#: is incomplete, which the note below says in plain words.
+OUTCOMES_RUN = frozenset({
+    ATTEMPT_TOOL_ERROR, ATTEMPT_INCONCLUSIVE, ATTEMPT_CONFIRMED})
 
 # What each outcome means, in the operator's words. The two that did not run
 # are deliberately not phrased as results: nothing was checked, so there is
@@ -296,6 +305,11 @@ ATTEMPT_NOTES: dict[str, str] = {
     ATTEMPT_UNRECORDED: (
         "an attempt was recorded, but the engagement did not record whether "
         "the tool started"
+    ),
+    ATTEMPT_TOOL_ERROR: (
+        "a test started but did not complete (the tool exited with an "
+        "error) — whatever it printed is partial evidence, not a clean "
+        "result"
     ),
     ATTEMPT_INCONCLUSIVE: (
         "a test ran and did not confirm it — a test that found nothing is "
@@ -318,6 +332,16 @@ def attempt_outcome(node: dict) -> str:
     if properties.get("confirmed"):
         return ATTEMPT_CONFIRMED
     if properties.get("ok") is True:
+        # a nonzero exit is NOT a completed check: it is an interrupted
+        # one (Phase 2, 2026-11-17 — exit 137 at the sandbox cap and
+        # curl 18 on a truncated response both used to read as
+        # "inconclusive", i.e. a clean no-finding run). Records from
+        # before exit codes were stored read as inconclusive, exactly
+        # as before.
+        exit_code = properties.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) \
+                and exit_code != 0:
+            return ATTEMPT_TOOL_ERROR
         return ATTEMPT_INCONCLUSIVE
     if properties.get("ok") is False:
         return ATTEMPT_NOT_RUN
@@ -349,6 +373,7 @@ def attempt_names(attempt_label: object, hypothesis_id: str) -> bool:
 
 VERIFICATION_VERIFIED = "verified"          # an independent test agreed
 VERIFICATION_DISAGREED = "disagreed"        # an independent test contradicted
+VERIFICATION_UNRESOLVED = "unresolved"      # agreed-looking, but counterevidence stands
 VERIFICATION_INCONCLUSIVE = "inconclusive"  # ran; cannot establish either
 VERIFICATION_NOT_RUN = "not_run"            # no independent check executed
 
@@ -357,6 +382,7 @@ VERIFICATION_NOT_RUN = "not_run"            # no independent check executed
 _VERIFICATION_ORDER: tuple[str, ...] = (
     VERIFICATION_NOT_RUN,
     VERIFICATION_INCONCLUSIVE,
+    VERIFICATION_UNRESOLVED,
     VERIFICATION_DISAGREED,
     VERIFICATION_VERIFIED,
 )
@@ -370,6 +396,12 @@ VERIFICATION_NOTES: dict[str, str] = {
     VERIFICATION_DISAGREED: (
         "an independent test ran and did NOT agree with the finding — treat "
         "it as the first tool's claim, not an established fact"
+    ),
+    VERIFICATION_UNRESOLVED: (
+        "the independent test ran and saw an agreeing difference, but "
+        "counterevidence stands that a benign explanation could produce "
+        "the same difference — the question is left open, not settled "
+        "either way"
     ),
     VERIFICATION_INCONCLUSIVE: (
         "the independent test ran but could not establish either conclusion"
@@ -386,13 +418,18 @@ def verification_status(node: dict) -> str:
 
     The derivation reads only the node's execution evidence:
     ``verified`` (the boolean verdict), whether the probes returned both
-    responses (``true_len``/``false_len``), and whether a baseline was
-    available (``baseline_len``). A node whose probes never returned
+    responses (``true_len``/``false_len``), whether a baseline was
+    available (``baseline_len``), and the recorded ``counterevidence`` —
+    observations the check itself made that a benign explanation could
+    account for what it saw. A node whose probes never returned
     responses is ``not_run`` — scope refusal, missing parameter, failed
     spawn — and keeps its blocking ``reason``; it is never described as
     disproven or safe. A stored ``status`` word, if any producer writes
     one, is consulted by nothing: it cannot be the basis:
     - verified=True + probes returned responses -> ``verified``
+    - verified=True + responses + counterevidence -> ``unresolved``
+      (the agreeing difference was seen, but recorded counterevidence
+      stands that a benign cause could produce it — no promotion)
     - verified=False + no responses            -> ``not_run`` (blocked)
     - verified=False + responses, no baseline  -> ``inconclusive``
     - verified=False + responses + baseline    -> ``disagreed``
@@ -403,11 +440,18 @@ def verification_status(node: dict) -> str:
     responses = (properties.get("true_len") is not None
                  and properties.get("false_len") is not None)
     verdict = properties.get("verified")
+    counterevidence = properties.get("counterevidence")
+    has_counterevidence = (isinstance(counterevidence, list)
+                           and bool(counterevidence))
     if verdict is True:
         # "verified" without the probe responses it is derived from is a
         # stored word, not execution evidence — a tampered or hand-built
         # node reads as what its evidence shows: nothing.
-        return VERIFICATION_VERIFIED if responses else VERIFICATION_NOT_RUN
+        if not responses:
+            return VERIFICATION_NOT_RUN
+        if has_counterevidence:
+            return VERIFICATION_UNRESOLVED
+        return VERIFICATION_VERIFIED
     if verdict is False:
         if not responses:
             return VERIFICATION_NOT_RUN
@@ -446,18 +490,25 @@ def finding_verification_status(finding_id: str, graph: "EngagementGraph") -> st
 def finding_verification_detail(
         finding_id: str, graph: "EngagementGraph",) -> dict:
     """The render/print view of one finding's verification standing:
-    derived status, operator note, and — when the check never ran — the
-    actual blocking reason."""
+    derived status, operator note, the actual blocking reason when the
+    check never ran, and — recorded, never discarded — the
+    counterevidence the strongest attempt saw."""
     status = finding_verification_status(finding_id, graph)
     reason = ""
+    counterevidence: "list[str]" = []
     for attempt in graph.by_type("verify_attempt"):
-        if (attempt.get("label") == finding_id
-                and verification_status(attempt) == VERIFICATION_NOT_RUN):
+        if attempt.get("label") != finding_id:
+            continue
+        derived = verification_status(attempt)
+        if derived == VERIFICATION_NOT_RUN and not reason:
             reason = verify_block_reason(attempt)
-            if reason:
-                break
+        if derived == status:
+            ce = (attempt.get("properties") or {}).get("counterevidence")
+            if isinstance(ce, list) and ce:
+                counterevidence = [str(c) for c in ce]
     note = VERIFICATION_NOTES[status]
-    return {"status": status, "note": note, "block_reason": reason}
+    return {"status": status, "note": note, "block_reason": reason,
+            "counterevidence": counterevidence}
 
 
 def exploit_status(hypothesis_id: str, graph: EngagementGraph) -> str:

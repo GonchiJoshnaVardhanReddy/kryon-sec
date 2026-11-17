@@ -80,11 +80,16 @@ def egress_firewall_ok() -> tuple[bool, str]:
             continue
         stderr = (proc.stderr or "").strip()
         if prefix and ("a password is required" in stderr.lower()
-                       or "incorrect password" in stderr.lower()):
+                       or "incorrect password" in stderr.lower()
+                       or "interactive authentication" in stderr.lower()):
             problems.append(
-                f"sudo -n {cmd}: password cache required — run "
-                "`sudo -v` first (non-interactive root is needed to "
-                "program the Zone B egress firewall)")
+                f"sudo -n {cmd}: password cache required — either run "
+                "`sudo -v` in this terminal right before starting "
+                "Kryonsec (the sudo cache is per-terminal and "
+                "time-limited), or add a scoped NOPASSWD sudoers rule "
+                "for iptables/ip6tables to this user; non-interactive "
+                "root is required to program the Zone B egress firewall "
+                "at engagement start, so there is no weaker fallback")
         else:
             problems.append(
                 f"{cmd}: DOCKER-USER chain unreadable ({stderr[:120] or 'exit ' + str(proc.returncode)})")
@@ -454,10 +459,21 @@ def runtime_smoke_test(image: str) -> tuple[bool, str]:
     if not shutil.which("docker"):
         return False, "docker CLI not found"
     name = f"kryonsec-preflight-{uuid.uuid4().hex[:12]}"
+    # Resource caps: the memory cap stays deliberately tight (the probe
+    # runs one file-existence check), but the pids cap must leave room
+    # for runsc's OWN background tasks — the sentry's Go threads, the
+    # gofer and the shim all live in the container's cgroup, and at
+    # pids=32 bash's fork for the entrypoint's output-wrapping jq was
+    # rejected ~15-35% of the time on WSL2 ("fork rejected by pids
+    # controller" in the kernel log at every failure; failures were
+    # cap-independent across 64m-2g of memory). 64 was clean over 40
+    # consecutive runs (25/25 + 15/15). Measured on this combination,
+    # not arbitrary; the real engagement runtime keeps its own caps in
+    # purple/sandbox.py.
     create_args = [
         "create", "--name", name, "--runtime", "runsc", "--network", "none",
         "--read-only", "--tmpfs", "/tmp:size=16m", "--memory", "64m",
-        "--cpus", "0.10", "--pids-limit", "32",
+        "--cpus", "0.10", "--pids-limit", "64",
         "--user", "kryonsec-runner", "--entrypoint", "/entrypoint.sh",
         image, "python3", "-c",
         (

@@ -123,7 +123,7 @@ def test_docker_argv_mounts_evidence_dir_read_write(tmp_path):
     cfg = KryonsecConfig(home=tmp_path)
     s = KaliSandbox(cfg=cfg, evidence_dir="/opt/eng/evidence",
                     seccomp_profile=tmp_path / "n.json")
-    argv = s._docker_argv(["gowitness", "scan", "website"])
+    argv = s._docker_argv(["gowitness", "scan", "single"])
     # the engagement evidence folder is the ONLY rw mount, at the FIXED
     # /evidence path (gowitness screenshots land there)
     assert argv[argv.index("-v") + 1] == "/opt/eng/evidence:/evidence:rw"
@@ -155,6 +155,73 @@ def test_code_and_evidence_mounts_coexist(tmp_path):
     mounts = [a for a in argv if ":" in a and a.startswith(("/opt/", "/"))]
     assert "/opt/victim-code:/code:ro" in mounts
     assert "/opt/eng/evidence:/evidence:rw" in mounts
+
+
+# ---- pinned-resolver resolv.conf mount (gVisor 127.0.0.11 gap) -----------
+
+class _FakePolicy:
+    """Minimal egress policy stand-in for argv construction tests."""
+
+    def __init__(self, resolvers):
+        self.network_name = "kryonsec-egress-test0"
+        self.dns_resolvers = resolvers
+
+
+def _sandbox_with_policy(tmp_path, resolvers):
+    s = _sandbox(tmp_path)
+    s.egress_policy = _FakePolicy(resolvers)
+    return s
+
+
+def test_docker_argv_mounts_pinned_resolv_conf_under_egress(tmp_path):
+    """Docker's embedded resolver (127.0.0.11, which owns /etc/resolv.conf
+    on user-defined networks) has no listener inside gVisor's netstack —
+    every by-name lookup in the sandbox would die with "connection
+    refused". The launch argv must therefore bind-mount a minimal
+    resolv.conf carrying EXACTLY the policy's pinned resolvers, the same
+    set --dns carries and the boundary already allows on dport 53."""
+    s = _sandbox_with_policy(tmp_path, ["10.213.44.1", "10.213.44.2"])
+    argv = s._docker_argv(["curl", "http://juice-shop.lab/"])
+    assert argv[argv.index("--network") + 1] == "kryonsec-egress-test0"
+    assert argv.count("--dns") == 2
+    assert argv[argv.index("--dns") + 1] == "10.213.44.1"
+    mounts = [a for a in argv if a.endswith(":/etc/resolv.conf:ro")]
+    assert len(mounts) == 1, mounts
+    src = mounts[0].split(":/etc/resolv.conf:ro")[0]
+    assert Path(src).is_absolute(), src
+    assert Path(src).read_text(encoding="utf-8") == (
+        "nameserver 10.213.44.1\nnameserver 10.213.44.2\n")
+
+
+def test_docker_argv_resolv_conf_mount_keeps_isolation_invariant(tmp_path):
+    """The mount is additive: the launch argv still satisfies the hard
+    isolation invariant (runsc, non-root, read-only rootfs, caps, ...)."""
+    from kryonsec.purple.sandbox import missing_isolation_flags
+
+    s = _sandbox_with_policy(tmp_path, ["10.213.44.1"])
+    argv = s._docker_argv(["nmap", "-sV", "juice-shop.lab"])
+    assert missing_isolation_flags(argv) == []
+
+
+def test_docker_argv_no_resolv_conf_mount_for_network_none(tmp_path):
+    """A network-none run touches no network at all — no --dns and no
+    resolver mount may appear on its argv."""
+    s = _sandbox_with_policy(tmp_path, ["10.213.44.1"])
+    argv = s._docker_argv(["searchsploit", "apache"], network_mode="none")
+    assert "--dns" not in argv
+    assert not any("resolv.conf" in a for a in argv)
+    assert argv[argv.index("--network") + 1] == "none"
+
+
+def test_docker_argv_no_resolver_mount_without_pinned_resolvers(tmp_path):
+    """No pinned resolver = no DNS (fail closed): no --dns, no mount —
+    name resolution must fail loudly, never fall back to an unapproved
+    resolver path."""
+    s = _sandbox_with_policy(tmp_path, [])
+    argv = s._docker_argv(["curl", "http://juice-shop.lab/"])
+    assert "--dns" not in argv
+    assert not any("resolv.conf" in a for a in argv)
+    assert argv[argv.index("--network") + 1] == "kryonsec-egress-test0"
 
 
 # ---- spawn result parsing ----------------------------------------------

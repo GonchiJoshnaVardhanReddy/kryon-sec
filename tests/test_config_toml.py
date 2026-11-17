@@ -21,6 +21,7 @@ def clean_env(monkeypatch):
     for var in (
         "OPENAI_API_KEY", "DATABASE_URL", "OLLAMA_HOST",
         "SHODAN_API_KEY", "CENSYS_API_ID", "CENSYS_API_SECRET",
+        "KRYONSEC_SANDBOX_IMAGE",
         # AWS_* are set for real AWS work on many dev machines and the
         # bedrock fields read them on construction
         "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION_NAME", "AWS_DEFAULT_REGION",
@@ -157,6 +158,42 @@ def test_bedrock_fields_round_trip(tmp_path, clean_env):
 
 def test_bedrock_region_defaults_to_us_east_1(tmp_path, clean_env):
     assert KryonsecConfig(home=tmp_path).bedrock_region == "us-east-1"
+
+
+# ---- sandbox image precedence (Phase 3 regression) --------------------------
+
+def test_sandbox_image_env_overrides_toml(tmp_path, clean_env, monkeypatch):
+    """KRYONSEC_SANDBOX_IMAGE is documented as an env override like the
+    credential/connection fields: an explicitly set env image must beat
+    TOML's [sandbox].image (which itself beats the source-tree default).
+    Regression: from_toml applied the TOML image AFTER the env-default
+    field, silently dropping a user's env pin."""
+    path = write_config(config_path(tmp_path), {
+        "sandbox": {"image": "localhost:5000/kryonsec/sandbox@sha256:" + "a" * 64},
+    })
+    monkeypatch.setenv("KRYONSEC_SANDBOX_IMAGE",
+                       "registry.example/kryonsec/sandbox@sha256:" + "b" * 64)
+    cfg = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert cfg.sandbox_image == (
+        "registry.example/kryonsec/sandbox@sha256:" + "b" * 64)
+
+
+def test_sandbox_image_toml_beats_default_without_env(tmp_path, clean_env):
+    """With no env override, TOML's [sandbox].image wins over the
+    source-tree default tag (which the Purple runtime rejects anyway)."""
+    path = write_config(config_path(tmp_path), {
+        "sandbox": {"image": "localhost:5000/kryonsec/sandbox@sha256:" + "a" * 64},
+    })
+    cfg = KryonsecConfig.from_toml(read_config(path), home=tmp_path)
+    assert cfg.sandbox_image == (
+        "localhost:5000/kryonsec/sandbox@sha256:" + "a" * 64)
+
+
+def test_sandbox_image_default_tag_when_nothing_configured(tmp_path, clean_env):
+    """No env, no TOML: the documented default (an unpinned tag the
+    Purple runtime then refuses — precedence never bypasses validation)."""
+    cfg = KryonsecConfig.from_toml({}, home=tmp_path)
+    assert cfg.sandbox_image == "kryonsec/sandbox:latest"
 
 
 def test_bedrock_env_overrides_toml(tmp_path, clean_env, monkeypatch):

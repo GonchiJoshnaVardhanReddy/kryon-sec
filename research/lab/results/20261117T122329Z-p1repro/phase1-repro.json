@@ -1,0 +1,81 @@
+[
+  {
+    "run": "subfinder",
+    "argv": [
+      "subfinder",
+      "-d",
+      "juice-shop.lab",
+      "-passive",
+      "-silent"
+    ],
+    "exit_code": 2,
+    "ok": true,
+    "duration_s": 1.03,
+    "stdout_chars": 40,
+    "error_excerpt": "",
+    "stdout_tail": "flag provided but not defined: -passive\n"
+  },
+  {
+    "run": "amass",
+    "argv": [
+      "amass",
+      "enum",
+      "-passive",
+      "-d",
+      "juice-shop.lab"
+    ],
+    "exit_code": 1,
+    "ok": true,
+    "duration_s": 1.1,
+    "stdout_chars": 194,
+    "error_excerpt": "",
+    "stdout_tail": "Need root privileges to download libpostal data files\nsudo: effective uid is not 0, is /usr/bin/sudo on a file system with the 'nosuid' option set or an NFS file system without root privileges?\n"
+  },
+  {
+    "run": "assetfinder",
+    "argv": [
+      "assetfinder",
+      "-silent",
+      "juice-shop.lab"
+    ],
+    "exit_code": 2,
+    "ok": true,
+    "duration_s": 0.86,
+    "stdout_chars": 120,
+    "error_excerpt": "",
+    "stdout_tail": "flag provided but not defined: -silent\nUsage of assetfinder:\n  -subs-only\n    \tOnly include subdomains of search domain\n"
+  },
+  {
+    "run": "curl-ftp",
+    "argv": [
+      "curl",
+      "-sS",
+      "--max-time",
+      "30",
+      "http://juice-shop.lab/ftp"
+    ],
+    "exit_code": 18,
+    "ok": true,
+    "duration_s": 7.29,
+    "stdout_chars": 11358,
+    "error_excerpt": "",
+    "stdout_tail": "an class=\"date\">11/17/2026 12:23:29 PM</span></a></li>\n<li><a href=\"ftp/package-lock.json.bak\" class=\"icon icon icon-bak icon-default\" title=\"package-lock.json.bak\"><span class=\"name\">package-lock.json.bak</span><span class=\"size\">750353</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/package.json.bak\" class=\"icon icon icon-bak icon-default\" title=\"package.json.bak\"><span class=\"name\">package.json.bak</span><span class=\"size\">4263</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/suspicious_errors.yml\" class=\"icon icon icon-yml icon-text\" title=\"suspicious_errors.yml\"><span class=\"name\">suspicious_errors.yml</span><span class=\"size\">723</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li></ul>\n    </div>\n  </body>\n</html>"
+  },
+  {
+    "run": "wget-ftp",
+    "argv": [
+      "wget",
+      "-q",
+      "-O",
+      "-",
+      "--timeout=30",
+      "http://juice-shop.lab/ftp"
+    ],
+    "exit_code": 4,
+    "ok": true,
+    "duration_s": 266.32,
+    "stdout_chars": 11309,
+    "error_excerpt": "",
+    "stdout_tail": "an class=\"date\">11/17/2026 12:23:29 PM</span></a></li>\n<li><a href=\"ftp/package-lock.json.bak\" class=\"icon icon icon-bak icon-default\" title=\"package-lock.json.bak\"><span class=\"name\">package-lock.json.bak</span><span class=\"size\">750353</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/package.json.bak\" class=\"icon icon icon-bak icon-default\" title=\"package.json.bak\"><span class=\"name\">package.json.bak</span><span class=\"size\">4263</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/suspicious_errors.yml\" class=\"icon icon icon-yml icon-text\" title=\"suspicious_errors.yml\"><span class=\"name\">suspicious_errors.yml</span><span class=\"size\">723</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li></ul>\n    </div>\n  </body>\n</html>"
+  }
+]

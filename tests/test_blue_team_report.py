@@ -266,15 +266,24 @@ def test_run_code_scanners_full_run(tmp_path):
             stdout='{"artifacts": [{"name": "flask"}, {"name": "requests"}]}'),
         "osv-scanner": _SpawnResult(stdout='{"results": []}'),
         "grype": _SpawnResult(stdout='{"matches": [{"v": {}}, {"v": {}}]}'),
+        # Phase 4 dir-mode binary/forensics scanners
+        "checksec": _SpawnResult(
+            # the REAL run shape (Phase 4b lab): a hardening table with
+            # per-column ANSI color — checksec has no no-color flag for
+            # dir mode; the excerpt must arrive clean
+            stdout="\x1b[32mFull RELRO   \x1b[m   \x1b[32mCanary found   "
+                   "\x1b[m   \x1b[32mNX enabled \x1b[m   /code/elf-sample"),
+        "exiftool": _SpawnResult(stdout="File Name: app"),
     })
 
     ran = run_code_scanners(graph, sandbox, audit, has_dockerfile=True)
-    assert ran == 9
-    assert len(sandbox.argvs) == 9
+    assert ran == 11
+    assert len(sandbox.argvs) == 11
     # every scanner reads the fixed /code mount, never the host path
-    # (grype spells it dir:/code — same fixed literal, prefix notation)
+    # (grype spells it dir:/code — same fixed literal, prefix notation;
+    # checksec spells it --dir=/code — same literal as a flag value)
     assert all(
-        any(a == "/code" or a == "dir:/code"
+        any(a == "/code" or a == "dir:/code" or a == "--dir=/code"
             or a.startswith("/code/") or a.startswith("dir:/code/")
             for a in argv)
         for argv in sandbox.argvs)
@@ -282,7 +291,7 @@ def test_run_code_scanners_full_run(tmp_path):
     nodes = {n["label"]: n["properties"] for n in graph.by_type("scanner_result")}
     assert set(nodes) == {"semgrep", "bandit", "gitleaks", "trivy",
                           "checkov", "hadolint", "syft", "osv-scanner",
-                          "grype"}
+                          "grype", "checksec", "exiftool"}
     assert nodes["semgrep"]["findings_count"] == 12
     assert nodes["trivy"]["findings_count"] == 1
     assert nodes["checkov"]["findings_count"] == 5
@@ -292,10 +301,14 @@ def test_run_code_scanners_full_run(tmp_path):
     assert "findings_count" not in nodes["syft"]
     assert nodes["syft"]["packages_count"] == 2
     assert nodes["grype"]["findings_count"] == 2
+    # checksec's excerpt is ANSI-clean (same excerpt-hygiene contract
+    # as the recon excerpts): the tool colors its whole table
+    assert "\x1b" not in nodes["checksec"]["excerpt"]
+    assert "Full RELRO" in nodes["checksec"]["excerpt"]
 
     events = _events(audit)
-    assert events.count("tool_spawn") == 9
-    assert events.count("tool_result") == 9
+    assert events.count("tool_spawn") == 11
+    assert events.count("tool_result") == 11
     assert "scanners_done" in events
     ok, reason = audit.verify()
     assert ok, reason
@@ -309,7 +322,7 @@ def test_hadolint_only_with_dockerfile(tmp_path):
     run_code_scanners(_graph(), sandbox, audit, has_dockerfile=False)
     tools = [argv[0] for argv in sandbox.argvs]
     assert "hadolint" not in tools
-    assert len(tools) == 8
+    assert len(tools) == 10
 
 
 def test_failing_scanner_is_audited_skip(tmp_path):
@@ -367,7 +380,7 @@ def test_scanners_fail_closed_on_empty_allowlist(tmp_path):
     assert sandbox.argvs == []  # nothing ever spawned
     assert graph.by_type("scanner_result") == []
     events = _events(audit)
-    assert events.count("scanner_rejected_by_allowlist") == 8
+    assert events.count("scanner_rejected_by_allowlist") == 10
     ok, reason = audit.verify()
     assert ok, reason
 

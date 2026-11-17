@@ -199,37 +199,66 @@ class PlannerBudget(BaseModel):
 # the selection metadata table — DESCRIBES, never enables
 # ---------------------------------------------------------------------------
 
-#: priority: lower runs first. Basic service/web identification before
-#: dependent or long checks; the two long checks last.
+#: priority: lower runs first. The Batch 1/2 discovery probes plan
+#: first (they run pre-discovery in practice and plan as covered
+#: post-hoc), then basic service/web identification, then dependent
+#: or long checks; the two longest checks last.
 _PRIORITY = {
+    "nmap-probe": 4,         # discovery: authoritative service scan (pre-plan lane)
+    "naabu-probe": 5,        # discovery: bounded port scan (pre-plan lane)
+    "dnsx-probe": 6,         # discovery: DNS resolution (pre-plan lane)
     "httpx-probe": 10,       # base evidence: statuses, titles, tech
     "whatweb-probe": 20,     # richer technology fingerprints
     "api-probe": 30,         # read-only API baseline (bounded, quick)
+    "katana-probe": 35,      # pinned-depth web crawl (bounded, medium)
+    "gowitness-probe": 36,   # bounded screenshot per web base (Batch 2)
     "tls-probe": 40,         # ~3-5 min under real caps (measured 2B.5)
     "nuclei-probe": 50,      # vetted non-destructive template checks
+    "feroxbuster-probe": 60,  # bounded directory busting (longest web check)
 }
 _COST = {
+    "nmap-probe": "medium",      # -sV -sC service scan, bounded port list
+    "naabu-probe": "low",
+    "dnsx-probe": "low",
     "httpx-probe": "low",
     "whatweb-probe": "low",
     "api-probe": "medium",
+    "katana-probe": "medium",
+    "gowitness-probe": "medium",  # headless-browser screenshot per base
     "tls-probe": "high",
     "nuclei-probe": "high",
+    "feroxbuster-probe": "high",
 }
 #: what each check consumes / produces in the evidence graph — used for
-#: the explainability report and the requires-evidence reason strings
+#: the explainability report and the requires-evidence reason strings.
+#: The discovery probes consume nothing (naabu) or the engagement
+#: target itself (dnsx/nmap): their lanes run pre-discovery, not
+#: planner-gated.
 _REQUIRES = {
+    "nmap-probe": (),
+    "naabu-probe": (),
+    "dnsx-probe": (),
     "httpx-probe": ("web_endpoint",),
     "whatweb-probe": ("web_endpoint",),
     "api-probe": ("web_endpoint",),
+    "katana-probe": ("web_endpoint",),
+    "gowitness-probe": ("web_endpoint",),
     "tls-probe": ("https_base",),
     "nuclei-probe": ("web_endpoint",),
+    "feroxbuster-probe": ("web_endpoint",),
 }
 _PRODUCES = {
+    "nmap-probe": ("service",),   # the authoritative service nodes
+    "naabu-probe": (),            # feeds the shared port set; no nodes
+    "dnsx-probe": ("dns_resolution",),
     "httpx-probe": ("web_endpoint",),
     "whatweb-probe": ("tech_fingerprint",),
     "api-probe": ("api_observation", "path"),
+    "katana-probe": ("path",),
+    "gowitness-probe": ("screenshot",),
     "tls-probe": ("tls_observation", "vuln_candidate"),
     "nuclei-probe": ("vuln_candidate",),
+    "feroxbuster-probe": ("path",),
 }
 #: the honest-partial rule: these wrappers exit 0 even when they were
 #: killed at their internal bound — their run-summary node carries the
@@ -500,14 +529,27 @@ class ToolPlanner:
     # -- the plan ---------------------------------------------------------
 
     def plan(self, *, state: str, target: str,
-             bases: "list[str]", graph, audit) -> ExecutionPlan:
+             bases: "list[str]", graph, audit,
+             domain_targets: "list[str] | None" = None) -> ExecutionPlan:
         """Build the bounded, ordered plan for ONE state.
 
         ``bases`` are the stage's in-scope, scope-validated base URLs
         (already derived from observed open ports — the planner never
-        discovers targets). Every registered adapter x base pair gets
-        an explicit decision entry; the plan is FROZEN and returned.
+        discovers targets). ``domain_targets`` (Tool Expansion Batch
+        1) are the scope-validated DOMAIN-kind targets (the
+        engagement target itself) for the registered domain-kind
+        adapters (naabu-probe / dnsx-probe). The pairing is strict,
+        never cross-kind: a URL-kind adapter is only ever paired with
+        ``bases`` and a domain-kind adapter only with
+        ``domain_targets`` — preparing an adapter against the wrong
+        target kind would be refused by prepare_adapter_run, so the
+        plan must never produce such a pair. Adapters of other target
+        kinds (hostport/term/assetless) get no entries here yet.
+
+        Every registered adapter x matching target pair gets an
+        explicit decision entry; the plan is FROZEN and returned.
         """
+        domain_targets = list(domain_targets or ())
         entries: list[PlanEntry] = []
         committed = 0
         matched_suggestions: set[tuple[str, str]] = set()
@@ -520,7 +562,35 @@ class ToolPlanner:
                 "note": "described nowhere, executable nowhere",
             })
         for entry in self.catalog.entries():
-            for base in bases:
+            # the stage gate is per REGISTERED ADAPTER, before any
+            # target pairing: an adapter whose stage is not this one
+            # gets ONE explicit ``out_of_stage`` entry (explainability)
+            # — never silently absent, never paired to invented targets
+            if state not in entry.stages:
+                anchor = bases[0][:500] if bases else (
+                    domain_targets[0][:500] if domain_targets
+                    else target[:500])
+                entries.append(PlanEntry(
+                    adapter_id=entry.adapter_id,
+                    executable=entry.adapter.executable,
+                    target=anchor, stage=state,
+                    priority=entry.priority,
+                    estimated_seconds=entry.max_seconds,
+                    status="out_of_stage",
+                    reason=(f"adapter stage is {list(entry.stages)}, "
+                            f"not {state}")[:300]))
+                continue
+            kind = entry.adapter.target_kind
+            if kind == "url":
+                entry_targets: "list[str]" = bases
+            elif kind == "domain":
+                entry_targets = domain_targets
+            else:
+                # hostport/term/assetless adapters are not plannable
+                # against either target list yet — zero entries, no
+                # invented pairing
+                entry_targets = []
+            for base in entry_targets:
                 norm = normalize_target(base)
                 suggestion = self._suggestions.get(
                     (entry.adapter_id, norm))

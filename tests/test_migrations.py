@@ -225,6 +225,7 @@ def test_graph_revision_is_skipped_without_purple_storage(cfg):
     names = inspect(engine).get_table_names()
     assert "stm_nodes" not in names
     assert "stm_edges" not in names
+    assert "handoff_records" not in names
 
 
 def test_graph_revision_upgrades_an_old_database(cfg):
@@ -254,13 +255,19 @@ def test_graph_revision_upgrades_an_old_database(cfg):
             " 'example.com', 2)"
         ))
 
-    # the pre-existing schema is stamped, so only 0002 actually runs
+    # the pre-existing schema is stamped, so only the later revisions run:
+    # 0002 (the graph), 0003 (the Batch-3 handoff table) and 0004 (the
+    # Batch-4 scheduler checkpoint table)
     assert apply_pending(engine, _tables(include_purple=True)) == [
-        "0002_security_graph_edges"
+        "0002_security_graph_edges",
+        "0003_handoff_records",
+        "0004_handoff_scheduler",
     ]
 
     names = inspect(engine).get_table_names()
     assert "stm_edges" in names
+    assert "handoff_records" in names
+    assert "handoff_scheduler" in names
     node_columns = {c["name"] for c in inspect(engine).get_columns("stm_nodes")}
     assert {"canonical_key", "provenance", "status"} <= node_columns
 

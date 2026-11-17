@@ -111,6 +111,8 @@ class _StubEgressPolicy:
     """The duck-typed egress-policy stub (the executor only needs it
     present; the REAL boundary lives inside the sandbox's own spawn)."""
 
+    dns_resolvers = ("192.0.2.53",)  # TEST-NET-1 fixture for the dnsx lane's -r
+
 
 class FakeSandbox:
     """Duck-typed sandbox double (the codebase's standard test seam)."""

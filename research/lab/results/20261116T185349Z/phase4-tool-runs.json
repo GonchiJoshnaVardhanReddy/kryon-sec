@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "when": "20261116T185349Z",
+    "target": "juice-shop.lab",
+    "real_runs": 1,
+    "skipped": 0,
+    "harness_failures": 0,
+    "honest_note": "a tool-level failure inside a REAL run is still a REAL result (exit code recorded); detection performance is NOT measured here"
+  },
+  "runs": [
+    {
+      "tool": "dnsx",
+      "engagement": "lab-p4-dnsx",
+      "label": "REAL",
+      "note": "domain resolution",
+      "argv": [
+        "dnsx",
+        "-l",
+        "juice-shop.lab",
+        "-silent"
+      ],
+      "duration_s": 11.91,
+      "exit_code": 0,
+      "ok": true,
+      "failure_class": "",
+      "stdout_chars": 84,
+      "error_excerpt": "",
+      "excerpt": "[WRN] 1 domains failed to resolve (consider increasing -retry or reducing -threads)\n",
+      "output_format": "text",
+      "evidence_files": []
+    }
+  ]
+}

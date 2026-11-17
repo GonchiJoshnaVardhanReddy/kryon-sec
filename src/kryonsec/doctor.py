@@ -109,34 +109,6 @@ def _check_openai_compatible(cfg: KryonsecConfig) -> tuple[bool, str]:
     return True, f"OK ({base})"
 
 
-def _check_membership(cfg: KryonsecConfig) -> tuple[bool | None, str]:
-    """The paid gate, reported honestly.
-
-    Tri-state on purpose. No key is a SKIP, not a FAIL: a Copilot-only
-    install is fully supported and free, and a red row would tell those
-    users something is broken when nothing is.
-
-    `verify()` phones home at most once a day, so this is normally a cache
-    read — the one time it isn't is the one time the answer matters.
-    """
-    from .license import member_email, verify
-
-    if not cfg.license_key:
-        return None, "no membership key — Copilot mode only, which is free"
-
-    result = verify(cfg)
-    who = member_email(cfg)
-    # Which machine, not just whether: the key being fine and this box not
-    # being registered are different problems with different fixes.
-    where = (
-        f"machine connected as {who}" if who
-        else "this machine is NOT connected — run `kryonsec connect`"
-    )
-    if result.purple_allowed:
-        return True, f"OK ({result.status}; {where})"
-    return False, f"{result.status} — {result.message}; {where}"
-
-
 def _check_docker() -> tuple[bool, str]:
     from .purple import runtime_checks
 
@@ -208,12 +180,19 @@ def _docker_context_row() -> tuple[str, str]:
             f"{detail}; DOCKER_HOST overrides context selection — unset it "
             "only if this is not the intended daemon"
         )
-    if len(context.contexts) > 1:
-        return "WARNING", (
-            f"{detail}; multiple contexts exist, and Kryonsec will not switch "
-            "between them automatically"
-        )
-    return "PASS", detail
+    # A non-default current context is an explicit pin (`docker context use`
+    # or DOCKER_CONTEXT env): Docker resolves it deterministically, and the
+    # daemon verified by the surrounding rows is exactly the one Kryonsec
+    # will use — that is unambiguous and can PASS. Ambient selection of
+    # "default" while other contexts exist stays a WARNING; Kryonsec never
+    # switches contexts itself (and Docker Desktop re-selects its own).
+    if context.name != "default" or len(context.contexts) <= 1:
+        return "PASS", detail
+    return "WARNING", (
+        f"{detail}; context selection is ambient (default) while multiple "
+        "contexts exist — run `docker context use <native-context>` to pin "
+        "it explicitly; Kryonsec will not switch between them automatically"
+    )
 
 
 def _docker_versions_row() -> tuple[str, str]:
@@ -356,13 +335,15 @@ def run_doctor(
             f"unknown provider {cfg.provider!r}; run `kryonsec setup`",
         )
 
-    membership_ok, membership_msg = _check_membership(cfg)
+    # No membership check: this development build needs no account, no key,
+    # and phones home for none of it. The row exists so nobody reads the
+    # missing gate as a forgotten one. It is not a Purple prerequisite and
+    # must never gate purple_ok.
     add(
-        "Membership",
-        "Purple Team access",
-        "SKIPPED" if membership_ok is None else ("PASS" if membership_ok else "FAIL"),
-        membership_msg,
-        purple=True,
+        "Authentication",
+        "account / membership",
+        "PASS",
+        "NOT REQUIRED — local development build (no account, no key, no phone-home)",
     )
 
     if not is_linux:
@@ -495,7 +476,7 @@ def run_doctor(
             "[green]PASS — Profile 1 (Copilot) is usable.[/green]\n"
             "[yellow]Purple Team is not ready. Review every FAIL/WARNING/SKIPPED "
             "row; it requires Linux, the selected Docker daemon, registered "
-            "gVisor, a compatible sandbox image, and membership.[/yellow]",
+            "gVisor, and a compatible sandbox image.[/yellow]",
             title="What works here",
             border_style="green",
         ))

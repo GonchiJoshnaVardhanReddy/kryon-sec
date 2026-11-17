@@ -100,10 +100,15 @@ def main(argv: "list[str]") -> int:
                                template="(unterminated -t)")
             value = args[i + 1]
             i += 2
-            if value == TREE_ROOT:
-                # the legacy EXPLOIT-stage tree selection (Gate 2
-                # upstream); unchanged semantics, allowed
-                continue
+            # Phase 4 tightening (2026-11-17): the legacy allow for the
+            # exact tree root (TREE_ROOT == value) is GONE. Phase 1 made
+            # every product spawn a manifest-pinned -t FILE pair, so no
+            # product code passes a directory anymore — the allow was
+            # dead policy that still said "a whole directory is
+            # selectable", which the Phase 2B.7 audit disproved
+            # (directory membership does not establish safety). Now NO
+            # directory value is ever accepted, only manifest-listed,
+            # hash-verified files.
             real = os.path.realpath(value)
             if not real.startswith(REAL_TREE_ROOT + os.sep):
                 return _refuse("template_not_approved",

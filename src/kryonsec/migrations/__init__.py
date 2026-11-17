@@ -115,6 +115,44 @@ def _security_graph_edges(conn: Connection, tables: list) -> None:
     StmEdge.__table__.create(bind=conn, checkfirst=True)
 
 
+def _handoff_records(conn: Connection, tables: list) -> None:
+    """Revision 0003: the coordinator's handoff_records table (Batch 3).
+
+    Creates the table the structured agent-handoff layer persists its
+    records into. A fresh database already has it from the baseline's
+    ``create_all`` (the model is in PURPLE_TABLES), so ``checkfirst``
+    makes this a no-op there — the revision only does real work on a
+    schema that predates Batch 3.
+
+    The same purple-storage gate as revision 0002: when ``stm_nodes`` is
+    not part of this database there is nothing to create — engagement
+    storage never reaches the Copilot fallback database.
+    """
+    from ..storage.models import HandoffRecordRow
+
+    if "stm_nodes" not in {t.name for t in tables}:
+        return
+
+    HandoffRecordRow.__table__.create(bind=conn, checkfirst=True)
+
+
+def _handoff_scheduler(conn: Connection, tables: list) -> None:
+    """Revision 0004: the specialist scheduler's checkpoint table
+    (Batch 4).
+
+    Creates ``handoff_scheduler`` — one row per engagement holding the
+    scheduler's JSON snapshot — with the same purple-storage gate as
+    revisions 0002 and 0003: when ``stm_nodes`` is not part of this
+    database there is nothing to create.
+    """
+    from ..storage.models import HandoffSchedulerRow
+
+    if "stm_nodes" not in {t.name for t in tables}:
+        return
+
+    HandoffSchedulerRow.__table__.create(bind=conn, checkfirst=True)
+
+
 # Append new revisions here; never edit or renumber an existing one.
 REVISIONS: list[Revision] = [
     Revision(
@@ -126,6 +164,16 @@ REVISIONS: list[Revision] = [
         id="0002_security_graph_edges",
         description="stm_edges table and the stm_nodes graph columns",
         upgrade=_security_graph_edges,
+    ),
+    Revision(
+        id="0003_handoff_records",
+        description="handoff_records table (structured agent handoffs)",
+        upgrade=_handoff_records,
+    ),
+    Revision(
+        id="0004_handoff_scheduler",
+        description="handoff_scheduler table (specialist scheduler checkpoints)",
+        upgrade=_handoff_scheduler,
     ),
 ]
 

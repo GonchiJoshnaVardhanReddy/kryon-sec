@@ -84,6 +84,8 @@ def test_every_history_line_names_the_asset_its_hypothesis_targets():
         "services": [], "web_endpoints": [], "dns": [], "tls": [],
         "technologies": [], "api_observations": [], "vuln_candidates": [],
         "subdomains": [], "paths": [], "osint": [],
+        # Phase 4: the two new reconnaissance categories
+        "dns_enumeration": [], "smb_enumeration": [],
     }
 
 
@@ -384,6 +386,8 @@ def test_a_graph_predating_the_join_renders_every_line_as_before():
         "services": [], "web_endpoints": [], "dns": [], "tls": [],
         "technologies": [], "api_observations": [], "vuln_candidates": [],
         "subdomains": [], "paths": [], "osint": [],
+        # Phase 4: the two new reconnaissance categories
+        "dns_enumeration": [], "smb_enumeration": [],
     }
     assert context.truncated is False
 

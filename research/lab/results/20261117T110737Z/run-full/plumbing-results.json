@@ -1,0 +1,67 @@
+{
+  "engagement": "lab-plumbing",
+  "target": "juice-shop.lab",
+  "checks": [
+    {
+      "check": "egress.establish",
+      "result": "REAL",
+      "seconds": 1.034,
+      "detail": "ok"
+    },
+    {
+      "check": "egress.verify_before_spawns",
+      "result": "REAL",
+      "seconds": 0.127,
+      "detail": "ok"
+    },
+    {
+      "check": "target.http_get_200",
+      "result": "REAL",
+      "seconds": 1.113,
+      "detail": "exit=0 status='200'"
+    },
+    {
+      "check": "target.app_version",
+      "result": "REAL",
+      "seconds": 1.926,
+      "detail": "{\"version\":\"20.4.0-SNAPSHOT\"}"
+    },
+    {
+      "check": "dns.pinned_resolver_serves_lab_record",
+      "result": "REAL",
+      "seconds": 0.95,
+      "detail": "exit=0 NOERROR=True answer_10.213.43.10=True"
+    },
+    {
+      "check": "egress.unrelated_destination_dropped",
+      "result": "REAL",
+      "seconds": 12.747,
+      "detail": "exit=28 (28 = dropped at the boundary)"
+    },
+    {
+      "check": "egress.resolver_port80_dropped",
+      "result": "REAL",
+      "seconds": 12.664,
+      "detail": "exit=28"
+    },
+    {
+      "check": "egress.public_resolver_dns_dropped",
+      "result": "REAL",
+      "seconds": 10.96,
+      "detail": "exit=9 (must NOT get a NOERROR answer)"
+    },
+    {
+      "check": "egress.verify_after_spawns",
+      "result": "REAL",
+      "seconds": 0.104,
+      "detail": "ok"
+    },
+    {
+      "check": "egress.release",
+      "result": "REAL",
+      "seconds": 0.66,
+      "detail": "ok"
+    }
+  ],
+  "summary": "10/10 passed"
+}

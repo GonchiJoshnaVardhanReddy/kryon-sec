@@ -19,7 +19,17 @@ LABEL org.kryonsec.version="${KRYONSEC_VERSION}" \
 # (never installed here — the allowlist + image contents are the control).
 # Core block = the original, known-good set. Keep it separate so a flaky
 # extended block can never regress the core tools.
+#
+# Acquire::Retries/Timeout (2026-11-17): a mirror hiccup KILLED this
+# 45-minute layer outright (kali.download connection timeouts mid-fetch,
+# found live during the Phase 4 rebuild — the build cache had been wiped
+# by a WSL restart, so every package re-downloaded). The extended block
+# below always carried these options; the core block now does too.
+# seclists is split into its own RUN: at ~545 MB it dominates the layer,
+# and a failed seclists fetch must not re-download the nine small
+# packages before it (or vice versa).
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
     jq \
     nmap \
     dnsutils \
@@ -32,10 +42,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nikto \
     gobuster \
     ffuf \
-    seclists \
     wget \
     ca-certificates \
     openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# seclists: the frozen-argv wordlists (common.txt for feroxbuster/
+# dirsearch, DNS lists for the resolver template). Its own layer with
+# its own retry budget — see the core-block comment above.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    -o Acquire::Retries=8 -o Acquire::http::Timeout=120 \
+    seclists \
     && rm -rf /var/lib/apt/lists/*
 
 # Tool-expansion block (2026-09-13). Kali package names drift; if the
@@ -221,6 +238,52 @@ RUN mkdir -p /opt/tools && cd /opt/tools && \
     chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
       /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
 
+# Phase 4 tool-expansion block (2026-11-17) — the 61-candidate HexStrike
+# review's feasible set (research notes: kryonsec_hexstrike_61_tool_review.md).
+# Same per-package retry rule as the block above: one bad name costs one
+# WARN, never the whole set; a lost tool must be a build failure or a loud
+# retry. Two groups:
+#
+#   WIRED   — host-allowlisted + entrypoint-allowlisted + stage-plan entries;
+#             REQUIRED below (an image that silently loses one ships a dead
+#             capability behind a valid-looking digest).
+#   DORMANT — installed for the next batch but NOT allowlisted anywhere:
+#             every file-granular binary tool (gdb/radare2/binwalk/xxd/
+#             strings/objdump/ROPgadget/ropper/steghide/foremost) needs a
+#             FILE argument, and the fixed-argv grammar has no {file} slot
+#             yet (the /code mount is a DIRECTORY literal; dir-mode tools
+#             like checksec work, file-mode ones do not). Spawning them is
+#             refused at BOTH layers (audited, fail closed) until the slot
+#             exists — installed-but-unreachable, exactly like the Phase-8
+#             dormant post-exploit tools, and for the same reason.
+RUN EXTENDED_TOOLS=" \
+    wafw00f dirsearch dnsenum fierce nbtscan smbmap enum4linux-ng \
+    checksec libimage-exiftool-perl \
+    gdb radare2 binwalk xxd binutils steghide foremost \
+    python3-ropgadget ropper \
+    " && apt-get update && \
+    (apt-get install -y --no-install-recommends \
+        -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
+        $EXTENDED_TOOLS || \
+     for t in $EXTENDED_TOOLS; do \
+        ok=0; \
+        for try in 1 2 3; do \
+            apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=8 -o Acquire::http::Timeout=60 "$t" \
+              && ok=1 && break; \
+            sleep 5; \
+        done; \
+        [ "$ok" = 1 ] || echo "WARN: $t unavailable in this Kali snapshot"; \
+     done) && rm -rf /var/lib/apt/lists/*
+
+# Phase 4 pip tools: NONE. ROPgadget/ropper turned out to be Kali
+# packages (python3-ropgadget / ropper — in the apt block above), and
+# terrascan is the one Phase 4 candidate with NO Kali package (apt-cache
+# Candidate: ABSENT in the 2026-11 kali-rolling snapshot — the same
+# situation as checkov below): it is a Go binary, so it would need the
+# GitHub-release path with its own pinned tag; deferred to the next
+# batch rather than wired through an untested install.
+
 # Baked enumeration/probe scripts — fixed argv, no free-form shell.
 # The host allowlist lists these by FULL PATH (never a bare python3
 # invocation with a file argument).
@@ -273,6 +336,10 @@ RUN set -eu; \
     check_cmd nmap; check_cmd sqlmap; check_cmd nikto; check_cmd gobuster; \
     check_cmd ffuf; check_cmd curl; check_cmd wget; check_cmd openssl; \
     check_cmd dig; check_cmd nc; \
+    check_cmd wafw00f; check_cmd dirsearch; check_cmd dnsenum; \
+    check_cmd fierce; check_cmd nbtscan; check_cmd smbmap; \
+    check_cmd enum4linux-ng; check_cmd checksec; \
+    check_file /usr/bin/exiftool; \
     check_file /usr/share/seclists/Discovery/Web-Content/common.txt; \
     check_file /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt; \
     check_file /usr/share/seclists/Miscellaneous/dns-resolvers.txt; \
@@ -282,7 +349,7 @@ RUN set -eu; \
     check_file /opt/kryonsec/nuclei_manifest.json; \
     check_file /opt/nuclei-templates/.kryonsec-commit; \
     [ -z "$missing" ] || { echo "FATAL: required tools/files missing:$missing"; exit 1; }; \
-    echo "required tools verified: 6 Mode B adapters + entrypoint helpers + EXPLOIT core"
+    echo "required tools verified: 6 Mode B adapters + entrypoint helpers + EXPLOIT core + Phase 4 wired tools"
 
 ENTRYPOINT ["/entrypoint.sh"]
 USER kryonsec-runner

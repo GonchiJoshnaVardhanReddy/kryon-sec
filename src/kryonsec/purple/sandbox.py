@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import tempfile
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -275,6 +278,9 @@ class KaliSandbox:
         # injectable for tests: signature matches subprocess.run
         self._run = run_fn or subprocess.run
         self.seccomp_profile = seccomp_profile or _seccomp_default()
+        # host path of the pinned-resolver resolv.conf (created lazily on
+        # the first egress spawn, removed when this sandbox is collected)
+        self._resolv_conf_file: str | None = None
         if self.seccomp_profile and not Path(self.seccomp_profile).is_file():
             # M4: a missing packaged profile used to silently drop the
             # seccomp flag — sandbox hardening (CLAUDE.md rule 9) must be loud
@@ -371,8 +377,25 @@ class KaliSandbox:
             # bridge; `spawn` re-verifies the boundary before each launch
             # and refuses to run when it is missing or drifted.
             argv += ["--network", self.egress_policy.network_name]
-            for resolver in self.egress_policy.dns_resolvers:
-                argv += ["--dns", str(resolver)]
+            resolvers = [str(r) for r in self.egress_policy.dns_resolvers]
+            for resolver in resolvers:
+                argv += ["--dns", resolver]
+            if resolvers:
+                # gVisor fact (lab plumbing, 2026-11-16): on user-defined
+                # networks Docker points /etc/resolv.conf at its embedded
+                # resolver (127.0.0.11) and demotes --dns to upstream
+                # forwarders — but that listener has no counterpart inside
+                # gVisor's netstack, so EVERY by-name lookup in the sandbox
+                # dies with "connection refused" (only an explicit
+                # dig @server ever worked). Bind-mount a minimal
+                # resolv.conf carrying EXACTLY the policy's pinned
+                # resolvers — the same set the boundary already allows on
+                # dport 53 — so the system resolver reaches them directly
+                # under runsc. No egress change: nothing new is reachable.
+                argv += [
+                    "-v",
+                    f"{self._pinned_resolv_conf(resolvers)}:/etc/resolv.conf:ro",
+                ]
         argv += [self.image]
         argv += list(tool_argv)
         return argv
@@ -382,6 +405,24 @@ class KaliSandbox:
         import uuid
 
         return f"kryonsec-sbx-{uuid.uuid4().hex[:12]}"
+
+    def _pinned_resolv_conf(self, resolvers: "list[str]") -> str:
+        """Host path of a minimal resolv.conf with EXACTLY the pinned
+        resolvers (one `nameserver` line each), created once per sandbox
+        and removed when this instance is garbage-collected."""
+        if self._resolv_conf_file is None:
+            fd, path = tempfile.mkstemp(
+                prefix="kryonsec-resolv-", suffix=".conf")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    for resolver in resolvers:
+                        fh.write(f"nameserver {resolver}\n")
+            except BaseException:
+                os.unlink(path)
+                raise
+            self._resolv_conf_file = path
+            weakref.finalize(self, os.unlink, path)
+        return self._resolv_conf_file
 
     def _kill_container(self, name: str) -> None:
         """Best-effort: a timed-out container keeps running on the daemon
