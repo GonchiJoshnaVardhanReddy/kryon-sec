@@ -1,0 +1,24 @@
+[
+  {
+    "run": "nuclei-full-tree",
+    "argv": [
+      "nuclei",
+      "-u",
+      "http://juice-shop.lab/metrics",
+      "-t",
+      "/opt/nuclei-templates",
+      "-rate-limit",
+      "50",
+      "-timeout",
+      "30"
+    ],
+    "exit_code": 137,
+    "ok": true,
+    "duration_s": 301.04,
+    "stdout_chars": 1261,
+    "error_excerpt": "",
+    "stdout_tail": "onfig/nuclei/.nuclei-ignore: no such file or directory\n[\u001b[31mWRN\u001b[0m] Found 262 templates with runtime error (use -validate flag for further examination)\n[\u001b[34mINF\u001b[0m] Current nuclei version: v3.11.1 (\u001b[91moutdated\u001b[0m)\n[\u001b[34mINF\u001b[0m] Current nuclei-templates version:  (\u001b[92mlatest\u001b[0m)\n[\u001b[34mINF\u001b[0m] New templates added in latest release: 0\n[\u001b[34mINF\u001b[0m] Templates loaded for current scan: 11143\n[\u001b[34mINF\u001b[0m] Executing 11143 signed templates from projectdiscovery/nuclei-templates\n[\u001b[34mINF\u001b[0m] Targets loaded for current scan: 1\n[\u001b[34mINF\u001b[0m] Templates clustered: 2739 (Reduced 2604 Requests)\n[\u001b[34mINF\u001b[0m] Skipped juice-shop.lab:80 from target list as found unresponsive permanently: cause=\"no address found for host\" chain=\"got err while executing https://checkip.amazonaws.com/metrics\"\n",
+    "mem_samples": [],
+    "kernel_oom": "no oom lines in dmesg"
+  }
+]

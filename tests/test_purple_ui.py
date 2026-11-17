@@ -272,6 +272,50 @@ def test_failed_tool_is_marked_but_short():
     assert ui.errors == 1
 
 
+# ---- Phase 1 (2026-11-17): tool_result truth -------------------------------
+
+def test_nonzero_exit_is_failed_not_completed():
+    """ok=True means the SPAWN worked — a tool that ran and exited
+    nonzero is a FAILED row with the honest reason, never COMPLETED.
+    The lab engagement's nuclei died at the sandbox cap (137) and curl
+    ate a truncated response (18): all showed as green COMPLETED."""
+    ui = make_ui()
+    spawn(ui, "nuclei")
+    settle(ui, "nuclei", ok=True, exit_code=137)
+    event = next(t for t in ui.tools if t.tool == "nuclei")
+    assert event.status == FAILED
+    assert "300s cap" in (event.error_summary or "")
+    assert ui.errors == 1
+
+
+def test_curl_partial_response_names_the_quirk():
+    ui = make_ui()
+    spawn(ui, "curl")
+    settle(ui, "curl", ok=True, exit_code=18)
+    event = next(t for t in ui.tools if t.tool == "curl")
+    assert event.status == FAILED
+    assert "partial response" in (event.error_summary or "")
+
+
+def test_zero_exit_still_completed():
+    ui = make_ui()
+    spawn(ui, "curl")
+    settle(ui, "curl", ok=True, exit_code=0)
+    event = next(t for t in ui.tools if t.tool == "curl")
+    assert event.status == COMPLETED
+    assert ui.errors == 0
+
+
+def test_legacy_result_without_exit_code_still_ok_based():
+    """Entries written before exit codes were audited keep the old
+    ok-based rendering — additive honesty, never a rewrite."""
+    ui = make_ui()
+    spawn(ui, "nmap")
+    settle(ui, "nmap", ok=True)   # no exit_code field at all
+    event = next(t for t in ui.tools if t.tool == "nmap")
+    assert event.status == COMPLETED
+
+
 def test_error_count_is_visible_in_results():
     ui = make_ui()
     spawn(ui, "nmap")

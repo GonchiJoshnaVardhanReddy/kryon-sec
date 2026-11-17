@@ -1,0 +1,2 @@
+{"argv":["amass","enum","-passive","-d","juice-shop.lab"],"event":"tool_spawn","hash":"132caec5ebc416b65d580f937e4684299a1c97b3929bf906b3f841860b4f1877","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","run":"amass","ts":"2026-11-17T12:23:33+00:00"}
+{"error":"","event":"tool_result","exit_code":1,"hash":"a09bbcfe0ece50de9bbde77c3e2a501913d4cbfa6b346fdc9d8f2bb4d791fe0d","ok":true,"output_chars":194,"prev_hash":"132caec5ebc416b65d580f937e4684299a1c97b3929bf906b3f841860b4f1877","run":"amass","truncated":false,"ts":"2026-11-17T12:23:34+00:00"}

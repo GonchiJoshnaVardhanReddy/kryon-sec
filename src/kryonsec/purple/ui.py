@@ -39,6 +39,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .orchestrator import STATES
+from .exploit_contract import tool_exit_note
 from ..ui.events import BackendEventAdapter, UIEventBus
 from ..ui.theme import resolve_theme, terminal_capabilities
 
@@ -579,12 +580,29 @@ class PurpleUI:
         if event == "tool_spawn":
             self._begin(entry.get("tool", ""), state)
         elif event == "tool_result":
-            self._finish(
-                entry.get("tool", ""),
-                ok=bool(entry.get("ok")),
-                error=entry.get("error") or "",
-                summary=self._result_summary(entry),
-            )
+            # Truth about tool results (Phase 1, 2026-11-17): ok=True
+            # means "the spawn worked", NOT "the tool succeeded" — a
+            # tool can run and still die at the sandbox cap (137) or eat
+            # a truncated response (curl 18). A nonzero exit is a FAILED
+            # row with the honest reason, never a COMPLETED one.
+            _ok = bool(entry.get("ok"))
+            try:
+                _code = int(entry.get("exit_code") or 0)
+            except (TypeError, ValueError):
+                _code = 0
+            if _ok and _code != 0:
+                self._finish(
+                    entry.get("tool", ""), ok=False,
+                    error=tool_exit_note(entry.get("tool") or "",
+                                         _code) or f"exit {_code}",
+                    summary=self._result_summary(entry),
+                )
+            else:
+                self._finish(
+                    entry.get("tool", ""), ok=_ok,
+                    error=entry.get("error") or "",
+                    summary=self._result_summary(entry),
+                )
         elif event == "passive_source_start":
             self._begin(entry.get("source", ""), state)
         elif event == "passive_source_ok":

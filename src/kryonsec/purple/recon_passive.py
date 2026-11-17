@@ -7,6 +7,7 @@ engagement graph and every action lands in the audit chain.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import logging
 import re
@@ -68,6 +69,49 @@ def zone_a_fetchers(cfg: KryonsecConfig) -> list[Callable[[str], PassiveResult]]
     ]
 
 
+# Non-public TLDs (RFC 6761/6762/8375 special-use names plus the common
+# private/lab suffixes): no third-party passive source can hold records
+# for them, so spawning the passive tools against one is guaranteed to
+# fail — and did (subfinder/amass/assetfinder exits 2/1/2 against the
+# lab's .lab hostname, 2026-11-17). A SKIPPED "not applicable" is the
+# honest verdict; a failure implies the tool was broken.
+_NON_PUBLIC_TLDS: frozenset[str] = frozenset({
+    "test", "example", "invalid", "localhost",      # RFC 6761
+    "local",                                        # mDNS, RFC 6762
+    "home", "internal", "intranet", "private", "corp",
+    "lan", "lab",                                   # private / lab suffixes
+    "arpa",                                         # infrastructure
+})
+
+
+def passive_applicability(target: str) -> "str | None":
+    """Why PASSIVE subdomain enumeration cannot apply to ``target``.
+
+    Passive sources query third-party databases keyed by PUBLIC domain
+    names. Returns None when passive enumeration is applicable (a
+    public-looking domain name), or the honest reason it is not: an IP
+    literal has no subdomain records to find, a single label and a
+    non-public TLD exist in no public registry.
+    """
+    name = (target or "").strip().rstrip(".").lower()
+    if not name:
+        return "empty target"
+    try:
+        ipaddress.ip_address(name)
+        return ("target is an IP literal: passive subdomain enumeration "
+                "only applies to domain names")
+    except ValueError:
+        pass
+    if "." not in name:
+        return (f"single-label name {name!r}: no public registry for "
+                "passive sources to query")
+    tld = name.rsplit(".", 1)[1]
+    if tld in _NON_PUBLIC_TLDS:
+        return (f".{tld} is a non-public TLD: third-party passive "
+                "sources have no records for it")
+    return None
+
+
 def sandbox_passive_fetcher(
     sandbox,
     audit: AuditLog,
@@ -85,6 +129,19 @@ def sandbox_passive_fetcher(
     allow = allowlist or ToolAllowlist()
 
     def fetch(domain: str) -> PassiveResult:
+        # NOT_APPLICABLE first (Phase 1, 2026-11-17): the passive tools
+        # query public databases; against an IP literal or a non-public
+        # TLD they cannot do anything but fail (the lab engagement's
+        # exits 2/1/2). Report the honest skip — zero spawns, zero
+        # failures, zero packets — instead of three guaranteed errors.
+        not_applicable = passive_applicability(domain)
+        if not_applicable:
+            return PassiveResult(
+                source="sandbox-passive", subdomains=[],
+                skipped=f"not applicable: {not_applicable}",
+                notes=["passive subdomain enumeration needs a public "
+                       "domain name; this target is not one"],
+            )
         found: set[str] = set()
         for tool, argv in (
             ("subfinder", ["subfinder", "-d", domain, "-passive", "-silent"]),

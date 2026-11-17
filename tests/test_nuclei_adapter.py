@@ -260,17 +260,27 @@ def test_template_policy_is_frozen():
     assert adapter.max_seconds == 300 <= 330
 
 
-def test_exploit_stage_nuclei_semantics_untouched():
-    """The legacy EXPLOIT nuclei path is NOT touched by this adapter:
-    the shipped allowlist template, the fixed exploit argv shape and
-    the verdict-word confirmation markers stay exactly as audited, and
-    the adapter never claims the EXPLOIT stage."""
+def test_exploit_stage_nuclei_uses_the_same_reviewed_manifest():
+    """Phase 1 (2026-11-17): the EXPLOIT nuclei lane now carries the SAME
+    reviewed, hash-pinned manifest as the probe — the legacy full-tree
+    selection is gone (it ran 11,143 unreviewed templates, died at the
+    sandbox's 300s cap, and nuclei's own IP-check phone-home marked the
+    target unresponsive). The verdict-word markers and the adapter's
+    stage claim are unchanged."""
+    from kryonsec.purple.adapter_nuclei import APPROVED_TEMPLATE_PATHS
     from kryonsec.purple.allowlist import EXPLOIT_TEMPLATES
     from kryonsec.purple.exploit import _CONFIRMED_MARKERS
 
-    assert EXPLOIT_TEMPLATES["nuclei"] == [
-        "-u", "{url}", "-t", "{template}",
-        "-rate-limit", "{rate}", "-timeout", "30"]
+    template = EXPLOIT_TEMPLATES["nuclei"]
+    tvalues = [template[i + 1] for i, a in enumerate(template) if a == "-t"]
+    assert tvalues == list(APPROVED_TEMPLATE_PATHS)
+    # the safety flags match the probe's frozen set
+    assert template[0:2] == ["-u", "{url}"]
+    for flag in ("-etags", "intrusive", "-silent", "-nc", "-ni", "-duc",
+                 "-or", "-mt", "2m"):
+        assert flag in template
+    assert "/opt/nuclei-templates" not in tvalues
+    # markers and the adapter's own claim are untouched
     assert _CONFIRMED_MARKERS["nuclei"] == [
         "[info]", "[low]", "[medium]", "[high]", "[critical]"]
     adapter = make_nuclei_probe_adapter()

@@ -996,6 +996,63 @@ def test_sandbox_passive_fetcher_scopes_output(tmp_path):
     assert [e["ok"] for e in results] == [True, False, True]
 
 
+# ---- Phase 1 (2026-11-17): passive NOT_APPLICABLE ----------------------------
+
+def test_passive_applicability_honest_words():
+    from kryonsec.purple.recon_passive import passive_applicability
+
+    # a public domain: passive enumeration applies
+    assert passive_applicability("target-corp.com") is None
+    assert passive_applicability("www.target-corp.com") is None
+    # an IP literal: there are no subdomain records to find
+    reason = passive_applicability("10.213.43.10")
+    assert reason is not None and "IP literal" in reason
+    # a single label: no public registry
+    reason = passive_applicability("juice-shop")
+    assert reason is not None and "single-label" in reason
+    # non-public TLDs: third-party sources hold no records — the lab's
+    # own case (.lab), where the real runs died with exits 2/1/2
+    reason = passive_applicability("juice-shop.lab")
+    assert reason is not None and "non-public TLD" in reason
+    for name in ("host.local", "box.internal", "x.test", "y.arpa"):
+        assert passive_applicability(name) is not None, name
+    # empty / whitespace: not applicable, never a crash
+    assert passive_applicability("") is not None
+    assert passive_applicability("  ") is not None
+    # trailing dot is normalized
+    assert passive_applicability("target-corp.com.") is None
+
+
+def test_sandbox_passive_fetcher_skips_not_applicable_without_spawning(
+        tmp_path):
+    """A non-public-TLD target is a SKIPPED 'not applicable' with ZERO
+    spawns — never three guaranteed failures (the lab engagement's
+    subfinder/amass/assetfinder exits 2/1/2 against juice-shop.lab)."""
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.recon_passive import sandbox_passive_fetcher
+
+    sandbox = _FakeSandbox([])  # spawning would pop from an empty list = fail
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    fetch = sandbox_passive_fetcher(sandbox, audit, allowlist=ToolAllowlist())
+
+    result = fetch("juice-shop.lab")
+
+    assert sandbox.argvs == []                    # nothing spawned
+    assert result.subdomains == []
+    assert result.skipped is not None
+    assert "not applicable" in result.skipped
+    # audited as a skip, never as a tool failure (an AuditLog that wrote
+    # nothing creates no file — also acceptable: zero events is the point)
+    import json
+    if audit.path.exists():
+        with open(audit.path, encoding="utf-8") as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        assert not [e for e in events if e["event"] in
+                    ("tool_spawn", "tool_result")]
+        ok, reason = audit.verify()
+        assert ok, reason
+
+
 # ---- tool-expansion Wave 1 (2026-11-16): the archive module ------------------
 
 def _cc_row(url):

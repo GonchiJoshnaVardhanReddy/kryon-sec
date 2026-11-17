@@ -1,0 +1,20 @@
+[
+  {
+    "run": "wget-ftp-fixed",
+    "argv_len": 9,
+    "exit_code": 4,
+    "ok": true,
+    "duration_s": 22.34,
+    "stdout_chars": 11309,
+    "stdout_tail": "n.bak</span><span class=\"size\">750353</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/package.json.bak\" class=\"icon icon icon-bak icon-default\" title=\"package.json.bak\"><span class=\"name\">package.json.bak</span><span class=\"size\">4263</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li>\n<li><a href=\"ftp/suspicious_errors.yml\" class=\"icon icon icon-yml icon-text\" title=\"suspicious_errors.yml\"><span class=\"name\">suspicious_errors.yml</span><span class=\"size\">723</span><span class=\"date\">11/8/2026 6:44:34 PM</span></a></li></ul>\n    </div>\n  </body>\n</html>"
+  },
+  {
+    "run": "nuclei-manifest",
+    "argv_len": 3230,
+    "exit_code": 0,
+    "ok": true,
+    "duration_s": 78.35,
+    "stdout_chars": 0,
+    "stdout_tail": ""
+  }
+]

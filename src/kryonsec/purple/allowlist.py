@@ -13,7 +13,9 @@ test in tests/test_allowlist.py keeps the two lists from drifting.
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 
 
 def is_program_name(name: str) -> bool:
@@ -225,16 +227,97 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     f"{SANDBOX_SCRIPT_DIR}/openapi_probe.py": ["{url}"],
 }
 
+# ---- exploit templates --------------------------------------------------------
+
+# The reviewed, hash-pinned nuclei template manifest (Phase 2B.8 — the same
+# file the sandbox image bakes to /opt/kryonsec/nuclei_manifest.json and the
+# entrypoint gate re-verifies at execution time). The EXPLOIT lane's nuclei
+# template is BUILT from it: the manifest is the single source of truth, and
+# a manifest change IS an allowlist change (test_nuclei_policy.py asserts the
+# two agree with the adapter's frozen template).
+_NUCLEI_MANIFEST_PATH = Path(__file__).with_name("nuclei_manifest.json")
+
+
+def nuclei_manifest_template_args() -> tuple[str, ...]:
+    """Every reviewed template as flat ``(-t, path)`` argv pairs.
+
+    Reads the reviewed, hash-pinned manifest — the ONLY template inventory
+    any product nuclei run may carry. The full baked tree is NEVER
+    selectable: Phase 2B.7 audited it and found unsafe subtrees, and the
+    Phase-1 lab engagement (lab-p5-full-20261117T110737Z) proved the full
+    tree cannot even complete inside the sandbox's 300s cap — 11,143
+    templates loaded, 262 with runtime errors, killed at the cap.
+    """
+    data = json.loads(_NUCLEI_MANIFEST_PATH.read_text(encoding="utf-8"))
+    paths = sorted(data.get("templates") or {})
+    if not paths:
+        raise RuntimeError(
+            "nuclei_manifest.json carries no reviewed templates — "
+            "nuclei execution stays disabled (fail closed)")
+    return tuple(arg for path in paths for arg in ("-t", path))
+
+
+#: rendered once at import — the manifest is pinned, the pairs are frozen
+_NUCLEI_TEMPLATE_ARGS: tuple[str, ...] = nuclei_manifest_template_args()
+
+
+def render_exploit_template(tool: str, **slots: str) -> "list[str] | None":
+    """Render ``EXPLOIT_TEMPLATES[tool]``, filling ``{slot}`` placeholders.
+
+    The renderer build_argv uses for the tools whose templates are built
+    here (nuclei: manifest-pinned; wget: bounded retries) — the rendered
+    argv and the Layer-2 template are then the SAME list, so the two
+    cannot drift. Unknown slots are left untouched (there are none by
+    construction).
+    """
+    template = EXPLOIT_TEMPLATES.get(tool)
+    if template is None:
+        return None
+    rendered: list[str] = []
+    for arg in template:
+        for name, value in slots.items():
+            arg = arg.replace("{" + name + "}", value)
+        rendered.append(arg)
+    return rendered
+
+
 # Exploit/testing tools (spec §4.7; masscan intentionally absent)
 EXPLOIT_TEMPLATES: dict[str, list[str]] = {
-    "nuclei": ["-u", "{url}", "-t", "{template}", "-rate-limit", "{rate}", "-timeout", "30"],
+    # nuclei (Phase 1, 2026-11-17): the reviewed manifest ONLY — never the
+    # full baked tree. The legacy full-tree selection died twice over in the
+    # lab engagement: (1) 11,143 UNREVIEWED templates with 262 runtime
+    # errors behind a Gate-2 approval that could not have reviewed them,
+    # (2) killed at the sandbox's 300s cap (exit 137 — gVisor reports the
+    # entrypoint timeout's SIGKILL as 137, not coreutils' 124; proven with
+    # a zero-memory `sleep 400` run) before finishing, while nuclei's own
+    # external IP-check phoned home and marked the target unresponsive.
+    # The flags are the RECON_ACTIVE probe's proven safety set (frozen
+    # literals, adapter_nuclei.py): -etags intrusive (never a self-declared
+    # intrusive template), -silent/-nc (match lines only, no ANSI), -ni
+    # (NO interactsh/OAST), -duc (no update check), -or (no raw
+    # request/response dumps), -rl 20 -c 10 (bounded rate/concurrency),
+    # -retries 1, and -mt 2m — nuclei's own graceful max-time so the run
+    # COMPLETES inside the 300s cap instead of being killed.
+    "nuclei": [
+        "-u", "{url}", *_NUCLEI_TEMPLATE_ARGS,
+        "-etags", "intrusive", "-silent", "-nc", "-ni", "-duc", "-or",
+        "-rl", "20", "-c", "10", "-timeout", "30", "-retries", "1",
+        "-mt", "2m",
+    ],
     "sqlmap": [
         "-u", "{url}", "--batch", "--risk={1|2}", "--level={1|2|3}",
         "--technique={B|E|U|T|Q}", "--timeout={30|60|120}", "--threads={1|2|3|4}",
     ],
     "nikto": ["-h", "{url}", "-timeout", "30", "-maxtime", "120"],
     "curl": ["-sS", "--max-time", "30", "{url}"],
-    "wget": ["-q", "-O", "-", "--timeout=30", "{url}"],
+    # wget (Phase 1, 2026-11-17): bounded retries. wget's DEFAULT -t 20
+    # burned 266s inside the sandbox on the lab /ftp response (the server
+    # closes the body 12 bytes short of Content-Length; every retry hit
+    # the same quirk). -t 3 with --waitretry=2 caps the worst case near
+    # 30s of transfer attempts — a truncated response is still captured
+    # content, and the failure is honestly classified downstream.
+    "wget": ["-q", "-O", "-", "--timeout=30", "-t", "3", "--waitretry=2",
+             "{url}"],
     # ffuf/gobuster/wfuzz: directory fuzzing with the sandbox's common wordlist.
     # {urlfuzz}: the URL carries the FUZZ position marker.
     "ffuf": ["-w", SECLISTS_WEB, "-u", "{urlfuzz}", "-t", "5", "-maxtime", "120"],
