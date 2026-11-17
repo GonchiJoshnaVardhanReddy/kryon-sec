@@ -69,22 +69,28 @@ STATE_ACTION: dict[str, str] = {
 
 BRAND_MARK = "\n".join(
     (
-        "█   █ ████  █   █  ███  █   █  ████ █████  ████",
-        "█  █  █   █  █ █  █   █ ██  █ █     █     █    ",
-        "███   ████    █   █   █ █ █ █  ███  ████  █    ",
-        "█  █  █  █    █   █   █ █  ██     █ █     █    ",
-        "█   █ █   █   █    ███  █   █ ████  █████  ████",
+        "██╗  ██╗  ██████╗  ██╗   ██╗  ██████╗  ██████╗  ███████╗ ███████╗  ██████╗",
+        "██║  ██║  ██╔══██╗  ╚██╗ ██╔╝ ██╔═══██╗ ██╔═██╗  ██╔════╝ ██╔════╝ ██╔════╝",
+        "██║  ██║  ██╔══██╗   ╚████╔╝  ██║   ██║ ██║ ██║  ███████╗ █████╗   ██║",
+        "██████╔╝  ██████╔╝    ╚██╔╝   ██║   ██║ ██║ ██║  ╚════██╗ ██████╔╝ ██║",
+        "██╔══██╗  ██╔══██╗     ██║    ██║   ██║ ██║ ██║       ██║ ██╔════╝ ██║",
+        "██║  ██╗  ██║  ██║     ██║    ╚██████╔╝ ██████╔╝ ███████║ ███████║ ╚██████╗",
+        "╚═╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝     ╚═════╝  ╚═════╝  ╚══════╝ ╚══════╝  ╚═════╝",
+        "                                  by rahasec",
     )
 )
 
 BRAND_SMALL = r"""
   K R Y O N S E C
+   by rahasec
 """.strip("\n")
 
 HELP_TEXT = (
     "Shortcuts: Enter send · Shift+Enter newline · Ctrl+P commands · "
     "Shift+Tab mode · Ctrl+←/→ sessions · Ctrl+N new session · Ctrl+Q quit.\n"
-    "Commands: /help /cve /search /read /ls /write /workspace /mode /theme /quit"
+    "Mode A commands: /cve /search /read /ls /write /workspace /rename /theme\n"
+    "Mode B: /engage <target> · plain text asks a question · /report [open] /rename\n"
+    "All modes: /help /mode /quit"
 )
 
 
@@ -345,7 +351,9 @@ class ApprovalScreen(ModalScreen[bool]):
             ):
                 text.append(f"{label:<12}", style="dim")
                 text.append(f"{safe(value, 500)}\n")
-            text.append("\nApproving authorizes only this proposed testing.\n", style="dim")
+            text.append("\nIn plain words\n", style="bold")
+            text.append(safe(plain_explanation(hypothesis), 1600))
+            text.append("\n\nApproving authorizes only this proposed testing.\n", style="dim")
             text.append("It does not authorize post-exploitation.\n", style="dim")
             return text
         text.append("A shell was obtained on the target.\n\n")

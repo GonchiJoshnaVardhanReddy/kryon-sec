@@ -47,12 +47,13 @@ err_console = Console(stderr=True, style="red")
 # messages exchanged in the current session (for the goodbye line)
 _msg_count = [0]
 
-BANNER = r"""██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
-██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
-█████╔╝ ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║███████╗█████╗  ██║
-██╔═██╗ ██╔══██╗  ╚██╔╝  ██║   ██║██║╚██╗██║╚════██║██╔══╝  ██║
-██║  ██╗██║  ██║   ██║   ╚██████╔╝██║ ╚████║███████║███████║╚██████╗
-╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝"""
+BANNER = r"""██╗  ██╗  ██████╗  ██╗   ██╗  ██████╗  ██████╗  ███████╗ ███████╗  ██████╗
+██║  ██║  ██╔══██╗  ╚██╗ ██╔╝ ██╔═══██╗ ██╔═██╗  ██╔════╝ ██╔════╝ ██╔════╝
+██║  ██║  ██╔══██╗   ╚████╔╝  ██║   ██║ ██║ ██║  ███████╗ █████╗   ██║
+██████╔╝  ██████╔╝    ╚██╔╝   ██║   ██║ ██║ ██║  ╚════██╗ ██████╔╝ ██║
+██╔══██╗  ██╔══██╗     ██║    ██║   ██║ ██║ ██║       ██║ ██╔════╝ ██║
+██║  ██╗  ██║  ██║     ██║    ╚██████╔╝ ██████╔╝ ███████║ ███████║ ╚██████╗
+╚═╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝     ╚═════╝  ╚═════╝  ╚══════╝ ╚══════╝  ╚═════╝"""
 
 
 # fallback for legacy code-page consoles (cp1252 etc.) where the
@@ -61,7 +62,8 @@ BANNER_ASCII = """ .------.  .---.  .-----.  .---. .-.    .------.--------.
  |K .---/  | .-. \\ | .-.  \\ | |-.'| |    | .---'|  .--.  |
  |  .'|    | `-' | | `-'.  )| |-' `-'    | `--.| |  \\  |
  |  `-|    | .-. | | .-.  \\ | |    .     | .---'|  _  7
- `---'`-'  `-' `-' `-'  `--'`-'    `--.  `-'    `-' `--' KRYONSEC"""
+ `---'`-'  `-' `-' `-'  `--'`-'    `--.  `-'    `-' `--' KRYONSEC
+                     by rahasec"""
 
 
 def _active_banner() -> str:
@@ -69,9 +71,13 @@ def _active_banner() -> str:
 
 
 def banner_styled(mode: str) -> str:
-    """The banner, white in copilot mode, purple in purple team mode."""
+    """The banner, white in copilot mode, purple in purple team mode,
+    with the author credit underneath the wordmark."""
     color = "magenta" if mode == "purple" else "white"
-    return f"[bold {color}]{_active_banner()}[/bold {color}]"
+    return (
+        f"[bold {color}]{_active_banner()}[/bold {color}]\n"
+        f"[dim]{' ' * 28}by rahasec[/dim]"
+    )
 
 
 def _print_banner(mode: str) -> None:
