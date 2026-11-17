@@ -354,6 +354,21 @@ _SOURCES: tuple[_Source, ...] = (
         weight=3,
     ),
     _Source(
+        key="dns_enumeration",
+        node_type="dns_enumeration",
+        heading="DNS ENUMERATION (dnsenum / fierce)",
+        fields=("ips", "excerpt"),
+        weight=2,
+    ),
+    _Source(
+        key="smb_enumeration",
+        node_type="smb_enumeration",
+        heading="SMB/NETBIOS ENUMERATION (nbtscan / smbmap / "
+                "enum4linux-ng — only ran when an SMB port was open)",
+        fields=("source", "excerpt"),
+        weight=2,
+    ),
+    _Source(
         key="tls",
         node_type="tls_observation",
         heading="TLS OBSERVATIONS (sslscan / testssl)",
@@ -363,7 +378,7 @@ _SOURCES: tuple[_Source, ...] = (
     _Source(
         key="technologies",
         node_type="tech_fingerprint",
-        heading="TECHNOLOGY FINGERPRINTS (whatweb)",
+        heading="TECHNOLOGY FINGERPRINTS (whatweb / wafw00f)",
         fields=("excerpt",),
         weight=3,
     ),

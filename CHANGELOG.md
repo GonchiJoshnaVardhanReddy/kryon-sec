@@ -516,6 +516,76 @@ analysis.
   (no PostgreSQL environment); real Docker/gVisor paths untested (mocked suites only, by
   design on this host).
 
+### Tool inventory expansion (Phase 4, 2026-11-17)
+
+- **9 new wired tools** from the HexStrike 61-candidate review, each with a fixed
+  argv template, host + entrypoint allowlisting, stage routing, and audited events:
+  RECON_ACTIVE `wafw00f` (WAF fingerprinting per web base, `-a --no-color`),
+  `dirsearch` (content discovery, the baked common.txt wordlist, not recursive),
+  `dnsenum`/`fierce` (DNS enumeration — omitted, never faked, when no resolver is
+  pinned; `--dnsserver`/`--dns-servers` carry the egress policy's FIRST pinned
+  resolver; `--enum` bounded sweep, no wordlist brute), and the PORT-GATED
+  `nbtscan`/`smbmap`/`enum4linux-ng` (planned only when discovery OBSERVED 139/445
+  open; `nbtscan` additionally carries the target's RESOLVED IP — it rejects
+  hostnames — and is omitted when nothing resolved; a web-only scope gets the
+  honest empty plan); BLUE_TEAM `checksec` (`--dir=/code` ELF hardening audit)
+  and `exiftool` (`-r -q /code`).
+- **Two new graph node types**: `dns_enumeration` (source-attributed A records +
+  bounded excerpt from dnsenum/fierce — including their partial output on a
+  nonzero exit) and `smb_enumeration` (SMB trio). dirsearch paths land as the
+  SAME `path` node type feroxbuster/katana produce. Both new types join the
+  context sources (weight 2), so HYPOTHESIZE reads them; 13→15 context sections.
+- **Evidence-contract honesty**: findings counters for checksec/exiftool are
+  deliberately NOT added until their real output shapes are captured — no guessed
+  regexes. The nuclei gate's legacy `-t /opt/nuclei-templates` DIRECTORY allow is
+  GONE (Phase 1 made every spawn a manifest-pinned `-t FILE` pair; no product
+  code passes a directory anymore) — no directory value is ever accepted now.
+- **Image**: Phase 4 apt block (per-package retry rule), REQUIRED build
+  verification extended to the wired set (the build fails if the image loses a
+  wired tool); pip block removed (`ROPgadget`/`ropper` are Kali packages;
+  `terrascan` is ABSENT in the 2026-11 kali-rolling snapshot — deferred, like
+  `checkov`). The Dockerfile core block hardened: `Acquire::Retries=8`/
+  `Timeout=60` and seclists split into its own layer (a 545 MB fetch failure
+  killed the 45-minute core layer once — mirror timeouts found live).
+- **Dormant, unreachable, documented**: `gdb`, `radare2`, `binwalk`, `xxd`,
+  `strings`/`objdump`, `steghide`, `foremost`, `ROPgadget`, `ropper` install into
+  the image but are NOT allowlisted — every one needs a FILE argument and the
+  fixed-argv grammar has no `{file}` slot, so they are unreachable at both
+  layers until that slot is consciously designed.
+- **Tests**: ~30 new/updated across allowlist, plans, parsers, port/resolver
+  gating, graph nodes, context sections, entrypoint sync, and the nuclei-gate
+  tightening. Full suite re-run on the branch AFTER all Phase 4 changes:
+  **2,807 passed / 62 skipped / 0 failed** (WSL2, ~2m49s).
+- **Real-path verification** (`research/lab/phase4b_tool_verify.py`, approved
+  scope juice-shop.lab:80, three recorded runs in `research/lab/results/`).
+  Final recon run (`20261117T163332-p4b-verify`): wafw00f exit 0 (2.22s),
+  dirsearch exit 0 (21.33s; the parser read 20 REAL rows from its output),
+  nbtscan **exit 0 (3.18s)** after the fixes below, smbmap exit 0 (1.97s),
+  enum4linux-ng exit 0 (11.67s); dnsenum/fierce resolve the target (dnsenum's
+  parser still extracts the real A record `10.213.43.10` from the partial
+  output) and then fail on THIS lab zone: dnsmasq's hosts-file zone serves A
+  records but has no NS/SOA records (dig-verified: NOERROR, ANSWER: 0), and
+  both tools require them — recorded as a lab-zone artifact, not a template
+  bug; on a real zone both proceed. Blue-team run (`20261117T161222`):
+  checksec + exiftool through the REAL `run_code_scanners` path, each ran
+  once and produced a scanner_result node against a real ELF fixture. Five
+  template/parser fixes came FROM this real output, each pinned by a test
+  using the real shape: nbtscan `-w` did not exist in Kali's 1.7.2
+  (`-t 2000` milliseconds) AND it rejects hostnames, so the plan carries
+  the target's resolved IP and omits the row when nothing resolved;
+  smbmap's port-check spinner is not suppressible by any flag — its
+  excerpt is the tail-500 (verdict at the end); wafw00f's verdict sits at
+  the end of a ~490-char ASCII banner — tail-500; dirsearch's real row
+  shape `[HH:MM:SS] 200 - 483B - /path` replaced the guessed regex that
+  parsed zero real rows; dnsenum/enum4linux-ng/checksec color their
+  output with no no-color flag — the shared `clean_excerpt()` helper
+  (`purple/_text.py`) strips ANSI CSI from bounded excerpts on BOTH
+  lanes (recon + blue-team), raw stdout untouched in audit/evidence.
+  The approved target has no SMB ports open, so the REAL plan honestly
+  omits the SMB trio; their argv was verified via the harness's real dig
+  resolution + `_smb_plan` call. Final table and findings:
+  `docs/TOOL-EXPANSION-BATCH5.md` (working notes, gitignored).
+
 ## v1.3.11 — the reviewed Nuclei manifest, TLS/API adapters, and honest failures
 
 Eleven commits since v1.3.10, all in the Purple Team engine. The headline: the

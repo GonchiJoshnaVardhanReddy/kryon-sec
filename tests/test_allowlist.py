@@ -368,6 +368,17 @@ _TOOL_SOURCE: dict[str, str] = {
     "syft": "syft",
     "osv-scanner": "osv-scanner",
     "grype": "grype",
+    # Phase 4 expansion (2026-11-17) — apt, token = the Kali package
+    # name in the Dockerfile Phase 4 block (not always the binary name)
+    "wafw00f": "wafw00f",
+    "dirsearch": "dirsearch",
+    "dnsenum": "dnsenum",
+    "fierce": "fierce",
+    "nbtscan": "nbtscan",
+    "smbmap": "smbmap",
+    "enum4linux-ng": "enum4linux-ng",
+    "checksec": "checksec",
+    "exiftool": "libimage-exiftool-perl",
 }
 
 

@@ -139,6 +139,11 @@ SECLISTS_WEB = "/usr/share/seclists/Discovery/Web-Content/common.txt"
 WEB_PORTS = {80, 443, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8443, 8888, 9000}
 TLS_PORTS = {443, 8443, 9443}
 
+# Excerpt hygiene is shared with the blue-team scanners (checksec
+# colors its table): one definition in _text.py, re-exported here so
+# the recon excerpt sites and tests keep the same name.
+from ._text import clean_excerpt  # noqa: E402  (shared excerpt hygiene)
+
 
 def parse_nmap_services(stdout: str) -> list[dict]:
     """Extract open ports/services from nmap -sV output."""
@@ -211,6 +216,56 @@ def parse_feroxbuster(stdout: str) -> list[dict]:
             path = raw  # bare-path build
         paths.append({"path": path, "status": status})
     return paths[:50]  # bounded — the graph doesn't need 10k directories
+
+
+# dirsearch --no-color result row (v0.4.4, REAL shape from the Phase 4b
+# lab run — the earlier guessed shape "200   28KB  /admin" parsed ZERO
+# real rows): "[16:12:27] 200 -   483B - /.well-known/security.txt".
+# Columns are separated by " - "; a redirect row appends "  ->  /target"
+# (the \S+ stops at the space, so the captured path is the request path).
+# The [HH:MM:SS] prefix is optional so the parser also reads a
+# timestamp-less row shape.
+_DIRSEARCH_RE = re.compile(
+    r"^(?:\[\d{2}:\d{2}:\d{2}\]\s+)?"
+    r"(?P<status>\d{3})\s+-\s+\S+\s+-\s+(?P<path>/\S+)")
+
+
+def parse_dirsearch(stdout: str) -> list[dict]:
+    """Extract discovered paths from dirsearch --no-color output.
+
+    Same contract as parse_feroxbuster: (path, status) rows, bounded.
+    dirsearch v0.4.x prints one row per hit as
+    ``[HH:MM:SS] <status> - <size> - <path>``; banner/progress lines
+    never match a three-digit status followed by a slash-path.
+    """
+    paths = []
+    for line in stdout.splitlines():
+        m = _DIRSEARCH_RE.match(line.strip())
+        if not m:
+            continue
+        paths.append({
+            "path": m.group("path"),
+            "status": int(m.group("status")),
+        })
+    return paths[:50]  # bounded — same rule as feroxbuster
+
+
+# "host  ttl  IN  A  10.0.0.1" — the one record type every DNS
+# enumeration tool prints for address answers (dnsenum aligned columns,
+# fierce "Found:" lines). Bounded to dotted-quad IPv4, which is all a
+# lab/engagement DNS answer has ever carried here.
+_DNS_A_RE = re.compile(
+    r"\bIN\s+A\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def parse_dns_a_records(stdout: str) -> list[str]:
+    """The IPv4 A-record answers in dnsenum/fierce output, in order."""
+    ips = []
+    for line in stdout.splitlines():
+        m = _DNS_A_RE.search(line)
+        if m:
+            ips.append(m.group("ip"))
+    return list(dict.fromkeys(ips))[:50]  # dedup, bounded
 
 
 class ReconActiveSubagent:
@@ -328,6 +383,18 @@ class ReconActiveSubagent:
             # resolvers, which the gate drops — a spawn would be a
             # known-doomed run. The omission is visible in the plan
             # counts; the state ends with less evidence, honestly.
+        # Phase 4: DNS enumeration (dnsenum / fierce) — the SAME
+        # resolver rule as dnsx/naabu, for the SAME reason: both tools
+        # fall back to hardcoded public resolvers without an explicit
+        # one, and the gate drops those queries. Omitted (never faked)
+        # when nothing is pinned. --dnsserver takes ONE server — the
+        # first pinned one, deterministic.
+        resolvers = self._pinned_dns_resolvers()
+        if resolvers:
+            plan.append(("dnsenum", ["dnsenum", "--dnsserver", resolvers[0],
+                                     "--enum", self.target]))
+            plan.append(("fierce", ["fierce", "--domain", self.target,
+                                    "--dns-servers", resolvers[0]]))
         return plan
 
     def _httpx_adapter(self):
@@ -561,6 +628,14 @@ class ReconActiveSubagent:
                              ["gowitness", "scan", "single", "-u",
                               base, "--screenshot-path", "/evidence",
                               "--chrome-path", "/usr/bin/chromium", "-q"]))
+            # Phase 4: WAF fingerprinting + content discovery — read-only
+            # probes against the same approved base, one entry per web
+            # port like the other lanes (no adapters registered for
+            # these yet; the legacy plan entries always run).
+            plan.append(("wafw00f", ["wafw00f", "-a", "--no-color", base]))
+            plan.append(("dirsearch",
+                         ["dirsearch", "-u", base, "-w", SECLISTS_WEB,
+                          "-t", "10", "--timeout=30", "--no-color"]))
             if port in TLS_PORTS and not use_tls_adapter:
                 plan.append(("sslscan",
                              ["sslscan", "--no-failed", "--sleep", "100",
@@ -568,6 +643,35 @@ class ReconActiveSubagent:
                 plan.append(("testssl.sh",
                              ["testssl.sh", "--batch", "--severity=high",
                               "--no-color", base]))
+        return plan
+
+    def _smb_plan(
+            self, ports: set[int], target_ip: "str | None" = None,
+    ) -> "list[tuple[str, list[str]]]":
+        """Stage 3 (Phase 4): SMB/NetBIOS enumeration — only when
+        discovery OBSERVED an SMB port open (139/445).
+
+        Against a web-only scope the plan is EMPTY — the honest no-op:
+        spawning an SMB tool against a port the egress policy would
+        drop anyway is a known-doomed run, and the absence is visible
+        in the plan counts, exactly like the resolver-less DNS
+        omissions above.
+        """
+        if not ports & {139, 445}:
+            return []
+        plan: list[tuple[str, list[str]]] = []
+        # nbtscan 1.7.2 accepts IP addresses/ranges ONLY — a hostname
+        # dies with "Error: <name> is not an IP address or address
+        # range." (verified live, Phase 4b lab run). It is therefore
+        # planned only when discovery RESOLVED the target (the
+        # dns_resolution node), carrying the first observed IP.
+        # Omit-when-none: no resolved IP, no nbtscan row, never a
+        # known-doomed spawn.
+        if target_ip:
+            plan.append(("nbtscan", ["nbtscan", "-t", "2000", target_ip]))
+        plan.append(("smbmap", ["smbmap", "-H", self.target, "--no-banner",
+                                "--no-color", "--no-update"]))
+        plan.append(("enum4linux-ng", ["enum4linux-ng", "-A", self.target]))
         return plan
 
     # ---- execution --------------------------------------------------------
@@ -639,6 +743,40 @@ class ReconActiveSubagent:
                 self.audit.write({
                     "event": "recon_active_dnsx",
                     "resolved_ips": ips,
+                })
+            elif tool == "dnsenum":
+                # Phase 4: the A records + a bounded excerpt — the record
+                # sweep's other answers (NS/MX/SOA/BIND version) live in
+                # the excerpt, the graph keeps what HYPOTHESIZE reads
+                ips = parse_dns_a_records(result.stdout)
+                if result.stdout.strip():
+                    self.graph.add_node(
+                        node_type="dns_enumeration",
+                        label=self.target,
+                        properties={"source": "dnsenum", "ips": ips,
+                                    "excerpt": clean_excerpt(
+                                        result.stdout)[:500]},
+                    )
+                self.audit.write({
+                    "event": "recon_active_dnsenum",
+                    "a_records": ips,
+                    "output_chars": len(result.stdout),
+                })
+            elif tool == "fierce":
+                # same contract as dnsenum: A records + bounded excerpt
+                ips = parse_dns_a_records(result.stdout)
+                if result.stdout.strip():
+                    self.graph.add_node(
+                        node_type="dns_enumeration",
+                        label=self.target,
+                        properties={"source": "fierce", "ips": ips,
+                                    "excerpt": clean_excerpt(
+                                        result.stdout)[:500]},
+                    )
+                self.audit.write({
+                    "event": "recon_active_fierce",
+                    "a_records": ips,
+                    "output_chars": len(result.stdout),
                 })
 
         # Batches 1–2: the adapter lanes for the discovery entries —
@@ -880,6 +1018,86 @@ class ReconActiveSubagent:
                         "excerpt": result.stdout[:500],
                     },
                 )
+            elif tool == "wafw00f":
+                # Phase 4: the same bounded-excerpt contract as whatweb —
+                # the fingerprint text carries "is behind <WAF>" when a
+                # WAF answers, "No WAF detected" when none does. The
+                # verdict lives at the END of the output (the head is a
+                # ~430-char ASCII-art banner — real Phase 4b output:
+                # a head slice carried zero signal), so this excerpt is
+                # the TAIL 500.
+                self.graph.add_node(
+                    node_type="tech_fingerprint",
+                    label=self.target,
+                    properties={
+                        "source": "wafw00f",
+                        "excerpt": clean_excerpt(result.stdout)[-500:],
+                    },
+                )
+                self.audit.write({
+                    "event": "recon_active_wafw00f",
+                    "waf_lines": sum(
+                        1 for line in result.stdout.splitlines()
+                        if "is behind" in line),
+                })
+            elif tool == "dirsearch":
+                # discovered paths become path nodes — the SAME node
+                # type feroxbuster/katana produce, so HYPOTHESIZE reads
+                # one uniform surface
+                found = parse_dirsearch(result.stdout)
+                for p in found:
+                    self.graph.add_node(
+                        node_type="path",
+                        label=p["path"],
+                        properties={"status": p["status"],
+                                    "source": "dirsearch"},
+                    )
+                self.audit.write({
+                    "event": "recon_active_dirsearch",
+                    "paths_found": len(found),
+                    "output_chars": len(result.stdout),
+                })
+
+        # Phase 4: SMB/NetBIOS enumeration — the plan is EMPTY unless
+        # discovery observed 139/445 open (the honest no-op on a
+        # web-only scope; the omission is visible in the plan counts).
+        # nbtscan additionally needs the target's RESOLVED IP (it
+        # rejects hostnames — verified live), which the discovery
+        # stage left in the shared graph's dns_resolution node (the
+        # legacy dnsx parse and the dnsx-probe adapter both record
+        # ips there — the graph is the record).
+        target_ip: "str | None" = None
+        for node in self.graph.by_type("dns_resolution"):
+            if node["label"] == self.target:
+                ips = node["properties"].get("ips") or []
+                if ips:
+                    target_ip = str(ips[0])
+                    break
+        for tool, argv in self._smb_plan(open_ports, target_ip=target_ip):
+            result, ran = self._spawn(tool, argv)
+            executed += ran if result.ok else 0
+            if not result.ok:
+                continue
+            if result.stdout.strip():
+                raw = clean_excerpt(result.stdout)
+                # smbmap spends its HEAD on repeated spinner frames
+                # ("[\] Checking for open ports…" — no flag suppresses
+                # that phase display, verified live; --no-update only
+                # removes the "Working on it" message) and puts the
+                # verdict at the END: tail-500. nbtscan and
+                # enum4linux-ng lead with their signal: head-500.
+                excerpt = raw[-500:] if tool == "smbmap" else raw[:500]
+                self.graph.add_node(
+                    node_type="smb_enumeration",
+                    label=self.target,
+                    properties={"source": tool,
+                                "excerpt": excerpt},
+                )
+            self.audit.write({
+                "event": "recon_active_smb_enum",
+                "tool": tool,
+                "output_chars": len(result.stdout),
+            })
 
         if executed:
             done = {

@@ -225,6 +225,47 @@ ACTIVE_RECON_TEMPLATES: dict[str, list[str]] = {
     ],
     # OpenAPI/API discovery (Phase 8): baked probe script, fixed argv
     f"{SANDBOX_SCRIPT_DIR}/openapi_probe.py": ["{url}"],
+    # ---- Phase 4 expansion (2026-11-17) — HexStrike-review feasible set ----
+    # WAF fingerprinting: -a checks EVERY signature (no early-stop
+    # guess), --no-color for parseable output. Read-only HTTP probes
+    # against the approved base URL, bounded by the entrypoint cap.
+    "wafw00f": ["-a", "--no-color", "{url}"],
+    # Content discovery: the SAME baked SecLists common.txt wordlist the
+    # feroxbuster entry uses, 10 threads, per-request timeout, no ANSI.
+    # NOT recursive (-r absent): recursion is feroxbuster's lane.
+    "dirsearch": ["-u", "{url}", "-w", SECLISTS_WEB, "-t", "10",
+                  "--timeout=30", "--no-color"],
+    # DNS enumeration: --dnsserver carries the policy's PINNED resolver
+    # (the same never-caller-invented rule as dnsx/naabu — a run against
+    # hardcoded public resolvers is a known-doomed spawn, so plan code
+    # OMITS the entry when no resolver is pinned). --enum is the bounded
+    # standard record sweep (NS/SOA/MX/A + BIND version); no wordlist
+    # brute-force here (dnsrecon territory, and unbounded time).
+    "dnsenum": ["--dnsserver", "{resolver}", "--enum", "{target}"],
+    # fierce DNS recon: --dns-servers pins the resolver (same rule);
+    # --domain takes the scope target ({term} charset covers hostnames).
+    # fierce's own recursion is bounded by its zero-max default OFF —
+    # the shipped template pins no --wide/--depth extensions.
+    "fierce": ["--domain", "{term}", "--dns-servers", "{resolver}"],
+    # NetBIOS/SMB enumeration (Phase 4): PORT-GATED — plan code only
+    # builds these entries when discovery OBSERVED 139/445 open. -t 2000
+    # bounds nbtscan's per-address response wait (Kali's nbtscan 1.7.2
+    # takes MILLISECONDS here — verified from its real usage output,
+    # default 1000; the earlier -w flag does not exist in this build and
+    # exited 2 with usage text in the Phase 4b lab run). The {target}
+    # slot for nbtscan carries the target's RESOLVED IP — nbtscan 1.7.2
+    # rejects hostnames ("Error: ... is not an IP address or address
+    # range.", verified live) and the plan omits the row when discovery
+    # resolved nothing. smbmap's --no-banner/--no-color/--no-update are
+    # REAL flags (verified from the tool's own help): banner, color
+    # codes and the "Working on it" spinner are stripped at the source,
+    # keeping stdout parseable. enum4linux-ng -A is its
+    # simple-enumeration sweep (users/shares/policies, no credential
+    # brute) — it has NO no-color flag, so its excerpt is cleaned
+    # host-side (clean_excerpt).
+    "nbtscan": ["-t", "2000", "{target}"],
+    "smbmap": ["-H", "{target}", "--no-banner", "--no-color", "--no-update"],
+    "enum4linux-ng": ["-A", "{target}"],
 }
 
 # ---- exploit templates --------------------------------------------------------
@@ -407,6 +448,18 @@ BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
     "syft": ["scan", "/code", "-o", "json"],
     "osv-scanner": ["-r", "/code", "--format", "json"],
     "grype": ["dir:/code", "-o", "json"],
+    # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
+    # the read-only /code mount. File-GRANULAR binary tools (gdb/
+    # radare2/binwalk/xxd/strings/objdump/ROPgadget/ropper/steghide/
+    # foremost) are installed in the image but deliberately NOT
+    # allowlisted: the grammar has no {file} slot yet, and inventing
+    # one later is a conscious, reviewed change (Dockerfile note).
+    # terrascan deferred: no Kali package (Dockerfile note).
+    # checksec's dir mode audits every ELF's hardening in one run.
+    "checksec": ["--dir=/code"],
+    # exiftool -r walks /code printing file metadata (any file type);
+    # -q keeps per-file warnings out of the evidence excerpt.
+    "exiftool": ["-r", "-q", "/code"],
 }
 
 # Historical name kept (tests / callers import it): the union of everything

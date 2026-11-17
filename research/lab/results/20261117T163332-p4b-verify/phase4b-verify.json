@@ -1,0 +1,160 @@
+{
+  "when": "20261117T163332",
+  "target": "juice-shop.lab",
+  "runs": [
+    {
+      "tool": "wafw00f",
+      "argv": [
+        "wafw00f",
+        "-a",
+        "--no-color",
+        "http://juice-shop.lab:80/"
+      ],
+      "label": "REAL",
+      "duration_s": 2.22,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 630,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/wafw00f.out.txt"
+    },
+    {
+      "tool": "dirsearch",
+      "argv": [
+        "dirsearch",
+        "-u",
+        "http://juice-shop.lab:80/",
+        "-w",
+        "/usr/share/seclists/Discovery/Web-Content/common.txt",
+        "-t",
+        "10",
+        "--timeout=30",
+        "--no-color"
+      ],
+      "label": "REAL",
+      "duration_s": 21.33,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 999,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/dirsearch.out.txt",
+      "parser_paths_found": 20,
+      "parser_sample": [
+        {
+          "path": "/.well-known/security.txt",
+          "status": 200
+        },
+        {
+          "path": "/Video",
+          "status": 200
+        },
+        {
+          "path": "/api/experiments",
+          "status": 500
+        },
+        {
+          "path": "/apis",
+          "status": 500
+        },
+        {
+          "path": "/api/experiments/configurations",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "tool": "dnsenum",
+      "argv": [
+        "dnsenum",
+        "--dnsserver",
+        "10.213.44.1",
+        "--enum",
+        "juice-shop.lab"
+      ],
+      "label": "REAL",
+      "duration_s": 4.28,
+      "exit_code": 255,
+      "ok": true,
+      "stdout_chars": 285,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/dnsenum.out.txt",
+      "parser_a_records": [
+        "10.213.43.10"
+      ]
+    },
+    {
+      "tool": "fierce",
+      "argv": [
+        "fierce",
+        "--domain",
+        "juice-shop.lab",
+        "--dns-servers",
+        "10.213.44.1"
+      ],
+      "label": "REAL",
+      "duration_s": 3.44,
+      "exit_code": 255,
+      "ok": true,
+      "stdout_chars": 72,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/fierce.out.txt",
+      "parser_a_records": []
+    },
+    {
+      "tool": "nbtscan",
+      "argv": [
+        "nbtscan",
+        "-t",
+        "2000",
+        "10.213.43.10"
+      ],
+      "label": "REAL",
+      "duration_s": 3.18,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 211,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/nbtscan.out.txt"
+    },
+    {
+      "tool": "smbmap",
+      "argv": [
+        "smbmap",
+        "-H",
+        "juice-shop.lab",
+        "--no-banner",
+        "--no-color",
+        "--no-update"
+      ],
+      "label": "REAL",
+      "duration_s": 1.97,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 1206,
+      "error_excerpt": "",
+      "output_format": "json",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/smbmap.out.txt"
+    },
+    {
+      "tool": "enum4linux-ng",
+      "argv": [
+        "enum4linux-ng",
+        "-A",
+        "juice-shop.lab"
+      ],
+      "label": "REAL",
+      "duration_s": 11.67,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 1262,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T163332-p4b-verify/enum4linux-ng.out.txt"
+    }
+  ]
+}

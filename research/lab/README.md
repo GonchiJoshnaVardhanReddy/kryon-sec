@@ -39,6 +39,22 @@ the operator-approved scope below.
   verifies the DNS pin step after SIGHUP.
 - WebGoat: **PREPARED, scope pending** (second lab IP + DNS record; no
   tool may touch it until its scope is separately approved).
+- Phase 4b (9 NEW tool integrations, REAL-path runs): **COMPLETE —
+  three recorded runs in `results/*-p4b-verify/`** via
+  `phase4b_tool_verify.py`. Final recon run (`20261117T163332`):
+  wafw00f/dirsearch/smbmap/enum4linux-ng exit 0, **nbtscan exit 0**
+  with the target's RESOLVED IP (10.213.43.10), dirsearch parsed 20
+  real paths; dnsenum/fierce exit 255 on THIS lab zone — dnsmasq's
+  hosts-file zone has no NS/SOA records (dig-verified), a zone
+  artifact, not a template bug. Blue-team run (`20261117T161222`):
+  checksec + exiftool through the REAL `run_code_scanners` path,
+  once each, against a real ELF fixture. Five REAL-output fixes:
+  nbtscan `-w`→`-t` (ms) + hostname rejection → resolved-IP rule,
+  smbmap spinner survives `--no-update` → tail excerpt, wafw00f
+  banner head → tail excerpt, dirsearch real row shape → regex
+  rewrite (guessed shape parsed 0 real rows), ANSI-clean excerpts
+  (`clean_excerpt`) for dnsenum/enum4linux-ng (no no-color flags).
+  Detail: `docs/TOOL-EXPANSION-BATCH5.md` working notes.
 
 ## Phase 4 tool-drift findings (all found LIVE through the real path)
 

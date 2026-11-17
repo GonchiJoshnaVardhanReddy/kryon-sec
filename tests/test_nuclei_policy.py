@@ -393,21 +393,29 @@ def test_gate_refuses_missing_template(gate_mod):
     assert mod.main(argv) == 125
 
 
-def test_gate_refuses_directory_other_than_tree_root(gate_mod):
-    """THE Phase 2B.7 lesson: a directory is not a policy. Only the
-    exact legacy EXPLOIT tree root is allowed as a directory value;
-    token-spray/ (or any other subtree) is refused."""
+def test_gate_refuses_every_directory_including_tree_root(gate_mod):
+    """THE Phase 2B.7 lesson, now absolute (Phase 4 tightening): a
+    directory is not a policy. The legacy exact-tree-root allow is GONE
+    — no product code passes a directory anymore (Phase 1 made every
+    spawn a manifest-pinned -t FILE pair) — so token-spray/, any other
+    subtree, AND the tree root itself are all refused."""
     mod, tree = gate_mod
     for d in ("token-spray", "exposed-panels", "exposures/configs"):
         argv = _gate_argv(tree, "-u", "http://t/", "-t", str(tree / "http" / d))
         assert mod.main(argv) == 125, d
-
-
-def test_gate_allows_legacy_exploit_tree_root(gate_mod):
-    """The legacy EXPLOIT-stage semantics are unchanged: the tree root
-    selection stays allowed (it is human-gated upstream)."""
-    mod, tree = gate_mod
+    # the former legacy allow: the exact tree root is now refused too
     argv = _gate_argv(tree, "-u", "http://t/", "-t", str(tree))
+    assert mod.main(argv) == 125
+
+
+def test_gate_still_allows_manifest_file_after_tightening(gate_mod):
+    """The tightening refused directories, nothing else: a manifest-
+    listed, hash-verified FILE still passes (the only shape product
+    code ever sends since Phase 1)."""
+    mod, tree = gate_mod
+    argv = _gate_argv(
+        tree, "-u", "http://t/", "-t",
+        str(tree / "http" / "exposed-panels" / "alpha.yaml"))
     assert mod.main(argv) == 0
 
 

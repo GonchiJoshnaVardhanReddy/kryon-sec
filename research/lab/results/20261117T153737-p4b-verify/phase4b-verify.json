@@ -1,0 +1,161 @@
+{
+  "when": "20261117T153737",
+  "target": "juice-shop.lab",
+  "runs": [
+    {
+      "tool": "wafw00f",
+      "argv": [
+        "wafw00f",
+        "-a",
+        "--no-color",
+        "http://juice-shop.lab:80/"
+      ],
+      "label": "REAL",
+      "duration_s": 1.54,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 877,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/wafw00f.out.txt"
+    },
+    {
+      "tool": "dnsenum",
+      "argv": [
+        "dnsenum",
+        "--dnsserver",
+        "10.213.44.1",
+        "--enum",
+        "juice-shop.lab"
+      ],
+      "label": "REAL",
+      "duration_s": 2.31,
+      "exit_code": 255,
+      "ok": true,
+      "stdout_chars": 285,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/dnsenum.out.txt",
+      "parser_a_records": [
+        "10.213.43.10"
+      ]
+    },
+    {
+      "tool": "fierce",
+      "argv": [
+        "fierce",
+        "--domain",
+        "juice-shop.lab",
+        "--dns-servers",
+        "10.213.44.1"
+      ],
+      "label": "REAL",
+      "duration_s": 2.58,
+      "exit_code": 255,
+      "ok": true,
+      "stdout_chars": 72,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/fierce.out.txt",
+      "parser_a_records": []
+    },
+    {
+      "tool": "nbtscan",
+      "argv": [
+        "nbtscan",
+        "-w",
+        "2",
+        "juice-shop.lab"
+      ],
+      "label": "REAL",
+      "duration_s": 0.96,
+      "exit_code": 2,
+      "ok": true,
+      "stdout_chars": 1979,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/nbtscan.out.txt"
+    },
+    {
+      "tool": "smbmap",
+      "argv": [
+        "smbmap",
+        "-H",
+        "juice-shop.lab",
+        "--no-banner"
+      ],
+      "label": "REAL",
+      "duration_s": 1.96,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 1207,
+      "error_excerpt": "",
+      "output_format": "json",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/smbmap.out.txt"
+    },
+    {
+      "tool": "enum4linux-ng",
+      "argv": [
+        "enum4linux-ng",
+        "-A",
+        "juice-shop.lab"
+      ],
+      "label": "REAL",
+      "duration_s": 11.33,
+      "exit_code": 0,
+      "ok": true,
+      "stdout_chars": 1262,
+      "error_excerpt": "",
+      "output_format": "text",
+      "raw": "/mnt/d/project/kryon-sec/research/lab/results/20261117T153737-p4b-verify/enum4linux-ng.out.txt"
+    },
+    {
+      "tool": "checksec",
+      "label": "REAL",
+      "path": "run_code_scanners",
+      "ran": 11,
+      "node": {
+        "tool": "checksec",
+        "exit_code": 0,
+        "stdout_chars": 141,
+        "excerpt": "RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH    Symbols      \tFORTIFY\tFortified\tFortifiable   Filename\n"
+      }
+    },
+    {
+      "tool": "exiftool",
+      "label": "REAL",
+      "path": "run_code_scanners",
+      "ran": 11,
+      "node": {
+        "tool": "exiftool",
+        "exit_code": 0,
+        "stdout_chars": 0,
+        "excerpt": ""
+      }
+    },
+    {
+      "tool": "checksec",
+      "label": "REAL",
+      "path": "run_code_scanners",
+      "ran": 11,
+      "node": {
+        "tool": "checksec",
+        "exit_code": 0,
+        "stdout_chars": 141,
+        "excerpt": "RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH    Symbols      \tFORTIFY\tFortified\tFortifiable   Filename\n"
+      }
+    },
+    {
+      "tool": "exiftool",
+      "label": "REAL",
+      "path": "run_code_scanners",
+      "ran": 11,
+      "node": {
+        "tool": "exiftool",
+        "exit_code": 0,
+        "stdout_chars": 0,
+        "excerpt": ""
+      }
+    }
+  ]
+}

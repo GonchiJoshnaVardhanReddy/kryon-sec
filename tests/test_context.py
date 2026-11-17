@@ -91,6 +91,29 @@ def _plain_fit(graph, max_tokens):
 
 # --- determinism ----------------------------------------------------------
 
+def test_dns_and_smb_enumeration_render_for_hypothesize():
+    """Phase 4 (2026-11-17): the two new node types the RECON_ACTIVE
+    parsers produce are read by HYPOTHESIZE's context block — source,
+    A records and excerpt all render, each under its own heading."""
+    graph = EngagementGraph(engagement_id="e-p4ctx")
+    graph.add_node("dns_enumeration", "juice-shop.lab", {
+        "source": "dnsenum", "ips": ["10.213.43.10"],
+        "excerpt": "BIND version: 9.18",
+    })
+    graph.add_node("smb_enumeration", "10.213.43.10", {
+        "source": "smbmap", "excerpt": "Disk  read-only  share",
+    })
+
+    context = build_investigation_context(graph)
+    sections = _sections(context)
+    assert sections["dns_enumeration"] == [
+        "juice-shop.lab ips=10.213.43.10 excerpt=BIND version: 9.18"]
+    assert sections["smb_enumeration"] == [
+        "10.213.43.10 source=smbmap excerpt=Disk read-only share"]
+    assert "DNS ENUMERATION (dnsenum / fierce)" in context.text
+    assert "SMB/NETBIOS ENUMERATION" in context.text
+
+
 def test_same_graph_renders_byte_identically():
     graph = _recon_graph()
     first = build_investigation_context(graph)
@@ -115,7 +138,10 @@ def test_sections_follow_the_fixed_priority_order():
         # what is already established or already tried, first (A3)...
         "findings", "exploit_attempts", "verify_attempts",
         # ...then the A2 reconnaissance categories, in their own order
-        "services", "web_endpoints", "dns", "tls",
+        # (Phase 4: dns_enumeration directly after the resolution it
+        # deepens; smb_enumeration likewise port-gated adjacent)
+        "services", "web_endpoints", "dns", "dns_enumeration",
+        "smb_enumeration", "tls",
         "technologies", "api_observations", "vuln_candidates",
         "subdomains", "paths", "osint",
     ]
@@ -430,9 +456,9 @@ def test_empty_graph_renders_every_category_as_none():
     assert context.nodes_read == 0
     assert context.item_count == 0
     assert context.truncated is False
-    assert len(context.sections) == 13
+    assert len(context.sections) == 15
     assert all(section.items == () for section in context.sections)
-    assert context.text.count("- (none)") == 13
+    assert context.text.count("- (none)") == 15
     assert count_tokens(context.text) <= context.budget.max_tokens
 
 
@@ -783,8 +809,7 @@ def test_truncation_accounting_covers_the_new_categories():
     assert context.truncation["verify_attempts"].found == 6  # all kept
     assert context.truncation["findings"].found == 1
 
-    assert "- exploit_attempts: 40 of 50 omitted " \
-           "(40 over the per-category limit)" in context.text
+    assert "- exploit_attempts: 40/50 omitted" in context.text
     assert "- findings" not in context.text  # nothing was dropped there
 
 
@@ -1308,7 +1333,7 @@ def test_an_empty_graph_is_untouched_by_the_allocation():
 
     assert context.item_count == 0
     assert context.truncated is False
-    assert context.text.count("- (none)") == 13
+    assert context.text.count("- (none)") == 15
     assert "- (none kept)" not in context.text
 
 
@@ -1598,7 +1623,7 @@ def test_the_empty_line_never_stands_in_for_omitted_evidence():
            "history": (True, True, True)}),
     (500, {"paths": (True, True, True), "subdomains": (True, False, True),
            "history": (True, False, True)}),
-    (800, {"paths": (True, False, True), "subdomains": (False, False, False),
+    (800, {"paths": (True, True, True), "subdomains": (False, False, False),
            "history": (False, False, False)}),
 ])
 @pytest.mark.parametrize("kind", ["paths", "subdomains", "history"])
@@ -1610,9 +1635,12 @@ def test_a_budget_that_reads_well_is_left_alone(kind, max_tokens, expected):
     the framing is given up only where it buys a line, the verbose footer
     comes back as soon as it ties the terse one (subdomains and history at
     500: the same forty lines either way), and a shape the budget can carry
-    whole renders the full preamble (both of them at 800). Paths never reach
-    that: three hundred of them never fit, so the last line always costs
-    framing, and the verbose footer it can afford is the one it keeps."""
+    whole renders the full preamble (subdomains and history at 800). Paths
+    never reach that: three hundred of them never fit, so the last line
+    always costs framing. Phase 4 (2026-11-17) added two context categories
+    (dns_enumeration, smb_enumeration); their fixed overhead is exactly what
+    tips paths@800 from the verbose to the terse footer — the same lines
+    kept, the footer saying so in fewer bytes."""
     context = build_investigation_context(
         _sparse_graph(kind), ContextBudget(max_tokens=max_tokens))
     text = context.text
@@ -1784,13 +1812,13 @@ def test_a_value_cannot_forge_the_empty_categories_line():
 @pytest.mark.parametrize("kind", ["paths", "subdomains", "history"])
 def test_the_accounting_holds_under_the_collapse(kind, max_tokens):
     """The record is not the block: collapsing headings changes what is
-    rendered, never what is accounted for. All thirteen keys survive, every
+    rendered, never what is accounted for. All fifteen keys survive, every
     invariant that held before holds, and the bound is the rendered text's."""
     context = build_investigation_context(
         _sparse_graph(kind), ContextBudget(max_tokens=max_tokens))
 
     assert count_tokens(context.text) <= max_tokens
-    assert len(context.truncation) == 13
+    assert len(context.truncation) == 15
     for key, stat in context.truncation.items():
         assert stat.found == (stat.kept + stat.duplicates + stat.over_limit
                               + stat.over_budget), key
@@ -1816,11 +1844,17 @@ def test_the_declaration_and_the_frame_survive_the_collapse():
     """The two things the block may not lose are not evidence: the frame that
     says its lines are data, and the count that says a secret was replaced.
     Both are outside the rung's reach — the collapsed block still carries all
-    five claims of the compact frame and the declaration's number."""
+    five claims of the compact frame and the declaration's number.
+
+    Phase 4 (2026-11-17): with two more fixed categories the winning rung at
+    MIN_MAX_TOKENS is compact+terse WITHOUT collapsing the empty categories
+    (that rung no longer scores strictly better). The invariant under test —
+    frame and declaration survive the tightest legal budget — is rung-
+    independent, so it is asserted against whatever rung wins."""
     context = build_investigation_context(
         _secret_graph(), ContextBudget(max_tokens=MIN_MAX_TOKENS))
 
-    assert context.collapse_empty is True
+    assert context.collapse_empty is False  # Phase 4 rung shift, see docstring
     assert context.redactions == 2
     assert declared_redaction_count(context.text) == 2
     assert all(v not in context.text for v in ("forgot123", "hunter2sword"))

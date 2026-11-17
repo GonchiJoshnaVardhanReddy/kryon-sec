@@ -962,7 +962,7 @@ Two details worth calling out:
 |---|---|---|---|---|---|---|
 | `INIT` | Load config, validate the target into a bare in-scope domain, derive engagement id | init (deterministic) | none | validated scope + budget tracker · `engagement_created`, `state_enter` | `RECON_PASSIVE` | none — *authorization is yours*; an invalid target exits 2 before anything starts |
 | `RECON_PASSIVE` | Third-party recon, **zero packets to the target** (Zone A) | passive-recon (deterministic) | crt.sh, Wayback CDX, the archives module (Wayback + pinned Common Crawl, parameter mining), OTX passive DNS, RIPEstat whois/ASN, RDAP (IANA bootstrap), HackerTarget; keyed: Shodan, Censys, GitHub; optional sandbox `subfinder/amass/assetfinder -passive` | subdomain/path/osint nodes + provenance edges · `passive_source_ok/failed/skipped` per source | `RECON_ACTIVE` | none |
-| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe) **or** vetted adapters (httpx/whatweb/tls/api/nuclei/naabu/dnsx/nmap/katana/feroxbuster/gowitness probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
+| `RECON_ACTIVE` | Active scanning of in-scope assets only | active-recon (deterministic, planner optional) | fixed plan (nmap, naabu, dnsx, httpx, rustscan, whatweb, katana, hakrawler, feroxbuster, massdns, gowitness, sslscan, openapi_probe; Phase 4 adds wafw00f, dirsearch per web base, resolver-pinned dnsenum/fierce, port-gated nbtscan/smbmap/enum4linux-ng) **or** vetted adapters (httpx/whatweb/tls/api/nuclei/naabu/dnsx/nmap/katana/feroxbuster/gowitness probes) | service/endpoint/technology nodes, screenshots, evidence artifacts with sha256 · `tool_spawn/tool_result` | `HYPOTHESIZE` | none — sandbox availability is checked, else audited `zone_b_blocked` halt |
 | `HYPOTHESIZE` | Propose vulnerability hypotheses from the graph | hypothesizer **(LLM)** | nothing touches the target; enrichment: NVD, CISA KEV, EPSS, OSV, GHSA (host-side), searchsploit + nuclei-meta (sandbox-local) | hypothesis nodes with confidence, CVSS vector, enrichment · `enrichment_lookup` events | `HUMAN_REVIEW` | none |
 | `HUMAN_REVIEW` | **Blocking approval** of hypotheses | **you** | none | approved/rejected sets · every decision audited; **non-TTY approves nothing** | `EXPLOIT` if ≥1 approved, else `BLUE_TEAM` | **Gate 2** |
 | `EXPLOIT` | Execute **approved hypotheses only** | exploit (deterministic, LLM parses output) | `EXPLOIT` allowlist (sqlmap, nuclei, ffuf, gobuster, wfuzz, dalfox, commix, ssrfmap, arjun, tplmap, nikto, …); every nuclei run needs per-hypothesis approval | exploit_attempt nodes, exit codes, evidence · `tool_spawn/tool_result`, `capability_recorded` | `POST_EXPLOIT` only if shell detected **and** separately approved; else `VERIFY` | Gate-2 approval per hypothesis (+ **Gate 3** if a shell is claimed) |
@@ -1394,6 +1394,10 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `dnsx`, `massdns` | RECON_ACTIVE | sandbox | DNS resolution/enumeration | ⚙️ sandbox |
 | `httpx`, `httpx-toolkit` | RECON_ACTIVE | sandbox | HTTP probing of discovered hosts | ⚙️ sandbox |
 | `katana`, `hakrawler`, `feroxbuster` | RECON_ACTIVE | sandbox | crawling/content discovery | ⚙️ sandbox |
+| `wafw00f` | RECON_ACTIVE | sandbox | WAF fingerprinting (`-a` all signatures) per web base | ⚙️ sandbox |
+| `dirsearch` | RECON_ACTIVE | sandbox | content discovery (same baked common.txt wordlist; not recursive — feroxbuster's lane) | ⚙️ sandbox |
+| `dnsenum`, `fierce` | RECON_ACTIVE | sandbox | DNS enumeration — **omitted, never faked, when no resolver is pinned** (same rule as dnsx/naabu) | ⚙️ sandbox |
+| `nbtscan`, `smbmap`, `enum4linux-ng` | RECON_ACTIVE | sandbox | NetBIOS/SMB enumeration — **port-gated**: planned only when discovery observed 139/445 open (honest empty plan on a web-only scope); `nbtscan` additionally carries the target's RESOLVED IP (it rejects hostnames) and is omitted when nothing resolved | ⚙️ sandbox |
 | `gowitness` | RECON_ACTIVE | sandbox | screenshots → `/evidence` | ⚙️ sandbox |
 | `sslscan`, `testssl.sh` | RECON_ACTIVE | sandbox | legacy TLS lane (skipped while `tls-probe` is registered) | ⚙️ sandbox |
 | `/opt/kryonsec/openapi_probe.py` | RECON_ACTIVE | sandbox | baked OpenAPI inspection (skipped while `api-probe` is registered) | ⚙️ sandbox |
@@ -1423,6 +1427,8 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `osv-scanner` | dependency vulns (needs egress) | ✅ baked |
 | `grype` | SBOM vuln matching (needs egress) | ✅ baked |
 | `hadolint` | Dockerfile lint — conditional on a Dockerfile existing | optional in image |
+| `checksec` | ELF hardening audit in dir mode (`--dir=/code`) | ✅ baked |
+| `exiftool` | file metadata walk (`-r -q /code`); metadata is inventory, never findings | ✅ baked |
 | `kube-bench` | **deliberately NOT in the plan** — it audits a live node's kubelet, not a code folder | n/a |
 
 ### E. Allowlisted but not plan-registered (dormant / optional binaries)
@@ -1433,6 +1439,7 @@ The legacy plans — every argv must match its per-tool template exactly:
 | `GetNPUsers.py`, `GetUserSPNs.py`, `GetADUsers.py`, `findDelegation.py`, `bloodhound-python` | AD collection, excluded until a shell producer exists | 💤 dormant |
 | `dig`, `nc`, `ncat`, `openssl`, `http` | VERIFY secondary **reachability** probes — never mark a finding verified | ✅ |
 | `bandit`, `gitleaks`, `trivy`, `syft`, `grype`, `osv-scanner` (as templates) | same binaries as category D | ✅ |
+| `gdb`, `radare2`, `binwalk`, `xxd`, `strings`/`objdump` (binutils), `steghide`, `foremost`, `ROPgadget`, `ropper` | installed in the image but **NOT allowlisted** — every one needs a FILE argument and the fixed-argv grammar has no `{file}` slot yet (dir-mode tools like checksec work; file-granular ones stay unreachable at both layers until that slot is consciously designed) | 💤 dormant in image, unreachable |
 
 Also in the image but **never agent-registered**: `checkov`, `graphql-cop`, `semgrep`,
 `hadolint`, `kube-bench` are optional installs — their absence is an audited spawn
@@ -1932,7 +1939,7 @@ Thirty minutes of silence reads as "broken" no matter how good the engine is.
 | Batch 5 — exploit/verify contracts, counterevidence, verification-support specialist | ✅ code + mocked suites done on the feature branch — PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Batch 6 — capability lifecycle: binding, expiry, revocation, consumption guard, handoffs | ✅ code + mocked suites done on the feature branch — registries deliberately still EMPTY; PostgreSQL paths and real Docker/gVisor runs NOT exercised |
 | Wave 1 — Zone A archives module (gau/waybackurls/paramspider semantics, host-side, zero packets) | ✅ code + mocked suites done on the feature branch — no image change needed; real network calls to archives NOT exercised (mocked HTTP only) |
-| Wave 2b — JWT token producer + offline analyzer (code only; feeds the gated jwt_tool lane from captured evidence) | ✅ code + mocked suites done on the feature branch — no image change; wafw00f (the other Wave-2 half) DEFERRED — needs a sandbox image rebuild + new pinned digest, a maintainer decision |
+| Wave 2b — JWT token producer + offline analyzer (code only; feeds the gated jwt_tool lane from captured evidence) | ✅ code + mocked suites done on the feature branch — no image change; wafw00f (the other Wave-2 half) landed in Phase 4 (allowlisted, image rebuilt + digest-pinned, real-path verified) |
 | Docker bridge integrity checks (2C.2) | ✅ done |
 | Passive recon sources (10 Zone A sources) | ✅ done |
 | Hypothesis enrichment (NVD/CPE/CWE, KEV, EPSS, OSV, GHSA, searchsploit, nuclei-meta) | ✅ done |

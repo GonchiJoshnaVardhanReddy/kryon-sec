@@ -786,3 +786,335 @@ def test_verify_secondary_probes_https_gets_openssl(tmp_path):
     # the openssl probe connects to host:port, not a URL
     openssl_argv = next(a for a in sub.sandbox.spawned if a[0] == "openssl")
     assert openssl_argv[openssl_argv.index("-connect") + 1] == "target-corp.com:443"
+
+
+# ---- Phase 4 tool expansion (2026-11-17) ------------------------------------
+# wafw00f / dirsearch / dnsenum / fierce / nbtscan / smbmap / enum4linux-ng
+
+def test_web_plan_includes_wafw00f_and_dirsearch_per_web_port(tmp_path):
+    """Both new web probes run once per WEB port, never against a
+    non-web port (5432 gets none) — the same per-base rule as the
+    Phase 8 openapi/gowitness lanes."""
+    cfg = KryonsecConfig(home=tmp_path)
+    graph = EngagementGraph(engagement_id="e-ra-p4a")
+    sub = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "a.jsonl"), "t.com",
+        FakeSandbox(SpawnResult(ok=False, exit_code=-1, stdout="")))
+
+    plan = sub._web_plan({80, 443, 5432})
+    tools = [tool for tool, _ in plan]
+    assert tools.count("wafw00f") == 2
+    assert tools.count("dirsearch") == 2
+
+    # argv matches the allowlist template token-for-token
+    from kryonsec.purple.allowlist import ToolAllowlist
+    allow = ToolAllowlist()
+    for tool, argv in plan:
+        allow.validate(argv[0], argv)
+    waf = next(argv for t, argv in plan if t == "wafw00f")
+    assert waf == ["wafw00f", "-a", "--no-color", "http://t.com:80/"]
+    dirs = next(argv for t, argv in plan if t == "dirsearch")
+    assert dirs[0:2] == ["dirsearch", "-u"] and "http://t.com:80/" in dirs
+    assert dirs[dirs.index("-w") + 1].endswith("common.txt")
+    assert "--no-color" in dirs
+
+
+def test_discovery_plan_dns_enumeration_needs_pinned_resolver(tmp_path):
+    """dnsenum/fierce follow the resolver-pinned omit-when-none rule
+    (same as dnsx/naabu): with a pinned policy resolver both entries
+    carry it; with no egress policy both entries are OMITTED, never
+    faked against hardcoded public resolvers."""
+    cfg = KryonsecConfig(home=tmp_path)
+    graph = EngagementGraph(engagement_id="e-ra-p4b")
+    no_policy = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""))
+    sub = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "a.jsonl"), "t.com", no_policy)
+    tools = [tool for tool, _ in sub._discovery_plan()]
+    assert "dnsenum" not in tools
+    assert "fierce" not in tools
+
+    pinned = FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout=""))
+    pinned.egress_policy = type(
+        "P", (), {"dns_resolvers": ("192.0.2.53", "192.0.2.54")})()
+    sub2 = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "b.jsonl"), "t.com", pinned)
+    plan = sub2._discovery_plan()
+    by_tool = dict(plan)
+    # --dnsserver takes ONE server — the FIRST pinned one, deterministic
+    assert by_tool["dnsenum"] == [
+        "dnsenum", "--dnsserver", "192.0.2.53", "--enum", "t.com"]
+    assert by_tool["fierce"] == [
+        "fierce", "--domain", "t.com", "--dns-servers", "192.0.2.53"]
+
+    from kryonsec.purple.allowlist import ToolAllowlist
+    allow = ToolAllowlist()
+    for tool, argv in plan:
+        allow.validate(argv[0], argv)
+
+
+def test_smb_plan_is_port_gated(tmp_path):
+    """The SMB tools are planned ONLY when discovery observed 139/445
+    open — a web-only scope gets the honest empty plan, never a
+    known-doomed spawn against ports the egress policy drops.
+    nbtscan additionally needs the target's RESOLVED IP (nbtscan 1.7.2
+    rejects hostnames — verified live), so with no IP the plan is the
+    honest pair, with an IP the trio carries the IP in nbtscan's argv."""
+    cfg = KryonsecConfig(home=tmp_path)
+    graph = EngagementGraph(engagement_id="e-ra-p4c")
+    sub = ReconActiveSubagent(
+        cfg, graph, AuditLog(tmp_path / "a.jsonl"), "t.com",
+        FakeSandbox(SpawnResult(ok=True, exit_code=0, stdout="")))
+
+    assert sub._smb_plan({80, 443}) == []
+    assert sub._smb_plan(set()) == []
+
+    from kryonsec.purple.allowlist import ToolAllowlist
+    allow = ToolAllowlist()
+    # no resolved IP: smbmap + enum4linux-ng only (hostnames fine there)
+    for open_ports in ({445}, {139}, {80, 445}):
+        plan = sub._smb_plan(open_ports)
+        assert [t for t, _ in plan] == ["smbmap", "enum4linux-ng"], open_ports
+        for tool, argv in plan:
+            allow.validate(argv[0], argv)
+    # resolved IP: the full trio, nbtscan carrying the IP
+    plan = sub._smb_plan({445}, target_ip="10.0.0.1")
+    assert [t for t, _ in plan] == ["nbtscan", "smbmap", "enum4linux-ng"]
+    for tool, argv in plan:
+        allow.validate(argv[0], argv)
+    # -t is MILLISECONDS in Kali's nbtscan 1.7.2 (usage: "-t timeout
+    # wait timeout milliseconds for response", default 1000) — a
+    # -w flag does not exist in this build (Phase 4b lab run: exit 2,
+    # "invalid option -- 'w'"), and the target is the RESOLVED IP
+    # ("Error: juice-shop.lab is not an IP address or address range.")
+    assert dict(plan)["nbtscan"] == ["nbtscan", "-t", "2000", "10.0.0.1"]
+    # --no-banner/--no-color/--no-update are REAL smbmap flags
+    # (verified from the tool's own help): banner, color and the
+    # "Working on it" spinner are stripped at the source
+    assert dict(plan)["smbmap"] == [
+        "smbmap", "-H", "t.com", "--no-banner", "--no-color",
+        "--no-update"]
+
+
+def test_parse_dirsearch_rows():
+    """Fixture = the REAL v0.4.4 output shape (Phase 4b lab run): rows
+    carry an [HH:MM:SS] prefix and ' - ' column separators. The earlier
+    guessed fixture ('200   28KB  /admin') parsed ZERO real rows —
+    exactly the guessed-regex failure the parser contract exists to
+    catch."""
+    from kryonsec.purple.recon_active import parse_dirsearch
+
+    out = ("  _|. _ _  _  _  _ _|_    v0.4.4\n"
+           "Extensions: php, asp | Threads: 10\n"
+           "Wordlist size: 4749\n"
+           "Target: http://t.com:80/\n"
+           "[16:12:27] 200 -   483B - /.well-known/security.txt\n"
+           "[16:12:28] 200 -    2MB - /Video\n"
+           "[16:12:29] 500 -   738B - /api/experiments\n"
+           "[16:12:29] 301 -   156B - /assets  ->  /assets/\n"
+           "[16:12:43] 200 -    2MB - /video\n"
+           "\nTask Completed\n")
+    rows = parse_dirsearch(out)
+    assert rows == [
+        {"path": "/.well-known/security.txt", "status": 200},
+        {"path": "/Video", "status": 200},
+        {"path": "/api/experiments", "status": 500},
+        # a redirect row captures the REQUEST path, not the target
+        {"path": "/assets", "status": 301},
+        {"path": "/video", "status": 200},
+    ]
+    # bounded: a wall of hits never floods the graph
+    big = "".join(f"[16:12:29] 200 - 1KB - /p{i}\n" for i in range(60))
+    assert len(parse_dirsearch(big)) == 50
+    assert parse_dirsearch("no rows here") == []
+
+
+def test_parse_dns_a_records_dedups_in_order():
+    from kryonsec.purple.recon_active import parse_dns_a_records
+
+    out = ("juice-shop.lab. 300 IN A 10.213.43.10\n"
+           "juice-shop.lab. 300 IN A 10.213.43.10\n"
+           "juice-shop.lab. 300 IN A 10.213.43.11\n"
+           "juice-shop.lab. 300 IN NS ns.lab.\n"
+           "fierce: Found NS record\n")
+    assert parse_dns_a_records(out) == ["10.213.43.10", "10.213.43.11"]
+
+
+def test_dns_enumeration_results_become_graph_nodes(tmp_path):
+    """dnsenum/fierce output lands as dns_enumeration nodes (source-
+    attributed) plus their own audit events — HYPOTHESIZE reads them
+    through the context block. The REAL lab output colors its headings
+    (dnsenum emits ANSI with no no-color flag), so the excerpt is
+    cleaned — real colored shape pinned here."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "a.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra-p4d")
+
+    class DnsSandbox:
+        def __init__(self):
+            self.spawned = []
+            self.egress_policy = type(
+                "P", (), {"dns_resolvers": ("192.0.2.53",)})()
+
+        def spawn(self, argv):
+            self.spawned.append(argv)
+            if argv[0] in ("dnsenum", "fierce"):
+                # the real dnsenum shape from the Phase 4b lab run:
+                # ANSI-colored section headers around the A record
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="\x1b[1;34m\n-----   t.com   -----\n"
+                           "\x1b[0m\x1b[1;31m\nHost's addresses:\n"
+                           "\x1b[0mt.com. 0 IN A 1.2.3.4\x1b[1;31m\n")
+            return SpawnResult(ok=True, exit_code=0, stdout="")
+
+    fake = DnsSandbox()
+    ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+
+    nodes = graph.by_type("dns_enumeration")
+    assert {n["properties"]["source"] for n in nodes} == \
+        {"dnsenum", "fierce"}
+    for n in nodes:
+        assert n["properties"]["ips"] == ["1.2.3.4"]
+        # the excerpt is readable signal: no ANSI control codes survive
+        assert "\x1b" not in n["properties"]["excerpt"]
+        assert "-----   t.com   -----" in n["properties"]["excerpt"]
+    events = _events(audit)
+    assert "recon_active_dnsenum" in events
+    assert "recon_active_fierce" in events
+
+
+def test_wafw00f_excerpt_keeps_the_verdict_not_the_banner(tmp_path):
+    """The REAL wafw00f output (Phase 4b lab run) opens with a ~430-char
+    ASCII-art banner and puts the verdict at the END. A head slice kept
+    zero signal; the excerpt is the tail 500, ANSI-clean, and carries
+    the honest 'No WAF detected' result."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "a.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra-p4f")
+
+    class WafSandbox:
+        def __init__(self):
+            self.spawned = []
+
+        def spawn(self, argv):
+            self.spawned.append(argv)
+            if argv[0] == "nmap":
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="80/tcp open  http\n")
+            if argv[0] == "wafw00f":
+                banner = ("                 ?              ,.   (   ."
+                          "      )        .      \"\n"
+                          "    (___()'`;   ???          .; )  ' (( (\")"
+                          "    ;(,     ((  (  ;)  \"  )\")\n"
+                          "    \\\\   \\\\                 |____|____|"
+                          "____|____|____|____|____|____|____|____|\n"
+                          "                                "
+                          "~ WAFW00F : v2.4.2 ~\n"
+                          "                    ~ Sniffing Web Application"
+                          " Firewalls since 2009 ~\n")
+                verdict = ("[*] Checking http://t.com:80/\n"
+                           "[+] Generic Detection results:\n"
+                           "[-] No WAF detected by the generic detection\n"
+                           "[~] Number of requests: 7\n")
+                return SpawnResult(ok=True, exit_code=0,
+                                   stdout=banner + verdict)
+            return SpawnResult(ok=True, exit_code=0, stdout="")
+
+    ReconActiveSubagent(cfg, graph, audit, "t.com", WafSandbox()).run()
+
+    fps = [f for f in graph.by_type("tech_fingerprint")
+           if f["properties"]["source"] == "wafw00f"]
+    assert len(fps) == 1
+    excerpt = fps[0]["properties"]["excerpt"]
+    # the verdict survives the tail slice (a HEAD slice kept zero signal
+    # against the real ~490-char banner); some banner residue may remain
+    # in the bounded 500 — the contract is "the verdict is present",
+    # never "the art is gone"
+    assert "No WAF detected by the generic detection" in excerpt
+    assert excerpt.rstrip().endswith("Number of requests: 7")
+    assert "recon_active_wafw00f" in _events(audit)
+
+
+def test_smb_enum_results_become_graph_nodes(tmp_path):
+    """The SMB trio's node contract, through the REAL run() loop: when
+    discovery observed 139/445, each tool's output lands as an
+    smb_enumeration node with a CLEAN excerpt (enum4linux-ng un-
+    conditionally colors its output — the real Phase 4b lab shape) and
+    one recon_active_smb_enum event per tool."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "a.jsonl")
+    graph = EngagementGraph(engagement_id="e-ra-p4e")
+
+    class SmbSandbox:
+        def __init__(self):
+            self.spawned = []
+            # a pinned resolver makes dnsx part of the discovery plan —
+            # its resolution is what run() reads nbtscan's IP from
+            self.egress_policy = type(
+                "P", (), {"dns_resolvers": ("192.0.2.53",)})()
+
+        def spawn(self, argv):
+            self.spawned.append(argv)
+            if argv[0] == "nmap":
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="445/tcp open  microsoft-ds\n")
+            if argv[0] == "dnsx":
+                # the discovery stage's resolution — the dns_resolution
+                # node this leaves in the graph is where run() reads
+                # nbtscan's target IP from
+                return SpawnResult(
+                    ok=True, exit_code=0, stdout="192.0.2.10\n")
+            if argv[0] == "enum4linux-ng":
+                # the real enum4linux-ng shape: ANSI-colored banners
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="\x1b[92m\x1b[0mTarget IP: 10.0.0.1\n"
+                           "\x1b[92m[+]\x1b[0m Done\n")
+            if argv[0] == "smbmap":
+                # the real Phase 4b shape: the port-check spinner is
+                # UNCONDITIONAL (--no-update only drops the "Working on
+                # it" message; no flag suppresses the spinner) and the
+                # verdict lands at the END — a head-500 excerpt carried
+                # only spinner frames
+                spinner = "".join(
+                    f"[{c}] Checking for open ports..."
+                    f"{' ' * 110}\n" for c in "\\|/-")
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout=spinner + "[*] Detected 0 hosts serving SMB\n")
+            if argv[0] == "nbtscan":
+                return SpawnResult(
+                    ok=True, exit_code=0,
+                    stdout="NBTscan version 1.7.2.\n"
+                           "Doing NBT name scan for addresses from "
+                           "10.0.0.1 to 10.0.0.1\n\n"
+                           "*no response*\n")
+            return SpawnResult(ok=True, exit_code=0, stdout="")
+
+    fake = SmbSandbox()
+    ReconActiveSubagent(cfg, graph, audit, "t.com", fake).run()
+
+    nodes = graph.by_type("smb_enumeration")
+    assert {n["properties"]["source"] for n in nodes} == \
+        {"nbtscan", "smbmap", "enum4linux-ng"}
+    for n in nodes:
+        assert "\x1b" not in n["properties"]["excerpt"]
+    enum_node = next(n for n in nodes
+                     if n["properties"]["source"] == "enum4linux-ng")
+    assert "Target IP: 10.0.0.1" in enum_node["properties"]["excerpt"]
+    # smbmap's excerpt is the TAIL: it ENDS with the verdict (a head
+    # slice carried only spinner frames — real Phase 4b finding). The
+    # last spinner frame may still precede it inside the bounded 500 —
+    # the contract is "the verdict is present and last", never "no
+    # spinner text at all"
+    smb_node = next(n for n in nodes
+                    if n["properties"]["source"] == "smbmap")
+    assert smb_node["properties"]["excerpt"].rstrip().endswith(
+        "Detected 0 hosts serving SMB")
+    events = _events(audit)
+    assert events.count("recon_active_smb_enum") == 3
+    # nbtscan's argv carried the RESOLVED IP, never the hostname
+    nbt = next(argv for argv in fake.spawned if argv[0] == "nbtscan")
+    assert nbt == ["nbtscan", "-t", "2000", "192.0.2.10"]

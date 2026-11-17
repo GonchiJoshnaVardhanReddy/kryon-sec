@@ -1,0 +1,14 @@
+
+                 ?              ,.   (   .      )        .      "
+         __        ??          ("     )  )'     ,'        )  . (`     '`
+    (___()'`;   ???          .; )  ' (( (" )    ;(,     ((  (  ;)  "  )")
+    /,___ /`                 _"., ,._'_.,)_(..,( . )_  _' )_') (. _..( ' )
+    \\   \\                 |____|____|____|____|____|____|____|____|____|
+
+                                ~ WAFW00F : v2.4.2 ~
+                    ~ Sniffing Web Application Firewalls since 2009 ~
+
+[*] Checking http://juice-shop.lab:80/
+[+] Generic Detection results:
+[-] No WAF detected by the generic detection
+[~] Number of requests: 7

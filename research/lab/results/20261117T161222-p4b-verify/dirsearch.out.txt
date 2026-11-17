@@ -1,0 +1,32 @@
+
+  _|. _ _  _  _  _ _|_    v0.4.4
+ (_||| _) (/_(_|| (_| )
+
+Extensions: php, asp, aspx, jsp, html, htm | HTTP method: GET | Threads: 10
+Wordlist size: 4749
+
+Target: http://juice-shop.lab/
+
+[16:12:27] Scanning: 
+[16:12:27] 200 -   483B - /.well-known/security.txt
+[16:12:28] 200 -    2MB - /Video
+[16:12:29] 500 -   738B - /api/experiments
+[16:12:29] 500 -   731B - /apis
+[16:12:29] 500 -   747B - /api/experiments/configurations
+[16:12:29] 500 -   732B - /api
+[16:12:29] 301 -   156B - /assets  ->  /assets/
+[16:12:33] 200 -    4KB - /ftp
+[16:12:36] 301 -   155B - /media  ->  /media/
+[16:12:38] 500 -   576B - /profile
+[16:12:39] 200 -    2KB - /promotion
+[16:12:39] 500 -   804B - /redirect
+[16:12:39] 500 -   731B - /rest
+[16:12:39] 500 -   732B - /restaurants
+[16:12:39] 500 -   731B - /restored
+[16:12:39] 500 -   736B - /restricted
+[16:12:39] 500 -   733B - /restore
+[16:12:40] 200 -    28B - /robots.txt
+[16:12:40] 200 -   483B - /security.txt
+[16:12:43] 200 -    2MB - /video
+
+Task Completed

@@ -26,6 +26,7 @@ from .hypothesize import (
 )
 from .orchestrator import BudgetTracker, SubagentResult
 from .recon_passive import EngagementGraph
+from ._text import clean_excerpt
 # A15/D3: the duplicate relation is REPORT's, not a second opinion written
 # here. Importing the pass (not a copy of it) is what keeps the prompt from
 # telling the model a pair is one issue that the report then treats as two.
@@ -55,6 +56,18 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     ("syft", ["syft", "scan", "/code", "-o", "json"]),
     ("osv-scanner", ["osv-scanner", "-r", "/code", "--format", "json"]),
     ("grype", ["grype", "dir:/code", "-o", "json"]),
+    # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
+    # the same read-only /code mount. checksec audits every ELF's
+    # hardening; exiftool prints file metadata.
+    # File-granular binary tools (gdb/radare2/binwalk/…) stay dormant —
+    # see the Dockerfile Phase 4 note.
+    # terrascan DEFERRED: no Kali package in the 2026-11 kali-rolling
+    # snapshot (apt-cache Candidate: ABSENT — verified in-image), and a
+    # plan entry naming an absent binary is a guaranteed tool-error row.
+    # Same situation as checkov; revisit with the GitHub-release pinning
+    # path if ever needed.
+    ("checksec", ["checksec", "--dir=/code"]),
+    ("exiftool", ["exiftool", "-r", "-q", "/code"]),
 ]
 HADOLINT_PLAN_ENTRY = ("hadolint", ["hadolint", "/code/Dockerfile"])
 
@@ -70,6 +83,10 @@ _FINDING_COUNT_RES: dict[str, list[re.Pattern[str]]] = {
     "trivy": [re.compile(r"Total:\s*(\d+)")],
     "checkov": [re.compile(r"Failed checks:\s*(\d+)")],
     "hadolint": [re.compile(r"^/code/Dockerfile:", re.MULTILINE)],
+    # Phase 4 (checksec/exiftool/terrascan) is deliberately NOT here
+    # yet: the counters are added only against the REAL output shapes
+    # captured in the Phase-4 lab runs (the same rule that keeps syft
+    # uncounted) — a guessed regex counts nothing honestly.
 }
 
 
@@ -182,7 +199,13 @@ def run_code_scanners(
             "tool": tool,
             "exit_code": result.exit_code,
             "stdout_chars": len(result.stdout),
-            "excerpt": result.stdout[:MAX_SCANNER_EXCERPT],
+            # excerpt hygiene is the SAME contract as the recon
+            # excerpts: checksec colors its whole table and no flag
+            # exists to turn that off for the dir mode (verified from
+            # its own help in the Phase 4b run; --format=csv/json is
+            # the FUTURE hook for honest counters, not adopted now —
+            # a format switch would need its own real-path round)
+            "excerpt": clean_excerpt(result.stdout)[:MAX_SCANNER_EXCERPT],
         }
         count = _count_findings(tool, result.stdout)
         if count is not None:

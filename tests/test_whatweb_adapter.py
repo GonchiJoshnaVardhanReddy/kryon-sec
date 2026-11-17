@@ -626,7 +626,11 @@ def test_adapter_mode_probes_whatweb_once_never_both(tmp_path):
     assert list(runs) == ["1"]
     assert "--no-errors" in runs["1"] and "--color=never" in runs["1"]
     fps = graph.by_type("tech_fingerprint")
-    assert len(fps) == 1
+    # Phase 4: wafw00f produces its OWN tech_fingerprint node per base —
+    # the count under test is the whatweb lane's, exactly one per base
+    wafps = [f for f in fps if f["properties"]["source"] == "wafw00f"]
+    assert len(wafps) == 1
+    assert len(fps) - len(wafps) == 1
     assert fps[0]["properties"]["source"] == "whatweb"
     assert fps[0]["properties"]["adapter"] == ADAPTER_ID
     # the httpx adapter side of the combined registry still runs its
