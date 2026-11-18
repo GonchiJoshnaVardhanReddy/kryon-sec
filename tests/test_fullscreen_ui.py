@@ -16,6 +16,7 @@ import pytest
 from textual.containers import Vertical
 from textual.widgets import Static
 
+from kryonsec.command_registry import PURPLE_BUSY_SAFE, commands_for
 from kryonsec.config import KryonsecConfig
 from kryonsec.copilot.mcp_registry import REGISTRY_TOOL_KEYS
 from kryonsec.copilot.session import Message
@@ -24,9 +25,12 @@ from kryonsec.ui.app import (
     ApprovalScreen,
     BrandBanner,
     CommandPalette,
+    Composer,
     KryonsecApp,
     MemoryEntry,
+    ModelPickerScreen,
     RenameScreen,
+    SuggestionMenu,
 )
 from kryonsec.ui.runtime import interactive_terminal_available
 from kryonsec.ui.session_store import EngagementStore, SessionStore
@@ -327,6 +331,238 @@ def test_command_palette_opens_and_closes(workspace):
             await pilot.press("escape")
             await pilot.pause()
             assert not isinstance(app.screen, CommandPalette)
+
+    asyncio.run(scenario())
+
+
+# ---- live slash autocomplete ------------------------------------------------
+
+
+def test_typing_slash_opens_the_registry_menu_and_filters_live(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/")
+            await pilot.pause()
+            assert menu.display is True
+            assert composer.suggestion_active is True
+            assert {option.id for option in menu.options} == {
+                spec.name for spec in commands_for("copilot")
+            }
+            assert "/engage" not in {option.id for option in menu.options}
+
+            composer.insert("mo")
+            await pilot.pause()
+            assert [option.id for option in menu.options] == ["/mode", "/models"]
+            assert menu.highlighted == 0
+
+    asyncio.run(scenario())
+
+
+def test_autocomplete_arrow_keys_track_the_visible_list(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/mo")
+            await pilot.pause()
+            assert menu.highlighted == 0
+            await pilot.press("down")
+            await pilot.pause()
+            assert menu.highlighted == 1
+            assert menu.current().name == "/models"
+            await pilot.press("down")
+            await pilot.pause()
+            assert menu.highlighted == 0
+            await pilot.press("up")
+            await pilot.pause()
+            assert menu.highlighted == 1
+
+    asyncio.run(scenario())
+
+
+def test_tab_completes_and_escape_closes_without_sending(workspace):
+    sent: list[str] = []
+
+    async def fake_submit(text: str) -> None:
+        sent.append(text)
+
+    workspace.submit = fake_submit  # type: ignore[method-assign]
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/he")
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            assert composer.text == "/help"
+            assert menu.display is False
+            assert sent == []
+
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert sent == ["/help"]
+            assert composer.text == ""
+
+            composer.insert("/")
+            await pilot.pause()
+            assert menu.display is True
+            await pilot.press("escape")
+            await pilot.pause()
+            assert menu.display is False
+            assert composer.text == "/"
+
+    asyncio.run(scenario())
+
+
+def test_enter_on_a_bare_slash_never_starts_an_engagement(workspace):
+    workspace.mode_holder[0] = "purple"
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            composer.focus()
+            composer.insert("/")
+            await pilot.pause()
+            assert "/engage" in {option.id for option in app.query_one("#suggestion-menu", SuggestionMenu).options}
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert workspace.engagement_running is False
+            assert workspace.purple_view is None
+            assert workspace.busy is False
+
+    asyncio.run(scenario())
+
+
+def test_argument_commands_are_completed_never_executed(workspace):
+    workspace.mode_holder[0] = "purple"
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/engage")
+            await pilot.pause()
+            assert [option.id for option in menu.options] == ["/engage"]
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert composer.text == "/engage "
+            assert menu.display is False
+            assert workspace.engagement_running is False
+            assert workspace.purple_view is None
+            assert workspace.busy is False
+
+    asyncio.run(scenario())
+
+
+def test_no_match_rows_are_disabled_and_never_send(workspace):
+    sent: list[str] = []
+
+    async def fake_submit(text: str) -> None:
+        sent.append(text)
+
+    workspace.submit = fake_submit  # type: ignore[method-assign]
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/zzzz")
+            await pilot.pause()
+            assert menu.display is True
+            assert [option.id for option in menu.options] == ["__none__"]
+            assert menu.options[0].disabled is True
+            await pilot.press("enter")
+            await pilot.pause()
+            assert sent == []
+            assert composer.text == "/zzzz"
+
+    asyncio.run(scenario())
+
+
+def test_busy_purple_menu_advertises_only_busy_safe_commands(workspace):
+    workspace.mode_holder[0] = "purple"
+    workspace.busy = True
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            composer.focus()
+            composer.insert("/")
+            await pilot.pause()
+            shown = {option.id for option in app.query_one("#suggestion-menu", SuggestionMenu).options}
+            expected = {
+                spec.name
+                for spec in commands_for("purple")
+                if spec.name in PURPLE_BUSY_SAFE
+            }
+            assert shown == expected
+            assert "/engage" not in shown
+            assert "/mode" not in shown
+
+    asyncio.run(scenario())
+
+
+def test_suggestion_menu_stays_bounded_and_inside_the_terminal(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            composer.focus()
+            composer.insert("/")
+            await pilot.pause()
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            assert menu.display is True
+            assert menu.size.width <= 80
+            assert menu.size.height <= 11  # at most 8 rows plus the border
+            assert composer.region.bottom <= app.size.height
+
+    asyncio.run(scenario())
+
+
+def test_shift_enter_still_inserts_a_newline_and_closes_the_menu(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            menu = app.query_one("#suggestion-menu", SuggestionMenu)
+            composer.focus()
+            composer.insert("/help")
+            await pilot.pause()
+            assert menu.display is True
+            await pilot.press("shift+enter")
+            await pilot.pause()
+            assert "\n" in composer.text
+            assert menu.display is False
 
     asyncio.run(scenario())
 
@@ -653,7 +889,7 @@ def test_brand_collapses_for_activity_and_expands_for_new_workspace(workspace):
     asyncio.run(scenario())
 
 
-def test_brand_steps_down_on_a_narrow_terminal(workspace):
+def test_brand_steps_down_to_the_block_font_on_a_narrow_terminal(workspace):
     async def scenario():
         app = _app(workspace)
         async with app.run_test(size=(70, 24)) as pilot:
@@ -661,10 +897,46 @@ def test_brand_steps_down_on_a_narrow_terminal(workspace):
             banner = app.query_one("#brand-banner", BrandBanner)
             rendered = str(banner.render())
             assert "██╗" not in rendered
-            assert "_  __" in rendered
+            assert "█" in rendered
+            assert "by rahasec" in rendered
             assert max(len(line) for line in rendered.splitlines()) <= app._content_columns()
 
     asyncio.run(scenario())
+
+
+def test_brand_banner_fits_the_supported_terminal_matrix(workspace):
+    sizes = (
+        (60, 15),
+        (60, 24),
+        (80, 15),
+        (80, 24),
+        (100, 15),
+        (100, 24),
+        (100, 36),
+        (120, 24),
+        (120, 36),
+        (160, 15),
+        (160, 36),
+    )
+
+    for width, height in sizes:
+        async def scenario(width=width, height=height):
+            app = _app(workspace)
+            async with app.run_test(size=(width, height)) as pilot:
+                await pilot.pause()
+                banner = app.query_one("#brand-banner", BrandBanner)
+                rendered = str(banner.render())
+                lines = rendered.splitlines() or [""]
+                assert max(len(line) for line in lines) <= width
+                if height < 20:
+                    # Short windows keep the one-line brand and the composer.
+                    assert len(lines) == 1
+                    assert "KRYONSEC" in rendered
+                else:
+                    assert "by rahasec" in rendered
+                    assert "█" in rendered or "KRYONSEC" in rendered
+
+        asyncio.run(scenario())
 
 
 def test_mode_switch_applies_the_other_palette_immediately(workspace, monkeypatch):
@@ -695,6 +967,210 @@ def test_mode_switch_applies_the_other_palette_immediately(workspace, monkeypatc
             assert app._mode_shown == "purple"
             topmode = app.query_one("#topmode", Static)
             assert "MODE B" in await _render_text(topmode)
+            banner = app.query_one("#brand-banner", BrandBanner)
+            styles = {str(span.style) for span in banner.render().spans}
+            # Textual normalises the hex token to an rgb() style string.
+            assert any("168,85,247" in style for style in styles)
+
+    asyncio.run(scenario())
+
+
+# ---- interactive /models picker ---------------------------------------------
+
+
+def _open_model_picker(pilot, app):
+    composer = app.query_one("#composer", Composer)
+    composer.focus()
+    composer.insert("/models")
+    return pilot.press("enter")
+
+
+def test_plain_models_opens_a_provider_picker_without_text_output(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            assert isinstance(app.screen, ModelPickerScreen)
+            screen = app.screen
+            assert screen._step == "provider"
+            assert [option.id for option in screen.query_one("#models-list").options] == [
+                "provider:openai",
+                "provider:ollama",
+                "provider:bedrock",
+                "provider:openai_compatible",
+            ]
+            assert workspace.transient.get(workspace.session_index, []) == []
+
+    asyncio.run(scenario())
+
+
+def test_model_picker_filters_confirms_and_updates_the_sidebar(workspace, monkeypatch):
+    discovered = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
+    calls: list[tuple[str, str]] = []
+
+    def fake_discover(cfg, provider):
+        assert "sk-test-secret" not in provider
+        return discovered, ""
+
+    def fake_switch(cfg, provider, model):
+        calls.append((provider, model))
+        cfg.provider = provider
+        cfg.general_chat_model = model
+        return True, f"Model set to {provider} · {model} and saved."
+
+    monkeypatch.setattr("kryonsec.ui.app.discover_models", fake_discover)
+    monkeypatch.setattr("kryonsec.ui.app.switch_model", fake_switch)
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            screen = app.screen
+            # Step 1: OpenAI is already highlighted.
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            assert screen._step == "models"
+            listed = [option.id for option in screen.query_one("#models-list").options]
+            assert listed == ["model:gpt-4o", "model:gpt-4o-mini", "model:o3-mini"]
+
+            # Step 2: typing filters, arrows navigate.
+            screen.query_one("#models-search").value = "mini"
+            await pilot.pause()
+            assert [
+                option.id for option in screen.query_one("#models-list").options
+            ] == ["model:gpt-4o-mini", "model:o3-mini"]
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert screen._step == "confirm"
+            assert screen._selected == "o3-mini"
+
+            # Step 3: confirm writes through the existing switch function.
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            assert calls == [("openai", "o3-mini")]
+            assert not isinstance(app.screen, ModelPickerScreen)
+            assert workspace.cfg.provider == "openai"
+            assert workspace.cfg.general_chat_model == "o3-mini"
+            assert "Model set to openai · o3-mini" in workspace.notice
+
+            sidebar = await _render_text(app.query_one("#sidebar-content"))
+            assert "o3-mini" in sidebar
+
+    asyncio.run(scenario())
+
+
+def test_model_picker_failure_keeps_the_previous_selection(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "kryonsec.ui.app.discover_models",
+        lambda cfg, provider: (["gpt-4o"], ""),
+    )
+    monkeypatch.setattr(
+        "kryonsec.ui.app.switch_model",
+        lambda cfg, provider, model: (False, "provider rejected the request"),
+    )
+    before = (workspace.cfg.provider, workspace.cfg.general_chat_model)
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            screen = app.screen
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("enter")  # choose gpt-4o
+            await pilot.pause()
+            await pilot.press("enter")  # confirm
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, ModelPickerScreen)
+            assert screen._step == "confirm"
+            status = str(screen.query_one("#models-status").render())
+            assert "provider rejected the request" in status
+            assert workspace.cfg.provider == before[0]
+            assert workspace.cfg.general_chat_model == before[1]
+
+    asyncio.run(scenario())
+
+
+def test_model_picker_reports_discovery_failure_without_inventing_models(workspace, monkeypatch):
+    workspace.cfg.openai_api_key = "sk-test-secret"
+    monkeypatch.setattr(
+        "kryonsec.ui.app.discover_models",
+        lambda cfg, provider: (
+            None,
+            "No OpenAI API key is set. Run `kryonsec setup` or choose another provider.",
+        ),
+    )
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            screen = app.screen
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            ids = [option.id for option in screen.query_one("#models-list").options]
+            assert not any(str(value).startswith("model:") for value in ids)
+            rendered = str(screen.query_one("#models-status").render())
+            assert "No OpenAI API key is set" in rendered
+            assert "sk-test-secret" not in rendered
+            assert "sk-test-secret" not in str(screen.query_one("#models-subtitle").render())
+
+    asyncio.run(scenario())
+
+
+def test_models_picker_is_refused_during_a_live_engagement(workspace):
+    workspace.mode_holder[0] = "purple"
+    workspace.engagement_running = True
+    before = (workspace.cfg.provider, workspace.cfg.general_chat_model)
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            assert not isinstance(app.screen, ModelPickerScreen)
+            assert "engagement is running" in workspace.notice
+            assert (workspace.cfg.provider, workspace.cfg.general_chat_model) == before
+
+    asyncio.run(scenario())
+
+
+def test_models_text_subcommands_still_work_in_the_tui(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Composer)
+            composer.focus()
+            composer.insert("/models list")
+            await pilot.pause()
+            assert app.query_one("#suggestion-menu", SuggestionMenu).display is False
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            assert not isinstance(app.screen, ModelPickerScreen)
+            assert composer.text == ""
 
     asyncio.run(scenario())
 

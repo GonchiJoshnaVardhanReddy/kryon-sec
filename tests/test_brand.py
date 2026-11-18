@@ -13,6 +13,7 @@ from kryonsec.ui.brand import (
     CREDIT,
     LARGE_UNICODE,
     MEDIUM_ASCII,
+    MEDIUM_UNICODE,
     PLAIN,
     SPACED,
     brand_text,
@@ -34,10 +35,13 @@ def test_large_art_is_rectangular():
     assert all(line.strip() for line in LARGE_UNICODE)
 
 
-def test_medium_art_fits_its_own_width():
-    widest = max(len(line) for line in MEDIUM_ASCII)
-    assert widest <= 54
-    assert all(line.strip() for line in MEDIUM_ASCII)
+def test_medium_art_is_a_readable_block_font():
+    widths = {len(line) for line in MEDIUM_UNICODE}
+    assert widths == {47}
+    assert all(line.strip() for line in MEDIUM_UNICODE)
+    # The fallback must not reintroduce slash/pipe letterforms.
+    assert not any(set(line) & set("/\\|") for line in MEDIUM_UNICODE)
+    assert [line.replace("█", "#") for line in MEDIUM_UNICODE] == list(MEDIUM_ASCII)
 
 
 def test_wide_terminal_gets_block_art():
@@ -45,9 +49,9 @@ def test_wide_terminal_gets_block_art():
     assert brand_variant(73).lines == LARGE_UNICODE
 
 
-def test_medium_terminal_steps_down_to_ascii_font():
-    assert brand_variant(70).lines == MEDIUM_ASCII
-    assert brand_variant(54).lines == MEDIUM_ASCII
+def test_medium_terminal_steps_down_to_the_block_font():
+    assert brand_variant(70).lines == MEDIUM_UNICODE
+    assert brand_variant(54).lines == MEDIUM_UNICODE
 
 
 def test_narrow_terminal_gets_spaced_mark():
@@ -149,7 +153,17 @@ def test_cli_banner_keeps_mode_colors_and_credit():
 
 def test_cli_banner_shrinks_on_narrow_consoles():
     narrow = banner_styled("copilot", width=50)
-    assert "K R Y O N S E C" in narrow
+    assert "█" in narrow
+    assert "K R Y O N S E C" not in narrow
     tiny = banner_styled("copilot", width=10)
     assert "KRYONSEC" in tiny
     assert "██╗" not in tiny
+
+
+def test_cli_banner_is_centred_when_a_width_is_given():
+    wide = banner_styled("copilot", width=100)
+    art_lines = [line for line in wide.splitlines() if "[bold white]" in line]
+    assert all(line.startswith(" ") for line in art_lines)
+    credit = next(line for line in wide.splitlines() if CREDIT in line)
+    assert credit.startswith("[dim] ")
+    assert credit[len("[dim] ")] == " "

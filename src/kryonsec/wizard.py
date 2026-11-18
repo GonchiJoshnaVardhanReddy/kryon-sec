@@ -117,16 +117,6 @@ def _is_tty() -> bool:
         return False
 
 
-BANNER = r"""
-  ██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
-  ██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
-  █████╔╝ ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║███████╗█████╗  ██║
-  ██╔═██╗ ██╔══██╗  ╚██╔╝  ██║   ██║██║╚██╗██║╚════██║██╔══╝  ██║
-  ██║  ██║██║  ██║   ██║   ╚██████╔╝██║ ╚████║███████║███████║╚██████╗
-  ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝
-"""
-
-
 def _pick_provider(answers: list[str] | None = None) -> str:
     """Provider choice. answers is the plain-input fallback queue (tests)."""
     if _is_tty() and not answers:
@@ -816,11 +806,11 @@ def run_setup(cfg: KryonsecConfig, answers: list[str] | None = None) -> Kryonsec
 
     from rich.panel import Panel
 
-    # banner: box art on UTF-8 consoles, ASCII on legacy code pages
-    from .cli import BANNER_ASCII, _UTF8_OK
+    # One banner renderer for every surface: block art on UTF-8 consoles,
+    # ASCII on legacy code pages, sized to this console so it never wraps.
+    from .cli import banner_styled
 
-    console.print(
-        f"[bold white]{BANNER if _UTF8_OK else BANNER_ASCII}[/bold white]")
+    console.print(banner_styled("copilot", width=console.width))
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_column(style="dim")
     table.add_column(style="bold")

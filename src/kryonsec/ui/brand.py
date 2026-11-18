@@ -37,13 +37,20 @@ LARGE_UNICODE: tuple[str, ...] = (
     "╚═╝  ╚═╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝ ╚═════╝",
 )
 
-#: Medium font for terminals too narrow for the block art (52 columns).
-MEDIUM_ASCII: tuple[str, ...] = (
-    " _  __ ____   __  __  ____  _   _  ____  ____  ____",
-    "| |/ /|  _ \\  \\ \\/ / / __ \\| \\ | |/ ___||  __|/ ___|",
-    "| ' / | |_) |  \\  / | |  | |  \\| |\\___ \\| |  | |    ",
-    "| . \\ |  _ <   /  \\ | |__| | |\\  | ___) | |__| |___ ",
-    "|_|\\_\\|_| \\_\\ /_/\\_\\ \\____/|_| \\_||____/|____|\\____|",
+#: Medium font: the same block-letter language as the large mark, five rows
+#: high and 47 columns wide.  It deliberately avoids the slashes and pipes of
+#: the old fallback, which were hard to read at a glance.
+MEDIUM_UNICODE: tuple[str, ...] = (
+    "█   █ ████  █   █ █████ █   █ █████ █████ █████",
+    "█  █  █   █  █ █  █   █ ██  █ █     █     █    ",
+    "███   ████    █   █   █ █ █ █ ████  ████  █    ",
+    "█  █  █  █    █   █   █ █  ██     █ █     █    ",
+    "█   █ █   █   █   █████ █   █ █████ █████ █████",
+)
+
+#: ASCII terminals get the identical letterforms in ``#`` blocks.
+MEDIUM_ASCII: tuple[str, ...] = tuple(
+    line.replace("█", "#") for line in MEDIUM_UNICODE
 )
 
 #: Spelled-out mark for very narrow terminals.
@@ -51,7 +58,7 @@ SPACED = "K R Y O N S E C"
 PLAIN = "KRYONSEC"
 
 _LARGE_WIDTH = max(len(line) for line in LARGE_UNICODE)
-_MEDIUM_WIDTH = max(len(line) for line in MEDIUM_ASCII)
+_MEDIUM_WIDTH = max(len(line) for line in MEDIUM_UNICODE)
 
 
 @dataclass(frozen=True)
@@ -80,7 +87,7 @@ def brand_variant(width: int, *, unicode_ok: bool = True) -> BrandVariant:
     if width >= _LARGE_WIDTH + 2:
         return BrandVariant(LARGE_UNICODE)
     if width >= _MEDIUM_WIDTH + 2:
-        return BrandVariant(MEDIUM_ASCII)
+        return BrandVariant(MEDIUM_UNICODE)
     if width >= len(SPACED) + 2:
         return BrandVariant((SPACED,))
     if width >= len(PLAIN):

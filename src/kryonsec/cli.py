@@ -21,7 +21,7 @@ from rich.console import Console
 
 from . import __version__
 from .config import KryonsecConfig
-from .ui.brand import CREDIT, LARGE_UNICODE, brand_variant
+from .ui.brand import CREDIT, LARGE_UNICODE, MEDIUM_ASCII, brand_variant
 
 # Glyphs that legacy code-page consoles (cp1252) can't encode crash Rich
 # mid-print — mid-chat-turn. Detect once at import: UTF-8 consoles get the
@@ -53,11 +53,7 @@ BANNER = "\n".join(LARGE_UNICODE)
 
 # fallback for legacy code-page consoles (cp1252 etc.) where the
 # box-drawing art would raise UnicodeEncodeError at startup
-BANNER_ASCII = r""" _  __ ____   __  __  ____  _   _  ____  ____  ____
-| |/ /|  _ \  \ \/ / / __ \| \ | |/ ___||  __|/ ___|
-| ' / | |_) |  \  / | |  | |  \| |\___ \| |  | |    
-| . \ |  _ <   /  \ | |__| | |\  | ___) | |__| |___ 
-|_|\_\|_| \_\ /_/\_\ \____/|_| \_||____/|____|\____|"""
+BANNER_ASCII = "\n".join(MEDIUM_ASCII)
 
 
 def _active_banner() -> str:
@@ -75,13 +71,21 @@ def banner_styled(mode: str, *, width: int | None = None) -> str:
     color = "magenta" if mode == "purple" else "white"
     effective = width if width is not None else len(LARGE_UNICODE[0]) + 2
     variant = brand_variant(effective, unicode_ok=_UTF8_OK)
-    lines = [f"[bold {color}]{line.rstrip()}[/bold {color}]" for line in variant.lines]
-    if not lines or not variant.lines[0]:
+    art = [line.rstrip() for line in variant.lines]
+    if not art or not art[0]:
         return f"[dim]{CREDIT}[/dim]" if effective >= len(CREDIT) else ""
-    mark_width = max(len(line) for line in variant.lines)
-    pad = " " * max(0, (mark_width - len(CREDIT)) // 2)
+    mark_width = max(len(line) for line in art)
+    # Centre the same way the Textual banner does.  With no explicit width
+    # the historical left-aligned block is kept for stable callers.
+    pad = " " * max(0, (effective - mark_width) // 2) if width is not None else ""
+    credit_pad = (
+        " " * max(0, (effective - len(CREDIT)) // 2)
+        if width is not None
+        else " " * max(0, (mark_width - len(CREDIT)) // 2)
+    )
+    lines = [f"{pad}[bold {color}]{line}[/bold {color}]" for line in art]
     lines.append("")
-    lines.append(f"[dim]{pad}{CREDIT}[/dim]")
+    lines.append(f"[dim]{credit_pad}{CREDIT}[/dim]")
     return "\n".join(lines)
 
 

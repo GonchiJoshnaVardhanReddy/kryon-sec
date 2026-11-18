@@ -16,6 +16,7 @@ from kryonsec.command_registry import (
     commands_text,
     help_text,
     lookup,
+    suggest,
 )
 
 
@@ -93,3 +94,47 @@ def test_busy_safe_commands_never_start_or_change_an_engagement():
     for name in PURPLE_BUSY_SAFE:
         # /exit is an alias, not a registered name; every other entry is real.
         assert name == "/exit" or name in specs
+
+
+# ---- live autocomplete ---------------------------------------------------
+
+
+def test_suggest_filters_by_prefix_and_alias():
+    assert [spec.name for spec in suggest("/mo", "copilot")] == ["/mode", "/models"]
+    assert [spec.name for spec in suggest("/models", "copilot")] == ["/models"]
+    assert [spec.name for spec in suggest("/ex", "copilot")] == ["/quit"]
+
+
+def test_suggest_returns_every_mode_command_for_a_bare_slash():
+    assert suggest("/", "copilot") == commands_for("copilot")
+    assert suggest("/", "purple") == commands_for("purple")
+
+
+def test_suggest_respects_mode_availability():
+    copilot = {spec.name for spec in suggest("/", "copilot")}
+    purple = {spec.name for spec in suggest("/", "purple")}
+    assert "/engage" not in copilot
+    assert "/cve" not in purple
+    assert [spec.name for spec in suggest("/eng", "copilot")] == []
+
+
+def test_suggest_hides_commands_the_busy_dispatcher_would_refuse():
+    busy = {spec.name for spec in suggest("/", "purple", busy=True)}
+    expected = {
+        spec.name for spec in commands_for("purple") if spec.name in PURPLE_BUSY_SAFE
+    }
+    assert busy == expected
+    assert "/engage" not in busy
+    assert "/mode" not in busy
+    # Copilot's busy rule blocks every command, and the caller hides the menu;
+    # a space already means the operator is typing an argument, not a command.
+    assert suggest("/models use", "copilot") == []
+
+
+def test_argument_taking_commands_complete_instead_of_running():
+    specs = {spec.name: spec for spec in COMMANDS}
+    for name in ("/engage", "/rename", "/cve", "/search", "/read", "/write"):
+        assert specs[name].requires_argument is True
+        assert specs[name].completion() == f"{name} "
+    assert specs["/models"].requires_argument is False
+    assert specs["/models"].completion() == "/models"

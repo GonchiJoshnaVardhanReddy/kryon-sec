@@ -21,7 +21,12 @@ BOTH = (MODE_A, MODE_B)
 
 @dataclass(frozen=True)
 class CommandSpec:
-    """One user-visible slash command and the modes that may run it."""
+    """One user-visible slash command and the modes that may run it.
+
+    ``requires_argument`` is declarative: the autocomplete menu completes
+    these commands instead of running them, so a bare ``/engage`` (or a bare
+    ``/``) can never start an engagement by accident.
+    """
 
     name: str
     summary: str
@@ -29,12 +34,17 @@ class CommandSpec:
     modes: tuple[str, ...] = BOTH
     aliases: tuple[str, ...] = ()
     group: str = "Workspace"
+    requires_argument: bool = False
 
     def label(self) -> str:
         return self.usage or self.name
 
     def available_in(self, mode: str) -> bool:
         return mode in self.modes
+
+    def completion(self) -> str:
+        """What Tab/Enter place in the composer for this command."""
+        return f"{self.name} " if self.requires_argument else self.name
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
@@ -83,6 +93,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Rename the current session or engagement tab",
         "/rename <name>",
         group="Workspace",
+        requires_argument=True,
     ),
     CommandSpec(
         "/workspace",
@@ -107,6 +118,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Look up a CVE by id",
         "/cve <CVE-ID>",
         modes=(MODE_A,),
+        requires_argument=True,
         group="Copilot",
     ),
     CommandSpec(
@@ -114,6 +126,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Search the web and add the results to this session",
         "/search <query>",
         modes=(MODE_A,),
+        requires_argument=True,
         group="Copilot",
     ),
     CommandSpec(
@@ -121,6 +134,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Read a file into the session context",
         "/read <path>",
         modes=(MODE_A,),
+        requires_argument=True,
         group="Copilot",
     ),
     CommandSpec(
@@ -135,6 +149,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Write a file after the normal approval gate",
         "/write <path>\\n<content>",
         modes=(MODE_A,),
+        requires_argument=True,
         group="Copilot",
     ),
     # ---- Mode B ----------------------------------------------------------
@@ -143,6 +158,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Start a human-approved Purple Team engagement",
         "/engage <authorized target>",
         modes=(MODE_B,),
+        requires_argument=True,
         group="Purple Team",
     ),
     CommandSpec(
@@ -184,6 +200,33 @@ def lookup(text: str) -> CommandSpec | None:
 
 def commands_for(mode: str) -> list[CommandSpec]:
     return [spec for spec in COMMANDS if spec.available_in(mode)]
+
+
+def suggest(
+    query: str, mode: str, *, busy: bool = False
+) -> list[CommandSpec]:
+    """Live autocomplete candidates for the text the operator has typed.
+
+    Only the first slash token is a command.  As soon as a space appears the
+    caller is typing an argument, so the menu closes instead of offering
+    commands that cannot run.  ``busy`` applies the same allowlist the
+    dispatcher uses while a Purple engagement is running, so the menu never
+    advertises a command the workspace will refuse.
+    """
+    value = (query or "").strip().lower()
+    if not value.startswith("/") or any(char.isspace() for char in value):
+        return []
+    pool = commands_for(mode)
+    if busy and mode == MODE_B:
+        pool = [spec for spec in pool if spec.name in PURPLE_BUSY_SAFE]
+    if value == "/":
+        return pool
+    return [
+        spec
+        for spec in pool
+        if spec.name.startswith(value)
+        or any(alias.startswith(value) for alias in spec.aliases)
+    ]
 
 
 def command_groups(mode: str) -> list[tuple[str, list[CommandSpec]]]:
@@ -241,5 +284,6 @@ __all__ = [
     "commands_text",
     "help_text",
     "lookup",
+    "suggest",
     "usage_line",
 ]
