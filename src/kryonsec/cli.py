@@ -1339,8 +1339,45 @@ def main(argv: list[str] | None = None) -> int:
         "--strict", action="store_true",
         help="exit non-zero unless Copilot and the verified Purple runtime are ready",
     )
+    doctor.add_argument(
+        "--fix", action="store_true",
+        help="plan safe repairs, apply unprivileged local fixes, and re-check",
+    )
+    doctor.add_argument(
+        "--dry-run", action="store_true",
+        help="with --fix: show every proposed action without changing anything",
+    )
+    doctor.add_argument(
+        "--verbose", action="store_true",
+        help="with --fix: show action details and full repair output",
+    )
+    doctor.add_argument(
+        "--quiet", action="store_true",
+        help="with --fix: show stages, failures, and the final summary only",
+    )
 
     sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
+
+    storage = sub.add_parser(
+        "storage",
+        help="show disk usage (read-only); --cleanup removes exact old files only",
+    )
+    storage.add_argument(
+        "--cleanup", action="store_true",
+        help="after confirmation, remove old config backups, repair logs, and atomic-write temp files",
+    )
+    storage.add_argument(
+        "--dry-run", action="store_true",
+        help="with --cleanup: list the exact files without removing them",
+    )
+    storage.add_argument(
+        "--retention-days", type=int, default=30,
+        help="keep backups and repair logs newer than this many days (default 30)",
+    )
+    storage.add_argument(
+        "--verbose", action="store_true",
+        help="print each removed path",
+    )
 
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
@@ -1374,6 +1411,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from .doctor import run_doctor
 
+        if args.fix or args.dry_run:
+            if args.verbose and args.quiet:
+                err_console.print("[red]--verbose and --quiet cannot be used together[/red]")
+                return 2
+            from .install.fix import run_fix
+
+            return run_fix(
+                cfg,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                quiet=args.quiet,
+            )
         return run_doctor(cfg, deep=args.deep, strict=args.strict)
 
     if args.command == "purple":
@@ -1387,7 +1436,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "setup":
         from .wizard import run_setup
-
         try:
             run_setup(cfg)
         except KeyboardInterrupt:
@@ -1401,6 +1449,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         return 0
+
+    if args.command == "storage":
+        from .install.storage import run_storage
+
+        return run_storage(
+            cfg,
+            cleanup=args.cleanup,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            retention_days=max(1, args.retention_days),
+        )
 
     # first run without a config -> wizard before the chat loop
     from .config import config_path
