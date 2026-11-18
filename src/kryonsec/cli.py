@@ -21,6 +21,7 @@ from rich.console import Console
 
 from . import __version__
 from .config import KryonsecConfig
+from .ui.brand import CREDIT, LARGE_UNICODE, brand_variant
 
 # Glyphs that legacy code-page consoles (cp1252) can't encode crash Rich
 # mid-print — mid-chat-turn. Detect once at import: UTF-8 consoles get the
@@ -47,42 +48,46 @@ err_console = Console(stderr=True, style="red")
 # messages exchanged in the current session (for the goodbye line)
 _msg_count = [0]
 
-BANNER = r"""██╗  ██╗  ██████╗  ██╗   ██╗  ██████╗  ██████╗  ███████╗ ███████╗  ██████╗
-██║  ██║  ██╔══██╗  ╚██╗ ██╔╝ ██╔═══██╗ ██╔═██╗  ██╔════╝ ██╔════╝ ██╔════╝
-██║  ██║  ██╔══██╗   ╚████╔╝  ██║   ██║ ██║ ██║  ███████╗ █████╗   ██║
-██████╔╝  ██████╔╝    ╚██╔╝   ██║   ██║ ██║ ██║  ╚════██╗ ██████╔╝ ██║
-██╔══██╗  ██╔══██╗     ██║    ██║   ██║ ██║ ██║       ██║ ██╔════╝ ██║
-██║  ██╗  ██║  ██║     ██║    ╚██████╔╝ ██████╔╝ ███████║ ███████║ ╚██████╗
-╚═╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝     ╚═════╝  ╚═════╝  ╚══════╝ ╚══════╝  ╚═════╝"""
+BANNER = "\n".join(LARGE_UNICODE)
 
 
 # fallback for legacy code-page consoles (cp1252 etc.) where the
 # box-drawing art would raise UnicodeEncodeError at startup
-BANNER_ASCII = """ .------.  .---.  .-----.  .---. .-.    .------.--------.
- |K .---/  | .-. \\ | .-.  \\ | |-.'| |    | .---'|  .--.  |
- |  .'|    | `-' | | `-'.  )| |-' `-'    | `--.| |  \\  |
- |  `-|    | .-. | | .-.  \\ | |    .     | .---'|  _  7
- `---'`-'  `-' `-' `-'  `--'`-'    `--.  `-'    `-' `--' KRYONSEC
-                     by rahasec"""
+BANNER_ASCII = r""" _  __ ____   __  __  ____  _   _  ____  ____  ____
+| |/ /|  _ \  \ \/ / / __ \| \ | |/ ___||  __|/ ___|
+| ' / | |_) |  \  / | |  | |  \| |\___ \| |  | |    
+| . \ |  _ <   /  \ | |__| | |\  | ___) | |__| |___ 
+|_|\_\|_| \_\ /_/\_\ \____/|_| \_||____/|____|\____|"""
 
 
 def _active_banner() -> str:
+    """Retained for callers that need the raw art (wizard, tests)."""
     return BANNER if _UTF8_OK else BANNER_ASCII
 
 
-def banner_styled(mode: str) -> str:
+def banner_styled(mode: str, *, width: int | None = None) -> str:
     """The banner, white in copilot mode, purple in purple team mode,
-    with the author credit underneath the wordmark."""
+    with the author credit underneath the wordmark.
+
+    ``width`` lets the caller pick a smaller wordmark on narrow consoles;
+    omitting it keeps the widest block art for stable callers and tests.
+    """
     color = "magenta" if mode == "purple" else "white"
-    return (
-        f"[bold {color}]{_active_banner()}[/bold {color}]\n"
-        f"[dim]{' ' * 28}by rahasec[/dim]"
-    )
+    effective = width if width is not None else len(LARGE_UNICODE[0]) + 2
+    variant = brand_variant(effective, unicode_ok=_UTF8_OK)
+    lines = [f"[bold {color}]{line.rstrip()}[/bold {color}]" for line in variant.lines]
+    if not lines or not variant.lines[0]:
+        return f"[dim]{CREDIT}[/dim]" if effective >= len(CREDIT) else ""
+    mark_width = max(len(line) for line in variant.lines)
+    pad = " " * max(0, (mark_width - len(CREDIT)) // 2)
+    lines.append("")
+    lines.append(f"[dim]{pad}{CREDIT}[/dim]")
+    return "\n".join(lines)
 
 
 def _print_banner(mode: str) -> None:
     """Re-print the banner whenever the mode flips (Shift+Tab or /mode)."""
-    console.print(banner_styled(mode))
+    console.print(banner_styled(mode, width=console.width))
 
 
 def welcome(cfg: "KryonsecConfig") -> str:
@@ -95,7 +100,7 @@ def welcome(cfg: "KryonsecConfig") -> str:
         "openai_compatible": "OpenAI-compatible endpoint",
     }.get(cfg.provider, "Ollama (local)")
     return (
-        f"{banner_styled('copilot')}\n"
+        f"{banner_styled('copilot', width=console.width)}\n"
         f"[bold cyan]v{__version__}[/bold cyan] — dual-mode cybersecurity CLI\n"
         f"[cyan]\\[COPILOT]>[/cyan] general assistant   "
         f"[magenta]\\[PURPLE]>[/magenta] purple team (Profile 2, Linux)\n"

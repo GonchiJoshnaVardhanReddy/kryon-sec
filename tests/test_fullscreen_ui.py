@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from textual.containers import Vertical
 from textual.widgets import Static
 
 from kryonsec.config import KryonsecConfig
@@ -21,6 +22,7 @@ from kryonsec.copilot.session import Message
 from kryonsec.storage import reset_engine
 from kryonsec.ui.app import (
     ApprovalScreen,
+    BrandBanner,
     CommandPalette,
     KryonsecApp,
     MemoryEntry,
@@ -592,6 +594,75 @@ def test_app_starts_with_mode_palette_and_looks_monochrome(workspace):
             copilot_css = app.CSS
             assert PURE_PURPLE not in copilot_css
             assert "#ffffff" in copilot_css
+
+    asyncio.run(scenario())
+
+
+def test_brand_banner_is_expanded_on_startup_even_with_stored_messages(workspace):
+    tab = workspace.sessions[0]
+    tab.session.messages = [Message("user", "Review a CVE")]
+    workspace.session_store.save(tab)
+    workspace.sessions = workspace.session_store.list_tabs()
+    workspace.session_index = 0
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            banner = app.query_one("#brand-banner", BrandBanner)
+            rendered = str(banner.render())
+            assert "██╗" in rendered
+            assert "by rahasec" in rendered
+            assert app.query_one("#message-list", Vertical).display is True
+
+    asyncio.run(scenario())
+
+
+def test_empty_state_no_longer_duplicates_the_wordmark(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            empty = str(app.query_one("#empty-state", Static).render())
+            assert "██╗" not in empty
+            assert "by rahasec" not in empty
+            assert "Ctrl+P" in empty
+
+    asyncio.run(scenario())
+
+
+def test_brand_collapses_for_activity_and_expands_for_new_workspace(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            banner = app.query_one("#brand-banner", BrandBanner)
+            assert "\n" in str(banner.render())
+
+            app._set_brand_expanded(False)
+            await pilot.pause()
+            compact = str(banner.render())
+            assert "KRYONSEC" in compact
+            assert "by rahasec" in compact
+            assert "██╗" not in compact
+
+            app.action_new_tab()
+            await pilot.pause()
+            assert "██╗" in str(banner.render())
+
+    asyncio.run(scenario())
+
+
+def test_brand_steps_down_on_a_narrow_terminal(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(70, 24)) as pilot:
+            await pilot.pause()
+            banner = app.query_one("#brand-banner", BrandBanner)
+            rendered = str(banner.render())
+            assert "██╗" not in rendered
+            assert "_  __" in rendered
+            assert max(len(line) for line in rendered.splitlines()) <= app._content_columns()
 
     asyncio.run(scenario())
 

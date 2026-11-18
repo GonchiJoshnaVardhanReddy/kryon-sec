@@ -41,6 +41,7 @@ from textual.widgets.option_list import Option
 from .. import __version__
 from ..config import KryonsecConfig
 from ..purple.hypothesis_plain import plain_explanation
+from .brand import brand_text
 from .state import (
     AGENT_LABELS,
     PURPLE_STATES,
@@ -66,24 +67,6 @@ STATE_ACTION: dict[str, str] = {
     "BLUE_TEAM": "Writing remediation",
     "REPORT": "Compiling report",
 }
-
-BRAND_MARK = "\n".join(
-    (
-        "██╗  ██╗  ██████╗  ██╗   ██╗  ██████╗  ██████╗  ███████╗ ███████╗  ██████╗",
-        "██║  ██║  ██╔══██╗  ╚██╗ ██╔╝ ██╔═══██╗ ██╔═██╗  ██╔════╝ ██╔════╝ ██╔════╝",
-        "██║  ██║  ██╔══██╗   ╚████╔╝  ██║   ██║ ██║ ██║  ███████╗ █████╗   ██║",
-        "██████╔╝  ██████╔╝    ╚██╔╝   ██║   ██║ ██║ ██║  ╚════██╗ ██████╔╝ ██║",
-        "██╔══██╗  ██╔══██╗     ██║    ██║   ██║ ██║ ██║       ██║ ██╔════╝ ██║",
-        "██║  ██╗  ██║  ██║     ██║    ╚██████╔╝ ██████╔╝ ███████║ ███████║ ╚██████╗",
-        "╚═╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝     ╚═════╝  ╚═════╝  ╚══════╝ ╚══════╝  ╚═════╝",
-        "                                  by rahasec",
-    )
-)
-
-BRAND_SMALL = r"""
-  K R Y O N S E C
-   by rahasec
-""".strip("\n")
 
 HELP_TEXT = (
     "Shortcuts: Enter send · Shift+Enter newline · Ctrl+P commands · "
@@ -201,6 +184,20 @@ class NoticeBlock(Static):
         text.append("· ", style="dim")
         text.append(content, style="dim")
         super().__init__(text, markup=False, classes="notice-block")
+
+
+class BrandBanner(Static):
+    """Hero wordmark above the conversation.
+
+    Starts expanded on launch, on a mode switch, and on a new workspace, so
+    the brand is visible even when stored sessions already exist.  The app
+    collapses it to one line once the operator starts using the workspace;
+    terminal height is checked by the app so a short window never loses the
+    composer to the artwork.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(Text(""), markup=False, id="brand-banner")
 
 
 # ---- command palette ----------------------------------------------------
@@ -490,6 +487,10 @@ class KryonsecApp(App[None]):
         self.cfg = cfg
         self.controller = controller
         self._truecolor = terminal_capabilities(sys.stdout).get("truecolor", False)
+        self._unicode_ok = terminal_capabilities(sys.stdout).get("unicode", True)
+        # The hero wordmark starts expanded and collapses once the operator
+        # starts working; mode switches and new workspaces expand it again.
+        self._brand_expanded = True
         # The workspace palette is mode-driven; a saved theme preference can
         # no longer bring accent colors back into it.
         self.tokens = theme or workspace_tokens(
@@ -528,6 +529,7 @@ class KryonsecApp(App[None]):
             yield Static("", id="topmode", markup=False)
         with Horizontal(id="body"):
             with Vertical(id="main"):
+                yield BrandBanner()
                 with VerticalScroll(id="conversation"):
                     yield Static(self._empty_state(), id="empty-state", markup=False)
                     yield Vertical(id="message-list")
@@ -548,6 +550,43 @@ class KryonsecApp(App[None]):
         await self._refresh_all(force=True)
         self.set_interval(1.0, self._tick)
         self.call_after_refresh(self._focus_composer)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        # Pick the wordmark that fits the new terminal width, then let the
+        # height guard collapse it if the window became too short.
+        self._refresh_brand()
+
+    def _content_columns(self) -> int:
+        """Columns available to the main pane (sidebar included in the app)."""
+        width = _columns(self)
+        # Mirrors the stylesheet: the 34-column sidebar exists at >= 100, and
+        # #main has one column of padding on each side.
+        if width >= 100:
+            width -= 36
+        else:
+            width -= 2
+        return max(1, width)
+
+    def _refresh_brand(self) -> None:
+        try:
+            banner = self.query_one("#brand-banner", BrandBanner)
+            height = int(self.size.height)
+        except Exception:
+            return
+        expanded = self._brand_expanded and height >= 20
+        banner.update(
+            brand_text(
+                self.tokens,
+                width=self._content_columns(),
+                unicode_ok=self._unicode_ok,
+                compact=not expanded,
+                show_tagline=expanded,
+            )
+        )
+
+    def _set_brand_expanded(self, expanded: bool) -> None:
+        self._brand_expanded = expanded
+        self._refresh_brand()
 
     def on_unmount(self) -> None:
         self.controller.set_change_callback(lambda _reason: None)
@@ -590,11 +629,15 @@ class KryonsecApp(App[None]):
         self.CSS = _build_css(self.tokens)
         self.theme = _textual_theme_name(mode)
         self.refresh_css()
+        # A mode switch is a visible identity change: show the full wordmark
+        # in the new colour before the next interaction collapses it again.
+        self._brand_expanded = True
         try:
             self.query_one("#brand", Static).update(
                 Text("◆ KRYONSEC", style=f"bold {self.tokens.brand}")
             )
             self.query_one("#empty-state", Static).update(self._empty_state())
+            self._refresh_brand()
         except Exception:
             pass  # compose may not have run yet
 
@@ -615,6 +658,7 @@ class KryonsecApp(App[None]):
 
     async def _refresh_all(self, *, force: bool = False) -> None:
         await self._refresh_tabs(force=force)
+        self._refresh_brand()
         self._refresh_topmode()
         self._refresh_main(force=force)
         self._refresh_sidebar()
@@ -863,6 +907,8 @@ class KryonsecApp(App[None]):
         value = composer.take_text()
         if not value.strip():
             return
+        # Working state: keep the brand, free the vertical space.
+        self._set_brand_expanded(False)
         self.run_worker(self._submit(value), exclusive=False)
 
     async def _submit(self, value: str) -> None:
@@ -907,13 +953,17 @@ class KryonsecApp(App[None]):
             self.controller.new_session()
         else:
             self.controller.new_engagement_placeholder()
+        # A new workspace is a fresh start: show the full mark again.
+        self._set_brand_expanded(True)
         self._focus_composer()
 
     def action_prev_tab(self) -> None:
         self.controller.switch_tab(-1)
+        self._set_brand_expanded(False)
 
     def action_next_tab(self) -> None:
         self.controller.switch_tab(1)
+        self._set_brand_expanded(False)
 
     def action_rename_session(self, index: int | None = None) -> None:
         controller = self.controller
@@ -984,6 +1034,7 @@ class KryonsecApp(App[None]):
             self.action_new_tab()
         else:
             self.controller.activate_tab(event.index)
+            self._set_brand_expanded(False)
         self._focus_composer()
 
     def on_memory_entry_activated(self, _event: MemoryEntry.Activated) -> None:
@@ -1033,14 +1084,19 @@ class KryonsecApp(App[None]):
     # ---- rendering helpers --------------------------------------------
 
     def _empty_state(self) -> Text:
+        # The wordmark now lives in BrandBanner above the conversation; the
+        # empty state is only the next-action hint, so it never duplicates
+        # the artwork or pushes the composer down twice.
         text = Text()
         text.append("\n\n")
-        mark = BRAND_MARK if _columns(self) >= 92 else BRAND_SMALL
-        for line in mark.splitlines():
-            text.append(line + "\n", style=f"bold {self.tokens.brand}")
-        text.append("\n")
-        text.append("security workspaces for your terminal\n", style=self.tokens.muted)
-        text.append("start a conversation below · Ctrl+P for commands\n", style="dim")
+        text.append(
+            "Start a conversation below · Ctrl+P for commands\n",
+            style=self.tokens.muted,
+        )
+        text.append(
+            "Shift+Tab switches mode · Ctrl+N starts a new workspace\n",
+            style="dim",
+        )
         return text
 
     def _activity_text(self, rows: list[Any]) -> Text:
@@ -1585,6 +1641,14 @@ def _build_css(tokens: ThemeTokens) -> str:
             padding: 0 1;
             background: {t.background};
         }}
+        #brand-banner {{
+            width: 1fr;
+            height: auto;
+            padding: 1 0 0 0;
+            background: {t.background};
+            content-align: center middle;
+            text-align: center;
+        }}
         #conversation {{
             height: 1fr;
             padding: 0 1;
@@ -1836,6 +1900,7 @@ def _build_css(tokens: ThemeTokens) -> str:
 
 __all__ = [
     "ApprovalScreen",
+    "BrandBanner",
     "CommandPalette",
     "Composer",
     "KryonsecApp",
