@@ -1475,3 +1475,39 @@ def test_purple_workflow_timeline_shows_stage_durations(workspace):
             assert "7s" in purple
 
     asyncio.run(scenario())
+
+
+# ---- palette reads the one command registry -----------------------------
+
+
+def test_palette_offers_registry_commands_for_the_active_mode():
+    copilot = CommandPalette(_make_controller_stub("copilot"))._options
+    copilot_ids = [identifier for _, identifier in copilot]
+    assert "run:/commands" in copilot_ids
+    assert "run:/models" in copilot_ids
+    assert "run:/mcp" in copilot_ids
+    assert "run:/skills" in copilot_ids
+    assert "run:/engage" not in copilot_ids
+    assert "mode" in copilot_ids
+
+    purple = CommandPalette(_make_controller_stub("purple"))._options
+    purple_ids = [identifier for _, identifier in purple]
+    assert "run:/engage" in purple_ids
+    assert "run:/report" in purple_ids
+    assert "run:/cve" not in purple_ids
+    assert "memory" in purple_ids
+
+
+def test_palette_run_entry_dispatches_through_the_workspace(workspace):
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._palette_result("run:/commands")
+            await pilot.pause()
+            await pilot.pause()
+            messages = workspace.display_messages()
+            assert any("COMMANDS · Mode A" in m.content for m in messages)
+            assert any("/models" in m.content for m in messages)
+
+    asyncio.run(scenario())

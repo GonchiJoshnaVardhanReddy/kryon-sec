@@ -39,6 +39,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from .. import __version__
+from ..command_registry import commands_for
 from ..config import KryonsecConfig
 from ..purple.hypothesis_plain import plain_explanation
 from .brand import brand_text
@@ -67,15 +68,6 @@ STATE_ACTION: dict[str, str] = {
     "BLUE_TEAM": "Writing remediation",
     "REPORT": "Compiling report",
 }
-
-HELP_TEXT = (
-    "Shortcuts: Enter send · Shift+Enter newline · Ctrl+P commands · "
-    "Shift+Tab mode · Ctrl+←/→ sessions · Ctrl+N new session · Ctrl+Q quit.\n"
-    "Mode A commands: /cve /search /read /ls /write /workspace /rename /theme\n"
-    "Mode B: /engage <target> · plain text asks a question · /report [open] /rename\n"
-    "All modes: /help /mode /quit"
-)
-
 
 def _textual_theme_name(mode: str) -> str:
     return f"kryonsec-workspace-{mode}"
@@ -215,17 +207,9 @@ class CommandPalette(ModalScreen[str | None]):
         Binding("escape", "dismiss_palette", "Close", show=False),
     ]
 
-    BASE_COMMANDS = [
-        ("New session", "new"),
-        ("Switch mode", "mode"),
-        ("Show help", "help"),
-        ("Appearance help", "theme"),
-        ("Quit", "quit"),
-    ]
-
     def __init__(self, controller: WorkspaceController | None = None) -> None:
         super().__init__()
-        options = list(self.BASE_COMMANDS)
+        options = [("New session", "new"), ("Switch mode", "mode")]
         if controller is None:
             self._options = options
             return
@@ -242,9 +226,20 @@ class CommandPalette(ModalScreen[str | None]):
                 session_entries.append(
                     (f"Close session {index + 1}: {label}", f"close:{index + 1}")
                 )
-            options = [*session_entries, *options]
+            options = [
+                *session_entries,
+                ("New session", "new"),
+                ("Switch mode", "mode"),
+            ]
         else:
+            options = [("New engagement", "new"), ("Switch mode", "mode")]
             options.insert(2, ("Open Kryonsec Memory", "memory"))
+        # Every slash command comes from the one registry, so the palette can
+        # never drift from /help, /commands, or direct slash input.
+        options.extend(
+            (f"{spec.label()} — {spec.summary}", f"run:{spec.name}")
+            for spec in commands_for(controller.mode)
+        )
         self._options = options
 
     def compose(self) -> ComposeResult:
@@ -921,6 +916,12 @@ class KryonsecApp(App[None]):
     def _palette_result(self, choice: str | None) -> None:
         if not choice:
             return
+        if choice.startswith("run:"):
+            text = choice.partition(":")[2]
+            if not text:
+                return
+            self.run_worker(self._submit(text), exclusive=False)
+            return
         if choice.startswith("rename:"):
             self.action_rename_session(int(choice.partition(":")[2]) - 1)
         elif choice.startswith("close:"):
@@ -935,15 +936,6 @@ class KryonsecApp(App[None]):
             self.action_open_memory()
         elif choice == "mode":
             self.run_worker(self.controller.switch_mode(), exclusive=False)
-        elif choice == "help":
-            self.controller.add_system_message(HELP_TEXT)
-        elif choice == "theme":
-            self.controller.add_system_message(
-                "Workspace colors follow the active mode: Mode A is pure "
-                "black/white/gray; Mode B is monochrome with the purple "
-                "KRYONSEC wordmark. `/theme <name>` only affects other "
-                "Kryonsec surfaces (kryonsec · tokyonight · dracula)."
-            )
         elif choice == "quit":
             self.action_quit_app()
         self._focus_composer()
