@@ -264,7 +264,33 @@ def _image_row(cfg: KryonsecConfig) -> tuple[str, str]:
         expected_version=__version__,
         server_architecture=info.architecture if info else None,
     )
-    return check.status, check.detail
+    if check.status == "PASS":
+        return check.status, check.detail
+    # Explain the real source and whether a compatible image is already
+    # present.  This is read-only; doctor still fails closed.
+    from .install import recovery
+
+    diagnosis = recovery.diagnose(
+        cfg,
+        expected_version=__version__,
+        validation_detail=check.detail,
+        server_architecture=info.architecture if info else "",
+        scan=True,
+    )
+    detail = f"{check.detail} Selected via {diagnosis.source}."
+    best = diagnosis.best_candidate
+    if best is not None:
+        detail += (
+            f" A compatible local {best.version} image is present "
+            f"({best.reference}); `kryonsec doctor --fix` can select its "
+            "verified digest without rebuilding."
+        )
+    else:
+        detail += (
+            " No compatible local image was found; `kryonsec doctor --fix` "
+            "prints the safe options."
+        )
+    return check.status, detail
 
 
 def _runtime_smoke_row(cfg: KryonsecConfig) -> tuple[str, str]:

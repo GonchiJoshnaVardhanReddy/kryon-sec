@@ -136,6 +136,7 @@ class ImageInfo:
     user: str = ""
     repo_digests: tuple[str, ...] = ()
     labels: dict[str, str] | None = None
+    created: str = ""
 
 
 @dataclass(frozen=True)
@@ -348,6 +349,7 @@ def image_inspect(image: str) -> ImageInfo | None:
         user=str(config.get("User") or ""),
         repo_digests=tuple(str(value) for value in repo_digests),
         labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+        created=str(data.get("Created") or ""),
     )
 
 
@@ -646,6 +648,59 @@ def runsc_registered() -> bool:
     """True if the gVisor (runsc) runtime is registered with Docker."""
     runtimes = docker_runtimes()
     return runtimes is not None and "runsc" in runtimes
+
+
+def list_sandbox_image_refs() -> list[str]:
+    """Local image references carrying a Kryonsec version label.
+
+    Read-only: two filtered ``docker image ls`` queries.  No image is
+    pulled, tagged, pushed, or deleted.  Both label spellings accepted by
+    :func:`validate_image` are queried so a correctly built local image
+    cannot hide behind the other convention.
+    """
+    if not shutil.which("docker"):
+        return []
+    refs: set[str] = set()
+    for label in ("org.kryonsec.version", "org.opencontainers.image.version"):
+        try:
+            proc = _run_docker(
+                [
+                    "image",
+                    "ls",
+                    "--filter",
+                    f"label={label}",
+                    "--format",
+                    "{{.Repository}}:{{.Tag}}",
+                ]
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            value = line.strip()
+            if value and "<none>" not in value:
+                refs.add(value)
+    return sorted(refs)
+
+
+def container_inspect(name: str) -> dict | None:
+    """Inspect one container on the selected daemon; never mutate it."""
+    if not name or not shutil.which("docker"):
+        return None
+    try:
+        proc = _run_docker(["container", "inspect", name])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    return data[0]
 
 
 def image_present(image: str) -> bool:

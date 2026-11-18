@@ -7,8 +7,11 @@ Safety contract:
   read-only detection queries (docker version/inspect, runsc --version) still
   run, because they are how the plan knows what to offer;
 * automatic actions are local, unprivileged, and reversible;
-* the only subprocess a repair can execute is an explicitly approved,
-  digest-pinned ``docker pull`` (never a tag, never a delete/prune);
+* approved subprocesses are limited to a digest-pinned ``docker pull``, or
+  the explicitly listed registration steps for a validated local build
+  (``docker start`` of the already-verified loopback registry,
+  ``docker tag``, and ``docker push`` to that loopback address).  Nothing is
+  ever deleted or pruned, and no image is relabelled;
 * every system-level change is printed as an exact manual action and never
   executed — no package install, service restart, firewall edit, daemon.json
   edit, sudoers change, or Docker context switch;
@@ -30,8 +33,10 @@ from ..config import KryonsecConfig, config_path
 from .detect import SystemSnapshot, detect_system
 from .plan import APPROVAL, AUTO, MANUAL, RepairAction, RepairPlan, build_plan
 from .progress import RepairReporter, STAGES
+from .recovery import REGISTRY_CONTAINER
 
 PULL_TIMEOUT_S = 30 * 60
+PUSH_TIMEOUT_S = 30 * 60
 
 
 class RepairRefused(RuntimeError):
@@ -53,6 +58,49 @@ def _backup_config(cfg: KryonsecConfig) -> Path | None:
     return backup
 
 
+def _validated_digest_reference(reference: str) -> str:
+    """Fail closed unless the reference is a real, locally valid digest pin."""
+    if "@sha256:" not in reference:
+        raise RepairRefused(
+            "refused: the sandbox image must be selected by an immutable digest"
+        )
+    from .. import __version__
+    from ..purple import runtime_checks
+
+    info = runtime_checks.docker_info()
+    if info is None:
+        raise RepairRefused(
+            "refused: the selected Docker daemon did not report its architecture"
+        )
+    check = runtime_checks.validate_image(
+        reference,
+        expected_version=__version__,
+        server_architecture=info.architecture,
+    )
+    if check.status != "PASS":
+        raise RepairRefused(
+            f"refused: {check.detail}"
+        )
+    return reference
+
+
+def _write_image_reference(cfg: KryonsecConfig, reference: str) -> str:
+    """Back up config.toml, persist a validated digest, or restore the old one."""
+    reference = _validated_digest_reference(reference)
+    old = cfg.sandbox_image
+    backup = _backup_config(cfg)
+    cfg.sandbox_image = reference
+    try:
+        cfg.save()
+    except Exception:
+        cfg.sandbox_image = old
+        raise
+    note = f"selected {reference}"
+    if backup is not None:
+        note += f" (backup {backup.name})"
+    return note
+
+
 def _execute_auto(cfg: KryonsecConfig, action: RepairAction) -> str:
     """Run one unprivileged local action and return a verification note."""
     if action.key in {"home", "workspace"}:
@@ -70,18 +118,10 @@ def _execute_auto(cfg: KryonsecConfig, action: RepairAction) -> str:
         if mode & 0o077:
             raise OSError(f"chmod left mode {mode:o}")
         return f"{path} is now {mode:o}"
-    if action.key == "pin-digest":
-        old = cfg.sandbox_image
-        backup = _backup_config(cfg)
-        cfg.sandbox_image = action.new_image
-        try:
-            cfg.save()
-        except Exception:
-            cfg.sandbox_image = old
-            raise
-        note = f"pinned to {action.new_image}"
-        if backup is not None:
-            note += f" (backup {backup.name})"
+    if action.key in {"pin-digest", "select-compatible-digest"}:
+        note = _write_image_reference(cfg, action.new_image)
+        if action.key == "pin-digest":
+            note = note.replace("selected", "pinned", 1)
         return note
     raise OSError(f"no safe executor for automatic action {action.key!r}")
 
@@ -123,6 +163,104 @@ def _stream_docker_pull(
     return True, last or "pull completed"
 
 
+def _loopback_registry_host(reference: str) -> str:
+    """The host part of a local-registry reference, or a refusal."""
+    value = str(reference or "")
+    host = ""
+    if value.startswith("["):
+        end = value.find("]")
+        host = value[1:end] if end > 0 else ""
+    elif "/" in value:
+        first = value.split("/", 1)[0]
+        host = first.rsplit(":", 1)[0] if ":" in first else first
+    if host not in {"127.0.0.1", "::1"}:
+        raise RepairRefused(
+            f"refused: registry reference {value!r} is not loopback-bound"
+        )
+    return host
+
+
+def _registration_step_ok(
+    command: tuple[str, ...], action: RepairAction
+) -> bool:
+    """Only the exact additive commands the planner approved may run."""
+    if len(command) < 2 or command[0] != "docker":
+        return False
+    if command[1] == "start":
+        return len(command) == 3 and command[2] == REGISTRY_CONTAINER
+    if command[1] == "tag":
+        return (
+            len(command) == 4
+            and command[2] == action.local_ref
+            and command[3] == action.registry_ref
+        )
+    if command[1] == "push":
+        return len(command) == 3 and command[2] == action.registry_ref
+    return False
+
+
+def _execute_registration(
+    cfg: KryonsecConfig,
+    action: RepairAction,
+    reporter: RepairReporter,
+) -> tuple[bool, str]:
+    """Run the approved tag/push steps, then pin the digest Docker reports."""
+    if not action.steps or not action.registry_ref:
+        return False, "refused: registration steps are missing"
+    try:
+        _loopback_registry_host(action.registry_ref)
+        for command in action.steps:
+            if not _registration_step_ok(command, action):
+                return False, f"refused: unexpected step {command!r}"
+            if command[1] in {"tag", "push"}:
+                _loopback_registry_host(command[-1])
+    except RepairRefused as exc:
+        return False, str(exc)
+
+    last = ""
+    for command in action.steps:
+        try:
+            proc = subprocess.run(
+                list(command),
+                capture_output=True,
+                text=True,
+                timeout=PUSH_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"{' '.join(command)} failed: {exc}"
+        for line in (proc.stdout or "").splitlines():
+            if line.strip():
+                last = line.strip()
+                reporter.line(last, verbose_only=False)
+        if proc.returncode != 0:
+            error = (proc.stderr or proc.stdout or "").strip()
+            return False, (
+                f"{' '.join(command)} exited {proc.returncode}"
+                + (f": {error.splitlines()[-1]}" if error else "")
+            )
+
+    from ..purple import runtime_checks
+
+    info = runtime_checks.image_inspect(action.registry_ref)
+    if info is None:
+        return False, "registry did not return the pushed image metadata"
+    repo = action.registry_ref.rsplit(":", 1)[0]
+    digests = [
+        value
+        for value in info.repo_digests
+        if value.startswith(f"{repo}@sha256:")
+    ]
+    if not digests:
+        return False, (
+            "the registry did not publish an immutable digest; config is unchanged"
+        )
+    try:
+        note = _write_image_reference(cfg, digests[0])
+    except Exception as exc:
+        return False, f"registry published {digests[0]} but config was not saved: {exc}"
+    return True, f"{note}; registry digest verified by Docker"
+
+
 def _ask_approval(action: RepairAction, input_fn: Callable[[str], str]) -> bool:
     prompt = (
         f"\nThis will run exactly:\n  {action.exact_action}\n"
@@ -147,7 +285,18 @@ def _print_action(reporter: RepairReporter, action: RepairAction, *, dry_run: bo
     elif action.kind == APPROVAL:
         reporter.line(f"    {action.exact_action}")
     if action.detail:
-        reporter.line(f"    {action.detail}", verbose_only=True)
+        # A mismatch explanation is the point of the repair; never hide it
+        # behind --verbose.
+        recovery = {
+            "select-compatible-digest",
+            "register-local-image",
+            "image-incompatible",
+            "image-env-override",
+        }
+        reporter.line(
+            f"    {action.detail}",
+            verbose_only=action.key not in recovery,
+        )
     if dry_run and action.kind == AUTO:
         reporter.line("    dry run: not executed", verbose_only=True)
 
@@ -267,8 +416,35 @@ def run_fix(
 
         # 6. DOWNLOADING SANDBOX -------------------------------------------
         with reporter.stage("DOWNLOADING SANDBOX"):
-            reporter.line(f"configured image: {snapshot.image.reference}")
-            reporter.line(f"present locally: {'yes' if snapshot.image.present else 'no'}")
+            image = snapshot.image
+            reporter.line(f"configured image: {image.reference}")
+            reporter.line(f"source: {image.source or 'unknown'}")
+            reporter.line(f"present locally: {'yes' if image.present else 'no'}")
+            if image.version:
+                reporter.line(f"image version: {image.version}")
+            if image.validation_status == "FAIL":
+                reporter.line(f"validation: {image.validation_detail}", error=True)
+                best = image.best_candidate
+                if best is not None:
+                    digest_note = (
+                        best.digest_reference
+                        if best.digest_reference
+                        else "no registry digest yet"
+                    )
+                    reporter.line(
+                        f"compatible local candidate: {best.reference} "
+                        f"(version {best.version}, {best.architecture}/{best.operating_system}, "
+                        f"{digest_note})"
+                    )
+                else:
+                    reporter.line("compatible local candidate: none found")
+                if image.registry is not None and image.registry.present:
+                    state = "running" if image.registry.running else "stopped"
+                    binding = image.registry.address or "no loopback binding"
+                    reporter.line(
+                        f"developer registry: {image.registry.container} "
+                        f"({state}, {binding})"
+                    )
             for action in plan.for_stage("DOWNLOADING SANDBOX"):
                 _print_action(reporter, action, dry_run=dry_run)
                 if action.kind != APPROVAL or dry_run:
@@ -278,6 +454,14 @@ def run_fix(
                         "skipped: no approval (the exact command is printed above "
                         "and in the READY summary)"
                     )
+                    continue
+                if action.key == "register-local-image":
+                    ok, detail = _execute_registration(cfg, action, reporter)
+                    if ok:
+                        reporter.line(f"done: {detail}")
+                        executions.append(f"{action.key}: {detail}")
+                    else:
+                        reporter.line(f"registration failed: {detail}", error=True)
                     continue
                 ok, detail = _stream_docker_pull(action.command, reporter)
                 if ok:

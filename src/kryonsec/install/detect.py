@@ -17,6 +17,13 @@ from pathlib import Path
 
 from ..config import KryonsecConfig, config_path
 from .. import __version__
+from .recovery import (
+    ImageCandidate,
+    RegistryStatus,
+    best_digest,
+    configured_image_source,
+    diagnose,
+)
 
 DEBIAN_IDS = frozenset({"debian", "ubuntu", "linuxmint", "pop", "raspbian"})
 ARCH_IDS = frozenset({"arch", "omarchy", "manjaro", "endeavouros", "garuda"})
@@ -76,11 +83,20 @@ class ImageSnapshot:
     labels: dict[str, str] = field(default_factory=dict)
     validation_status: str = ""
     validation_detail: str = ""
+    source: str = ""
+    version: str = ""
+    candidates: tuple[ImageCandidate, ...] = ()
+    registry: RegistryStatus | None = None
 
     @property
     def digest(self) -> str:
+        return best_digest(self.repo_digests)
+
+    @property
+    def best_candidate(self) -> ImageCandidate | None:
         return next(
-            (value for value in self.repo_digests if "@sha256:" in value), ""
+            (candidate for candidate in self.candidates if candidate.compatible),
+            None,
         )
 
 
@@ -234,35 +250,62 @@ def _gvisor() -> GvisorSnapshot:
 def _image(cfg: KryonsecConfig, docker: DockerSnapshot) -> ImageSnapshot:
     from ..purple import runtime_checks
 
+    reference, source = configured_image_source(cfg)
     if not docker.server_ok:
-        return ImageSnapshot(reference=cfg.sandbox_image)
-    present = runtime_checks.image_present(cfg.sandbox_image)
+        return ImageSnapshot(reference=reference, source=source)
+    present = runtime_checks.image_present(reference)
     if not present:
-        return ImageSnapshot(reference=cfg.sandbox_image, present=False)
-    info = runtime_checks.image_inspect(cfg.sandbox_image)
+        return ImageSnapshot(
+            reference=reference,
+            source=source,
+            present=False,
+        )
+    info = runtime_checks.image_inspect(reference)
     check = runtime_checks.validate_image(
-        cfg.sandbox_image,
+        reference,
         expected_version=__version__,
         server_architecture=docker.architecture or None,
     )
     if info is None:
         return ImageSnapshot(
-            reference=cfg.sandbox_image,
+            reference=reference,
+            source=source,
             present=True,
             validation_status=check.status,
             validation_detail=check.detail,
         )
+    labels = dict(info.labels or {})
+    version = (
+        labels.get("org.kryonsec.version")
+        or labels.get("org.opencontainers.image.version")
+        or ""
+    )
+    diagnosis = None
+    if check.status == "FAIL":
+        # Only a failing image needs the (read-only) local candidate scan and
+        # registry verification; a healthy run never enumerates images.
+        diagnosis = diagnose(
+            cfg,
+            expected_version=__version__,
+            validation_detail=check.detail,
+            server_architecture=docker.architecture or "",
+            scan=True,
+        )
     return ImageSnapshot(
-        reference=cfg.sandbox_image,
+        reference=reference,
+        source=source,
         present=True,
         architecture=info.architecture,
         operating_system=info.operating_system,
         entrypoint=info.entrypoint,
         user=info.user,
         repo_digests=info.repo_digests,
-        labels=dict(info.labels or {}),
+        labels=labels,
         validation_status=check.status,
         validation_detail=check.detail,
+        version=version,
+        candidates=diagnosis.candidates if diagnosis else (),
+        registry=diagnosis.registry if diagnosis else None,
     )
 
 

@@ -21,12 +21,14 @@ It never executes anything.  Three severities are deliberate:
 
 from __future__ import annotations
 
+import shlex
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import KryonsecConfig
 from .detect import SystemSnapshot
+from .recovery import SOURCE_ENV, explain as explain_recovery
 
 AUTO = "auto"
 APPROVAL = "approval"
@@ -43,15 +45,25 @@ class RepairAction:
     command: tuple[str, ...] = ()
     shell_hint: str = ""
     new_image: str = ""
+    # A registry-registration approval needs more than one argv command.
+    # Every step is shown before approval and executed without a shell.
+    steps: tuple[tuple[str, ...], ...] = ()
+    local_ref: str = ""
+    registry_ref: str = ""
+    version: str = ""
 
     @property
     def executes(self) -> bool:
-        return self.kind in (AUTO, APPROVAL) and bool(self.command)
+        return self.kind in (AUTO, APPROVAL) and bool(self.command or self.steps)
 
     @property
     def exact_action(self) -> str:
         if self.shell_hint:
             return self.shell_hint
+        if self.steps:
+            return " && ".join(
+                " ".join(_quote(part) for part in step) for step in self.steps
+            )
         if self.command:
             return " ".join(_quote(part) for part in self.command)
         return self.title
@@ -227,8 +239,18 @@ def _sandbox_actions(cfg: KryonsecConfig, snapshot: SystemSnapshot) -> list[Repa
 
     # The image is present.  A tag is not an identity: pin the digest the
     # daemon reported, with a config backup, so a later pull cannot change
-    # what Purple Team executes.
-    if "@sha256:" not in image.reference and image.digest and snapshot.config_exists:
+    # what Purple Team executes.  Pinning is only correct when the tag itself
+    # is the sole failure; pinning a stale version would just change a version
+    # error into a digest error.  An environment override outranks config, so
+    # editing config.toml would not change what actually runs.
+    if (
+        "@sha256:" not in image.reference
+        and image.digest
+        and snapshot.config_exists
+        and image.source != SOURCE_ENV
+        and image.validation_status == "FAIL"
+        and "mutable tag" in image.validation_detail
+    ):
         actions.append(
             RepairAction(
                 "VERIFYING SANDBOX",
@@ -240,21 +262,115 @@ def _sandbox_actions(cfg: KryonsecConfig, snapshot: SystemSnapshot) -> list[Repa
                 new_image=image.digest,
             )
         )
-    # A mutable tag is the one failure pinning can fix.  Anything else
-    # (version, architecture, entrypoint, root user, missing metadata) is a
-    # different image and needs an operator decision — never an automatic
-    # delete or replacement.
-    if image.validation_status == "FAIL" and "mutable tag" not in image.validation_detail:
+        # Pinning resolves the only failure (the mutable tag).
+        return actions
+    if image.validation_status != "FAIL":
+        return actions
+
+    # Version/architecture/entrypoint/user mismatches are a different image.
+    # Recovery only selects an already-present image whose metadata was
+    # validated; it never relabels an old image, invents a digest, deletes a
+    # volume, or starts an unattended Kali rebuild.
+    diagnosis = image  # ImageSnapshot carries the same fields as ImageDiagnosis.
+    explanation = explain_recovery(diagnosis, snapshot.kryonsec_version)
+    best = image.best_candidate
+    if image.source == SOURCE_ENV:
+        # Never suggest a mutable tag: an environment override must also be
+        # an immutable digest before Kryonsec will run it.
+        suggested = best.digest_reference if best is not None else ""
+        detail = (
+            f"{explanation} {image.validation_detail}. "
+            "KRYONSEC_SANDBOX_IMAGE takes precedence over config.toml, so "
+            "Kryonsec will not edit the environment or the config behind your "
+            "back. Update or unset the variable yourself, then rerun."
+        )
+        if best is not None and not suggested:
+            detail += (
+                " The local build has no registry digest yet; register it with "
+                "a loopback registry (or push it yourself) before setting the "
+                "variable."
+            )
+        shell = (
+            f"export KRYONSEC_SANDBOX_IMAGE={shlex.quote(suggested)}"
+            if suggested
+            else "unset KRYONSEC_SANDBOX_IMAGE"
+        )
         actions.append(
             _manual(
                 "VERIFYING SANDBOX",
-                "image-incompatible",
-                "The sandbox image failed verification",
-                image.validation_detail
-                + " Kryonsec will not delete or replace the image.",
-                shell="bash install.sh --profile=purple",
+                "image-env-override",
+                "The sandbox image is set by the environment",
+                detail,
+                shell=shell,
             )
         )
+        return actions
+    if best is not None and best.digest_reference:
+        actions.append(
+            RepairAction(
+                "VERIFYING SANDBOX",
+                "select-compatible-digest",
+                "Select the compatible local sandbox image",
+                AUTO,
+                f"{explanation} {image.validation_detail}. Selecting "
+                f"{best.digest_reference} is reversible: config.toml is backed "
+                "up and no image or volume is touched.",
+                new_image=best.digest_reference,
+            )
+        )
+        return actions
+    registry = image.registry
+    if best is not None and best.needs_registration and registry is not None and registry.loopback:
+        registry_ref = registry.reference(best.version)
+        steps: list[tuple[str, ...]] = []
+        if not registry.running:
+            steps.append(("docker", "start", registry.container))
+        steps.append(("docker", "tag", best.reference, registry_ref))
+        steps.append(("docker", "push", registry_ref))
+        actions.append(
+            RepairAction(
+                "VERIFYING SANDBOX",
+                "register-local-image",
+                "Register the validated local build in the loopback registry",
+                APPROVAL,
+                f"{explanation} {image.validation_detail}. The registry is "
+                f"verified loopback-bound at {registry.address}. Registration "
+                "only adds a tag and pushes to that local registry; no image "
+                "or volume is deleted. After the push Kryonsec pins the digest "
+                "Docker reports, with a config backup.",
+                steps=tuple(steps),
+                local_ref=best.reference,
+                registry_ref=registry_ref,
+                version=best.version,
+            )
+        )
+        return actions
+    detail = (
+        f"{explanation} {image.validation_detail}. Kryonsec will not relabel "
+        "an old image, treat a mutable tag as a digest, delete an image or "
+        "volume, or start a Kali rebuild for you."
+    )
+    if best is not None and best.needs_registration:
+        if registry is not None and registry.reason:
+            detail += f" The local registry cannot be used: {registry.reason}."
+        detail += (
+            " Start the approved loopback registry or push the image to a "
+            "registry yourself, then rerun `kryonsec doctor --fix`."
+        )
+    else:
+        detail += (
+            " Install or build the release-matched image, then rerun "
+            "`kryonsec doctor --fix`."
+        )
+    actions.append(
+        _manual(
+            "VERIFYING SANDBOX",
+            "image-incompatible",
+            "The sandbox image failed verification",
+            detail,
+            shell="bash install.sh --profile=purple",
+        )
+    )
     return actions
 
 

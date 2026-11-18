@@ -197,13 +197,18 @@ def test_present_tag_is_pinned_to_the_daemon_digest(cfg):
         operating_system="linux",
         entrypoint=("/entrypoint.sh",),
         user="kryonsec-runner",
-        validation_status="PASS",
-        validation_detail="compatible",
+        validation_status="FAIL",
+        validation_detail=(
+            "image version 1.3.11; configured ref is a mutable tag; resolved "
+            f"digest {digest} — configure the digest before starting Purple Team"
+        ),
     )
     plan = build_plan(cfg, _snapshot(cfg, image=image))
     action = next(action for action in plan.actions if action.key == "pin-digest")
     assert action.kind == AUTO
     assert action.new_image == digest
+    # Pinning fixes the only failure; no contradictory manual action follows.
+    assert not [action for action in plan.actions if action.key == "image-incompatible"]
 
 
 def test_present_tag_is_not_pinned_when_config_does_not_exist(cfg):
@@ -273,12 +278,20 @@ def test_fix_pins_a_present_image_and_keeps_a_config_backup(cfg, monkeypatch):
         reference="kryonsec/sandbox:ui-1.3.11",
         present=True,
         repo_digests=(digest,),
-        validation_status="PASS",
-        validation_detail="compatible",
+        validation_status="FAIL",
+        validation_detail=(
+            "image version 1.3.11; configured ref is a mutable tag; resolved "
+            f"digest {digest} — configure the digest before starting Purple Team"
+        ),
     )
     snapshot = _snapshot(cfg, image=image)
     monkeypatch.setattr(fix_module, "detect_system", lambda _cfg: snapshot)
     monkeypatch.setattr("kryonsec.doctor.run_doctor", lambda _cfg: 0)
+    # The digest itself was validated when the plan was built; this test pins
+    # through the config writer without a live Docker daemon.
+    monkeypatch.setattr(
+        fix_module, "_validated_digest_reference", lambda reference: reference
+    )
     calls: list[str] = []
     monkeypatch.setattr(
         fix_module,
