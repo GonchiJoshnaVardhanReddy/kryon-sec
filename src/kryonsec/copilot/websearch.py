@@ -1,9 +1,10 @@
 """Web search (spec v2.1.1 §3.7): Copilot-mode general web search.
 
-Egress allowlist: DuckDuckGo's endpoints and Mojeek (no API keys, no
-tracking params). Sources are tried in order until one answers: DDG html
-endpoint, DDG lite (POST), Mojeek, DDG Instant Answer JSON API — the web
-endpoints bot-challenge some IPs, so no single source is trusted.
+Egress allowlist: DuckDuckGo's endpoints, Mojeek and Wikipedia (no API
+keys, no tracking params). Sources are tried in order until one answers:
+DDG html endpoint, DDG lite (POST), Mojeek, DDG Instant Answer JSON API,
+Wikipedia — the web endpoints bot-challenge some IPs, so no single
+source is trusted.
 Results are titles + snippet text + URLs, cached in system_knowledge
 keyed by the query hash so repeat queries work offline. Never used in
 Purple mode — engagement data stays local.

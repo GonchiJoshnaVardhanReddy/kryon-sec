@@ -74,6 +74,26 @@ def _describe_error(exc: BaseException) -> str:
     return "; ".join(dict.fromkeys(leaves))
 
 
+def _is_connection_loss(exc: BaseException) -> bool:
+    """True when the exception says the TRANSPORT died (not a tool error).
+
+    mcp 2.x reports a closed server as a JSON-RPC error
+    (``MCPError(-32000, 'Connection closed')``) instead of unwinding the
+    session context, so this is what a mid-session death usually looks
+    like from a call. anyio's closed-stream errors and broken pipes are
+    the same condition from lower layers. A tool's OWN error keeps its
+    own message and is never matched here.
+    """
+    text = str(exc)
+    if getattr(exc, "code", None) == -32000 and \
+            "connection closed" in text.lower():
+        return True
+    if type(exc).__name__ in (
+            "ClosedResourceError", "BrokenResourceError", "EndOfStream"):
+        return True
+    return isinstance(exc, (BrokenPipeError, ConnectionResetError))
+
+
 def _read_errlog(errlog: Any, tail_lines: int = STDERR_TAIL_LINES) -> str:
     """The last few lines a server wrote to stderr, or "".
 
@@ -193,6 +213,14 @@ class _ServerConnection:
         self.entry: dict[str, tuple[dict, Any]] = {}
         self.error: str = ""
         self.stderr_tail: str = ""       # its own last words, when it had any
+        # what this connection contributed to the toolbox's merged view —
+        # captured at death so the toolbox can UN-merge exactly these
+        # entries (identity-checked, so a same-named tool from another
+        # server that won the first-merge race is never clobbered)
+        self.merged: dict[str, tuple[dict, Any]] = {}
+        # set by the owning toolbox; called once when a live session dies
+        self.on_death: "Callable[[_ServerConnection], None] | None" = None
+        self._death_lock = threading.Lock()
 
     async def run(self, params: Any, errlog: Any) -> None:
         """Bootstrap + park: initialize, list tools, keep pipes open."""
@@ -222,12 +250,35 @@ class _ServerConnection:
         except Exception as e:  # server died / exited — tools die with it
             # the session is unwinding, so the process is on its way out and
             # its stderr is complete — read it before the file is closed
-            self.error = _describe_error(e)
             self.stderr_tail = _read_errlog(errlog)
-            self.entry.clear()
+            self._mark_dead(e)
             log.info("MCP background session ended: %s", e)
         finally:
             self.ready.set()  # unblock the waiting connect thread
+
+    def _mark_dead(self, error: Any) -> None:
+        """Record a death ONCE: capture what this connection contributed
+        to the toolbox view, clear the live entries, fire the callback.
+
+        Two death signals exist and both land here: a transport-level
+        exception unwinding run()'s session, and the client's own
+        'Connection closed' error surfacing through a call (mcp 2.x
+        turns the closed pipe into a JSON-RPC error WITHOUT unwinding
+        the session context — the connection would otherwise sit
+        'connected' forever). Idempotent and thread-safe: several
+        executor threads may see the loss at once."""
+        with self._death_lock:
+            if self.error:      # already marked — one report only
+                return
+            self.error = _describe_error(error)
+            self.merged = dict(self.entry)   # what we had contributed
+            self.entry.clear()
+        log.info("MCP server %r session died: %s", self.name, self.error)
+        if self.on_death is not None:
+            try:
+                self.on_death(self)
+            except Exception:  # the death cleanup must never raise
+                log.exception("MCP on-death handler failed")
 
     def _executor(self, session: Any, tool_name: str):
         def call(**kwargs: Any) -> str:
@@ -244,6 +295,13 @@ class _ServerConnection:
             except FutTimeout:
                 future.cancel()
                 return f"error: MCP tool {tool_name!r} timed out"
+            except Exception as e:
+                if _is_connection_loss(e):
+                    # the transport is gone: mark it so no later call is
+                    # told the server is 'connected'; the raise still
+                    # reaches the registry's own failure audit
+                    self._mark_dead(e)
+                raise
             parts = []
             for content in (getattr(result, "content", None) or []):
                 text = getattr(content, "text", None)
@@ -373,6 +431,16 @@ class McpToolbox:
                 continue
             try:
                 conn, slow = self._connect_one(server)
+                with self._lock:
+                    if self._closing:  # close() raced us mid-connect
+                        conn.close()
+                        torn_down = True
+                    elif conn.error and not conn.entry:
+                        # died between the ready wake-up and registration —
+                        # same outcome as a startup failure, never merged
+                        raise RuntimeError(_startup_failure(conn))
+                    else:
+                        self.connections.append(conn)
             except Exception as e:
                 # log at info: the user already sees the notice below —
                 # a log.warning here made every failure print TWICE
@@ -386,12 +454,6 @@ class McpToolbox:
                     }
                 self._notice(f"MCP server {name!r} failed to start: {e}")
                 continue
-            with self._lock:
-                if self._closing:  # close() raced us mid-connect
-                    conn.close()
-                    torn_down = True
-                else:
-                    self.connections.append(conn)
             if torn_down:
                 return dict(self.tools)  # plain copy: the lock is released
             self._merge(conn.entry)
@@ -423,6 +485,41 @@ class McpToolbox:
                     continue
                 self.tools[name] = entry
 
+    def _on_connection_death(self, conn: "_ServerConnection") -> None:
+        """A live server died mid-session: its merged tools leave the
+        snapshot() view NOW and its status says what actually happened.
+
+        Without this the toolbox kept serving stale entries from a dead
+        process and the status stayed 'connected' — a tool call then
+        surfaced a misleading 'connected but has no tool' refusal.
+        Skipped entirely while close() is tearing the toolbox down, and
+        for connections that never registered as live (a startup
+        failure is already reported by connect_all's own path)."""
+        if self._closing:
+            return
+        with self._lock:
+            if conn not in self.connections:
+                return  # never went live — connect_all reported the failure
+            removed = 0
+            for key, entry in conn.merged.items():
+                if self.tools.get(key) is entry:
+                    del self.tools[key]
+                    removed += 1
+            self._server_status[conn.name] = {
+                "name": conn.name,
+                "status": "disconnected",
+                "detail": (f"server exited mid-session: "
+                           f"{(conn.error or 'unknown error')[:140]}"),
+                "tools": 0,
+            }
+        if removed:
+            self._notice(
+                f"MCP server {conn.name!r} exited — {removed} tool(s) "
+                "no longer available")
+        else:
+            self._notice(
+                f"MCP server {conn.name!r} exited mid-session")
+
     def _wait_late(self, conn: _ServerConnection, name: str) -> None:
         """Background waiter for a slow-boot server: register its tools
         when they land (v1.1.0 rebuilt the toolbox per turn, so late
@@ -451,6 +548,10 @@ class McpToolbox:
             self._notice(
                 f"MCP server {name!r} ready — {len(conn.entry)} tool(s) now available")
         else:
+            if conn.error:
+                # the death handler already reported this exit — never a
+                # second 'exited before listing any tools' notice on top
+                return
             with self._lock:
                 self._server_status[str(name)] = {
                     "name": str(name),
@@ -508,6 +609,7 @@ class McpToolbox:
             pass
 
         conn = _ServerConnection(str(server.get("name", "?")))
+        conn.on_death = self._on_connection_death
         # daemon thread, never joined — a local is enough (M6: a self._thread
         # attribute here was clobbered per server and read by nobody)
         thread = threading.Thread(

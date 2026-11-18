@@ -10,7 +10,7 @@ must install them, upgrades can change behavior, and "read-only" is only
 as true as their unreleased next version) and enforce scope in code we
 do not control. ``docsafe`` instead:
 
-- is ~250 lines of in-repo, reviewable, deterministic code with NO
+- is a single in-repo, reviewable, deterministic file with NO
   third-party dependency (stdlib + the ``mcp`` package Kryonsec already
   requires);
 - binds no ports, opens no network connections, reads no environment

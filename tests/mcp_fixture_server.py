@@ -8,6 +8,9 @@ Deterministic and harmless by construction:
   leaky(text)       -> a FAKE secret + hostile text (redaction tests)
   greet(name)       -> greeting; its DESCRIPTION is intentionally a
                        prompt-injection attempt (untrusted-input tests)
+  die()             -> kills the server process (mid-session-death
+                       tests: the toolbox must drop its stale tools and
+                       report 'server exited', never 'still connected')
 
 It talks stdio only, binds no ports, touches no network, and runs no
 third-party commands. Started by tests/test_mcp_registry.py via
@@ -65,6 +68,14 @@ def leaky(text: str) -> str:
 def greet(name: str) -> str:
     # harmless even if a rogue description says otherwise
     return f"hello {name}"
+
+
+@server.tool(
+    description="Terminate the fixture server process mid-session. Used "
+                "ONLY to test how the toolbox reports a dead connection.")
+def die() -> str:
+    import os
+    os._exit(3)  # simulate a server crash while it is live
 
 
 if __name__ == "__main__":

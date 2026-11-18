@@ -104,10 +104,23 @@ class FileTools:
                     target, "Agent file read", "read")):
                 raise FileAccessDenied(f"user denied read: {target}")
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            data = target.read_bytes()
         except OSError as e:
             raise FileAccessDenied(f"cannot read {target}: {e}") from e
-        return text[:MAX_READ_CHARS]
+        # a binary file decoded with errors="replace" used to hand the
+        # model a mojibake blob — refuse it plainly instead (same policy
+        # as the docsafe MCP provider)
+        if b"\x00" in data[:4096]:
+            raise FileAccessDenied(f"binary file refused: {target}")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise FileAccessDenied(
+                f"not a UTF-8 text file (binary?): {target}") from e
+        if len(text) > MAX_READ_CHARS:
+            return text[:MAX_READ_CHARS] + (
+                f"\n…[truncated at {MAX_READ_CHARS} chars]")
+        return text
 
     def list_directory(self, path: str) -> list[str]:
         target = Path(path).expanduser()

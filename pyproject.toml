@@ -27,7 +27,9 @@ dependencies = [
     "jinja2>=3.1",
     "rich>=13.7",
     "textual>=8.0",
-    "mcp>=1.0",
+    # the shipped docsafe provider imports the 2.x SDK layout
+    # (`mcp.server.mcpserver`) — a 1.x install satisfies nothing here
+    "mcp>=2.0",
 ]
 
 [project.optional-dependencies]

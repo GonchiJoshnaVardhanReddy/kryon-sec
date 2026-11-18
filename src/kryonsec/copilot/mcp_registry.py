@@ -430,6 +430,12 @@ class McpRegistry:
             entry = conn.entry.get(key)
             if entry is not None:
                 return entry, None
+            # a connection that died mid-session must NOT read as
+            # "connected but has no tool" — the process is gone; say so
+            error = str(getattr(conn, "error", "") or "")
+            if error:
+                return None, (f"connection {connection!r} is not running — "
+                              f"server exited: {error[:160]}")
             return None, (f"connection {connection!r} is connected but has "
                           f"no tool {tool!r}")
         # not among live connections: say WHY from its status
@@ -611,6 +617,12 @@ class McpRegistry:
             return f"error: {reason}"
         (schema, executor) = entry
 
+        # arguments-shape validation happens BEFORE the approval gate: a
+        # non-object arguments value must never waste a human prompt on a
+        # call that is refused anyway (fail-closed either way)
+        if arguments is not None and not isinstance(arguments, dict):
+            self.audit_refused(connection, tool, "arguments must be an object")
+            return "error: arguments must be an object (name/value pairs)"
         args_now = arguments if isinstance(arguments, dict) else {}
         if policy.needs_approval():
             fn = schema.get("function", {})

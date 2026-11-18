@@ -9,7 +9,12 @@ import pytest
 from pathlib import Path
 
 from kryonsec.config import KryonsecConfig
-from kryonsec.copilot.tools import ApprovalRequest, FileAccessDenied, FileTools
+from kryonsec.copilot.tools import (
+    MAX_READ_CHARS,
+    ApprovalRequest,
+    FileAccessDenied,
+    FileTools,
+)
 
 
 @pytest.fixture()
@@ -231,3 +236,36 @@ def test_prompt_approve_shows_the_real_target(env, monkeypatch):
     text = "".join(prompts)
     assert str(real_target) in text        # the real target is shown
     assert str(named.absolute()) in text   # and what the agent asked for
+
+
+
+# ---- binary / non-UTF-8 reads (Phase 1, 2026-11-18) ------------------------
+
+def test_binary_file_refused_not_mojibake(env):
+    """errors="replace" used to hand the model a mojibake blob; a
+    binary file is refused plainly instead."""
+    cfg, _ = env
+    blob = cfg.workspace / "blob.bin"
+    blob.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    tools = FileTools(cfg, approver=lambda req: True)
+    with pytest.raises(FileAccessDenied, match="binary file refused"):
+        tools.read_file(str(blob))
+
+
+def test_non_utf8_text_refused(env):
+    cfg, _ = env
+    latin = cfg.workspace / "latin1.txt"
+    latin.write_bytes(b"caf\xe9 au lait\n")   # latin-1, not valid UTF-8
+    tools = FileTools(cfg, approver=lambda req: True)
+    with pytest.raises(FileAccessDenied, match="not a UTF-8 text file"):
+        tools.read_file(str(latin))
+
+
+def test_long_read_gets_a_truncation_marker(env):
+    """The cap stays, but the model is TOLD the content was cut."""
+    cfg, _ = env
+    big = cfg.workspace / "big.txt"
+    big.write_text("y" * (MAX_READ_CHARS + 5), encoding="utf-8")
+    tools = FileTools(cfg, approver=lambda req: True)
+    out = tools.read_file(str(big))
+    assert out.endswith(f"[truncated at {MAX_READ_CHARS} chars]")
