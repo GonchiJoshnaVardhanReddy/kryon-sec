@@ -205,16 +205,33 @@ jobs:
       # The Dockerfile's required-tool guard fails this build if any required
       # adapter executable, entrypoint helper, EXPLOIT/VERIFY core tool or
       # frozen-argv wordlist is missing — a silent tool loss cannot build.
+      #
+      # linux/amd64 is explicit: the Dockerfile pins the Kali base by
+      # multi-arch index digest, and without a platform BuildKit would build
+      # for the runner's default (amd64 today, but not a contract). The
+      # candidate image is a single-platform release artifact.
+      #
+      # GHA cache: the build is ~50 apt/pip/GitHub tool installs and took
+      # ~45 min cold. `mode=min` exports only final-image layers (the apt and
+      # tool layers ARE final-image layers here), which is what a rebuild
+      # reuses; `mode=max` would add intermediates for no benefit. The repo
+      # cache budget is 10 GB SHARED with the pip caches in the tests job, so
+      # expect eviction pressure on a ~9 GB uncompressed image;
+      # `ignore-error=true` keeps a cache-export hiccup from failing a
+      # release build (the image itself still built and verified).
       - name: Build the candidate image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: containers/sandbox/Dockerfile.kali
+          platforms: linux/amd64
           build-args: |
             KRYONSEC_VERSION=v${{ inputs.version }}
           load: true
           push: ${{ inputs.push_staging_image }}
           tags: ${{ steps.tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Tool inventory (record versions; assert the required set)
         run: |

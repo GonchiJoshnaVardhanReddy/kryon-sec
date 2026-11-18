@@ -1,22 +1,77 @@
+# syntax=docker/dockerfile:1.7
 # Kryonsec Zone B sandbox image (spec v2.1.1 §8.5).
 #
-# Build (inside WSL2, from the repo root):
+# Build (from the repo root). BuildKit is REQUIRED — the APT/pip cache
+# mounts below are BuildKit syntax; Docker 23+ has BuildKit on by default:
 #   docker build -t kryonsec/sandbox -f containers/sandbox/Dockerfile.kali .
 #
-# Pin by digest after the smoke test (spec §8.6):
+# Base image: PINNED BY DIGEST (2026-11-18). `kalilinux/kali-rolling:latest`
+# is a moving tag; the same Dockerfile built months apart produced different
+# images from it. This is the multi-arch INDEX digest, so the build still
+# resolves the runner's architecture:
+#   index  sha256:1ff4a2be3849333687b3ed2b31bb5af0cd1b7c0a11ec7713feb5abe5a6b2795c
+#   amd64  sha256:12e581978942a815b35ab2406725c274a4f28825650595d2ec2b7fb7668b039d
+#   arm64  sha256:2e84b39b9f0df4a9be74cddff7f85cdca798f623d521d334bbaa8aad4a2873ca
+# Bump it deliberately (rebuild + smoke test + new pinned image digest),
+# never to track "latest".
+#
+# Pin the BUILT image by digest after the smoke test (spec §8.6):
 #   docker inspect --format '{{index .RepoDigests 0}}' kryonsec/sandbox
 # Then set KRYONSEC_SANDBOX_IMAGE in the environment / .env.
 ARG KRYONSEC_VERSION=dev
-FROM kalilinux/kali-rolling:latest
+FROM kalilinux/kali-rolling@sha256:1ff4a2be3849333687b3ed2b31bb5af0cd1b7c0a11ec7713feb5abe5a6b2795c
 
 ARG KRYONSEC_VERSION=dev
 LABEL org.kryonsec.version="${KRYONSEC_VERSION}" \
       org.opencontainers.image.version="${KRYONSEC_VERSION}" \
       org.opencontainers.image.title="Kryonsec Zone B sandbox"
 
+# Image-content trim. The sandbox runs FIXED ARGV through the entrypoint
+# allowlist — no tool ever opens a man page, info file, translated gettext
+# catalog or package changelog. On the v1.3.11 image those trees measured
+# ~75 MB (/usr/share/doc) + ~18 MB (/usr/share/man) + ~147 MB
+# (/usr/share/locale); excluding them here means later apt layers never
+# write them at all, so the bytes never enter an image layer (deleting them
+# in a later RUN would only add a layer, not remove the old one).
+#
+# copyright files are KEPT (path-include below): the image is distributable
+# and the GPL et al. require the license texts to travel with the binaries.
+# locale.alias is kept because `locale` reads it; locales themselves are not
+# used (the image sets LANG=C.UTF-8 and tool output is parsed by argv, not
+# by translated text). Chromium's own locale packs live under
+# /usr/lib/chromium/locales and are NOT touched (gowitness screenshots).
+RUN set -eu; \
+    printf '%s\n' \
+      '# Kryonsec: fixed-argv sandbox — docs/man/locales are never read.' \
+      'path-exclude=/usr/share/doc/*' \
+      'path-include=/usr/share/doc/*/copyright' \
+      'path-exclude=/usr/share/man/*' \
+      'path-exclude=/usr/share/info/*' \
+      'path-exclude=/usr/share/groff/*' \
+      'path-exclude=/usr/share/lintian/*' \
+      'path-exclude=/usr/share/locale/*' \
+      'path-include=/usr/share/locale/locale.alias' \
+      > /etc/dpkg/dpkg.cfg.d/01-kryonsec-trim; \
+    find /usr/share/doc -mindepth 1 ! -name copyright -type f -delete; \
+    find /usr/share/doc -mindepth 1 ! -name copyright -type l -delete; \
+    find /usr/share/doc -mindepth 1 -type d -empty -delete; \
+    find /usr/share/man -mindepth 1 -delete; \
+    find /usr/share/info -mindepth 1 -delete; \
+    find /usr/share/groff -mindepth 1 -delete; \
+    find /usr/share/lintian -mindepth 1 -delete; \
+    find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name locale.alias \
+      -exec rm -rf {} +
+
 # jq is REQUIRED (entrypoint uses it) and is NOT in the base image.
-# Minimal toolset only: no metasploit-framework/beef-xss/setoolkit
-# (never installed here — the allowlist + image contents are the control).
+# Minimal toolset only: no metasploit-framework/beef-xss/setoolkit is
+# requested directly — the allowlist + image contents are the control.
+# HONEST CAVEAT (audited 2026-11-18): `commix` hard-Depends on
+# metasploit-framework, so apt pulls msf (~635 MB), john (+john-data,
+# ~163 MB) and oracle-instantclient-basic (~210 MB) in TRANSITIVELY. They
+# are installed but unreachable: `msfconsole` is in neither the host
+# allowlist nor the entrypoint's ALLOWED_TOOLS, so no template can spawn
+# it. Removing them means dropping `commix` (a wired tool) or a
+# force-remove that leaves dpkg broken — deferred, deliberately.
 # Core block = the original, known-good set. Keep it separate so a flaky
 # extended block can never regress the core tools.
 #
@@ -25,10 +80,19 @@ LABEL org.kryonsec.version="${KRYONSEC_VERSION}" \
 # found live during the Phase 4 rebuild — the build cache had been wiped
 # by a WSL restart, so every package re-downloaded). The extended block
 # below always carried these options; the core block now does too.
-# seclists is split into its own RUN: at ~545 MB it dominates the layer,
-# and a failed seclists fetch must not re-download the nine small
-# packages before it (or vice versa).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# seclists is split into its own RUN: at ~545 MB compressed (~1.9 GB
+# installed) it dominates the layer, and a failed seclists fetch must not
+# re-download the nine small packages before it (or vice versa).
+#
+# APT cache mounts (2026-11-18): /var/lib/apt/lists and /var/cache/apt are
+# BuildKit cache mounts, NOT image layers — the .deb archives and package
+# lists are reused across rebuilds and still never ship in the image, so
+# the old `rm -rf /var/lib/apt/lists/*` is gone (it would have wiped the
+# cache it is meant to reuse). `sharing=locked` serialises concurrent
+# builds; the four apt blocks below share the same cache.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
     jq \
     nmap \
@@ -44,16 +108,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffuf \
     wget \
     ca-certificates \
-    openssl \
-    && rm -rf /var/lib/apt/lists/*
+    openssl
 
 # seclists: the frozen-argv wordlists (common.txt for feroxbuster/
 # dirsearch, DNS lists for the resolver template). Its own layer with
 # its own retry budget — see the core-block comment above.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     -o Acquire::Retries=8 -o Acquire::http::Timeout=120 \
-    seclists \
-    && rm -rf /var/lib/apt/lists/*
+    seclists
 
 # Tool-expansion block (2026-09-13). Kali package names drift; if the
 # batch install fails, retry per-package so ONE bad name doesn't drop the
@@ -70,7 +134,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (pkg.kali.org/pkg/checkov is a 404), so naming it here only produced a
 # per-build "WARN: checkov unavailable" while the tool stayed missing. It
 # is a Python tool and is installed from PyPI below instead.
-RUN EXTENDED_TOOLS=" \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    EXTENDED_TOOLS=" \
     amass subfinder assetfinder naabu dnsx httpx-toolkit rustscan whatweb \
     katana hakrawler feroxbuster sslscan testssl.sh dalfox commix \
     wfuzz arjun exploitdb httpie \
@@ -89,7 +155,7 @@ RUN EXTENDED_TOOLS=" \
             sleep 5; \
         done; \
         [ "$ok" = 1 ] || echo "WARN: $t unavailable in this Kali snapshot"; \
-     done) && rm -rf /var/lib/apt/lists/*
+     done)
 
 # Bake nuclei templates at BUILD time, not runtime (sandbox has no
 # internet egress to template sources). The tool runs as
@@ -119,13 +185,155 @@ RUN cd /tmp && \
     test -n "$(find /opt/nuclei-templates -name '*.yaml' -type f | head -1)" && \
     printf '%s' "${NUCLEI_TEMPLATES_COMMIT}" > /opt/nuclei-templates/.kryonsec-commit
 
+# PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
+# all-or-nothing: one unresolvable name aborts the whole command and
+# installs NOTHING — and the trailing `|| WARN` hides it. That is exactly
+# how bloodhound-python, jwt_tool AND graphql-cop all went missing in the
+# same build: the old line asked for `bloodhound.py`, `jwt-tool` and
+# `graphql-cop`, and NONE of those three names exists on PyPI (checked
+# with `pip index versions`). Per-package installs make one bad name cost
+# only that one tool — the same rule as the apt block above.
+#   bloodhound-python -> the real PyPI name; provides `bloodhound-python`
+#   checkov           -> no Kali package (see the apt note above), on PyPI
+# semgrep is NOT here: the intent was "Kali ships it and the apt install
+# above works", but in the 2026-11 kali-rolling snapshot it is NOT
+# packaged (per-build "WARN: semgrep unavailable"). If blue-team code
+# scanning needs it, install from PyPI below like checkov — after a
+# real run proves the version pin. Until then blue-team semgrep spawns
+# fail closed (audited tool_failure), never fall back.
+# pip wheel cache is a BuildKit cache mount too: rebuilds reuse the
+# downloaded wheels, but they never become part of an image layer (so
+# dropping --no-cache-dir here does NOT grow the image).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    for pkg in bloodhound-python checkov; do \
+      pip install --break-system-packages \
+        --index-url https://pypi.org/simple/ \
+        --timeout 60 --retries 3 "$pkg" \
+        || echo "WARN: $pkg not installed (PyPI unreachable?)"; \
+    done
+
+# GitHub-hosted tools (no apt package). All best-effort with the same
+# rule as pip above: absent tool = audited spawn failure, never a silent
+# security hole. EVERY download is pinned (tag or commit SHA — never
+# `latest` or a branch head): a rebuild months later must get the exact
+# code that was smoke-tested (M11). Bump pins deliberately, like deps.
+# wget gets --tries/--timeout: a flaky network once left a truncated
+# kr tarball and a 0-byte grype that the || WARN path happily accepted.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /opt/tools && cd /opt/tools && \
+    (wget -q --tries=3 --timeout=30 https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
+      || echo "WARN: linpeas.sh not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
+      || echo "WARN: pspy64 not installed") && \
+    (wget -q --tries=3 --timeout=30 https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
+      || echo "WARN: linux-exploit-suggester not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kiterunner_1.0.2_linux_amd64.tar.gz -O kr.tar.gz \
+      && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
+      || echo "WARN: kiterunner (kr) not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
+      && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
+      && cd /opt/tools/SSRFmap \
+      && pip install --break-system-packages dnslib dnspython flask tldextract \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' ssrfmap.py \
+      && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
+      || echo "WARN: ssrfmap not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
+      && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
+      && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
+      || echo "WARN: tplmap not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
+      && tar xzf /tmp/syft.tar.gz -C /tmp syft && mv /tmp/syft /usr/local/bin/syft && rm -f /tmp/syft.tar.gz \
+      || echo "WARN: syft not installed (SBOM scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/anchore/grype/releases/download/v0.95.0/grype_0.95.0_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
+      && tar xzf /tmp/grype.tar.gz -C /tmp grype && mv /tmp/grype /usr/local/bin/grype && rm -f /tmp/grype.tar.gz \
+      || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
+      && chmod 0755 /usr/local/bin/osv-scanner \
+      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/ticarpi/jwt_tool/archive/refs/tags/v2.3.0.tar.gz -O /tmp/jwt.tar.gz \
+      && mkdir -p /opt/tools/jwt_tool \
+      && tar xzf /tmp/jwt.tar.gz -C /opt/tools/jwt_tool --strip-components=1 \
+      && pip install --break-system-packages -r /opt/tools/jwt_tool/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/jwt_tool/jwt_tool.py \
+      && chmod 0755 /opt/tools/jwt_tool/jwt_tool.py \
+      && ln -sf /opt/tools/jwt_tool/jwt_tool.py /usr/local/bin/jwt_tool \
+      && rm -f /tmp/jwt.tar.gz \
+      || echo "WARN: jwt_tool not installed") && \
+    (wget -q --tries=3 --timeout=30 https://github.com/dolevf/graphql-cop/archive/refs/tags/1.15.tar.gz -O /tmp/gqlcop.tar.gz \
+      && mkdir -p /opt/tools/graphql-cop \
+      && tar xzf /tmp/gqlcop.tar.gz -C /opt/tools/graphql-cop --strip-components=1 \
+      && pip install --break-system-packages -r /opt/tools/graphql-cop/requirements.txt \
+      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/graphql-cop/graphql-cop.py \
+      && chmod 0755 /opt/tools/graphql-cop/graphql-cop.py \
+      && ln -sf /opt/tools/graphql-cop/graphql-cop.py /usr/local/bin/graphql-cop \
+      && rm -f /tmp/gqlcop.tar.gz \
+      || echo "WARN: graphql-cop not installed") ; \
+    chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
+      /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
+
+# Phase 4 tool-expansion block (2026-11-17) — the 61-candidate HexStrike
+# review's feasible set (research notes: kryonsec_hexstrike_61_tool_review.md).
+# Same per-package retry rule as the block above: one bad name costs one
+# WARN, never the whole set; a lost tool must be a build failure or a loud
+# retry. Two groups:
+#
+#   WIRED   — host-allowlisted + entrypoint-allowlisted + stage-plan entries;
+#             REQUIRED below (an image that silently loses one ships a dead
+#             capability behind a valid-looking digest).
+#   DORMANT — installed for the next batch but NOT allowlisted anywhere:
+#             every file-granular binary tool (gdb/radare2/binwalk/xxd/
+#             strings/objdump/ROPgadget/ropper/steghide/foremost) needs a
+#             FILE argument, and the fixed-argv grammar has no {file} slot
+#             yet (the /code mount is a DIRECTORY literal; dir-mode tools
+#             like checksec work, file-mode ones do not). Spawning them is
+#             refused at BOTH layers (audited, fail closed) until the slot
+#             exists — installed-but-unreachable, exactly like the Phase-8
+#             dormant post-exploit tools, and for the same reason.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    EXTENDED_TOOLS=" \
+    wafw00f dirsearch dnsenum fierce nbtscan smbmap enum4linux-ng \
+    checksec libimage-exiftool-perl \
+    gdb radare2 binwalk xxd binutils steghide foremost \
+    python3-ropgadget ropper \
+    " && apt-get update && \
+    (apt-get install -y --no-install-recommends \
+        -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
+        $EXTENDED_TOOLS || \
+     for t in $EXTENDED_TOOLS; do \
+        ok=0; \
+        for try in 1 2 3; do \
+            apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=8 -o Acquire::http::Timeout=60 "$t" \
+              && ok=1 && break; \
+            sleep 5; \
+        done; \
+        [ "$ok" = 1 ] || echo "WARN: $t unavailable in this Kali snapshot"; \
+     done)
+
+# Phase 4 pip tools: NONE. ROPgadget/ropper turned out to be Kali
+# packages (python3-ropgadget / ropper — in the apt block above), and
+# terrascan is the one Phase 4 candidate with NO Kali package (apt-cache
+# Candidate: ABSENT in the 2026-11 kali-rolling snapshot — the same
+# situation as checkov below): it is a Go binary, so it would need the
+# GitHub-release path with its own pinned tag; deferred to the next
+# batch rather than wired through an untested install.
+
 # The reviewed, hash-pinned template manifest (Phase 2B.8): the policy
 # the adapter, this image and the entrypoint all enforce. The build
 # FAILS unless EVERY manifest entry exists in the baked tree with the
 # exact reviewed sha256 — template drift is never silently shipped —
 # and unless the unsafe subtrees the Phase 2B.7 audit identified
 # (token-spray/, misconfiguration/) are ABSENT from the manifest.
+#
+# ORDERED AFTER the tool-install layers on purpose: the manifest is
+# re-reviewed and edited whenever the template set changes, and a COPY
+# invalidates every layer after it. Here an edit only re-runs this
+# verification (seconds) instead of re-downloading ~6.6 GB of apt/pip/
+# GitHub tools.
 COPY src/kryonsec/purple/nuclei_manifest.json /opt/kryonsec/nuclei_manifest.json
+# World-readable: the non-root runner reads it at spawn time.
+RUN chmod 0644 /opt/kryonsec/nuclei_manifest.json
 RUN python3 - <<'EOF'
 import hashlib, json, sys
 m = json.load(open("/opt/kryonsec/nuclei_manifest.json"))
@@ -155,134 +363,6 @@ if bad:
 print(f"nuclei manifest verified: {len(entries)} reviewed templates at "
       f"commit {commit}")
 EOF
-RUN chmod -R a+rX /opt/kryonsec/nuclei_manifest.json
-
-# PyPI tools, installed ONE AT A TIME. A single `pip install a b c` is
-# all-or-nothing: one unresolvable name aborts the whole command and
-# installs NOTHING — and the trailing `|| WARN` hides it. That is exactly
-# how bloodhound-python, jwt_tool AND graphql-cop all went missing in the
-# same build: the old line asked for `bloodhound.py`, `jwt-tool` and
-# `graphql-cop`, and NONE of those three names exists on PyPI (checked
-# with `pip index versions`). Per-package installs make one bad name cost
-# only that one tool — the same rule as the apt block above.
-#   bloodhound-python -> the real PyPI name; provides `bloodhound-python`
-#   checkov           -> no Kali package (see the apt note above), on PyPI
-# semgrep is NOT here: the intent was "Kali ships it and the apt install
-# above works", but in the 2026-11 kali-rolling snapshot it is NOT
-# packaged (per-build "WARN: semgrep unavailable"). If blue-team code
-# scanning needs it, install from PyPI below like checkov — after a
-# real run proves the version pin. Until then blue-team semgrep spawns
-# fail closed (audited tool_failure), never fall back.
-RUN for pkg in bloodhound-python checkov; do \
-      pip install --no-cache-dir --break-system-packages \
-        --index-url https://pypi.org/simple/ \
-        --timeout 60 --retries 3 "$pkg" \
-        || echo "WARN: $pkg not installed (PyPI unreachable?)"; \
-    done
-
-# GitHub-hosted tools (no apt package). All best-effort with the same
-# rule as pip above: absent tool = audited spawn failure, never a silent
-# security hole. EVERY download is pinned (tag or commit SHA — never
-# `latest` or a branch head): a rebuild months later must get the exact
-# code that was smoke-tested (M11). Bump pins deliberately, like deps.
-# wget gets --tries/--timeout: a flaky network once left a truncated
-# kr tarball and a 0-byte grype that the || WARN path happily accepted.
-RUN mkdir -p /opt/tools && cd /opt/tools && \
-    (wget -q --tries=3 --timeout=30 https://github.com/peass-ng/PEASS-ng/releases/download/20260914-474d0061/linpeas.sh -O /usr/local/bin/linpeas.sh \
-      || echo "WARN: linpeas.sh not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64 -O /usr/local/bin/pspy64 \
-      || echo "WARN: pspy64 not installed") && \
-    (wget -q --tries=3 --timeout=30 https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/937cf955501fe7da85994c98f0ca6151194e7c1d/linux-exploit-suggester.sh -O /usr/local/bin/linux-exploit-suggester.sh \
-      || echo "WARN: linux-exploit-suggester not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/assetnote/kiterunner/releases/download/v1.0.2/kiterunner_1.0.2_linux_amd64.tar.gz -O kr.tar.gz \
-      && tar xzf kr.tar.gz kr && mv kr /usr/local/bin/kr && rm -f kr.tar.gz \
-      || echo "WARN: kiterunner (kr) not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/swisskyrepo/SSRFmap/archive/290e07d75c52d68e021b6d0b4200c2a41ea20365.tar.gz -O ssrfmap.tar.gz \
-      && mkdir -p /opt/tools/SSRFmap && tar xzf ssrfmap.tar.gz -C /opt/tools/SSRFmap --strip-components=1 \
-      && cd /opt/tools/SSRFmap \
-      && pip install --no-cache-dir --break-system-packages dnslib dnspython flask tldextract \
-      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' ssrfmap.py \
-      && ln -s /opt/tools/SSRFmap/ssrfmap.py /usr/local/bin/ssrfmap && rm -f /opt/tools/ssrfmap.tar.gz \
-      || echo "WARN: ssrfmap not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/epinna/tplmap/archive/616b0e527f62dd0930e6346ede6bef79e9bcf717.tar.gz -O tplmap.tar.gz \
-      && mkdir -p /opt/tools/tplmap && tar xzf tplmap.tar.gz -C /opt/tools/tplmap --strip-components=1 \
-      && ln -s /opt/tools/tplmap/tplmap.py /usr/local/bin/tplmap && rm -f /opt/tools/tplmap.tar.gz \
-      || echo "WARN: tplmap not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/anchore/syft/releases/download/v1.26.0/syft_1.26.0_linux_amd64.tar.gz -O /tmp/syft.tar.gz \
-      && tar xzf /tmp/syft.tar.gz -C /tmp syft && mv /tmp/syft /usr/local/bin/syft && rm -f /tmp/syft.tar.gz \
-      || echo "WARN: syft not installed (SBOM scan unavailable)") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/anchore/grype/releases/download/v0.95.0/grype_0.95.0_linux_amd64.tar.gz -O /tmp/grype.tar.gz \
-      && tar xzf /tmp/grype.tar.gz -C /tmp grype && mv /tmp/grype /usr/local/bin/grype && rm -f /tmp/grype.tar.gz \
-      || echo "WARN: grype not installed (dependency vuln scan unavailable)") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/google/osv-scanner/releases/download/v2.0.2/osv-scanner_linux_amd64 -O /usr/local/bin/osv-scanner \
-      && chmod 0755 /usr/local/bin/osv-scanner \
-      || echo "WARN: osv-scanner not installed (OSV dependency scan unavailable)") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/ticarpi/jwt_tool/archive/refs/tags/v2.3.0.tar.gz -O /tmp/jwt.tar.gz \
-      && mkdir -p /opt/tools/jwt_tool \
-      && tar xzf /tmp/jwt.tar.gz -C /opt/tools/jwt_tool --strip-components=1 \
-      && pip install --no-cache-dir --break-system-packages -r /opt/tools/jwt_tool/requirements.txt \
-      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/jwt_tool/jwt_tool.py \
-      && chmod 0755 /opt/tools/jwt_tool/jwt_tool.py \
-      && ln -sf /opt/tools/jwt_tool/jwt_tool.py /usr/local/bin/jwt_tool \
-      && rm -f /tmp/jwt.tar.gz \
-      || echo "WARN: jwt_tool not installed") && \
-    (wget -q --tries=3 --timeout=30 https://github.com/dolevf/graphql-cop/archive/refs/tags/1.15.tar.gz -O /tmp/gqlcop.tar.gz \
-      && mkdir -p /opt/tools/graphql-cop \
-      && tar xzf /tmp/gqlcop.tar.gz -C /opt/tools/graphql-cop --strip-components=1 \
-      && pip install --no-cache-dir --break-system-packages -r /opt/tools/graphql-cop/requirements.txt \
-      && sed -i '1s|^#!.*|#!/usr/bin/env python3|' /opt/tools/graphql-cop/graphql-cop.py \
-      && chmod 0755 /opt/tools/graphql-cop/graphql-cop.py \
-      && ln -sf /opt/tools/graphql-cop/graphql-cop.py /usr/local/bin/graphql-cop \
-      && rm -f /tmp/gqlcop.tar.gz \
-      || echo "WARN: graphql-cop not installed") ; \
-    chmod 0755 /usr/local/bin/linpeas.sh /usr/local/bin/pspy64 \
-      /usr/local/bin/linux-exploit-suggester.sh 2>/dev/null || true
-
-# Phase 4 tool-expansion block (2026-11-17) — the 61-candidate HexStrike
-# review's feasible set (research notes: kryonsec_hexstrike_61_tool_review.md).
-# Same per-package retry rule as the block above: one bad name costs one
-# WARN, never the whole set; a lost tool must be a build failure or a loud
-# retry. Two groups:
-#
-#   WIRED   — host-allowlisted + entrypoint-allowlisted + stage-plan entries;
-#             REQUIRED below (an image that silently loses one ships a dead
-#             capability behind a valid-looking digest).
-#   DORMANT — installed for the next batch but NOT allowlisted anywhere:
-#             every file-granular binary tool (gdb/radare2/binwalk/xxd/
-#             strings/objdump/ROPgadget/ropper/steghide/foremost) needs a
-#             FILE argument, and the fixed-argv grammar has no {file} slot
-#             yet (the /code mount is a DIRECTORY literal; dir-mode tools
-#             like checksec work, file-mode ones do not). Spawning them is
-#             refused at BOTH layers (audited, fail closed) until the slot
-#             exists — installed-but-unreachable, exactly like the Phase-8
-#             dormant post-exploit tools, and for the same reason.
-RUN EXTENDED_TOOLS=" \
-    wafw00f dirsearch dnsenum fierce nbtscan smbmap enum4linux-ng \
-    checksec libimage-exiftool-perl \
-    gdb radare2 binwalk xxd binutils steghide foremost \
-    python3-ropgadget ropper \
-    " && apt-get update && \
-    (apt-get install -y --no-install-recommends \
-        -o Acquire::Retries=8 -o Acquire::http::Timeout=60 \
-        $EXTENDED_TOOLS || \
-     for t in $EXTENDED_TOOLS; do \
-        ok=0; \
-        for try in 1 2 3; do \
-            apt-get install -y --no-install-recommends \
-              -o Acquire::Retries=8 -o Acquire::http::Timeout=60 "$t" \
-              && ok=1 && break; \
-            sleep 5; \
-        done; \
-        [ "$ok" = 1 ] || echo "WARN: $t unavailable in this Kali snapshot"; \
-     done) && rm -rf /var/lib/apt/lists/*
-
-# Phase 4 pip tools: NONE. ROPgadget/ropper turned out to be Kali
-# packages (python3-ropgadget / ropper — in the apt block above), and
-# terrascan is the one Phase 4 candidate with NO Kali package (apt-cache
-# Candidate: ABSENT in the 2026-11 kali-rolling snapshot — the same
-# situation as checkov below): it is a Go binary, so it would need the
-# GitHub-release path with its own pinned tag; deferred to the next
-# batch rather than wired through an untested install.
 
 # Baked enumeration/probe scripts — fixed argv, no free-form shell.
 # The host allowlist lists these by FULL PATH (never a bare python3
