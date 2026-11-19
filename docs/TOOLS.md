@@ -245,7 +245,7 @@ hypothesis review.
 
 | Tool | Template | In plan? |
 |---|---|---|
-| `linpeas.sh` | `-a` | yes (when reachable) |
+| `linpeas.sh` | `-s -N -q` | yes (when reachable) |
 | `pspy64` | *(no args)* | yes |
 | `linux-exploit-suggester.sh` | *(no args)* | yes |
 | `/opt/kryonsec/enum_processes.py` | `{target}` | yes |

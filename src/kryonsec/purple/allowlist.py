@@ -410,7 +410,16 @@ VERIFY_TEMPLATES: dict[str, list[str]] = {
 # one. They activate the day a shell-producing tool exists (same rule as
 # the rest of POST_EXPLOIT: the plan, never the LLM, decides).
 POST_EXPLOIT_TEMPLATES: dict[str, list[str]] = {
-    "linpeas.sh": ["-a"],
+    # `-s` (stealth/faster) disables the `su` brute force and the slow
+    # broad finds; `-N` clears linpeas' colour variables and `-q` drops
+    # the banner (the ASCII logo is hardcoded truecolor — measured: 1718
+    # escapes survive -N, which would make the bounded excerpt pure art).
+    # NOT `-a`: it sets ONLINE_VULN_CHECKS=1 (a HackTricks phone-home)
+    # and EXTRA_CHECKS, and the `su` brute force never finishes inside
+    # the sandbox's 300s cap — measured 2026-11-18, the container dies at
+    # ~255s mid-"Bruteforcing user root", so the run produced no payload
+    # at all. `-s -N -q` is bounded, offline AND readable.
+    "linpeas.sh": ["-s", "-N", "-q"],
     "pspy64": [],
     "linux-exploit-suggester.sh": [],
     f"{SANDBOX_SCRIPT_DIR}/enum_processes.py": ["{target}"],
