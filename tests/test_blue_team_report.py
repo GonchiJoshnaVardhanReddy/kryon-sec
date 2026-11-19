@@ -636,6 +636,74 @@ def test_report_claims_testing_only_with_real_attempts(tmp_path):
     assert "you are allowed to test" in " ".join(report.split())
 
 
+def test_report_does_not_call_a_started_but_failed_tool_unrun(tmp_path):
+    """Real lab run 20261119T170135Z: H2:curl exited 18 after receiving
+    the /ftp page and H4:curl exited 7 on a refused connection. Both
+    attempts STARTED (ok, exit code and output are on the record), but
+    the report told the reader "this test did not run" and "did not
+    record whether the tool actually started" — the opposite of the same
+    document's coverage section, which counted them as runs."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:curl", {
+        "tool": "curl", "ok": True, "exit_code": 18, "confirmed": False,
+        "outcome": "tool-error",
+        "argv": ["curl", "-sS", "--max-time", "30",
+                 "http://target-corp.com/ftp"],
+        "output_excerpt": "<title>listing directory /ftp/</title>",
+        "exit_note": "partial response: server closed the transfer short "
+                     "of its Content-Length",
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    # the template wraps these lines; compare on collapsed whitespace
+    flat = " ".join(report.split())
+    # the record is a run with a partial result, not a missing run
+    assert "started but did not finish" in flat
+    assert "This test did not run" not in flat
+    assert "did not record whether the tool actually started" not in flat
+    # the partial output is shown as evidence, labelled as not a result
+    assert "Partial output (evidence, not a result)" in flat
+    assert "listing directory /ftp/" in flat
+    # and the hypothesis line does not read as a clean "Tested: yes"
+    assert "Tested: started, but the check did not finish" in flat
+    assert "Tested: yes" not in flat
+
+
+def test_coverage_counts_items_and_runs_separately(tmp_path):
+    """The old line said "tool runs really started for N of them" where
+    "them" was the hypothesis count — with several tools per hypothesis
+    N could exceed it (4 items, 7 runs on the 2026-11-19 lab run)."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "ok": True, "exit_code": 0, "confirmed": True,
+        "outcome": "confirmed",
+        "argv": ["sqlmap"], "output_excerpt": "vulnerable",
+    })
+    graph.add_node("finding", "H1", {"tool": "sqlmap"})
+    graph.add_node("exploit_attempt", "H1:nikto", {
+        "tool": "nikto", "ok": True, "exit_code": 0, "confirmed": False,
+        "outcome": "inconclusive",
+        "argv": ["nikto"], "output_excerpt": "- Nikto v2.6.1",
+    })
+    graph.add_node("exploit_attempt", "H2:curl", {
+        "tool": "curl", "ok": True, "exit_code": 7, "confirmed": False,
+        "outcome": "tool-error",
+        "argv": ["curl", "-sS", "http://target-corp.com/x"],
+        "output_excerpt": "curl: (7) Failed to connect",
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    flat = " ".join(report.split())
+    assert "a tool run really started for 2 of them" in flat
+    assert "Tool runs that really started: 3" in flat
+    assert "Started but did not finish (no clean result): 1 (H2)" in flat
+    # the confirmed item is not described as an unconfirmed suggestion
+    assert "These started as **suggestions**" in flat
+    assert "The items marked **confirmed by the test tool**" in flat
+
+
 def test_report_shows_verified_badge(tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     graph = _graph()

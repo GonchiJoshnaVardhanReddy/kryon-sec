@@ -570,7 +570,7 @@ def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
     side by side with what the model claimed, and every bucket can be
     empty: absent from a list is **unassessed**, never "checked clean".
     """
-    from .views import exploit_status
+    from .views import ATTEMPT_INCONCLUSIVE, exploit_status
 
     hypotheses = graph.by_type("hypothesis")
     attempts = graph.by_type("exploit_attempt")
@@ -583,6 +583,7 @@ def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
     tested_surfaces: list[str] = []
     confirmed: list[str] = []
     tested_unconfirmed: list[str] = []
+    incomplete: list[str] = []
     unassessed: list[str] = []
     unclear: list[str] = []
     blocked: list[dict] = []
@@ -595,11 +596,20 @@ def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
                         or "").strip()
             if asset:
                 tested_surfaces.append(asset)
-            if (exploit_status(label, graph) == ATTEMPT_CONFIRMED
-                    and label in finding_labels):
+            status = exploit_status(label, graph)
+            if status == ATTEMPT_CONFIRMED and label in finding_labels:
                 confirmed.append(label)
-            else:
+            elif status == ATTEMPT_CONFIRMED or ATTEMPT_INCONCLUSIVE in outcomes:
+                # a completed check exists: at least one attempt ran to
+                # its own exit (or the tool answered but its finding
+                # record is missing) — neither is "did not finish"
                 tested_unconfirmed.append(label)
+            else:
+                # every run that started was interrupted: the target was
+                # touched, but no check reached a conclusion. Reporting
+                # this as "tested but not confirmed" would read as a
+                # clean negative the records do not support.
+                incomplete.append(label)
         elif runs:
             for a in runs:
                 if attempt_outcome(a) == ATTEMPT_NOT_RUN:
@@ -631,12 +641,20 @@ def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
         "tested_surfaces": sorted(set(tested_surfaces))[:MAX_COVERAGE_ITEMS],
         "confirmed_findings": sorted(confirmed)[:MAX_COVERAGE_ITEMS],
         "tested_unconfirmed": sorted(tested_unconfirmed)[:MAX_COVERAGE_ITEMS],
+        "started_not_finished": sorted(incomplete)[:MAX_COVERAGE_ITEMS],
         "unresolved": sorted(set(unclear + verify_unresolved))[:MAX_COVERAGE_ITEMS],
         "skipped_or_blocked": blocked[:MAX_COVERAGE_ITEMS],
         "out_of_scope_refused": out_of_scope,
         "unassessed": sorted(unassessed)[:MAX_COVERAGE_ITEMS],
-        # model claims vs machine-observed activity, side by side
+        # model claims vs machine-observed activity, side by side.
+        # ``items_with_run`` counts HYPOTHESES a tool really ran for;
+        # ``machine_observed_runs`` counts the runs themselves. One
+        # hypothesis may have several attempts, so the run count can be
+        # greater — the report says both instead of "N of them" over a
+        # number that could exceed the item count.
         "model_claims": len(hypotheses),
+        "items_with_run": (
+            len(confirmed) + len(tested_unconfirmed) + len(incomplete)),
         "machine_observed_runs": sum(
             1 for a in attempts if attempt_outcome(a) in OUTCOMES_RUN),
         "tool_runs_never_started": never_started,
