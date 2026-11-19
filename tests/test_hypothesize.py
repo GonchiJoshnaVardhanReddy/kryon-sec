@@ -117,6 +117,40 @@ def test_hypothesis_id_rejects_colon():
         Hypothesis(id="H1:sqlmap", title="t", target_asset="a", rationale="r")
 
 
+def test_explicit_null_in_an_optional_field_is_its_default():
+    """Real failure 2026-11-19T162715Z: the model answered ``"cve": null``
+    on every hypothesis; pydantic rejected the whole set (4 validation
+    errors -> hypothesize_failed -> zero hypotheses for an engagement
+    that paid for the call). A null on a field that HAS a default says
+    "none", exactly like omitting the key: sanitise, don't reject."""
+    hs = HypothesisSet.model_validate({"hypotheses": [{
+        "id": "H1", "title": "t", "target_asset": "/rest/products?id=1",
+        "rationale": "r",
+        "cve": None, "cvss_vector": None, "tools": None,
+        "confidence": None, "related_assets": None, "relationship": None,
+    }]})
+    h = hs.hypotheses[0]
+    assert h.cve == ""
+    assert h.cvss_vector == ""
+    assert h.tools == []
+    assert h.confidence == 0.5
+    assert h.related_assets == []
+    assert h.relationship == ""
+
+
+def test_null_in_a_required_evidence_field_still_fails():
+    """The tolerance above stops at the evidence fields: a hypothesis
+    that names no asset (or has no rationale) cannot be reviewed or
+    tested, and the audit must show the failure instead of silently
+    accepting an empty claim."""
+    for missing in ("target_asset", "rationale", "title", "id"):
+        payload = {"id": "H1", "title": "t", "target_asset": "/a",
+                   "rationale": "r"}
+        payload[missing] = None
+        with pytest.raises(ValidationError):
+            HypothesisSet.model_validate({"hypotheses": [payload]})
+
+
 # --- JSON extraction (the no-instructor fallback) ---
 
 def test_extract_json_plain():

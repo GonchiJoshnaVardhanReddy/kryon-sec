@@ -117,8 +117,38 @@ class AssetReference(BaseModel):
         return _claim_text(value, limit)
 
 
+#: Fields whose pydantic default is also the answer to an explicit ``null``.
+#: A default applies only when the key is ABSENT; a model that spells
+#: ``"cve": null`` means the same thing ("this hypothesis names no CVE"),
+#: and rejecting it fails the WHOLE set (pydantic validates the set
+#: atomically). Observed for real on 2026-11-19: four hypotheses, every
+#: one ``"cve": null``, four validation errors, zero hypotheses for the
+#: engagement. These are the optional fields whose default is meaningful
+#: as-is; the required evidence fields (id/title/target_asset/rationale)
+#: stay strict, because a hypothesis that names no asset cannot be tested
+#: and that failure must stay visible in the audit.
+_NULL_MEANS_DEFAULT: "dict[str, object]" = {
+    "cvss_vector": "",
+    "cve": "",
+    "tools": (),          # pydantic copies it into a fresh list
+    "confidence": 0.5,
+}
+
+
 class Hypothesis(BaseModel):
     """One vulnerability hypothesis proposed by the LLM."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explicit_null_uses_the_default(cls, value):
+        if not isinstance(value, dict):
+            return value
+        replaced = {
+            key: _NULL_MEANS_DEFAULT[key]
+            for key in _NULL_MEANS_DEFAULT
+            if key in value and value[key] is None
+        }
+        return {**value, **replaced} if replaced else value
 
     # id format is rigid where it MATTERS: ids join labels like
     # "H1:sqlmap", so a ':' in an id would silently corrupt the
