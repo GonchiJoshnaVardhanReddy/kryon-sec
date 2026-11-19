@@ -524,6 +524,12 @@ def test_report_renders_everything(tmp_path):
     assert audit.head_hash() in report
     # no exploit_attempt nodes => the report must NOT claim testing happened
     assert "No testing was done against the website" in report
+    # ... and it must not deny the reconnaissance that DID happen either:
+    # lab run 20261119T162715Z had 14 real tool spawns (4 plan + 10
+    # adapters) yet the report said "no tools were run in this engagement".
+    assert "No test steps to show" not in report
+    assert "no tools were run in this engagement" not in report
+    assert "No hypothesis-driven test steps to show" in report
 
 
 def test_report_validation_clean(tmp_path):

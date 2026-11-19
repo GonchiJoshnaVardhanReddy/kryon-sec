@@ -104,7 +104,10 @@ test environment and compare what the tool answers. Only test websites
 you are allowed to test.
 {% endfor %}
 {% else %}
-No test steps to show — no tools were run in this engagement.
+No hypothesis-driven test steps to show — no exploit or verification
+tool ran in this engagement (no issue reached the testing phase).
+Reconnaissance tool runs, if any, are recorded in the engagement's audit
+chain; this section only ever describes tests of a proposed issue.
 {% endif %}
 
 ## What we found about the target
