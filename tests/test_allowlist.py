@@ -379,6 +379,14 @@ _TOOL_SOURCE: dict[str, str] = {
     "enum4linux-ng": "enum4linux-ng",
     "checksec": "checksec",
     "exiftool": "libimage-exiftool-perl",
+    # Phase 3 file-granular tools (2026-11-19) — apt, token = package name
+    "strings": "binutils",
+    "objdump": "binutils",
+    "xxd": "xxd",
+    "binwalk": "binwalk",
+    "ROPgadget": "python3-ropgadget",
+    "r2": "radare2",
+    "gdb": "gdb",
 }
 
 
@@ -452,3 +460,48 @@ def test_plain_url_still_accepted(allow):
 def test_embedded_newline_rejected(allow):
     with pytest.raises(AllowlistViolation):
         allow.validate("curl", ["curl", "-sS", "--max-time", "30", "http://t/\nX"])
+
+
+# ---- typed {file} slot (Phase 3, 2026-11-19) ------------------------------
+# File-granular binary tools need a FILE argument. The slot is TYPED: only a
+# regular-looking path under the fixed read-only /code mount, no traversal,
+# no option-looking value (it always starts with "/code/"), no shell
+# metacharacters. The host path never reaches the sandbox verbatim — the
+# operator's folder is mounted at /code and the plan maps relative names.
+
+_FILE_ARGVS = [
+    ("strings", ["strings", "-n", "8", "/code/elf-sample"]),
+    ("xxd", ["xxd", "-l", "4096", "/code/dir with space/app.py"]),
+    ("binwalk", ["binwalk", "-B", "/code/.hidden"]),
+    ("objdump", ["objdump", "-d", "--no-show-raw-insn", "/code/elf-sample"]),
+    ("ROPgadget", ["ROPgadget", "--binary", "/code/elf-sample",
+                   "--depth", "6", "--only", "pop|ret"]),
+    ("r2", ["r2", "-N", "-q", "-c", "iI;q", "/code/elf-sample"]),
+    ("gdb", ["gdb", "-nx", "-batch", "-ex", "info functions",
+             "/code/elf-sample"]),
+]
+
+
+@pytest.mark.parametrize("tool,argv", _FILE_ARGVS)
+def test_file_templates_accept_code_paths(allow, tool, argv):
+    allow.validate(tool, argv)
+
+
+@pytest.mark.parametrize("path", [
+    "/etc/passwd",                 # outside the /code mount
+    "/code/../etc/passwd",         # traversal at the first segment
+    "/code/a/../../etc/passwd",    # traversal deeper in
+    "/code/./app.py",              # "." segment
+    "/code/",                      # no file named
+    "/code",                       # the mount itself
+    "/code//app.py",               # empty segment
+    "/code/app.py\n",              # trailing newline
+    "/code/app.py;id",             # shell metacharacter
+    "/code/$(id)",
+    "/code/app.py\x00",
+    "code/app.py",                 # relative
+    "-/code/app.py",               # option-looking
+])
+def test_file_slot_rejects_everything_else(allow, path):
+    with pytest.raises(AllowlistViolation):
+        allow.validate("strings", ["strings", "-n", "8", path])

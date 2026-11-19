@@ -59,6 +59,10 @@ class AllowlistViolation(Exception):
 #   "{hostport}"    host:port (openssl s_client -connect)
 #   "{token}"       JWT-shaped token (three base64url segments)
 #   "{term}"        searchsploit search term (no shell metacharacters)
+#   "{file}"        file under the fixed read-only /code mount — typed:
+#                   every segment must be a real name (never "." or ".."),
+#                   the value always starts "/code/", so it can never look
+#                   like an option, and no shell metacharacter is allowed.
 # {…} segments may sit inside a larger literal: "--severity={low|medium}"
 # or "/opt/kryonsec/{probe}.py".
 
@@ -79,7 +83,29 @@ _ARG_PATTERNS: dict[str, re.Pattern[str]] = {
     # comma-separated resolver addresses (IPv4/IPv6) — dnsx -r. No '-' in
     # the charset, so an option can never hide in a resolver slot.
     "resolver": re.compile(r"^[0-9A-Fa-f:.]+(,[0-9A-Fa-f:.]+)*$"),
+    # file under the fixed read-only /code mount (BLUE_TEAM file-granular
+    # tools). The negative lookahead bans "." and ".." as WHOLE segments at
+    # every depth — a dotfile like ".env" is still selectable. The value
+    # always begins "/code/", so it can never be parsed as an option by the
+    # tool, and the charset has no shell metacharacter (argv is a list
+    # anyway; this is the second, independent fence).
+    "file": re.compile(
+        r"^/code/(?:(?!\.{1,2}(?:/|$))[A-Za-z0-9._+@% -]+/)*"
+        r"(?!\.{1,2}(?:/|$))[A-Za-z0-9._+@% -]+$"),
 }
+
+
+def is_safe_code_file(path: str) -> bool:
+    """True when ``path`` is a value the typed ``{file}`` slot accepts.
+
+    Public so plan builders can refuse to emit a path the allowlist would
+    reject — the two rules can never drift.
+    """
+    # fullmatch, not match: the raw pattern ends with "$" (it gets embedded
+    # into compiled templates, where \Z supplies the true anchor), and "$"
+    # alone would accept a trailing newline here.
+    return bool(_ARG_PATTERNS["file"].fullmatch(path))
+
 
 # {…} segments inside an argument (may be the whole argument)
 _SEGMENT_RE = re.compile(r"\{([^{}]+)\}")
@@ -458,17 +484,37 @@ BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
     "osv-scanner": ["-r", "/code", "--format", "json"],
     "grype": ["dir:/code", "-o", "json"],
     # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
-    # the read-only /code mount. File-GRANULAR binary tools (gdb/
-    # radare2/binwalk/xxd/strings/objdump/ROPgadget/ropper/steghide/
-    # foremost) are installed in the image but deliberately NOT
-    # allowlisted: the grammar has no {file} slot yet, and inventing
-    # one later is a conscious, reviewed change (Dockerfile note).
+    # the read-only /code mount.
     # terrascan deferred: no Kali package (Dockerfile note).
     # checksec's dir mode audits every ELF's hardening in one run.
     "checksec": ["--dir=/code"],
     # exiftool -r walks /code printing file metadata (any file type);
     # -q keeps per-file warnings out of the evidence excerpt.
     "exiftool": ["-r", "-q", "/code"],
+    # ---- Phase 3 (2026-11-19): file-granular binary tools --------------
+    # The typed {file} slot exists now: every argv carries ONLY a
+    # traversal-free path under the fixed read-only /code mount. The plan
+    # (blue_team.build_file_scan_plan) selects regular files host-side,
+    # never follows symlinks, and caps file count/size. Flags verified
+    # live against the pinned image on /usr/bin/ls (2026-11-19).
+    # strings: printable strings, minimum length 8.
+    "strings": ["-n", "8", "{file}"],
+    # xxd: first 4096 bytes as a hex dump — bounded by the flag itself.
+    "xxd": ["-l", "4096", "{file}"],
+    # binwalk -B: signature scan ONLY (-e extraction is never used).
+    "binwalk": ["-B", "{file}"],
+    # objdump: disassembly without raw instruction bytes (smaller, readable).
+    "objdump": ["-d", "--no-show-raw-insn", "{file}"],
+    # ROPgadget: pop/ret gadgets only — the full gadget inventory is
+    # output-heavy and says nothing a bounded excerpt can carry.
+    "ROPgadget": ["--binary", "{file}", "--depth", "6",
+                  "--only", "pop|ret"],
+    # radare2: file info only (-c "iI;q"); -N skips the user rc file so a
+    # planted .radare2rc in the code folder can never run.
+    "r2": ["-N", "-q", "-c", "iI;q", "{file}"],
+    # gdb: defined functions only; -nx disables init files for the same
+    # reason (nothing in the code folder can execute).
+    "gdb": ["-nx", "-batch", "-ex", "info functions", "{file}"],
 }
 
 # Historical name kept (tests / callers import it): the union of everything

@@ -314,6 +314,101 @@ def test_run_code_scanners_full_run(tmp_path):
     assert ok, reason
 
 
+def test_file_scan_plan_is_typed_deterministic_and_symlink_safe(tmp_path):
+    """Phase 3: the file-granular plan carries ONLY /code paths the typed
+    {file} slot accepts. Symlinks are never followed, oversized files are
+    skipped, and the same tree builds the same plan twice."""
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.blue_team import (
+        MAX_FILE_BYTES, build_file_scan_plan,
+    )
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (code / ".env").write_text("TOKEN=x\n", encoding="utf-8")
+    spaced = code / "dir with space"
+    spaced.mkdir()
+    (spaced / "tool.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    elf = code / "elf-sample"
+    elf.write_bytes(b"\x7fELF" + b"\x00" * 128)
+    (code / "big.bin").write_bytes(b"\x00" * (MAX_FILE_BYTES + 1))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (code / "escape").symlink_to(outside)
+    (code / "escape-elf").symlink_to(elf)
+
+    plan = build_file_scan_plan(code)
+    assert plan, "a code folder with files must produce a file plan"
+    assert plan == build_file_scan_plan(code), "plan must be deterministic"
+
+    allow = ToolAllowlist()
+    paths = []
+    for tool, argv in plan:
+        allow.validate(tool, argv)  # every argv passes the REAL Layer 2
+        file_args = [a for a in argv if a.startswith("/code")]
+        assert len(file_args) == 1, argv
+        paths.append(file_args[0])
+    assert "/code/app.py" in paths
+    assert "/code/.env" in paths
+    assert "/code/dir with space/tool.sh" in paths
+    assert "/code/big.bin" not in paths, "oversized file must be skipped"
+    assert not any("escape" in p for p in paths), (
+        "a symlink must never be followed into the plan")
+    # objdump/ROPgadget/r2/gdb only see real ELF files
+    elf_tools = {"objdump", "ROPgadget", "r2", "gdb"}
+    for tool, argv in plan:
+        if tool in elf_tools:
+            assert any(a == "/code/elf-sample" for a in argv), argv
+
+
+def test_file_scanners_run_through_real_allowlist(tmp_path):
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (code / "tool").write_bytes(b"\x7fELF" + b"\x00" * 64)
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({
+        # base dir-mode scanners still run (scripted so labels/counts are real)
+        "semgrep": _SpawnResult(stdout="0 findings in /code"),
+        "checksec": _SpawnResult(stdout="RELRO  STACK CANARY  NX  PIE"),
+        # file-granular tools (Phase 3)
+        "strings": _SpawnResult(stdout="GNU C Library"),
+        "xxd": _SpawnResult(stdout="00000000: 7f45 4c46"),
+        "binwalk": _SpawnResult(stdout="0  0x0  ELF, 64-bit"),
+        "objdump": _SpawnResult(stdout="file format elf64-x86-64"),
+        "ROPgadget": _SpawnResult(stdout="Gadgets information"),
+        "r2": _SpawnResult(stdout="arch x86"),
+        "gdb": _SpawnResult(stdout="All defined functions:"),
+    })
+
+    ran = run_code_scanners(graph, sandbox, audit,
+                            code_folder=str(code))
+    labels = {n["label"] for n in graph.by_type("scanner_result")}
+    # one node per (tool, file): the label names both, never just the tool
+    assert "strings:/code/app.py" in labels
+    assert "strings:/code/tool" in labels
+    assert "objdump:/code/tool" in labels
+    assert "gdb:/code/tool" in labels
+    # base scanners still ran with their plain labels
+    assert "semgrep" in labels and "checksec" in labels
+    assert ran > 7
+    # every file-granular spawn reads the fixed /code mount
+    file_tools = {"strings", "xxd", "binwalk", "objdump", "ROPgadget",
+                  "r2", "gdb"}
+    for argv in sandbox.argvs:
+        if argv[0] in file_tools:
+            assert any(a.startswith("/code/") for a in argv), argv
+            assert "\x1b" not in " ".join(argv)
+    audit_events = _events(audit)
+    assert audit_events.count("tool_spawn") == len(sandbox.argvs)
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
 def test_hadolint_only_with_dockerfile(tmp_path):
     from kryonsec.purple.blue_team import run_code_scanners
 
