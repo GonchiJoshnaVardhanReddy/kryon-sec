@@ -222,8 +222,8 @@ jobs:
           OUT="$(mktemp)"
           docker run --rm --network none --entrypoint /bin/sh \
             "${{ steps.tag.outputs.tag }}" -c '
-              for t in nmap naabu dnsx httpx httpx-toolkit whatweb katana hakrawler \
-                       feroxbuster massdns gowitness sslscan testssl.sh nuclei sqlmap \
+              for t in nmap naabu dnsx httpx-toolkit whatweb katana hakrawler \
+                       feroxbuster massdns gowitness sslscan testssl nuclei sqlmap \
                        nikto ffuf gobuster wfuzz dalfox commix ssrfmap arjun tplmap \
                        graphql-cop jwt_tool kr searchsploit curl wget dig nc ncat \
                        openssl http jq timeout python3; do
@@ -234,15 +234,18 @@ jobs:
                 fi
               done
               nuclei --version 2>/dev/null | head -1 || true
-              testssl.sh --version 2>/dev/null | head -1 || true
+              /usr/bin/testssl --version 2>/dev/null | head -1 || true
               nmap --version 2>/dev/null | head -1 || true
               python3 --version 2>/dev/null || true
             ' | tee "$OUT"
           cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
-          for REQUIRED in httpx whatweb testssl.sh nuclei searchsploit jq timeout python3; do
+          for REQUIRED in httpx-toolkit whatweb nuclei searchsploit jq timeout python3; do
             grep -q "^${REQUIRED} *present$" "$OUT" || {
               echo "::error::required tool missing from the built image: $REQUIRED"; exit 1; }
           done
+          docker run --rm --network none --entrypoint /bin/sh \
+            "${{ steps.tag.outputs.tag }}" -c "test -x /usr/bin/testssl" || {
+            echo "::error::required tool missing from the built image: /usr/bin/testssl"; exit 1; }
           for BAKED in api_probe.py tls_probe.py nuclei_gate.py probe.py; do
             docker run --rm --network none --entrypoint /bin/sh \
               "${{ steps.tag.outputs.tag }}" -c "test -r /opt/kryonsec/$BAKED" || {
