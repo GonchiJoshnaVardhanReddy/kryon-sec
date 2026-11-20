@@ -424,6 +424,7 @@ class PurpleUI:
         self.sandbox_status = sandbox_status
         self.outcome: str | None = None
         self.halt_reason: str | None = None
+        self.failed_states: list[str] = []
         self.report_path: str | None = None
         self.glyphs = GLYPHS_UTF8 if _utf8_ok(console, utf8) else GLYPHS_ASCII
         self.frame = _Frame(console, self.glyphs is GLYPHS_UTF8)
@@ -545,11 +546,15 @@ class PurpleUI:
         *,
         halt_reason: str | None = None,
         report_path: str | None = None,
+        failed_states: "list[str] | tuple[str, ...]" = (),
     ) -> None:
         """Record an operator-facing terminal outcome for the live workspace."""
         self.outcome = outcome
         self.halt_reason = halt_reason
-        self.report_path = report_path
+        self.failed_states = [str(state) for state in failed_states]
+        # Same rule as the presentation state: finish never un-writes a
+        # report the audited report_written event already named.
+        self.report_path = report_path or self.report_path
         self._refresh()
 
     def _state_line(self, state: str) -> None:
@@ -633,6 +638,17 @@ class PurpleUI:
             self.on_notice(
                 "post-exploit skipped — no shell/session capability "
                 "detected (dormant by design)")
+        elif event == "report_written":
+            # Phase 4 UI feedback: the operator hears the report landed
+            # the moment the audited event says so, with the real path.
+            path = str(entry.get("path") or "")[:240]
+            if path:
+                self.report_path = path
+                self.on_notice(f"✓ Report saved: {path[:200]}")
+        elif event == "report_failed":
+            self.on_notice(
+                "! Report save failed — "
+                + (str(entry.get("reason") or "reason not recorded")[:200]))
 
         # Batch 4: specialist scheduler + budget events. Read-only
         # progress, one line each, every field defaulted — the scheduler's
@@ -871,7 +887,12 @@ class PurpleUI:
         table.add_row("Stage", f"{self.stage_number() or 0} / {len(STATES)}")
         dot = self.glyphs["dot"]
         if self.outcome:
-            outcome_style = self.theme.success if self.outcome == "completed" else self.theme.warning
+            if self.outcome == "completed":
+                outcome_style = self.theme.success
+            elif self.outcome == "failed":
+                outcome_style = self.theme.error
+            else:
+                outcome_style = self.theme.warning
             status = f"[bold {outcome_style}]{dot} {self.outcome.upper()}[/bold {outcome_style}]"
         else:
             status = (f"[bold {self.theme.running}]{dot} RUNNING[/bold {self.theme.running}]"
@@ -1106,6 +1127,10 @@ class PurpleUI:
         body = Group(summary, Text(""), table)
         if self.halt_reason:
             body = Group(body, Text(""), Text(f"Halt reason: {self.halt_reason}", style=self.theme.warning))
+        elif self.failed_states:
+            body = Group(body, Text(""), Text(
+                "Failed stages: " + ", ".join(self.failed_states),
+                style=self.theme.warning))
         return self.frame.panel(body, title="[bold]FINDINGS & EVIDENCE[/bold]", border_style=self.theme.border)
 
     def _footer(self) -> Text:

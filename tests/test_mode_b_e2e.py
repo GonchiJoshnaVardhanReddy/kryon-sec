@@ -46,8 +46,11 @@ from kryonsec.config import KryonsecConfig
 from kryonsec.purple.blue_team import Remediation, RemediationSet
 from kryonsec.purple.hypothesize import Hypothesis, HypothesisSet
 from kryonsec.purple.runner import (
+    STATE_FAILED_CODE,
+    engagement_outcome,
     persist_graph,
     record_engagement_ending,
+    safe_halt_code,
     start_engagement,
 )
 
@@ -315,12 +318,17 @@ def run_engagement(tmp_path, monkeypatch, *, engagement_id="e2e",
     completed = orch.run()
     # The CLI's post-run duties, so the artifacts match a real command run.
     persist_graph(cfg, engagement_id, graph, audit)
+    outcome = engagement_outcome(orch.halt_reason, orch.failed_states)
+    reason = safe_halt_code(orch.halt_reason)
+    if outcome == "failed" and reason is None:
+        reason = STATE_FAILED_CODE
     record_engagement_ending(
         cfg, engagement_id,
-        outcome="halted" if orch.halt_reason else "completed",
-        reason=orch.halt_reason,
+        outcome=outcome,
+        reason=reason,
         last_state=completed[-1] if completed else None,
         states_entered=len(completed),
+        failed_states=orch.failed_states,
     )
     engagement_dir = cfg.home / "engagements" / engagement_id
     events = _read_chain(cfg.home, engagement_id)

@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — PR review fixes: local-only engagement questions, working registration approval
+
+- **Engagement questions never leave the machine.** The read-only question
+  path used the configured chat model, so a hosted provider received the
+  target, stage, findings and recent tool activity. It now calls a new
+  `chat_local()` boundary: an `ollama/` model only, a loopback endpoint only,
+  no provider routing and no hosted fallback. Any misconfiguration or local
+  failure returns the existing deterministic snapshot summary, clearly
+  labelled, without a remote request. Redaction remains defence in depth,
+  not permission to export engagement data.
+- **`doctor --fix` now actually performs an approved local-image
+  registration.** The planner schedules `register-local-image` under
+  `VERIFYING SANDBOX`, but that stage executed only automatic actions while
+  the executor lived in `DOWNLOADING SANDBOX`. The approval is now handled
+  in the stage that receives it, with the same exact `docker start` / `tag` /
+  `push` preview, loopback and step allowlists, Docker-reported digest pin,
+  config backup, and no change on rejection or failure.
+- **CI doctor assertions no longer depend on table wrapping.** The tests
+  render the table wider than its content and strip vertical borders before
+  matching diagnostic text, so host-dependent row counts cannot split a
+  phrase. The content assertions are unchanged.
+
+## Unreleased — UI acceptance fixes: honest stop, honest failure, real replay clock
+
+Found while running the fullscreen UI against the real engine. Each fix has a
+regression test; no safety gate, allowlist, egress rule or sandbox boundary
+was relaxed.
+
+- **Ctrl+C in the Purple UI now really stops the run — at a state
+  boundary.** The UI already told the operator the current state would
+  finish first, but the loop had no stop input. The orchestrator now polls a
+  `should_stop` predicate between states (never mid-state), records
+  `operator_interrupt`, and keeps the finished state's evidence and
+  checkpoint. A predicate that raises is logged and treated as "no".
+- **A run with a failed stage is no longer recorded as completed.** A
+  subagent returning `failed` never halted the deterministic route, so the
+  terminal event used to say `completed` and `report.json` listed every
+  entered state as done. The orchestrator now tracks `failed_states`; one
+  helper (`engagement_outcome`) decides `completed` / `failed` / `halted` /
+  `interrupted` for the UI, the summary and the audit chain; the chain
+  records `failed_states` with reason `state_failed`; and the markdown report
+  and `report.json` name the stages that did not finish. `report.json` is
+  schema `1.1` (additive `failed_states`).
+- **INIT is a clean no-op.** The generic fallback stub made INIT return
+  `failed` on every run — noise before, and a false "failed engagement" once
+  failed stages started counting. It now returns `ok`; the real validation
+  still happens in `start_engagement`.
+- **A reopened engagement shows the duration it actually ran.** Replay used
+  the process's monotonic clock, so the elapsed field meant "time since the
+  tab opened" and every stage duration was zero. Replays now derive the
+  total and per-stage durations from the audit chain's ISO `ts` values, and
+  the engagement list reads the same `ts` field the chain writes (it had
+  been reading a non-existent `timestamp`).
+- **The model picker starts on the provider in use.** `/models` marked the
+  current provider but left the cursor on OpenAI, so a plain Enter
+  discovered the wrong provider.
+
 ## Unreleased — account/membership requirements removed (development build)
 
 The development branch no longer requires any Kryonsec account. `kryonsec

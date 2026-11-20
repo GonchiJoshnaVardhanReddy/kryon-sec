@@ -17,6 +17,7 @@ import asyncio
 import sys
 import threading
 import time
+from collections.abc import Callable
 from textwrap import dedent
 from typing import Any
 
@@ -25,6 +26,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -39,7 +41,22 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from .. import __version__
+from ..command_registry import (
+    PURPLE_BUSY_SAFE,
+    CommandSpec,
+    commands_for,
+    suggest,
+)
 from ..config import KryonsecConfig
+from ..model_catalog import (
+    PROVIDERS,
+    discover_models,
+    normalize_model,
+    provider_label,
+    switch_model,
+)
+from ..purple.hypothesis_plain import plain_explanation
+from .brand import brand_text
 from .state import (
     AGENT_LABELS,
     PURPLE_STATES,
@@ -65,27 +82,6 @@ STATE_ACTION: dict[str, str] = {
     "BLUE_TEAM": "Writing remediation",
     "REPORT": "Compiling report",
 }
-
-BRAND_MARK = "\n".join(
-    (
-        "█   █ ████  █   █  ███  █   █  ████ █████  ████",
-        "█  █  █   █  █ █  █   █ ██  █ █     █     █    ",
-        "███   ████    █   █   █ █ █ █  ███  ████  █    ",
-        "█  █  █  █    █   █   █ █  ██     █ █     █    ",
-        "█   █ █   █   █    ███  █   █ ████  █████  ████",
-    )
-)
-
-BRAND_SMALL = r"""
-  K R Y O N S E C
-""".strip("\n")
-
-HELP_TEXT = (
-    "Shortcuts: Enter send · Shift+Enter newline · Ctrl+P commands · "
-    "Shift+Tab mode · Ctrl+←/→ sessions · Ctrl+N new session · Ctrl+Q quit.\n"
-    "Commands: /help /cve /search /read /ls /write /workspace /mode /theme /quit"
-)
-
 
 def _textual_theme_name(mode: str) -> str:
     return f"kryonsec-workspace-{mode}"
@@ -122,17 +118,126 @@ def _workspace_textual_theme(mode: str, tokens: ThemeTokens) -> Theme:
 # ---- small widgets ------------------------------------------------------
 
 
+class SuggestionMenu(OptionList):
+    """Anchored slash-command suggestions shown above the composer.
+
+    The composer keeps focus while this menu is open; the app moves the
+    OptionList highlight programmatically.  Options come only from
+    ``command_registry`` so the menu cannot drift from the dispatcher.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(id="suggestion-menu")
+        # The composer owns the keyboard; this list is display-only.  Mouse
+        # clicks still select through OptionList's normal click handling.
+        self.can_focus = False
+        self.display = False
+        self._specs: dict[str, CommandSpec] = {}
+
+    def show(
+        self,
+        specs: list[CommandSpec],
+        *,
+        width: int,
+        query: str,
+        max_rows: int,
+    ) -> None:
+        self._specs = {spec.name: spec for spec in specs}
+        self.clear_options()
+        limit = max(16, width - 4)
+        if specs:
+            self.add_options(
+                [
+                    Option(
+                        _short(f"{spec.name:<10} {spec.summary}", limit),
+                        id=spec.name,
+                    )
+                    for spec in specs
+                ]
+            )
+        else:
+            no_match = f"No commands match {query}" if query else "No commands available"
+            self.add_option(Option(_short(no_match, limit), id="__none__", disabled=True))
+        self.highlighted = 0
+        self.display = True
+        self.styles.max_height = max(3, min(8, max_rows))
+        self.scroll_to_highlight()
+
+    def hide(self) -> None:
+        self.display = False
+        self.clear_options()
+        self._specs.clear()
+
+    def current(self) -> CommandSpec | None:
+        if not self.display or self.highlighted is None:
+            return None
+        option = self.highlighted_option
+        if option is None or option.disabled or not option.id:
+            return None
+        return self._specs.get(option.id)
+
+    def move(self, delta: int) -> None:
+        count = len(self._specs)
+        if count <= 0 or self.highlighted is None:
+            return
+        self.highlighted = (self.highlighted + delta) % count
+        self.scroll_to_highlight()
+
+
 class Composer(TextArea):
-    """Multiline prompt input. Enter sends; Shift+Enter inserts a newline."""
+    """Multiline prompt input. Enter sends; Shift+Enter inserts a newline.
+
+    While the slash-suggestion menu is open, Up/Down move its highlight,
+    Enter selects, Tab completes, and Escape closes it.  The composer remains
+    focused throughout, so normal typing keeps filtering the menu.
+    """
 
     class Submitted(Message):
+        pass
+
+    class MoveSuggestions(Message):
+        def __init__(self, delta: int) -> None:
+            super().__init__()
+            self.delta = delta
+
+    class AcceptSuggestion(Message):
+        pass
+
+    class CompleteSuggestion(Message):
+        pass
+
+    class DismissSuggestions(Message):
         pass
 
     def __init__(self, **kw: Any) -> None:
         kw.setdefault("placeholder", "Ask anything — /help for commands")
         super().__init__(**kw)
+        self.suggestion_active = False
 
     async def _on_key(self, event: events.Key) -> None:
+        if self.suggestion_active:
+            if event.key in {"up", "down"}:
+                event.prevent_default()
+                event.stop()
+                self.post_message(
+                    self.MoveSuggestions(-1 if event.key == "up" else 1)
+                )
+                return
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.AcceptSuggestion())
+                return
+            if event.key == "tab":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.CompleteSuggestion())
+                return
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.DismissSuggestions())
+                return
         if event.key == "enter":
             event.prevent_default()
             event.stop()
@@ -196,6 +301,20 @@ class NoticeBlock(Static):
         super().__init__(text, markup=False, classes="notice-block")
 
 
+class BrandBanner(Static):
+    """Hero wordmark above the conversation.
+
+    Starts expanded on launch, on a mode switch, and on a new workspace, so
+    the brand is visible even when stored sessions already exist.  The app
+    collapses it to one line once the operator starts using the workspace;
+    terminal height is checked by the app so a short window never loses the
+    composer to the artwork.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(Text(""), markup=False, id="brand-banner")
+
+
 # ---- command palette ----------------------------------------------------
 
 
@@ -211,17 +330,9 @@ class CommandPalette(ModalScreen[str | None]):
         Binding("escape", "dismiss_palette", "Close", show=False),
     ]
 
-    BASE_COMMANDS = [
-        ("New session", "new"),
-        ("Switch mode", "mode"),
-        ("Show help", "help"),
-        ("Appearance help", "theme"),
-        ("Quit", "quit"),
-    ]
-
     def __init__(self, controller: WorkspaceController | None = None) -> None:
         super().__init__()
-        options = list(self.BASE_COMMANDS)
+        options = [("New session", "new"), ("Switch mode", "mode")]
         if controller is None:
             self._options = options
             return
@@ -238,9 +349,20 @@ class CommandPalette(ModalScreen[str | None]):
                 session_entries.append(
                     (f"Close session {index + 1}: {label}", f"close:{index + 1}")
                 )
-            options = [*session_entries, *options]
+            options = [
+                *session_entries,
+                ("New session", "new"),
+                ("Switch mode", "mode"),
+            ]
         else:
+            options = [("New engagement", "new"), ("Switch mode", "mode")]
             options.insert(2, ("Open Kryonsec Memory", "memory"))
+        # Every slash command comes from the one registry, so the palette can
+        # never drift from /help, /commands, or direct slash input.
+        options.extend(
+            (f"{spec.label()} — {spec.summary}", f"run:{spec.name}")
+            for spec in commands_for(controller.mode)
+        )
         self._options = options
 
     def compose(self) -> ComposeResult:
@@ -264,6 +386,406 @@ class CommandPalette(ModalScreen[str | None]):
 
     def action_dismiss_palette(self) -> None:
         self.dismiss(None)
+
+
+class ModelPickerScreen(ModalScreen[str | None]):
+    """Interactive provider → model → confirm flow for plain ``/models``.
+
+    Discovery is the real provider call, run in a thread so the terminal
+    keeps rendering.  The switch itself goes through
+    :func:`kryonsec.model_catalog.switch_model`, so provider routing,
+    verification, atomic save, and rollback are identical to
+    ``/models use``.  Nothing here can invent a model or print a credential.
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", show=False, priority=True),
+    ]
+
+    def __init__(
+        self,
+        cfg: KryonsecConfig,
+        *,
+        locked: Callable[[], str] | None = None,
+        tokens: ThemeTokens | None = None,
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self._locked = locked or (lambda: "")
+        self._tokens = tokens
+        self._step = "provider"
+        self._provider = ""
+        self._models: list[str] = []
+        self._selected = ""
+        self._reason = ""
+        self._loading = False
+        self._query = ""
+
+    # ---- layout -------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="models-box"):
+            yield Static(Text("MODELS", style="bold"), classes="models-title")
+            yield Static("", id="models-subtitle", classes="models-hint")
+            yield Input(placeholder="Search models", id="models-search")
+            yield OptionList(id="models-list")
+            yield Static("", id="models-status", classes="models-status")
+            yield Static("", id="models-footer", classes="models-hint")
+
+    def on_mount(self) -> None:
+        self._show_providers()
+
+    # ---- steps --------------------------------------------------------
+
+    def _show_providers(self) -> None:
+        self._step = "provider"
+        self._provider = ""
+        self._loading = False
+        self._reason = ""
+        self._models = []
+        self._selected = ""
+        self._query = ""
+        search = self.query_one("#models-search", Input)
+        search.display = False
+        search.value = ""
+        self._subtitle("Select a provider")
+        self._status("", error=False)
+        self._footer("↑/↓ select · Enter continue · Esc close")
+        keys = list(PROVIDERS)
+        # Start on the provider that is actually in use. The list is ordered
+        # OpenAI-first, so leaving the cursor at row 0 would make a plain
+        # Enter discover OpenAI while the row above it is marked "current".
+        current = keys.index(self.cfg.provider) if self.cfg.provider in keys else 0
+        self._fill(
+            [
+                (
+                    f"{'●' if key == self.cfg.provider else ' '} "
+                    f"{provider_label(key)}"
+                    + ("  ·  current" if key == self.cfg.provider else ""),
+                    f"provider:{key}",
+                )
+                for key in keys
+            ],
+            highlight=current,
+        )
+        self.query_one("#models-list", OptionList).focus()
+
+    def _start_discovery(self, provider: str) -> None:
+        self._step = "models"
+        self._provider = provider
+        self._models = []
+        self._selected = ""
+        self._reason = ""
+        self._query = ""
+        self._loading = True
+        search = self.query_one("#models-search", Input)
+        search.display = True
+        search.value = ""
+        self._subtitle(f"{provider_label(provider)} · contacting provider…")
+        self._status("")
+        self._footer("↑/↓ select · Enter choose · Esc back")
+        self._fill([("Discovering models…", "__loading__", True)])
+        search.focus()
+        self.run_worker(
+            self._discover(provider),
+            name="model-discovery",
+            exclusive=True,
+            group="model-discovery",
+        )
+
+    async def _discover(self, provider: str) -> None:
+        try:
+            models, reason = await asyncio.to_thread(
+                discover_models, self.cfg, provider
+            )
+        except Exception:
+            # The provider may fail in a way its own discovery code did not
+            # classify. Show a safe reason; never render the exception (it can
+            # contain a URL with credentials).
+            models, reason = (
+                None,
+                "Model discovery failed unexpectedly. Check the provider "
+                "connection and try again.",
+            )
+        if not self.is_mounted:
+            return
+        if self._step != "models" or self._provider != provider:
+            return
+        self._loading = False
+        self._models = list(models or [])
+        self._reason = reason
+        self._render_models()
+
+    def _render_models(self) -> None:
+        if self._step != "models":
+            return
+        label = provider_label(self._provider)
+        rows: list[tuple[str, str, bool]] = []
+        if self._loading:
+            rows.append(("Discovering models…", "__loading__", True))
+            self._subtitle(f"{label} · contacting provider…")
+            self._status("")
+        elif self._reason:
+            self._subtitle(f"{label} · discovery failed")
+            self._status(self._reason, error=True)
+            current = self.cfg.general_chat_model
+            if self.cfg.provider == self._provider and current:
+                rows.append(
+                    (
+                        f"● {_short(current, 40)}  ·  {label}  ·  "
+                        "configured  ·  unverified",
+                        "__current__",
+                        True,
+                    )
+                )
+        else:
+            query = self._query.strip().lower()
+            visible = [
+                model for model in self._models if query in model.lower()
+            ]
+            current_normalized = (
+                normalize_model(self._provider, self.cfg.general_chat_model)
+                if self.cfg.provider == self._provider
+                else ""
+            )
+            for model in visible:
+                normalized = normalize_model(self._provider, model)
+                is_current = normalized == current_normalized
+                rows.append(
+                    (
+                        f"{'●' if is_current else ' '} {_short(model, 44)}  ·  "
+                        f"{label}  ·  verified"
+                        + ("  ·  current" if is_current else ""),
+                        f"model:{model}",
+                        False,
+                    )
+                )
+            if not visible:
+                text = (
+                    f"No models match {self._query!r}"
+                    if query
+                    else f"{label} reported no usable models"
+                )
+                rows.append((text, "__none__", True))
+            self._subtitle(
+                f"{label} · {len(self._models)} verified model"
+                + ("s" if len(self._models) != 1 else "")
+            )
+            self._status("")
+        self._fill(rows)
+
+    def _show_confirm(self, model: str) -> None:
+        lock = self._locked()
+        if lock:
+            self._status(lock, error=True)
+            return
+        self._step = "confirm"
+        self._selected = model
+        search = self.query_one("#models-search", Input)
+        search.display = False
+        self._subtitle("Confirm the model switch")
+        self._status("")
+        self._footer("Enter confirms · Esc goes back")
+        self._fill(
+            [
+                (
+                    f"Switch to {provider_label(self._provider)} · "
+                    f"{_short(model, 44)}",
+                    "confirm",
+                ),
+                ("Back to models", "back"),
+            ]
+        )
+        self.query_one("#models-list", OptionList).focus()
+
+    def _apply(self) -> None:
+        if self._step != "confirm" or not self._selected:
+            return
+        lock = self._locked()
+        if lock:
+            self._status(lock, error=True)
+            return
+        provider, model = self._provider, self._selected
+        self._step = "applying"
+        self.query_one("#models-search", Input).display = False
+        self._subtitle(f"Switching to {provider_label(provider)} · {_short(model, 40)}")
+        self._status("Verifying with the provider and saving…")
+        self._footer("Please wait")
+        self._fill([("Applying the verified selection…", "__applying__", True)])
+        self.run_worker(
+            self._switch(provider, model),
+            name="model-switch",
+            exclusive=True,
+            group="model-switch",
+        )
+
+    async def _switch(self, provider: str, model: str) -> None:
+        lock = self._locked()
+        if lock:
+            self._finish_error(lock)
+            return
+        try:
+            ok, message = await asyncio.to_thread(
+                switch_model, self.cfg, provider, model
+            )
+        except Exception:
+            ok, message = (
+                False,
+                "The switch failed unexpectedly. The previous model is still "
+                "active.",
+            )
+        if not self.is_mounted:
+            return
+        if ok:
+            self.dismiss(message)
+            return
+        self._finish_error(message)
+
+    def _finish_error(self, message: str) -> None:
+        # switch_model restores the previous provider/model on failure; this
+        # screen only reports the reason and keeps the picker open.
+        self._step = "confirm"
+        self._subtitle("The switch did not complete")
+        self._status(message, error=True)
+        self._footer("Esc goes back · the previous model is still active")
+        self._fill(
+            [
+                (
+                    f"Retry {provider_label(self._provider)} · "
+                    f"{_short(self._selected, 44)}",
+                    "confirm",
+                ),
+                ("Back to models", "back"),
+            ]
+        )
+        self.query_one("#models-list", OptionList).focus()
+
+    # ---- interaction --------------------------------------------------
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if getattr(event.option_list, "id", "") != "models-list":
+            return
+        event.stop()
+        option_id = str(event.option.id or "")
+        if option_id.startswith("provider:"):
+            self._start_discovery(option_id.partition(":")[2])
+            return
+        if option_id.startswith("model:"):
+            self._show_confirm(option_id.partition(":")[2])
+            return
+        if option_id == "confirm":
+            self._apply()
+            return
+        if option_id == "back":
+            self._back_from_confirm()
+            return
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "models-search" or self._step != "models":
+            return
+        self._query = event.value
+        self._render_models()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "models-search" or self._step != "models":
+            return
+        event.stop()
+        if not self._loading:
+            self._choose_highlighted()
+
+    def on_key(self, event: events.Key) -> None:
+        # The search box keeps focus so typing filters; Up/Down must move the
+        # list highlight instead of moving a text cursor.
+        if self._step == "models" and event.key in {"up", "down"}:
+            if not self._loading:
+                self._move_list(-1 if event.key == "up" else 1)
+                event.prevent_default()
+                event.stop()
+
+    def _choose_highlighted(self) -> None:
+        option = self.query_one("#models-list", OptionList).highlighted_option
+        if option is None or option.disabled or not option.id:
+            return
+        value = str(option.id)
+        if value.startswith("model:"):
+            self._show_confirm(value.partition(":")[2])
+
+    def _move_list(self, delta: int) -> None:
+        listing = self.query_one("#models-list", OptionList)
+        selectable = [
+            index
+            for index, option in enumerate(listing.options)
+            if not option.disabled
+        ]
+        if not selectable:
+            return
+        current = listing.highlighted if listing.highlighted is not None else selectable[0]
+        if current not in selectable:
+            listing.highlighted = selectable[0]
+            return
+        position = selectable.index(current)
+        listing.highlighted = selectable[(position + delta) % len(selectable)]
+        listing.scroll_to_highlight()
+
+    def action_back(self) -> None:
+        if self._step == "applying":
+            return  # a verified write is already in flight; let it finish
+        if self._step in {"models", "confirm"}:
+            if self._step == "models":
+                self._show_providers()
+            else:
+                self._back_from_confirm()
+            return
+        self.dismiss(None)
+
+    def _back_from_confirm(self) -> None:
+        self._step = "models"
+        search = self.query_one("#models-search", Input)
+        search.display = True
+        search.focus()
+        self._subtitle(provider_label(self._provider))
+        self._status("")
+        self._footer("↑/↓ select · Enter choose · Esc back")
+        self._render_models()
+
+    # ---- widgets ------------------------------------------------------
+
+    def _fill(self, rows: list[tuple], *, highlight: int = 0) -> None:
+        listing = self.query_one("#models-list", OptionList)
+        listing.clear_options()
+        options: list[Option] = []
+        for row in rows:
+            label, option_id = row[0], row[1]
+            disabled = bool(row[2]) if len(row) > 2 else False
+            options.append(
+                Option(_short(label, 72), id=option_id, disabled=disabled)
+            )
+        listing.add_options(options)
+        listing.highlighted = (
+            max(0, min(highlight, len(options) - 1)) if options else 0
+        )
+        listing.scroll_to_highlight()
+
+    def _subtitle(self, value: str) -> None:
+        self.query_one("#models-subtitle", Static).update(
+            Text(_short(value, 76), style=self._style("muted", "dim"))
+        )
+
+    def _status(self, value: str, *, error: bool = False) -> None:
+        style = self._style("error", "red") if error else self._style("muted", "dim")
+        self.query_one("#models-status", Static).update(
+            Text(_short(value, 220), style=style)
+        )
+
+    def _footer(self, value: str) -> None:
+        self.query_one("#models-footer", Static).update(
+            Text(value, style="dim")
+        )
+
+    def _style(self, token: str, fallback: str) -> str:
+        if self._tokens is None:
+            return fallback
+        return str(getattr(self._tokens, token, fallback))
 
 
 # ---- approval dialogs ---------------------------------------------------
@@ -344,7 +866,9 @@ class ApprovalScreen(ModalScreen[bool]):
             ):
                 text.append(f"{label:<12}", style="dim")
                 text.append(f"{safe(value, 500)}\n")
-            text.append("\nApproving authorizes only this proposed testing.\n", style="dim")
+            text.append("\nIn plain words\n", style="bold")
+            text.append(safe(plain_explanation(hypothesis), 1600))
+            text.append("\n\nApproving authorizes only this proposed testing.\n", style="dim")
             text.append("It does not authorize post-exploitation.\n", style="dim")
             return text
         text.append("A shell was obtained on the target.\n\n")
@@ -481,6 +1005,10 @@ class KryonsecApp(App[None]):
         self.cfg = cfg
         self.controller = controller
         self._truecolor = terminal_capabilities(sys.stdout).get("truecolor", False)
+        self._unicode_ok = terminal_capabilities(sys.stdout).get("unicode", True)
+        # The hero wordmark starts expanded and collapses once the operator
+        # starts working; mode switches and new workspaces expand it again.
+        self._brand_expanded = True
         # The workspace palette is mode-driven; a saved theme preference can
         # no longer bring accent colors back into it.
         self.tokens = theme or workspace_tokens(
@@ -489,6 +1017,10 @@ class KryonsecApp(App[None]):
         self._mode_shown = controller.mode
         self.CSS = _build_css(self.tokens)
         self._approval_open = False
+        # Completing a suggestion rewrites the composer on purpose.  The
+        # menu stays closed for exactly that text; the next real edit may
+        # open it again.
+        self._suggestions_dismissed_text: str | None = None
         self._tabs_signature: tuple[Any, ...] | None = None
         self._conversation_signature: tuple[Any, ...] | None = None
         self._mode_shown = controller.mode
@@ -517,6 +1049,10 @@ class KryonsecApp(App[None]):
             with HorizontalScroll(id="tabstrip"):
                 pass
             yield Static("", id="topmode", markup=False)
+        # The welcome mark spans the whole workspace (including the sidebar
+        # column) so a wide terminal gets the large wordmark instead of the
+        # narrow conversation pane forcing a smaller variant.
+        yield BrandBanner()
         with Horizontal(id="body"):
             with Vertical(id="main"):
                 with VerticalScroll(id="conversation"):
@@ -526,6 +1062,7 @@ class KryonsecApp(App[None]):
                 yield Static("", id="purple-view", markup=False)
                 yield Static("", id="notice-line", markup=False)
                 with Vertical(id="composer-area"):
+                    yield SuggestionMenu()
                     with Horizontal(id="composer-meta-row"):
                         yield Static("", id="composer-meta", markup=False)
                         yield Static("", id="composer-hints", markup=False)
@@ -539,6 +1076,44 @@ class KryonsecApp(App[None]):
         await self._refresh_all(force=True)
         self.set_interval(1.0, self._tick)
         self.call_after_refresh(self._focus_composer)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        # Pick the wordmark that fits the new terminal width, then let the
+        # height guard collapse it if the window became too short.
+        self._refresh_brand()
+        self._refresh_suggestions()
+
+    def _content_columns(self) -> int:
+        """Columns available to the full-width welcome banner.
+
+        The banner sits above the body, so the sidebar no longer narrows it.
+        One column of breathing room is kept on each edge when the terminal is
+        wide enough; the renderer itself also refuses to emit art wider than
+        the request.
+        """
+        width = _columns(self)
+        return max(1, width - 2 if width > 4 else width)
+
+    def _refresh_brand(self) -> None:
+        try:
+            banner = self.query_one("#brand-banner", BrandBanner)
+            height = int(self.size.height)
+        except Exception:
+            return
+        expanded = self._brand_expanded and height >= 20
+        banner.update(
+            brand_text(
+                self.tokens,
+                width=self._content_columns(),
+                unicode_ok=self._unicode_ok,
+                compact=not expanded,
+                show_tagline=expanded,
+            )
+        )
+
+    def _set_brand_expanded(self, expanded: bool) -> None:
+        self._brand_expanded = expanded
+        self._refresh_brand()
 
     def on_unmount(self) -> None:
         self.controller.set_change_callback(lambda _reason: None)
@@ -581,11 +1156,15 @@ class KryonsecApp(App[None]):
         self.CSS = _build_css(self.tokens)
         self.theme = _textual_theme_name(mode)
         self.refresh_css()
+        # A mode switch is a visible identity change: show the full wordmark
+        # in the new colour before the next interaction collapses it again.
+        self._brand_expanded = True
         try:
             self.query_one("#brand", Static).update(
                 Text("◆ KRYONSEC", style=f"bold {self.tokens.brand}")
             )
             self.query_one("#empty-state", Static).update(self._empty_state())
+            self._refresh_brand()
         except Exception:
             pass  # compose may not have run yet
 
@@ -606,12 +1185,14 @@ class KryonsecApp(App[None]):
 
     async def _refresh_all(self, *, force: bool = False) -> None:
         await self._refresh_tabs(force=force)
+        self._refresh_brand()
         self._refresh_topmode()
         self._refresh_main(force=force)
         self._refresh_sidebar()
         self._refresh_composer_meta()
         self._refresh_status()
         self._refresh_notice()
+        self._refresh_suggestions()
 
     async def _refresh_tabs(self, *, force: bool = False) -> None:
         controller = self.controller
@@ -695,6 +1276,18 @@ class KryonsecApp(App[None]):
             return
         rows = self.controller.copilot_tools()
         if not rows:
+            # Thinking is real work with nothing to show yet — an honest
+            # line beats a silent pane.  While an approval waits, the
+            # approval dialog is the state; "thinking" would be a lie.
+            if self.controller.busy and self.controller.approval is None:
+                widget.display = True
+                widget.update(
+                    Text(
+                        " ● thinking — the assistant is working; no tool is running",
+                        style="dim",
+                    )
+                )
+                return
             widget.display = False
             return
         widget.display = True
@@ -776,9 +1369,21 @@ class KryonsecApp(App[None]):
         text.append(mode, style=f"bold {self.tokens.text}")
         text.append(sep, style="dim")
         if controller.mode == "copilot":
-            model = str(self.cfg.general_chat_model)
-            label = f"{controller.provider_label()} / {model}" if wide else model
-            text.append(_short(label, 34 if wide else 20), style=self.tokens.text)
+            running_tool = next(
+                (row for row in controller.copilot_tools() if row.status == "running"),
+                None,
+            )
+            if controller.busy and running_tool is not None:
+                # Mirror of the Mode B segment: what is running right now.
+                text.append(f"● {running_tool.name}", style=self.tokens.running)
+            elif controller.busy and controller.approval is None:
+                # Between tool calls the assistant is reasoning — say so
+                # instead of a bare "working".
+                text.append("● thinking…", style=self.tokens.running)
+            else:
+                model = str(self.cfg.general_chat_model)
+                label = f"{controller.provider_label()} / {model}" if wide else model
+                text.append(_short(label, 34 if wide else 20), style=self.tokens.text)
         elif wide:
             # live identity of what the engine is doing right now
             view = controller.purple_view
@@ -804,7 +1409,7 @@ class KryonsecApp(App[None]):
             view = controller.purple_view
             if view is not None:
                 snapshot = view.snapshot()
-                stamp = elapsed(snapshot["started_at"], snapshot["finished_at"])
+                stamp = _engagement_clock(snapshot)
                 state = snapshot["current_state"].lower() or "waiting"
                 running_tool = next(
                     (row for row in reversed(snapshot["tools"]) if row["status"] == "running"),
@@ -825,15 +1430,164 @@ class KryonsecApp(App[None]):
 
     # ---- composer and actions -----------------------------------------
 
+    def _suggestion_widgets(self) -> tuple[Composer, SuggestionMenu] | None:
+        try:
+            return (
+                self.query_one("#composer", Composer),
+                self.query_one("#suggestion-menu", SuggestionMenu),
+            )
+        except NoMatches:
+            return None
+
+    def _hide_suggestions(self) -> None:
+        widgets = self._suggestion_widgets()
+        if widgets is None:
+            return
+        composer, menu = widgets
+        menu.hide()
+        composer.suggestion_active = False
+
+    def _refresh_suggestions(self) -> None:
+        """Rebuild the menu from the registry for the current composer text."""
+        widgets = self._suggestion_widgets()
+        if widgets is None:
+            return
+        composer, menu = widgets
+        value = composer.text
+        if self._suggestions_dismissed_text is not None:
+            if value == self._suggestions_dismissed_text:
+                menu.hide()
+                composer.suggestion_active = False
+                return
+            self._suggestions_dismissed_text = None
+        active = bool(value) and value.startswith("/") and not any(
+            char.isspace() for char in value
+        )
+        # A Copilot turn blocks every slash command; advertising options the
+        # dispatcher will refuse would be a lie.  Purple keeps its explicit
+        # read-only allowlist, mirrored from the same registry set.
+        if active and self.controller.busy and self.controller.mode != "purple":
+            active = False
+        if not active:
+            menu.hide()
+            composer.suggestion_active = False
+            return
+        specs = suggest(
+            value,
+            self.controller.mode,
+            busy=self.controller.busy,
+        )
+        # Typing a command is active work: give the menu the vertical space
+        # by collapsing the hero mark instead of pushing the composer off the
+        # bottom of a 24-row terminal.
+        if self._brand_expanded:
+            self._set_brand_expanded(False)
+        max_rows = max(2, min(8, int(self.size.height) - 19))
+        menu.show(
+            specs,
+            width=self._content_columns(),
+            query=value,
+            max_rows=max_rows,
+        )
+        composer.suggestion_active = True
+
+    def _accept_suggestion(self, *, execute: bool) -> None:
+        widgets = self._suggestion_widgets()
+        if widgets is None:
+            return
+        composer, menu = widgets
+        spec = menu.current()
+        if spec is None:
+            return
+        if execute and not spec.requires_argument:
+            completion = spec.name
+        else:
+            completion = spec.completion()
+        # Argument-taking commands are completed, never submitted: a bare
+        # `/engage` can only ever fill the composer with `/engage `.
+        self._suggestions_dismissed_text = completion
+        composer.clear()
+        composer.insert(completion)
+        self._hide_suggestions()
+        if execute and not spec.requires_argument:
+            self._send_composer()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if getattr(event.text_area, "id", "") == "composer":
+            self._refresh_suggestions()
+
+    def on_composer_move_suggestions(self, event: Composer.MoveSuggestions) -> None:
+        event.stop()
+        widgets = self._suggestion_widgets()
+        if widgets is not None:
+            widgets[1].move(event.delta)
+
+    def on_composer_accept_suggestion(self, _event: Composer.AcceptSuggestion) -> None:
+        self._accept_suggestion(execute=True)
+
+    def on_composer_complete_suggestion(self, _event: Composer.CompleteSuggestion) -> None:
+        self._accept_suggestion(execute=False)
+
+    def on_composer_dismiss_suggestions(self, _event: Composer.DismissSuggestions) -> None:
+        widgets = self._suggestion_widgets()
+        if widgets is not None:
+            self._suggestions_dismissed_text = widgets[0].text
+        self._hide_suggestions()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if getattr(event.option_list, "id", "") != "suggestion-menu":
+            return
+        event.stop()
+        self._accept_suggestion(execute=True)
+
     def on_composer_submitted(self, _event: Composer.Submitted) -> None:
+        self._send_composer()
+
+    def _send_composer(self) -> None:
         composer = self.query_one("#composer", Composer)
         value = composer.take_text()
         if not value.strip():
             return
+        self._hide_suggestions()
+        # Working state: keep the brand, free the vertical space.
+        self._set_brand_expanded(False)
         self.run_worker(self._submit(value), exclusive=False)
 
     async def _submit(self, value: str) -> None:
+        # Plain `/models` opens the selectable picker in the full-screen TUI.
+        # The argument forms (`list`, `current`, `use`, `save`) keep their
+        # text behaviour, and the legacy CLI never reaches this class.
+        if value.strip().lower() == "/models":
+            lock = self._model_switch_lock()
+            if lock:
+                self.controller.notify(lock)
+                return
+            self.push_screen(
+                ModelPickerScreen(
+                    self.cfg,
+                    locked=self._model_switch_lock,
+                    tokens=self.tokens,
+                ),
+                self._model_picker_result,
+            )
+            return
         await self.controller.submit(value)
+        self.call_after_refresh(self._focus_composer)
+
+    def _model_switch_lock(self) -> str:
+        """Why a model switch must not happen right now, or an empty string."""
+        if self.controller.mode == "purple" and self.controller.engagement_running:
+            return (
+                "A model switch is refused while an engagement is running; "
+                "finish the engagement, then switch."
+            )
+        if self.controller.busy:
+            return "The current operation is still running."
+        return ""
+
+    def _model_picker_result(self, message: str | None) -> None:
+        if message:
+            self.controller.notify(message, reason="models")
         self.call_after_refresh(self._focus_composer)
 
     def action_command_palette(self) -> None:
@@ -841,6 +1595,12 @@ class KryonsecApp(App[None]):
 
     def _palette_result(self, choice: str | None) -> None:
         if not choice:
+            return
+        if choice.startswith("run:"):
+            text = choice.partition(":")[2]
+            if not text:
+                return
+            self.run_worker(self._submit(text), exclusive=False)
             return
         if choice.startswith("rename:"):
             self.action_rename_session(int(choice.partition(":")[2]) - 1)
@@ -856,15 +1616,6 @@ class KryonsecApp(App[None]):
             self.action_open_memory()
         elif choice == "mode":
             self.run_worker(self.controller.switch_mode(), exclusive=False)
-        elif choice == "help":
-            self.controller.add_system_message(HELP_TEXT)
-        elif choice == "theme":
-            self.controller.add_system_message(
-                "Workspace colors follow the active mode: Mode A is pure "
-                "black/white/gray; Mode B is monochrome with the purple "
-                "KRYONSEC wordmark. `/theme <name>` only affects other "
-                "Kryonsec surfaces (kryonsec · tokyonight · dracula)."
-            )
         elif choice == "quit":
             self.action_quit_app()
         self._focus_composer()
@@ -874,27 +1625,40 @@ class KryonsecApp(App[None]):
             self.controller.new_session()
         else:
             self.controller.new_engagement_placeholder()
+        # A new workspace is a fresh start: show the full mark again.
+        self._set_brand_expanded(True)
         self._focus_composer()
 
     def action_prev_tab(self) -> None:
         self.controller.switch_tab(-1)
+        self._set_brand_expanded(False)
 
     def action_next_tab(self) -> None:
         self.controller.switch_tab(1)
+        self._set_brand_expanded(False)
 
     def action_rename_session(self, index: int | None = None) -> None:
         controller = self.controller
-        if controller.mode != "copilot":
-            controller.notify(
-                "Engagement tabs keep their immutable identifiers; only Copilot sessions can be renamed."
-            )
-            self._refresh_notice()
-            return
         if index is None:
-            index = controller.session_index
-        if not (0 <= index < len(controller.sessions)):
+            index = (
+                controller.session_index
+                if controller.mode == "copilot"
+                else controller.engagement_index
+            )
+        if index is None:
             return
-        tab = controller.sessions[index]
+        if controller.mode == "copilot":
+            if not (0 <= index < len(controller.sessions)):
+                return
+            tab = controller.sessions[index]
+            current = tab.custom_title or tab.title
+            self.push_screen(RenameScreen(current), self._rename_result(index))
+            return
+        # Mode B: a display title is presentation-only. The engagement id,
+        # the recorded target, and the audit chain are never touched.
+        if not (0 <= index < len(controller.engagements)):
+            return
+        tab = controller.engagements[index]
         current = tab.custom_title or tab.title
         self.push_screen(RenameScreen(current), self._rename_result(index))
 
@@ -942,6 +1706,7 @@ class KryonsecApp(App[None]):
             self.action_new_tab()
         else:
             self.controller.activate_tab(event.index)
+            self._set_brand_expanded(False)
         self._focus_composer()
 
     def on_memory_entry_activated(self, _event: MemoryEntry.Activated) -> None:
@@ -960,7 +1725,7 @@ class KryonsecApp(App[None]):
                 )
             else:
                 self.controller.notify(
-                    "Approval cancelled. Purple Team finishes the current state before it can stop."
+                    "Stop requested. Purple Team finishes the current state, then stops."
                 )
             return
         self.action_quit_app()
@@ -991,14 +1756,19 @@ class KryonsecApp(App[None]):
     # ---- rendering helpers --------------------------------------------
 
     def _empty_state(self) -> Text:
+        # The wordmark now lives in BrandBanner above the conversation; the
+        # empty state is only the next-action hint, so it never duplicates
+        # the artwork or pushes the composer down twice.
         text = Text()
         text.append("\n\n")
-        mark = BRAND_MARK if _columns(self) >= 92 else BRAND_SMALL
-        for line in mark.splitlines():
-            text.append(line + "\n", style=f"bold {self.tokens.brand}")
-        text.append("\n")
-        text.append("security workspaces for your terminal\n", style=self.tokens.muted)
-        text.append("start a conversation below · Ctrl+P for commands\n", style="dim")
+        text.append(
+            "Start a conversation below · Ctrl+P for commands\n",
+            style=self.tokens.muted,
+        )
+        text.append(
+            "Shift+Tab switches mode · Ctrl+N starts a new workspace\n",
+            style="dim",
+        )
         return text
 
     def _activity_text(self, rows: list[Any]) -> Text:
@@ -1027,6 +1797,8 @@ class KryonsecApp(App[None]):
             text.append("  PURPLE TEAM\n", style=f"bold {self.tokens.text}")
             text.append("  deterministic, bounded, human-approved testing\n\n", style="dim")
             text.append("  Type an authorized target below to begin.\n", style=self.tokens.muted)
+            text.append("  /engage <target> starts one explicitly; plain text here starts one too.\n", style="dim")
+            text.append("  Once an engagement is open, ask questions in plain text at any time.\n", style="dim")
             text.append("  Approvals and sandbox checks remain fail-closed.\n", style="dim")
             return text
         snapshot = view.snapshot()
@@ -1046,7 +1818,7 @@ class KryonsecApp(App[None]):
         text.append("  agent       ", style="dim")
         text.append(f"{self._agent_of_state(current)}\n", style=self.tokens.text)
         text.append("  elapsed     ", style="dim")
-        text.append(f"{elapsed(snapshot['started_at'], snapshot['finished_at'])}\n\n")
+        text.append(f"{_engagement_clock(snapshot)}\n\n")
 
         text.append("  WORKFLOW · 10 STATES\n", style=f"bold {self.tokens.text}")
         completed = set(snapshot["completed_states"])
@@ -1141,6 +1913,24 @@ class KryonsecApp(App[None]):
             if tool.get("detail"):
                 text.append("  outcome  ", style="dim")
                 text.append(f"{_short(tool['detail'], 200)}\n", style="dim")
+
+        qa = snapshot.get("qa") or []
+        if qa:
+            text.append("\n  QUESTIONS & ANSWERS\n", style=f"bold {self.tokens.text}")
+            text.append(
+                "  read-only: a question never starts, stops, or changes the engagement\n",
+                style="dim",
+            )
+            for entry in qa:
+                text.append("  Q ", style="bold")
+                text.append(f"{_short(str(entry.get('q') or ''), 200)}\n", style=self.tokens.text)
+                answer = str(entry.get("a") or "")
+                if answer:
+                    text.append("  A ", style=f"bold {self.tokens.success}")
+                    text.append(f"{_short(answer, 2000)}\n", style=self.tokens.text)
+                else:
+                    text.append("  A ", style="dim")
+                    text.append("preparing the answer…\n", style="dim")
 
         notices = snapshot["notices"]
         if notices:
@@ -1296,7 +2086,7 @@ class KryonsecApp(App[None]):
             self._sidebar_row(text, "target", _short(snapshot["target"], 18), self.tokens.text)
             self._sidebar_row(text, "id", snapshot["engagement_id"], "dim")
             self._sidebar_row(text, "state", _short(current or "ready", 16), state_style)
-            self._sidebar_row(text, "elapsed", elapsed(snapshot["started_at"], snapshot["finished_at"]), self.tokens.text)
+            self._sidebar_row(text, "elapsed", _engagement_clock(snapshot), self.tokens.text)
             self._sidebar_row(text, "stage", _short(STATE_ACTION.get(current, "—"), 20), self.tokens.muted)
             self._sidebar_row(text, "agent", self._agent_of_state(current), state_style if not finished else self.tokens.muted)
             agents_snapshot = snapshot
@@ -1417,6 +2207,19 @@ class KryonsecApp(App[None]):
 # ---- helpers ------------------------------------------------------------
 
 
+def _engagement_clock(snapshot: dict[str, Any]) -> str:
+    """The live elapsed clock, or the recorded duration when replaying.
+
+    A reopened engagement has no process-relative start time, so it carries
+    the wall-clock duration read from its audit chain; using the monotonic
+    clock there would report how long the app had been open instead.
+    """
+    recorded = snapshot.get("recorded_duration")
+    if isinstance(recorded, (int, float)):
+        return elapsed(0.0, float(recorded))
+    return elapsed(snapshot.get("started_at"), snapshot.get("finished_at"))
+
+
 def _short(value: str, limit: int) -> str:
     value = " ".join(str(value or "").split())
     if len(value) <= limit:
@@ -1523,6 +2326,14 @@ def _build_css(tokens: ThemeTokens) -> str:
             padding: 0 1;
             background: {t.background};
         }}
+        #brand-banner {{
+            width: 1fr;
+            height: auto;
+            padding: 1 0 0 0;
+            background: {t.background};
+            content-align: center middle;
+            text-align: center;
+        }}
         #conversation {{
             height: 1fr;
             padding: 0 1;
@@ -1592,6 +2403,22 @@ def _build_css(tokens: ThemeTokens) -> str:
             width: 1fr;
             padding: 1 0 0 0;
             background: {t.background};
+        }}
+        #suggestion-menu {{
+            width: 1fr;
+            height: auto;
+            max-height: 8;
+            margin: 0 0 1 0;
+            border: tall {t.border};
+            background: {t.surface};
+            scrollbar-size-vertical: 1;
+        }}
+        #suggestion-menu > .option-list--option-highlighted {{
+            background: {t.accent};
+            color: {t.background};
+        }}
+        #suggestion-menu > .option-list--option-disabled {{
+            color: {t.faint};
         }}
         #composer-meta-row {{
             height: 1;
@@ -1691,6 +2518,57 @@ def _build_css(tokens: ThemeTokens) -> str:
             color: {t.background};
         }}
 
+        ModelPickerScreen {{
+            align: center middle;
+            background: {t.background} 80%;
+        }}
+        #models-box {{
+            width: 78;
+            height: auto;
+            max-height: 28;
+            border: round {t.accent};
+            background: {t.surface};
+            padding: 0 1;
+        }}
+        .models-title {{
+            height: 1;
+            color: {t.accent_bright};
+            text-style: bold;
+        }}
+        .models-hint {{
+            height: 1;
+            color: {t.faint};
+        }}
+        #models-search {{
+            width: 1fr;
+            height: 3;
+            border: tall {t.border};
+            background: {t.surface_high};
+            color: {t.text};
+        }}
+        #models-search:focus {{
+            border: tall {t.accent_bright};
+        }}
+        #models-list {{
+            width: 1fr;
+            height: auto;
+            max-height: 14;
+            background: {t.surface};
+            scrollbar-size-vertical: 1;
+        }}
+        #models-list > .option-list--option-highlighted {{
+            background: {t.accent};
+            color: {t.background};
+        }}
+        #models-list > .option-list--option-disabled {{
+            color: {t.faint};
+        }}
+        .models-status {{
+            height: auto;
+            max-height: 4;
+            color: {t.muted};
+        }}
+
         ApprovalScreen {{
             align: center middle;
             background: {t.background} 80%;
@@ -1774,10 +2652,12 @@ def _build_css(tokens: ThemeTokens) -> str:
 
 __all__ = [
     "ApprovalScreen",
+    "BrandBanner",
     "CommandPalette",
     "Composer",
     "KryonsecApp",
     "MemoryEntry",
+    "ModelPickerScreen",
     "RenameScreen",
     "TabItem",
 ]

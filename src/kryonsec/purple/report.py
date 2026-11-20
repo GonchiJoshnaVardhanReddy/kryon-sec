@@ -557,7 +557,9 @@ def read_audit_events(audit: AuditLog) -> list[dict]:
 # ---- Phase 1C: coverage, post-exploit honesty, limitations ------------------
 
 MAX_COVERAGE_ITEMS = 50
-REPORT_JSON_SCHEMA_VERSION = "1.0"
+#: 1.1 adds ``failed_states``: a route that reached HALT with a stage that
+#: returned ``failed`` must not look like a clean sweep to a JSON reader.
+REPORT_JSON_SCHEMA_VERSION = "1.1"
 
 
 def coverage_summary(graph: EngagementGraph, audit: AuditLog) -> dict:
@@ -760,6 +762,7 @@ def build_report_json(
     engagement_id: str,
     completed_states: list[str] | None = None,
     halt_reason: str | None = None,
+    failed_states: list[str] | None = None,
 ) -> str:
     """The deterministic machine-readable export, one document for the
     same graph + audit chain (no wall-clock data, sorted keys, no
@@ -888,6 +891,7 @@ def build_report_json(
         "post_exploit": post_exploit_view(graph),
         "limitations": report_limitations(graph, audit),
         "completed_states": list(completed_states or []),
+        "failed_states": list(failed_states or []),
         "halt_reason": halt_reason or "",
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -962,6 +966,7 @@ def render_report(
     engagement_id: str,
     completed_states: list[str] | None = None,
     halt_reason: str | None = None,
+    failed_states: list[str] | None = None,
 ) -> str:
     """Render the report markdown from the engagement graph."""
     from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -1117,6 +1122,7 @@ def render_report(
         exploit_attempted=exploit_attempted,
         completed_states=completed_states or [],
         halt_reason=halt_reason or "",
+        failed_states=failed_states or [],
         audit_head=audit.head_hash(),
         generated_at=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     )
@@ -1254,6 +1260,7 @@ class ReportSubagent:
                 self.graph, self.audit, self.engagement_id,
                 completed_states=getattr(self, "completed_states", None),
                 halt_reason=getattr(self, "halt_reason", None),
+                failed_states=getattr(self, "failed_states", None),
             )
 
             problems = validate_report(report, self.graph)
@@ -1287,6 +1294,7 @@ class ReportSubagent:
                 self.graph, self.audit, self.engagement_id,
                 completed_states=getattr(self, "completed_states", None),
                 halt_reason=getattr(self, "halt_reason", None),
+                failed_states=getattr(self, "failed_states", None),
             )
             write_report_json(json_payload, json_path)
             self.audit.write({

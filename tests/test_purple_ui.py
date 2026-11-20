@@ -649,6 +649,20 @@ def test_halted_summary_says_why_and_how_far_it_got(tmp_path):
     assert "2 / 10 stages" in out
 
 
+def test_a_failed_stage_produces_a_failed_summary(tmp_path):
+    """A route that reached HALT with a failed stage is not "complete"."""
+    graph = EngagementGraph(engagement_id="abc12345")
+    graph.add_node("target", "target-corp.com")
+    orch = FakeOrch()
+    orch.failed_states = ["HYPOTHESIZE"]
+
+    out = summary(tmp_path, graph, ["INIT", "RECON_PASSIVE"], orch)
+
+    assert "ENGAGEMENT FAILED" in out
+    assert "HYPOTHESIZE" in out
+    assert "ENGAGEMENT COMPLETE" not in out
+
+
 def test_summary_reports_the_report_and_debug_log_paths(tmp_path):
     graph = EngagementGraph(engagement_id="abc12345")
     graph.add_node("target", "target-corp.com")

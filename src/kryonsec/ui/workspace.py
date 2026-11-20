@@ -14,6 +14,7 @@ failure cannot alter a backend result.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import threading
 import time
@@ -22,8 +23,22 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from ..config import KryonsecConfig
+from ..command_registry import (
+    PURPLE_BUSY_SAFE,
+    command_name,
+    commands_text,
+    help_text,
+    lookup,
+)
 from ..copilot.session import GeneralSession
+from ..model_catalog import (
+    current_model_view,
+    discover_models,
+    provider_label as model_provider_label,
+    switch_model,
+)
 from ..secrets import redact
+from . import questions as _questions
 from .session_store import EngagementStore, EngagementTab, SessionStore, SessionTab
 from .state import (
     ApprovalGate,
@@ -39,6 +54,12 @@ log = logging.getLogger(__name__)
 
 class OperationCancelled(Exception):
     """Raised from an observation callback at a safe boundary."""
+
+
+# Purple commands that stay usable while an engagement is running come from
+# the central registry (`PURPLE_BUSY_SAFE`).  They are read-only or
+# presentation-only; `/models use` re-checks the engagement lock in its
+# handler and refuses to switch mid-run.
 
 
 @dataclass
@@ -80,6 +101,20 @@ class _LivePurpleState(PurpleWorkspaceState):
         self._notify("purple")
 
 
+def _audit_seconds(value: Any) -> float | None:
+    """Parse an audit ``ts`` (ISO-8601) into POSIX seconds.
+
+    Missing or malformed timestamps return None rather than raising: old
+    chains predate the field, and a replay must still render them.
+    """
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 class WorkspaceController:
     """Presentation-agnostic owner of sessions, modes, and backend calls."""
 
@@ -114,6 +149,14 @@ class WorkspaceController:
         self.mode_holder = ["copilot"]
         self.notice = ""
         self.busy = False
+        # True for the whole life of a live engagement run — set when the
+        # worker starts, cleared when it ends.  Unlike `busy` it is never
+        # touched by the /mode presentation hack, so it is the honest
+        # "is an engagement running" answer used to refuse /engage.
+        self.engagement_running = False
+        # One question may be answered at a time; a second is refused with
+        # a notice rather than queued or dropped silently.
+        self._question_in_flight = False
         self.stop_requested = False
         self.approval: ApprovalGate | None = None
         self.transient: dict[int, list[DisplayMessage]] = {}
@@ -231,31 +274,42 @@ class WorkspaceController:
         self._changed("tabs")
 
     def rename_session(self, index: int, name: str) -> bool:
-        """Give one Copilot session a display title.
+        """Give one tab a display title — Mode A sessions and Mode B tabs.
 
-        Renaming changes presentation only: the stored message history,
-        record id, and timestamps are untouched. ``EngagementTab`` titles in
-        Mode B derive from immutable engagement records, so rename is scoped
-        to Mode A. Returns True when the rename was applied.
+        Renaming changes presentation only.  Mode A: the stored message
+        history, record id, and timestamps are untouched.  Mode B: the
+        engagement id, the recorded target, and every audit event are
+        untouched; the title is stored as display_title.json beside the
+        audit chain.  Returns True when the rename was applied.
         """
-        if self.mode != "copilot":
-            self.notify(
-                "Engagement tabs keep their immutable identifiers; only Copilot sessions can be renamed."
-            )
-            return False
-        if not (0 <= index < len(self.sessions)):
-            return False
         cleaned = " ".join(str(name or "").split())
         if not cleaned:
-            self.notify("Session name cannot be empty.")
+            self.notify("Name cannot be empty.")
             return False
-        tab = self.sessions[index]
+        if self.mode == "copilot":
+            if not (0 <= index < len(self.sessions)):
+                return False
+            tab = self.sessions[index]
+            tab.custom_title = cleaned[:120]
+            if tab.session.messages:
+                try:
+                    self.session_store.save(tab)
+                except Exception as exc:
+                    self.notify(f"Renamed in view, but storage failed: {safe(exc, 200)}")
+            self._changed("tabs")
+            return True
+        if not (0 <= index < len(self.engagements)):
+            return False
+        tab = self.engagements[index]
         tab.custom_title = cleaned[:120]
-        if tab.session.messages:
+        if tab.path is not None:
             try:
-                self.session_store.save(tab)
+                if not self.engagement_store.rename(tab.engagement_id, tab.custom_title):
+                    self.notify("Renamed in view, but the engagement folder could not be updated.")
             except Exception as exc:
                 self.notify(f"Renamed in view, but storage failed: {safe(exc, 200)}")
+        # A live engagement tab has no directory yet; the title rides in
+        # memory and is re-stored when the run finishes (start_engagement).
         self._changed("tabs")
         return True
 
@@ -344,8 +398,10 @@ class WorkspaceController:
     async def switch_mode(self) -> None:
         from ..tui import set_mode
 
-        if self.busy:
-            self.notify("Mode switching is disabled until the active operation reaches a safe boundary.")
+        if self.busy or self.engagement_running:
+            self.notify(
+                "Mode switching is disabled until the active operation reaches a safe boundary."
+            )
             return
         target = "purple" if self.mode == "copilot" else "copilot"
         notice_holder = [self.notice]
@@ -385,7 +441,29 @@ class WorkspaceController:
         value = (text or "").strip()
         if not value:
             return
+        command = value.lower()
+        # A plain sentence while an engagement view is open is a read-only
+        # question about that engagement.  It never starts, stops, or
+        # changes an engagement, and it is deliberately allowed while the
+        # engagement is busy: the worker thread keeps running.
+        if (
+            self.mode == "purple"
+            and self.purple_view is not None
+            and not command.startswith("/")
+            and command not in ("quit", "exit", "q")
+        ):
+            await self._answer_purple_question(value)
+            return
         if self.busy:
+            # A small allowlist of purple commands stays available while an
+            # engagement runs; everything else waits for a safe boundary.
+            spec = lookup(value)
+            if self.mode == "purple" and (
+                command in ("quit", "exit", "q")
+                or (spec is not None and spec.name in PURPLE_BUSY_SAFE)
+            ):
+                await self._dispatch_purple(value)
+                return
             self.notify("The current operation is still running.")
             return
         self.busy = True
@@ -410,43 +488,87 @@ class WorkspaceController:
 
     async def _dispatch_copilot(self, text: str) -> None:
         command = text.lower()
+        name = command_name(text)
         tab = self.active_session()
+        spec = lookup(text)
+        if spec is not None and not spec.available_in("copilot"):
+            self._add_transient(
+                "system",
+                f"{spec.name} is a Purple Team command. Switch with /mode when no "
+                "engagement is running.",
+            )
+            return
         if command in ("/quit", "/exit", "exit", "quit", "q"):
             self._changed("quit")
             return
-        if command == "/help":
-            self._add_transient(
-                "system",
-                "Commands: /cve <id> · /search <query> · /read <path> · /ls <path> · "
-                "/write <path>\\ncontent · /workspace · /mode · /theme · /quit\n"
-                "Shortcuts: Enter send · Shift+Enter newline · Ctrl+P commands · "
-                "Shift+Tab mode · Ctrl+←/→ sessions · Ctrl+N new session.",
-            )
+        if name == "/help":
+            self._add_transient("system", help_text("copilot"))
             return
-        if command == "/mode":
+        if name == "/commands":
+            self._add_transient("system", commands_text("copilot"))
+            return
+        if name == "/mode":
             self.busy = False
             await self.switch_mode()
             return
-        if command.startswith("/theme"):
+        if name == "/models":
+            await self._command_models(text)
+            return
+        if name == "/mcp":
+            self._command_mcp(text)
+            return
+        if name == "/skills":
+            self._command_skills(text)
+            return
+        if name == "/sessions":
+            await self._command_sessions(text)
+            return
+        if name == "/theme" or name.startswith("/theme"):
             await self._handle_theme(text)
             return
-        if command == "/workspace":
+        if name == "/workspace":
             self._add_transient("system", str(self.cfg.workspace))
             return
-        if command.startswith("/cve "):
-            await self._command_cve(text[5:].strip())
+        if name == "/rename":
+            await self._command_rename(text, "session")
             return
-        if command.startswith("/search "):
-            await self._command_search(text[8:].strip(), tab)
+        if name == "/cve":
+            cve_id = text.partition(" ")[2].strip()
+            if not cve_id:
+                self._add_transient("system", "Use /cve <CVE-ID>.")
+                return
+            await self._command_cve(cve_id)
             return
-        if command.startswith("/read "):
-            await self._command_read(text[6:].strip(), tab)
+        if name == "/search":
+            query = text.partition(" ")[2].strip()
+            if not query:
+                self._add_transient("system", "Use /search <query>.")
+                return
+            await self._command_search(query, tab)
             return
-        if command.startswith("/ls "):
-            await self._command_list(text[4:].strip(), tab)
+        if name == "/read":
+            path = text.partition(" ")[2].strip()
+            if not path:
+                self._add_transient("system", "Use /read <path>.")
+                return
+            await self._command_read(path, tab)
             return
-        if command.startswith("/write "):
-            await self._command_write(text[7:], tab)
+        if name == "/ls":
+            path = text.partition(" ")[2].strip()
+            await self._command_list(path, tab)
+            return
+        if name == "/write":
+            value = text[7:] if len(text) > 6 else ""
+            if not value:
+                self._add_transient("system", "Use /write <path> then the content.")
+                return
+            await self._command_write(value, tab)
+            return
+        if name:
+            self._add_transient(
+                "system",
+                f"{name} is not a command here. Use /commands to see what is available.",
+            )
             return
 
         tab.session.add("user", text)
@@ -568,6 +690,363 @@ class WorkspaceController:
 
     # ---- commands ------------------------------------------------------
 
+    async def _command_rename(self, text: str, noun: str) -> None:
+        new_name = text.partition(" ")[2].strip()
+        index = (
+            self.session_index
+            if self.mode == "copilot"
+            else self.engagement_index
+        )
+        if index is None:
+            self._add_transient(
+                "system", f"Open a {noun} tab first — there is nothing to rename."
+            )
+            return
+        if not new_name:
+            self._add_transient(
+                "system",
+                f"Use /rename <new name> to title the current {noun} tab "
+                "(Ctrl+P → Rename opens a dialog).",
+            )
+            return
+        self.rename_session(index, new_name)
+
+    async def _command_sessions(self, text: str) -> None:
+        """List workspace tabs; an optional number switches to one."""
+        parts = text.split()
+        target = parts[1] if len(parts) > 1 else ""
+        if self.mode == "purple":
+            try:
+                self.engagements = await asyncio.to_thread(
+                    self.engagement_store.list_tabs
+                )
+            except Exception as exc:
+                self.notify(f"Engagement history unavailable: {type(exc).__name__}")
+                return
+            # Busy-safe feedback: the status line confirms the refresh even
+            # while the engagement worker keeps running.
+            self.notify(f"Loaded {len(self.engagements)} stored engagement(s).")
+            self._changed("tabs")
+            entries = self.engagements
+            current = self.engagement_index
+            noun = "engagement"
+        else:
+            entries = self.sessions
+            current = self.session_index
+            noun = "session"
+        if target.isdigit():
+            index = int(target) - 1
+            if 0 <= index < len(entries):
+                self.activate_tab(index)
+                return
+            self._add_transient("system", f"No {noun} {target}.")
+            return
+        lines = [f"{noun.upper()}S · {len(entries)}"]
+        for index, entry in enumerate(entries):
+            marker = "▸" if index == current else " "
+            title = getattr(entry, "title", "") or "(untitled)"
+            lines.append(f" {marker} {index + 1:>2}  {safe(title, 60)}")
+        if target:
+            lines.append(f"Use /sessions <number> to open one.")
+        self._add_transient("system", "\n".join(lines))
+
+    async def _command_models(self, text: str) -> None:
+        """Show or switch models using only what the provider really lists."""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "current"
+        if sub in ("list", "ls"):
+            provider = parts[2].lower() if len(parts) > 2 else self.cfg.provider
+            await self._models_list(provider)
+            return
+        if sub == "current":
+            view = current_model_view(self.cfg)
+            self._add_transient(
+                "system",
+                "MODEL\n"
+                f"  active          {model_provider_label(view['provider'])} · {view['model']}\n"
+                f"  local fallback  {view['local_fallback']}\n"
+                f"  search          {view['search_model']}\n"
+                f"  compaction      {view['compaction_model']}\n"
+                "Switch with /models use <provider> <model>; /models list shows real availability.",
+            )
+            return
+        if sub == "use":
+            if len(parts) < 4:
+                self._add_transient(
+                    "system",
+                    "Use /models use <provider> <model>. "
+                    "Providers: openai · ollama · bedrock · openai_compatible.",
+                )
+                return
+            if self.mode == "purple" and self.engagement_running:
+                self.notify(
+                    "A model switch is refused while an engagement is running; "
+                    "finish the engagement, then switch."
+                )
+                return
+            provider = parts[2].lower()
+            model = " ".join(parts[3:]).strip()
+            ok, message = await asyncio.to_thread(
+                switch_model, self.cfg, provider, model
+            )
+            if not ok:
+                self.notify(message)
+                return
+            self.notify(message)
+            self._changed("models")
+            return
+        if sub == "save":
+            try:
+                await asyncio.to_thread(self.cfg.save)
+            except Exception as exc:
+                self.notify(f"Config could not be saved ({type(exc).__name__}).")
+                return
+            self.notify("Model configuration saved.")
+            return
+        self._add_transient(
+            "system",
+            "Use /models · /models current · /models list [provider] · "
+            "/models use <provider> <model> · /models save.",
+        )
+
+    async def _models_list(self, provider: str) -> None:
+        models, reason = await asyncio.to_thread(discover_models, self.cfg, provider)
+        label = model_provider_label(provider)
+        if models is None:
+            self._add_transient("system", f"Models · {label}\n  {reason}")
+            return
+        if not models:
+            self._add_transient(
+                "system",
+                f"Models · {label}\n  No models are available from this provider.",
+            )
+            return
+        lines = [f"MODELS · {label} · {len(models)}"]
+        for model in models[:40]:
+            lines.append(f"  {model}")
+        if len(models) > 40:
+            lines.append(f"  … and {len(models) - 40} more")
+        lines.append(f"Use /models use {provider} <model>.")
+        self._add_transient("system", "\n".join(lines))
+
+    def _mcp_rows(self) -> list[dict[str, Any]]:
+        """Merge configured servers with the live, presentation-only status."""
+        statuses = {
+            str(row.get("name") or ""): row
+            for row in self.mcp_statuses()
+            if str(row.get("name") or "")
+        }
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for server in self.cfg.mcp_servers:
+            name = str(server.get("name") or "server")
+            seen.add(name)
+            status_row = statuses.get(name, {})
+            if not server.get("enabled", True):
+                status = "disabled"
+                detail = "disabled in config.toml; no process was started"
+                tools = 0
+            else:
+                status = str(status_row.get("status") or "not started")
+                detail = str(status_row.get("detail") or "")
+                tools = int(status_row.get("tools") or 0)
+            policy = (
+                self.mcp_registry.policy_for(name)
+                if self.mcp_registry is not None
+                else None
+            )
+            rows.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "detail": redact(safe(detail, 160))[0],
+                    "tools": tools,
+                    "trust": getattr(policy, "trust", "policy unavailable"),
+                    "allow_all": bool(getattr(policy, "allow_all_tools", False)),
+                    "allow_tools": sorted(getattr(policy, "allow_tools", ())),
+                }
+            )
+        # A live connection the config no longer names is still shown: the
+        # process exists, and hiding it would be a lie.
+        for name, row in statuses.items():
+            if name in seen:
+                continue
+            rows.append(
+                {
+                    "name": name,
+                    "status": str(row.get("status") or "unknown"),
+                    "detail": redact(safe(row.get("detail") or "", 160))[0],
+                    "tools": int(row.get("tools") or 0),
+                    "trust": "policy unavailable",
+                    "allow_all": False,
+                    "allow_tools": [],
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _mcp_status_label(status: str, detail: str = "") -> str:
+        """Human label for the toolbox's real status vocabulary.
+
+        ``disconnected`` is the toolbox's catch-all for "was not connected".
+        A failure reason is shown as FAILED; a connection that is simply not
+        up (no failure text) stays DISCONNECTED.  Nothing here invents a
+        state the toolbox did not report.
+        """
+        raw = str(status or "").strip().lower()
+        if raw == "disconnected":
+            failure = (
+                "timed out", "timeout", "exited", "failed", "error",
+                "not found", "refused", "denied", "unavailable",
+            )
+            return "FAILED" if any(word in detail.lower() for word in failure) else "DISCONNECTED"
+        return {
+            "starting": "CONNECTING",
+            "connected": "CONNECTED",
+            "blocked": "BLOCKED",
+            "disabled": "DISABLED",
+            "not started": "NOT STARTED",
+        }.get(raw, raw.upper() or "UNKNOWN")
+
+    def _command_mcp(self, text: str) -> None:
+        """Read-only MCP status. Never executes a tool or starts a server."""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub in ("list", "status"):
+            rows = self._mcp_rows()
+            if not rows:
+                self._add_transient(
+                    "system",
+                    "No MCP servers configured. Mode A MCP is optional; "
+                    "Mode B never uses MCP.",
+                )
+                return
+            lines = ["MCP · READ-ONLY STATUS"]
+            for row in rows:
+                label = self._mcp_status_label(row["status"], row["detail"])
+                allowed = (
+                    "all tools"
+                    if row["allow_all"]
+                    else (", ".join(row["allow_tools"]) or "none")
+                )
+                lines.append("")
+                lines.append(f"  {row['name']}  {label}  tools={row['tools']}")
+                lines.append(f"    trust={row['trust']}  authorized={allowed}")
+                if row["detail"]:
+                    lines.append(f"    {row['detail']}")
+                if label in {"FAILED", "DISCONNECTED", "BLOCKED", "NOT STARTED"}:
+                    lines.append(
+                        f"    next: check config.toml and the MCP policy; "
+                        f"/mcp tools {row['name']}"
+                    )
+            self._add_transient("system", "\n".join(lines))
+            return
+        if sub == "tools":
+            server = parts[2] if len(parts) > 2 else ""
+            if not server:
+                self._add_transient("system", "Use /mcp tools <server>.")
+                return
+            self._mcp_tools(server)
+            return
+        self._add_transient("system", "Use /mcp · /mcp list · /mcp status · /mcp tools <server>.")
+
+    def _mcp_tools(self, server: str) -> None:
+        row = next((r for r in self._mcp_rows() if r["name"] == server), None)
+        if row is None:
+            self._add_transient("system", f"No MCP server named {server!r}.")
+            return
+        if row["status"] != "connected":
+            self._add_transient(
+                "system",
+                f"{server} is {self._mcp_status_label(row['status'], row['detail'])}; "
+                "no tools are advertised. No process was started by this command.",
+            )
+            return
+        names: list[str] = []
+        box = self.mcp_toolbox
+        for connection in getattr(box, "connections", []) or []:
+            if getattr(connection, "name", "") != server:
+                continue
+            names = sorted(
+                key.removeprefix("mcp_") for key in getattr(connection, "entry", {})
+            )
+            break
+        if not names:
+            self._add_transient(
+                "system",
+                f"{server} is connected but advertises no tools right now.",
+            )
+            return
+        policy = (
+            self.mcp_registry.policy_for(server)
+            if self.mcp_registry is not None
+            else None
+        )
+        lines = [f"MCP TOOLS · {server} · {len(names)}"]
+        for name in names[:60]:
+            allowed = bool(policy and policy.allows(name))
+            lines.append(f"  {'✓' if allowed else '·'} {name}  {'authorized' if allowed else 'not authorized'}")
+        if len(names) > 60:
+            lines.append(f"  … and {len(names) - 60} more")
+        lines.append("Names only — tool schemas and server text are untrusted and not executed here.")
+        self._add_transient("system", "\n".join(lines))
+
+    def _command_skills(self, text: str) -> None:
+        """Read the real packaged skill registry; never invent an entry."""
+        from ..purple.skills import SkillError, load_packaged_skills
+
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        try:
+            registry = load_packaged_skills()
+        except SkillError as exc:
+            self._add_transient("system", f"Skill registry unavailable: {safe(exc, 200)}")
+            return
+        if sub == "info":
+            name = parts[2] if len(parts) > 2 else ""
+            if not name:
+                self._add_transient("system", "Use /skills info <name>.")
+                return
+            skill = registry.get(name)
+            if skill is None:
+                self._add_transient(
+                    "system",
+                    f"No packaged skill named {name!r}. Use /skills to list them.",
+                )
+                return
+            self._add_transient(
+                "system",
+                f"SKILL · {skill.name}\n"
+                f"  version     {skill.version}\n"
+                f"  category    {skill.category}\n"
+                f"  stages      {', '.join(sorted(skill.stages))}\n"
+                f"  source      {skill.source} (packaged, reviewed)\n"
+                f"  mode        Mode B specialist knowledge only\n"
+                f"  status      loaded · knowledge-only · not executable\n"
+                f"  purpose     {skill.description}",
+            )
+            return
+        if sub not in ("list", ""):
+            self._add_transient("system", "Use /skills · /skills list · /skills info <name>.")
+            return
+        skills = registry.to_dict()["skills"]
+        if not skills:
+            self._add_transient(
+                "system",
+                "No skills installed. Packaged skills ship with Kryonsec; "
+                "this build has none.",
+            )
+            return
+        lines = [f"SKILLS · {len(skills)} packaged · knowledge-only · not executable"]
+        for skill in skills:
+            lines.append("")
+            lines.append(f"  {skill['name']} v{skill['version']}  ·  {skill['category']}")
+            lines.append(f"    {safe(skill['description'], 180)}")
+            lines.append(f"    stages: {', '.join(skill['stages'])}  ·  source: {skill['source']}")
+        lines.append("")
+        lines.append("Mode B specialists read these as reference material; nothing here executes.")
+        self._add_transient("system", "\n".join(lines))
+
     async def _command_cve(self, cve_id: str) -> None:
         from ..copilot.cve import lookup_cve
 
@@ -674,37 +1153,160 @@ class WorkspaceController:
 
     # ---- Purple dispatch ----------------------------------------------
 
+    async def _answer_purple_question(self, question: str) -> None:
+        """Answer one read-only question about the open engagement.
+
+        This cannot start an engagement, run a tool, or change the workflow:
+        it reads only the presentation snapshot the state object already
+        reduced from real audit events, and asks the chat model to explain
+        it with no tools attached.  Serialized: one answer at a time, and
+        a second question is refused with an honest notice.
+        """
+        view = self.purple_view
+        if view is None:
+            return
+        if self._question_in_flight:
+            view.on_notice(
+                "One question at a time — the previous answer is still being prepared."
+            )
+            self._changed("activity")
+            return
+        self._question_in_flight = True
+        try:
+            view.add_question(question)
+            snapshot = view.snapshot()
+            self._changed("activity")
+            try:
+                answer = await asyncio.to_thread(
+                    _questions.answer_question, self.cfg, snapshot, question
+                )
+            except Exception as exc:
+                # Presentation must never break the engagement; the
+                # deterministic summary is still a real, bounded answer.
+                answer = (
+                    f"(local summary — the answer helper failed: {type(exc).__name__})\n"
+                    + _questions.engagement_plain_summary(snapshot)
+                )
+            view.add_answer(question, answer)
+        finally:
+            self._question_in_flight = False
+        self._changed("activity")
+
     async def _dispatch_purple(self, text: str) -> None:
         command = text.lower()
+        name = command_name(text)
+        spec = lookup(text)
+        if spec is not None and not spec.available_in("purple"):
+            self._add_transient(
+                "system",
+                f"{spec.name} is a Copilot command. Switch with /mode when no "
+                "engagement is running.",
+            )
+            return
         if command in ("/quit", "/exit", "exit", "quit", "q"):
             self._changed("quit")
             return
-        if command == "/help":
-            self._add_transient(
-                "system",
-                "Purple Team: type an authorized target to start. /mode returns to Copilot. /quit exits.",
-            )
+        if name == "/help":
+            self._add_transient("system", help_text("purple"))
             return
-        if command == "/mode":
+        if name == "/commands":
+            self._add_transient("system", commands_text("purple"))
+            return
+        if name == "/models":
+            await self._command_models(text)
+            return
+        if name == "/mcp":
+            self._command_mcp(text)
+            return
+        if name == "/skills":
+            self._command_skills(text)
+            return
+        if name == "/mode":
+            if self.engagement_running:
+                # Never let the busy-clearing hack below run while a worker
+                # thread is live: switching modes mid-engagement would
+                # orphan the run's presentation state.
+                self.notify(
+                    "An engagement is still running; wait for it to finish before switching modes."
+                )
+                return
             self.busy = False
             await self.switch_mode()
             return
-        if command.startswith("/theme"):
+        if name == "/theme":
             await self._handle_theme(text)
             return
-        if command == "/sessions":
-            try:
-                self.engagements = await asyncio.to_thread(self.engagement_store.list_tabs)
-            except Exception as exc:
-                self.notify(f"Engagement history unavailable: {type(exc).__name__}")
+        if name == "/workspace":
+            self._add_transient("system", str(self.cfg.workspace))
+            return
+        if name == "/engage":
+            target = text.partition(" ")[2].strip()
+            if self.engagement_running:
+                self.notify(
+                    "An engagement is already running; wait for it to finish, then use /engage again."
+                )
                 return
-            self.notify(f"Loaded {len(self.engagements)} stored engagement(s).")
-            self._changed("tabs")
+            if not target:
+                self._add_transient(
+                    "system", "Use /engage <authorized target> to start a new engagement."
+                )
+                return
+            await self.start_engagement(target)
             return
-        if command.startswith("/"):
-            self._add_transient("system", "That command is not available in Purple Team mode.")
+        if name == "/report":
+            await self._show_report(text)
             return
+        if name == "/rename":
+            await self._command_rename(text, "engagement")
+            return
+        if name == "/sessions":
+            await self._command_sessions(text)
+            return
+        if name:
+            self._add_transient(
+                "system",
+                f"{name} is not a command here. Use /commands to see what is available.",
+            )
+            return
+        # Plain text with no engagement view open starts an engagement
+        # (the placeholder screen's documented behaviour).  With a view
+        # open, plain text never reaches here — submit() routes it to the
+        # read-only question path instead.
         await self.start_engagement(text.strip())
+
+    async def _show_report(self, text: str) -> None:
+        """Tell the operator where the report is, optionally open it."""
+        view = self.purple_view
+        path = (view.report_path if view is not None else None) or ""
+        parts = text.split()
+        want_open = len(parts) > 1 and parts[1].lower() == "open"
+        if not path:
+            self._add_transient("system", "No report has been saved for this engagement yet.")
+            return
+        if want_open:
+            opened = await asyncio.to_thread(self._open_report_in_browser, path)
+            if not opened:
+                self._add_transient(
+                    "system", f"Could not open the report; it is saved at: {path}"
+                )
+                return
+            self._add_transient("system", f"Opened report: {path}")
+            return
+        self._add_transient("system", f"Report saved at: {path}")
+
+    @staticmethod
+    def _open_report_in_browser(target: str) -> bool:
+        """Open one saved report file; a failure is reported, never faked."""
+        try:
+            import webbrowser
+            from pathlib import Path
+
+            path = Path(target).expanduser().resolve()
+            if not path.is_file():
+                return False
+            return bool(webbrowser.open(path.as_uri()))
+        except Exception:
+            return False
 
     async def start_engagement(self, target: str) -> None:
         # The runner performs the authoritative target, license, sandbox, and
@@ -747,6 +1349,7 @@ class WorkspaceController:
                     output=False,
                     human_reviewer=self.request_human_review,
                     post_exploit_approver=self.request_post_exploit,
+                    stop_requested=lambda: self.stop_requested,
                 )
             except KeyboardInterrupt:
                 view.finish("interrupted", halt_reason="keyboard_interrupt")
@@ -757,21 +1360,35 @@ class WorkspaceController:
                 log.exception("full-screen Purple engagement failed")
                 return 1
 
-        code = await asyncio.to_thread(worker)
+        self.engagement_running = True
         try:
-            refreshed = await asyncio.to_thread(self.engagement_store.list_tabs)
-        except Exception:
-            refreshed = []
-        for record in refreshed:
-            if record.engagement_id == engagement_id:
-                self.engagements[0] = record
-                break
-        if view.outcome is None and code != 0:
-            view.finish("failed", halt_reason=f"exit_{code}")
-        if self.engagements:
-            self.engagements[0].status = view.outcome or "running"
-            self.engagements[0].last_state = view.current_state
-        self._changed("purple")
+            code = await asyncio.to_thread(worker)
+            try:
+                refreshed = await asyncio.to_thread(self.engagement_store.list_tabs)
+            except Exception:
+                refreshed = []
+            for record in refreshed:
+                if record.engagement_id == engagement_id:
+                    # An operator-given display title survives the run: the
+                    # refreshed record is re-read from disk, so re-apply it
+                    # and re-store it now that the directory exists.
+                    previous_title = self.engagements[0].custom_title
+                    if previous_title:
+                        record.custom_title = previous_title
+                        try:
+                            self.engagement_store.rename(engagement_id, previous_title)
+                        except Exception:
+                            pass
+                    self.engagements[0] = record
+                    break
+            if view.outcome is None and code != 0:
+                view.finish("failed", halt_reason=f"exit_{code}")
+            if self.engagements:
+                self.engagements[0].status = view.outcome or "running"
+                self.engagements[0].last_state = view.current_state
+            self._changed("purple")
+        finally:
+            self.engagement_running = False
 
     def load_engagement_view(self, tab: EngagementTab) -> None:
         view = _LivePurpleState(
@@ -781,20 +1398,71 @@ class WorkspaceController:
             sandbox_status="recorded",
         )
         view.started_at = time.monotonic()
-        for event in self.engagement_store.read_events(tab):
+        events = self.engagement_store.read_events(tab)
+        for event in events:
             event_name = event.get("event")
             if event_name == "state_enter":
                 view.on_state(str(event.get("state") or ""))
             view.on_audit(event)
             if event_name == "engagement_finished":
+                recorded_failed = event.get("failed_states")
                 view.finish(
                     str(event.get("outcome") or "recorded"),
                     halt_reason=str(event.get("reason") or "") or None,
+                    failed_states=(
+                        recorded_failed if isinstance(recorded_failed, list) else None
+                    ),
                 )
-        if view.current_state and view.current_state not in view.completed_states and view.outcome:
+        if (
+            view.current_state
+            and view.current_state not in view.completed_states
+            and view.current_state not in view.failed_states
+            and view.outcome
+        ):
             view.on_state_complete(view.current_state)
+        self._apply_recorded_timing(view, events)
         with self._lock:
             self.purple_view = view
+
+    @staticmethod
+    def _apply_recorded_timing(
+        view: _LivePurpleState, events: list[dict[str, Any]]
+    ) -> None:
+        """Make a replay report the run's real clock, not the app's.
+
+        ``started_at``/``finished_at`` are monotonic readings of *this*
+        process, so a reopened engagement used to report how long it had
+        been open rather than how long it ran, and every state duration was
+        zero. The audit chain already carries a wall-clock ``ts`` on each
+        entry; derive the duration and the per-state spans from those. A
+        chain old enough to have no ``ts`` keeps the old fallback.
+        """
+        stamps: list[float] = []
+        state_starts: list[tuple[str, float]] = []
+        finished_at: float | None = None
+        for event in events:
+            at = _audit_seconds(event.get("ts"))
+            if at is None:
+                continue
+            stamps.append(at)
+            name = event.get("event")
+            if name == "state_enter":
+                state = str(event.get("state") or "")
+                if state:
+                    state_starts.append((state, at))
+            elif name == "engagement_finished":
+                finished_at = at
+        if not stamps:
+            return
+        end = finished_at if finished_at is not None else stamps[-1]
+        view.recorded_duration = max(0.0, end - stamps[0])
+        for index, (state, started) in enumerate(state_starts):
+            next_at = (
+                state_starts[index + 1][1]
+                if index + 1 < len(state_starts)
+                else end
+            )
+            view.state_duration[state] = max(0.0, next_at - started)
 
     # ---- approvals -----------------------------------------------------
 

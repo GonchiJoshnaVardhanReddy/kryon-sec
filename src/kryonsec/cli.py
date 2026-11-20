@@ -21,6 +21,7 @@ from rich.console import Console
 
 from . import __version__
 from .config import KryonsecConfig
+from .ui.brand import CREDIT, LARGE_UNICODE, MEDIUM_ASCII, brand_variant
 
 # Glyphs that legacy code-page consoles (cp1252) can't encode crash Rich
 # mid-print — mid-chat-turn. Detect once at import: UTF-8 consoles get the
@@ -47,36 +48,50 @@ err_console = Console(stderr=True, style="red")
 # messages exchanged in the current session (for the goodbye line)
 _msg_count = [0]
 
-BANNER = r"""██╗  ██╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗███████╗███████╗ ██████╗
-██║ ██╔╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║██╔════╝██╔════╝██╔════╝
-█████╔╝ ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║███████╗█████╗  ██║
-██╔═██╗ ██╔══██╗  ╚██╔╝  ██║   ██║██║╚██╗██║╚════██║██╔══╝  ██║
-██║  ██╗██║  ██║   ██║   ╚██████╔╝██║ ╚████║███████║███████║╚██████╗
-╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝"""
+BANNER = "\n".join(LARGE_UNICODE)
 
 
 # fallback for legacy code-page consoles (cp1252 etc.) where the
 # box-drawing art would raise UnicodeEncodeError at startup
-BANNER_ASCII = """ .------.  .---.  .-----.  .---. .-.    .------.--------.
- |K .---/  | .-. \\ | .-.  \\ | |-.'| |    | .---'|  .--.  |
- |  .'|    | `-' | | `-'.  )| |-' `-'    | `--.| |  \\  |
- |  `-|    | .-. | | .-.  \\ | |    .     | .---'|  _  7
- `---'`-'  `-' `-' `-'  `--'`-'    `--.  `-'    `-' `--' KRYONSEC"""
+BANNER_ASCII = "\n".join(MEDIUM_ASCII)
 
 
 def _active_banner() -> str:
+    """Retained for callers that need the raw art (wizard, tests)."""
     return BANNER if _UTF8_OK else BANNER_ASCII
 
 
-def banner_styled(mode: str) -> str:
-    """The banner, white in copilot mode, purple in purple team mode."""
+def banner_styled(mode: str, *, width: int | None = None) -> str:
+    """The banner, white in copilot mode, purple in purple team mode,
+    with the author credit underneath the wordmark.
+
+    ``width`` lets the caller pick a smaller wordmark on narrow consoles;
+    omitting it keeps the widest block art for stable callers and tests.
+    """
     color = "magenta" if mode == "purple" else "white"
-    return f"[bold {color}]{_active_banner()}[/bold {color}]"
+    effective = width if width is not None else len(LARGE_UNICODE[0]) + 2
+    variant = brand_variant(effective, unicode_ok=_UTF8_OK)
+    art = [line.rstrip() for line in variant.lines]
+    if not art or not art[0]:
+        return f"[dim]{CREDIT}[/dim]" if effective >= len(CREDIT) else ""
+    mark_width = max(len(line) for line in art)
+    # Centre the same way the Textual banner does.  With no explicit width
+    # the historical left-aligned block is kept for stable callers.
+    pad = " " * max(0, (effective - mark_width) // 2) if width is not None else ""
+    credit_pad = (
+        " " * max(0, (effective - len(CREDIT)) // 2)
+        if width is not None
+        else " " * max(0, (mark_width - len(CREDIT)) // 2)
+    )
+    lines = [f"{pad}[bold {color}]{line}[/bold {color}]" for line in art]
+    lines.append("")
+    lines.append(f"[dim]{credit_pad}{CREDIT}[/dim]")
+    return "\n".join(lines)
 
 
 def _print_banner(mode: str) -> None:
     """Re-print the banner whenever the mode flips (Shift+Tab or /mode)."""
-    console.print(banner_styled(mode))
+    console.print(banner_styled(mode, width=console.width))
 
 
 def welcome(cfg: "KryonsecConfig") -> str:
@@ -89,7 +104,7 @@ def welcome(cfg: "KryonsecConfig") -> str:
         "openai_compatible": "OpenAI-compatible endpoint",
     }.get(cfg.provider, "Ollama (local)")
     return (
-        f"{banner_styled('copilot')}\n"
+        f"{banner_styled('copilot', width=console.width)}\n"
         f"[bold cyan]v{__version__}[/bold cyan] — dual-mode cybersecurity CLI\n"
         f"[cyan]\\[COPILOT]>[/cyan] general assistant   "
         f"[magenta]\\[PURPLE]>[/magenta] purple team (Profile 2, Linux)\n"
@@ -849,13 +864,20 @@ def _run_purple(
     output: bool = True,
     human_reviewer: "Callable[[list[dict]], set[str]] | None" = None,
     post_exploit_approver: "Callable[[str], bool] | None" = None,
+    stop_requested: "Callable[[], bool] | None" = None,
 ) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
     subcommand and the /mode toggle inside the chat loop.
 
     `memory_browser` is what those two callers pass: it prints the loopback
     URL of the read-only memory browser and leaves it serving. It is off by
-    default so a caller driving this function directly gets no socket."""
+    default so a caller driving this function directly gets no socket.
+
+    ``stop_requested`` is an optional predicate polled at each state
+    boundary by the orchestrator. It is the fullscreen UI's Ctrl+C: the
+    running state finishes, then the loop HALTs with ``operator_interrupt``.
+    The terminal (non-interactive) path has no such input and leaves it
+    None."""
     import uuid
     from pathlib import Path
 
@@ -864,6 +886,8 @@ def _run_purple(
     # longer printed anywhere. STATES is imported where it is used, below.
     from .engagement_id import is_valid_engagement_id
     from .purple.runner import (
+        STATE_FAILED_CODE,
+        engagement_outcome,
         persist_graph,
         persist_handoffs,
         record_engagement_ending,
@@ -993,6 +1017,7 @@ def _run_purple(
     outcome: str | None = None
     reason: str | None = None
     exception_type: str | None = None
+    failed_states: list[str] = []
     try:
         try:
             orch, audit, graph = start_engagement(
@@ -1000,6 +1025,7 @@ def _run_purple(
                 code_folder=code_folder,
                 human_reviewer=human_reviewer,
                 post_exploit_approver=post_exploit_approver,
+                should_stop=stop_requested,
             )
             # Two existing hooks, no new plumbing: the orchestrator announces
             # state transitions (before the subagent is built, so HUMAN_REVIEW's
@@ -1038,10 +1064,12 @@ def _run_purple(
             ui.start()
             completed = orch.run()
             report_path = cfg.home / "engagements" / engagement_id / "report.md"
+            failed_states = list(getattr(orch, "failed_states", ()) or ())
             ui.finish(
-                "halted" if orch.halt_reason else "completed",
+                engagement_outcome(orch.halt_reason, failed_states),
                 halt_reason=orch.halt_reason,
                 report_path=str(report_path) if report_path.exists() else None,
+                failed_states=failed_states,
             )
         finally:
             ui.stop()
@@ -1079,8 +1107,13 @@ def _run_purple(
         # graph is a failure of the run, and reading the halt reason earlier
         # would have already labelled it a clean finish. Interruption and
         # failure are the exception handlers' to decide, not this line's.
-        outcome = "halted" if orch.halt_reason else "completed"
+        # A stage that returned ``failed`` did reach this line, so the
+        # outcome must say failed rather than completed.
+        failed_states = list(getattr(orch, "failed_states", ()) or ())
+        outcome = engagement_outcome(orch.halt_reason, failed_states)
         reason = safe_halt_code(orch.halt_reason)
+        if outcome == "failed" and reason is None:
+            reason = STATE_FAILED_CODE
     except KeyboardInterrupt:
         # Recorded, then re-raised. The operator asked for the run to stop,
         # and it still stops — same traceback, same exit status as before
@@ -1105,6 +1138,7 @@ def _run_purple(
             last_state=entered[-1] if entered else None,
             states_entered=len(entered),
             exception_type=exception_type,
+            failed_states=failed_states,
         )
 
     if output:
@@ -1152,6 +1186,11 @@ def _print_purple_summary(
 
     engaged = bool(attempts)
     halted = bool(orch.halt_reason)
+    failed_states = [
+        state for state in (getattr(orch, "failed_states", None) or ())
+        if isinstance(state, str)
+    ]
+    failed = bool(failed_states)
 
     evidence_dir = cfg.home / "engagements" / engagement_id / "evidence"
     evidence_count = 0
@@ -1166,6 +1205,8 @@ def _print_purple_summary(
     rows.add_row("", "")
     if halted:
         rows.add_row("Completed", f"{len(completed)} / {len(STATES)} stages")
+    elif failed:
+        rows.add_row("Entered", f"{len(completed)} / {len(STATES)} stages")
     rows.add_row("Verified findings", f"[red]{len(verified)}[/red]"
                  if verified else "0")
     rows.add_row("Possible findings", str(len(possible)))
@@ -1203,6 +1244,11 @@ def _print_purple_summary(
         detail = f"[red]{orch.halt_reason}[/red]"
         rows.add_row("", "")
         rows.add_row("Reason", detail)
+    elif failed:
+        title = "[bold red]ENGAGEMENT FAILED[/bold red]"
+        border = "red"
+        rows.add_row("", "")
+        rows.add_row("Failed stages", ", ".join(failed_states))
     else:
         title = "[bold green]ENGAGEMENT COMPLETE[/bold green]"
         border = "green"
@@ -1213,6 +1259,11 @@ def _print_purple_summary(
     # ---- the verdict, in one line ---------------------------------
     if halted:
         verdict = f"[red]HALTED[/red] — {orch.halt_reason}"
+    elif failed:
+        verdict = (
+            f"[red]FAILED[/red] — stage(s) did not complete: "
+            f"{', '.join(failed_states)}"
+        )
     elif verified:
         verdict = f"[red]{len(verified)} verified finding(s)[/red] on {target}"
     elif findings:
@@ -1233,6 +1284,8 @@ def _print_purple_summary(
     console.print(verdict)
     if halted:
         console.print("[dim]next safe action: resolve the gate above, run `kryonsec doctor`, then start a new engagement[/dim]")
+    elif failed:
+        console.print("[dim]next safe action: inspect the failed stage(s) and the default debug log, then start a new engagement[/dim]")
     else:
         console.print("[dim]next safe action: review the report and audit fingerprint before sharing results[/dim]")
     console.print(f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]")
@@ -1328,8 +1381,45 @@ def main(argv: list[str] | None = None) -> int:
         "--strict", action="store_true",
         help="exit non-zero unless Copilot and the verified Purple runtime are ready",
     )
+    doctor.add_argument(
+        "--fix", action="store_true",
+        help="plan safe repairs, apply unprivileged local fixes, and re-check",
+    )
+    doctor.add_argument(
+        "--dry-run", action="store_true",
+        help="with --fix: show every proposed action without changing anything",
+    )
+    doctor.add_argument(
+        "--verbose", action="store_true",
+        help="with --fix: show action details and full repair output",
+    )
+    doctor.add_argument(
+        "--quiet", action="store_true",
+        help="with --fix: show stages, failures, and the final summary only",
+    )
 
     sub.add_parser("setup", help="run the setup wizard (config.toml: LLM, tools, MCP)")
+
+    storage = sub.add_parser(
+        "storage",
+        help="show disk usage (read-only); --cleanup removes exact old files only",
+    )
+    storage.add_argument(
+        "--cleanup", action="store_true",
+        help="after confirmation, remove old config backups, repair logs, and atomic-write temp files",
+    )
+    storage.add_argument(
+        "--dry-run", action="store_true",
+        help="with --cleanup: list the exact files without removing them",
+    )
+    storage.add_argument(
+        "--retention-days", type=int, default=30,
+        help="keep backups and repair logs newer than this many days (default 30)",
+    )
+    storage.add_argument(
+        "--verbose", action="store_true",
+        help="print each removed path",
+    )
 
     purple = sub.add_parser("purple", help="start a Purple Team engagement (Profile 2, Linux only)")
     purple.add_argument("--target", required=True, help="authorized target (e.g. example.com)")
@@ -1363,6 +1453,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from .doctor import run_doctor
 
+        if args.fix or args.dry_run:
+            if args.verbose and args.quiet:
+                err_console.print("[red]--verbose and --quiet cannot be used together[/red]")
+                return 2
+            from .install.fix import run_fix
+
+            return run_fix(
+                cfg,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                quiet=args.quiet,
+            )
         return run_doctor(cfg, deep=args.deep, strict=args.strict)
 
     if args.command == "purple":
@@ -1376,7 +1478,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "setup":
         from .wizard import run_setup
-
         try:
             run_setup(cfg)
         except KeyboardInterrupt:
@@ -1390,6 +1491,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         return 0
+
+    if args.command == "storage":
+        from .install.storage import run_storage
+
+        return run_storage(
+            cfg,
+            cleanup=args.cleanup,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            retention_days=max(1, args.retention_days),
+        )
 
     # first run without a config -> wizard before the chat loop
     from .config import config_path

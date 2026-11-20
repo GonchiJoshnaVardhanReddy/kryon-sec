@@ -6,6 +6,12 @@ installer refuses to change automatically.
 
 ## Support matrix
 
+Throughout this guide, **Profile 1 = Copilot (Mode A)** — the conversational
+security assistant — and **Profile 2 = Purple Team (Mode B)** — the
+deterministic, sandboxed engagement engine. `kryonsec doctor` reports the
+same names (`Profile 1 (Copilot)`); Profile 2 readiness is the set of Purple
+rows.
+
 | Environment | Copilot | Purple Team | Notes |
 |---|---:|---:|---|
 | Linux x86-64, Python 3.11–3.13 | Supported | Supported when all runtime checks pass | Docker Engine, registered gVisor, and the release image are required for Zone B. |
@@ -17,8 +23,13 @@ installer refuses to change automatically.
 | Rootless Docker | Supported for Copilot | Not claimed | Purple support requires a real `doctor --deep` result with the selected daemon and runsc. |
 | Remote Docker context | Supported for Copilot | Manual/unsupported by the installer | The daemon itself must have runsc registered and the image available. A local runsc binary is not enough. |
 
-Python 3.14 may be detected, but dependency wheels are not guaranteed. Use
-Python 3.12 or 3.13 for a release installation.
+The package requires Python 3.11+ (see `requires-python` in
+`pyproject.toml`). The Linux installer probes `python3.13`, `python3.12`,
+`python3.11`, then a bare `python3`, and deliberately skips 3.14+: very new
+interpreters can still miss prebuilt wheels for some dependencies, so pip
+silently compiles them from source and the install looks hung. A machine
+whose only interpreter is 3.14+ still installs via the bare `python3`
+fallback — it is just warned that it may be slow.
 
 ## What is required
 
@@ -159,6 +170,24 @@ kryonsec doctor
 kryonsec doctor --deep
 kryonsec doctor --deep --strict
 ```
+
+### What a fresh machine shows before first run
+
+On a machine with no `config.toml` yet, a plain `kryonsec doctor` reports
+honestly — and with exit code 1 — that nothing is usable yet:
+
+* **Configuration — SKIPPED** "not configured yet (…); run `kryonsec setup`".
+* **The provider row is the built-in default**, not your choice: until setup
+  has run, the default provider is OpenAI, so the `LLM: OpenAI` row FAILs
+  with `OPENAI_API_KEY not set` and a note that this is the built-in default.
+  If you intend to use local Ollama (no key needed), `kryonsec setup` writes
+  that choice and the OpenAI row disappears (it becomes SKIPPED).
+* **Storage — PASS** even before first use ("SQLite fallback not initialized
+  yet; first use will create it").
+
+Exit code 1 here is correct behaviour, not an installation bug: a machine
+with no configured provider cannot run Copilot chat. The red panel names the
+fix (`kryonsec setup`); rerun `kryonsec doctor` afterwards.
 
 The report uses `PASS`, `FAIL`, `WARNING`, and `SKIPPED`. It reports the active
 Docker context, a redacted endpoint, client/server versions, socket permission

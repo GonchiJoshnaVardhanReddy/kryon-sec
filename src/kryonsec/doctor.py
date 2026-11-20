@@ -68,13 +68,24 @@ def _check_ollama(cfg: KryonsecConfig) -> tuple[bool, str]:
                 return True, f"OK ({host})"
             return False, f"HTTP {r.status}"
     except Exception:
-        return False, f"not reachable at {host} (local model unavailable)"
+        return False, (
+            f"not reachable at {host} (local model unavailable — start "
+            "`ollama serve`, or install/pull a model if missing, then re-run)"
+        )
 
 
 def _check_openai(cfg: KryonsecConfig) -> tuple[bool, str]:
     if cfg.openai_api_key:
         return True, "OK (OPENAI_API_KEY set)"
-    return False, "OPENAI_API_KEY not set (third-party models unavailable)"
+    # The message must keep pointing at the two real fixes: choose a
+    # provider the machine can actually use (setup writes that choice), or
+    # supply the key for the provider that was chosen. "third-party models
+    # unavailable" alone sent readers hunting for a network problem that
+    # does not exist.
+    return False, (
+        "OPENAI_API_KEY not set; run `kryonsec setup` to pick a provider "
+        "(local Ollama needs no key) or set the key for this one"
+    )
 
 
 def _check_bedrock(cfg: KryonsecConfig) -> tuple[bool, str]:
@@ -253,7 +264,33 @@ def _image_row(cfg: KryonsecConfig) -> tuple[str, str]:
         expected_version=__version__,
         server_architecture=info.architecture if info else None,
     )
-    return check.status, check.detail
+    if check.status == "PASS":
+        return check.status, check.detail
+    # Explain the real source and whether a compatible image is already
+    # present.  This is read-only; doctor still fails closed.
+    from .install import recovery
+
+    diagnosis = recovery.diagnose(
+        cfg,
+        expected_version=__version__,
+        validation_detail=check.detail,
+        server_architecture=info.architecture if info else "",
+        scan=True,
+    )
+    detail = f"{check.detail} Selected via {diagnosis.source}."
+    best = diagnosis.best_candidate
+    if best is not None:
+        detail += (
+            f" A compatible local {best.version} image is present "
+            f"({best.reference}); `kryonsec doctor --fix` can select its "
+            "verified digest without rebuilding."
+        )
+    else:
+        detail += (
+            " No compatible local image was found; `kryonsec doctor --fix` "
+            "prints the safe options."
+        )
+    return check.status, detail
 
 
 def _runtime_smoke_row(cfg: KryonsecConfig) -> tuple[str, str]:
@@ -297,6 +334,10 @@ def run_doctor(
     add("Storage", "Copilot memory", "PASS" if storage_ok else "FAIL", storage_msg)
 
     config_ok, config_msg = _check_config(cfg)
+    # No config file = nothing was chosen yet: the provider rows below are
+    # checking the BUILT-IN default, and a reader who never configured
+    # anything must not read their FAIL as a mistake they made.
+    configured = config_ok is not None
     add(
         "Configuration",
         "first run and provider selection",
@@ -322,6 +363,12 @@ def run_doctor(
             ok, msg = check(cfg)
             status = "PASS" if ok else "FAIL"
             selected_llm_ok = ok
+            if not ok and not configured:
+                msg = (
+                    f"{msg} — no config file yet, so this is the built-in "
+                    "default provider, not a choice you made; `kryonsec "
+                    "setup` writes your real choice"
+                )
         else:
             status = "SKIPPED"
             msg = "optional provider not selected"
@@ -484,6 +531,9 @@ def run_doctor(
         console.print(Panel(
             "[red]FAIL — Profile 1 (Copilot) is not usable: storage and the "
             "selected LLM provider must pass.[/red]\n"
+            "[yellow]First run on a fresh machine? `kryonsec setup` writes "
+            "config.toml and picks a provider; local Ollama needs no "
+            "key.[/yellow]\n"
             "[yellow]Purple Team is independently gated and will not fall back "
             "to an unisolated runtime.[/yellow]",
             title="What works here",

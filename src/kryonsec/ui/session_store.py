@@ -160,9 +160,15 @@ class EngagementTab:
     last_state: str = ""
     path: Path | None = None
     started_at: str = ""
+    # Operator-chosen display title, optional.  Renaming NEVER changes the
+    # engagement id, the recorded target, or any stored event; the title
+    # lives beside the audit chain as display_title.json.
+    custom_title: str | None = None
 
     @property
     def title(self) -> str:
+        if self.custom_title:
+            return self.custom_title[:28] + ("…" if len(self.custom_title) > 28 else "")
         return self.target[:28] + ("…" if len(self.target) > 28 else "")
 
     @property
@@ -171,10 +177,55 @@ class EngagementTab:
 
 
 class EngagementStore:
-    """Read-only index of the existing engagement audit records."""
+    """Read-only index of the existing engagement audit records.
+
+    "Read-only" applies to the audit chain: the one operator-owned display
+    title is stored as ``display_title.json`` beside it, and nothing else
+    in the engagement directory is ever written here.
+    """
+
+    DISPLAY_TITLE_FILE = "display_title.json"
 
     def __init__(self, cfg: KryonsecConfig) -> None:
         self.cfg = cfg
+
+    def rename(self, engagement_id: str, title: str) -> bool:
+        """Store one engagement's display title; returns True when written.
+
+        The engagement id is a path component, so it is re-checked here the
+        same way ``--id`` is at creation.  An unknown id (no directory) is
+        refused rather than created.
+        """
+        from ..engagement_id import is_valid_engagement_id
+
+        if not is_valid_engagement_id(engagement_id):
+            return False
+        directory = self.cfg.home / "engagements" / engagement_id
+        if not directory.is_dir():
+            return False
+        cleaned = " ".join(str(title or "").split())[:120]
+        if not cleaned:
+            return False
+        try:
+            (directory / self.DISPLAY_TITLE_FILE).write_text(
+                json.dumps({"title": cleaned}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            return False
+        return True
+
+    def read_display_title(self, directory: Path) -> str | None:
+        try:
+            payload = json.loads(
+                (directory / self.DISPLAY_TITLE_FILE).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        title = " ".join(str(payload.get("title") or "").split())
+        return title[:120] or None
 
     def list_tabs(self, limit: int = 8) -> list[EngagementTab]:
         root = self.cfg.home / "engagements"
@@ -242,7 +293,8 @@ class EngagementStore:
             status=str(finished.get("outcome") or "running"),
             last_state=str(finished.get("last_state") or ""),
             path=path.parent,
-            started_at=str(created.get("timestamp") or ""),
+            started_at=str(created.get("ts") or ""),
+            custom_title=self.read_display_title(path.parent),
         )
 
 

@@ -292,6 +292,15 @@ class PurpleOrchestrator:
     # the scheduler's boundary work can be driven from ``_notify``'s
     # listener side, never from the transition decision itself.
     specialist_scheduler: object | None = None
+    # Operator stop input: a pure predicate read at the top of every state,
+    # never mid-state. It can only end the loop *between* states, so a tool
+    # that is already running is allowed to finish and its evidence is
+    # recorded before HALT. The UI sets the flag; the loop owns the decision.
+    should_stop: Callable[[], bool] | None = None
+    # States whose subagent returned ``failed``. The loop keeps its
+    # deterministic route (a failed state is not a halt), but the terminal
+    # lifecycle word must not call such a run "completed".
+    failed_states: list[str] = field(default_factory=list)
 
     def run(self) -> list[str]:
         """Run the loop to HALT. Returns the list of completed states."""
@@ -300,6 +309,20 @@ class PurpleOrchestrator:
                 self.halt_reason = "purple_team_requires_profile2 (Linux + Docker + gVisor)"
                 self.state = HALT
                 break
+            if self.should_stop is not None:
+                # Read between states, never inside one: the running tool
+                # finishes, its result is audited, and the checkpoint at the
+                # boundary is therefore consistent. A broken predicate must
+                # not stop a run, so it is logged and treated as "no".
+                try:
+                    stop = bool(self.should_stop())
+                except Exception:
+                    log.exception("stop predicate error (ignored)")
+                    stop = False
+                if stop:
+                    self.halt_reason = "operator_interrupt"
+                    self.state = HALT
+                    break
             if self.budget.exhausted():
                 self.halt_reason = "budget_exhausted"
                 self.state = HALT
@@ -338,6 +361,8 @@ class PurpleOrchestrator:
 
             if result.status == "halted" and result.halt_reason:
                 self.halt_reason = result.halt_reason
+            if result.status == "failed":
+                self.failed_states.append(self.state)
 
             # After the state's work, before the transition. self.state still
             # names the state that just ran, and the graph it produced is

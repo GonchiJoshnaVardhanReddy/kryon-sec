@@ -22,6 +22,7 @@ from . import runtime_checks
 from .audit import AuditLog
 from .coordinator import HandoffCoordinator, StageBoundaryRecorder
 from .orchestrator import (
+    STATES,
     BudgetTracker,
     HALT,
     PurpleOrchestrator,
@@ -185,6 +186,7 @@ def start_engagement(
     code_folder: str | None = None,
     human_reviewer: "Callable[[list[dict]], set[str]] | None" = None,
     post_exploit_approver: "Callable[[str], bool] | None" = None,
+    should_stop: "Callable[[], bool] | None" = None,
 ) -> tuple[PurpleOrchestrator, AuditLog, "object"]:
     """Wire up an engagement. Returns (orchestrator, audit, graph).
 
@@ -396,6 +398,7 @@ def start_engagement(
             def run_report() -> SubagentResult:
                 # the report records how far the engagement actually got
                 sub.completed_states = orch.completed
+                sub.failed_states = orch.failed_states
                 sub.halt_reason = orch.halt_reason
                 return sub.run()
 
@@ -464,6 +467,18 @@ def start_engagement(
             )
             return sub.run
 
+        if state == "INIT":
+            # INIT has no work of its own: start_engagement already
+            # validated the id and target, opened the audit chain and built
+            # the graph. Falling through to the generic stub made INIT
+            # return "failed" on every run, which polluted the log and —
+            # once failed stages started counting — would have marked every
+            # engagement failed before its first real state ran.
+            def init_done() -> SubagentResult:
+                return SubagentResult(status="ok")
+
+            return init_done
+
         if state in SANDBOX_FREE_STATES:
             return subagent_stub(state)
 
@@ -507,6 +522,7 @@ def start_engagement(
         budget=budget,
         execution_allowed=True,
         subagent_loader=loader,
+        should_stop=should_stop,
     )
     # Durable checkpoint (Phase 4.3). The graph is written to engagement
     # storage after every state, so an interruption costs at most the state
@@ -1013,22 +1029,52 @@ def resume_specialists(
 # writer once the runner has it.
 OUTCOMES = frozenset({"completed", "halted", "failed", "interrupted"})
 
+#: Terminal reason for a run that reached HALT with a failed stage. Not a
+#: halt code — nothing halted the loop — but the chain still needs one fixed
+#: word explaining why a finished route is recorded as failed.
+STATE_FAILED_CODE = "state_failed"
+
+
+def engagement_outcome(
+    halt_reason: str | None,
+    failed_states: "list[str] | tuple[str, ...]" = (),
+) -> str:
+    """The one durable word for how a run ended.
+
+    Precedence is explicit: a halt explains why the loop stopped, so it wins
+    (an operator stop is ``interrupted``, everything else is ``halted``).
+    Otherwise a stage that returned ``failed`` makes the run ``failed`` even
+    though the deterministic route reached HALT. Only a run with neither is
+    ``completed``. The UI, the summary panel and the audit chain all call
+    this, so they cannot disagree about what happened.
+    """
+    if halt_reason == "operator_interrupt":
+        return "interrupted"
+    if halt_reason:
+        return "halted"
+    if failed_states:
+        return "failed"
+    return "completed"
+
+
 # The two events that bracket one execution. The creation event opens a run
 # (and carries its run id, Phase 4.5B); the terminal event closes it.
 _CREATED_EVENT = "engagement_created"
 _TERMINAL_EVENT = "engagement_finished"
 
-# halt_reason is assigned in exactly three places — orchestrator.py:110,
-# orchestrator.py:114, and the zone_b_blocked closure below — and only the
-# first two are literals. Everything else is a sandbox probe message, which
-# quotes an image reference ("sandbox image not found locally: ...") and
-# names missing tools. That is free text, so the terminal event records a
-# code and the detailed reason stays in the zone_b_blocked entry that caused
-# the halt, which is already in the chain. A new halt_reason needs a code
-# added to this table.
+# halt_reason is assigned in exactly four places — the profile guard and the
+# budget guard in orchestrator.py, the operator-stop guard beside them, and
+# the zone_b_blocked closure below — and only the first three are literals.
+# Everything else is a sandbox probe message, which quotes an image
+# reference ("sandbox image not found locally: ...") and names missing
+# tools. That is free text, so the terminal event records a code and the
+# detailed reason stays in the zone_b_blocked entry that caused the halt,
+# which is already in the chain. A new halt_reason needs a code added to
+# this table.
 _HALT_CODES = {
     "budget_exhausted": "budget_exhausted",
     "purple_team_requires_profile2 (Linux + Docker + gVisor)": "profile2_required",
+    "operator_interrupt": "operator_interrupt",
 }
 _HALT_FALLBACK = "zone_b_blocked"
 
@@ -1142,6 +1188,7 @@ def record_engagement_ending(
     last_state: str | None = None,
     states_entered: int = 0,
     exception_type: str | None = None,
+    failed_states: "list[str] | tuple[str, ...]" = (),
 ) -> bool:
     """Append the engagement's single terminal lifecycle event (Phase 4.2).
 
@@ -1164,6 +1211,12 @@ def record_engagement_ending(
     than being refused the first one's (Phase 4.5B). A chain old enough to
     have no run id produces an ending shaped exactly as it was before this
     phase — the key is omitted rather than written as null.
+
+    ``failed_states`` names the stages that returned ``failed`` while the
+    deterministic route still reached HALT. Only names from the fixed state
+    list are written; the outcome is ``failed`` and the reason is
+    ``state_failed``, so a reader does not have to infer either from the
+    absence of findings.
 
     Returns True when the event was written.
     """
@@ -1214,6 +1267,9 @@ def record_engagement_ending(
             entry["last_state"] = last_state
         if exception_type is not None:
             entry["exception_type"] = exception_type
+        failed = [state for state in failed_states if state in STATES]
+        if failed:
+            entry["failed_states"] = failed
 
         # A fresh AuditLog rather than the run's, for two reasons: this
         # instance carries no observers, so the terminal entry is never
