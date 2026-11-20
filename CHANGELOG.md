@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — PR review fixes: local-only engagement questions, working registration approval
+
+- **Engagement questions never leave the machine.** The read-only question
+  path used the configured chat model, so a hosted provider received the
+  target, stage, findings and recent tool activity. It now calls a new
+  `chat_local()` boundary: an `ollama/` model only, a loopback endpoint only,
+  no provider routing and no hosted fallback. Any misconfiguration or local
+  failure returns the existing deterministic snapshot summary, clearly
+  labelled, without a remote request. Redaction remains defence in depth,
+  not permission to export engagement data.
+- **`doctor --fix` now actually performs an approved local-image
+  registration.** The planner schedules `register-local-image` under
+  `VERIFYING SANDBOX`, but that stage executed only automatic actions while
+  the executor lived in `DOWNLOADING SANDBOX`. The approval is now handled
+  in the stage that receives it, with the same exact `docker start` / `tag` /
+  `push` preview, loopback and step allowlists, Docker-reported digest pin,
+  config backup, and no change on rejection or failure.
+- **CI doctor assertions no longer depend on table wrapping.** The tests
+  render the table wider than its content and strip vertical borders before
+  matching diagnostic text, so host-dependent row counts cannot split a
+  phrase. The content assertions are unchanged.
+
 ## Unreleased — UI acceptance fixes: honest stop, honest failure, real replay clock
 
 Found while running the fullscreen UI against the real engine. Each fix has a
