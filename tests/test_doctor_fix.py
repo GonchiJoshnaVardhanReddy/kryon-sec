@@ -23,8 +23,13 @@ from kryonsec.install.detect import (
     OsRelease,
     SystemSnapshot,
 )
-from kryonsec.install.plan import APPROVAL, AUTO, MANUAL, build_plan
+from kryonsec.install.plan import APPROVAL, AUTO, MANUAL, RepairAction, build_plan
 from kryonsec.install.progress import STAGES
+from kryonsec.install.recovery import (
+    REGISTRY_CONTAINER,
+    ImageCandidate,
+    RegistryStatus,
+)
 
 
 def _snapshot(
@@ -382,3 +387,163 @@ def test_snapshot_detection_is_read_only(cfg, monkeypatch):
     assert snapshot.supported is True
     assert cfg.home.exists() is False
     assert calls  # mode was queried, never changed
+
+
+# ---- approved local-image registration ------------------------------------
+
+
+def _registration_snapshot(cfg: KryonsecConfig, *, running: bool = False) -> SystemSnapshot:
+    """A validated local build that needs the loopback registry to tag it."""
+    registry = RegistryStatus(
+        container=REGISTRY_CONTAINER,
+        present=True,
+        running=running,
+        loopback=True,
+        host="127.0.0.1",
+        port="5000",
+        image="registry:2",
+    )
+    candidate = ImageCandidate(
+        reference="kryonsec/sandbox:ui-1.3.11",
+        version="1.3.11",
+        architecture="amd64",
+        operating_system="linux",
+        entrypoint=("/entrypoint.sh",),
+        user="kryonsec-runner",
+        compatible=True,
+    )
+    image = ImageSnapshot(
+        reference="kryonsec/sandbox@sha256:" + "a" * 64,
+        present=True,
+        validation_status="FAIL",
+        validation_detail="image version 1.3.10; expected 1.3.11",
+        candidates=(candidate,),
+        registry=registry,
+    )
+    return _snapshot(cfg, image=image)
+
+
+def test_fix_approves_and_runs_registration_in_the_verifying_stage(
+    cfg, monkeypatch
+):
+    """The planner puts registration in VERIFYING SANDBOX; the executor must
+    approve and run it there instead of only printing it."""
+    cfg.home.mkdir(parents=True)
+    path = cfg.home / "config.toml"
+    path.write_text("provider = 'ollama'\n", encoding="utf-8")
+    snapshot = _registration_snapshot(cfg)
+    monkeypatch.setattr(fix_module, "detect_system", lambda _cfg: snapshot)
+    monkeypatch.setattr("kryonsec.doctor.run_doctor", lambda _cfg: 0)
+    monkeypatch.setattr(fix_module, "_validated_digest_reference", lambda ref: ref)
+
+    commands: list[tuple[str, ...]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "pushed"
+        stderr = ""
+
+    def fake_run(argv, **_kwargs):
+        commands.append(tuple(argv))
+        return Result()
+
+    monkeypatch.setattr(fix_module.subprocess, "run", fake_run)
+
+    digest = "127.0.0.1:5000/kryonsec/sandbox@sha256:" + "b" * 64
+
+    class Info:
+        repo_digests = (digest,)
+
+    monkeypatch.setattr(
+        "kryonsec.purple.runtime_checks.image_inspect", lambda _ref: Info()
+    )
+
+    prompts: list[str] = []
+    rc = fix_module.run_fix(
+        cfg, quiet=True, input_fn=lambda prompt: prompts.append(prompt) or "yes"
+    )
+
+    assert rc == 0
+    assert len(prompts) == 1, "registration must be approved exactly once"
+    assert f"docker start {REGISTRY_CONTAINER}" in prompts[0]
+    assert "docker tag kryonsec/sandbox:ui-1.3.11" in prompts[0]
+    assert "docker push 127.0.0.1:5000/kryonsec/sandbox:1.3.11" in prompts[0]
+    assert commands == [
+        ("docker", "start", REGISTRY_CONTAINER),
+        (
+            "docker",
+            "tag",
+            "kryonsec/sandbox:ui-1.3.11",
+            "127.0.0.1:5000/kryonsec/sandbox:1.3.11",
+        ),
+        ("docker", "push", "127.0.0.1:5000/kryonsec/sandbox:1.3.11"),
+    ]
+    assert cfg.sandbox_image == digest
+    assert list(cfg.home.glob("config.toml.bak-*"))
+
+
+def test_fix_rejected_registration_changes_nothing(cfg, monkeypatch, capsys):
+    cfg.home.mkdir(parents=True)
+    path = cfg.home / "config.toml"
+    original = "provider = 'ollama'\n"
+    path.write_text(original, encoding="utf-8")
+    before = cfg.sandbox_image
+    snapshot = _registration_snapshot(cfg)
+    monkeypatch.setattr(fix_module, "detect_system", lambda _cfg: snapshot)
+    monkeypatch.setattr("kryonsec.doctor.run_doctor", lambda _cfg: 0)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("docker ran without approval")
+
+    monkeypatch.setattr(fix_module.subprocess, "run", forbidden)
+    monkeypatch.setattr(fix_module, "_validated_digest_reference", forbidden)
+
+    fix_module.run_fix(cfg, input_fn=lambda _prompt: "no")
+
+    assert cfg.sandbox_image == before
+    assert path.read_text(encoding="utf-8") == original
+    assert not list(cfg.home.glob("config.toml.bak-*"))
+    assert "skipped: no approval" in capsys.readouterr().out
+
+
+def test_fix_dry_run_never_prompts_or_registers(cfg, monkeypatch, capsys):
+    snapshot = _registration_snapshot(cfg)
+    monkeypatch.setattr(fix_module, "detect_system", lambda _cfg: snapshot)
+    monkeypatch.setattr("kryonsec.doctor.run_doctor", lambda _cfg: 0)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a dry run must not execute or prompt")
+
+    monkeypatch.setattr(fix_module.subprocess, "run", forbidden)
+    monkeypatch.setattr(fix_module, "_execute_registration", forbidden)
+
+    assert fix_module.run_fix(cfg, dry_run=True, input_fn=forbidden) == 0
+    assert not list(cfg.home.glob("config.toml.bak-*"))
+    out = capsys.readouterr().out
+    assert "docker push 127.0.0.1:5000/kryonsec/sandbox:1.3.11" in out
+
+
+def test_registration_refuses_a_forged_non_loopback_step(monkeypatch):
+    class Reporter:
+        def line(self, *_args, **_kwargs):
+            pass
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a forged step reached subprocess")
+
+    monkeypatch.setattr(fix_module.subprocess, "run", forbidden)
+    action = RepairAction(
+        "VERIFYING SANDBOX",
+        "register-local-image",
+        "register",
+        APPROVAL,
+        steps=(("docker", "push", "evil.example.com/kryonsec/sandbox:1.3.11"),),
+        local_ref="kryonsec/sandbox:ui-1.3.11",
+        registry_ref="evil.example.com/kryonsec/sandbox:1.3.11",
+        version="1.3.11",
+    )
+    ok, detail = fix_module._execute_registration(
+        KryonsecConfig(home=Path("/nonexistent")), action, Reporter()
+    )
+    assert ok is False
+    assert "not loopback-bound" in detail

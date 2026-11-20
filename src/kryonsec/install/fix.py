@@ -273,6 +273,27 @@ def _ask_approval(action: RepairAction, input_fn: Callable[[str], str]) -> bool:
     return answer.strip().lower() == "yes"
 
 
+def _execute_approval(
+    cfg: KryonsecConfig,
+    action: RepairAction,
+    reporter: RepairReporter,
+    input_fn: Callable[[str], str],
+) -> tuple[bool, str]:
+    """Ask for approval, then run exactly the approved action.
+
+    Dispatch is keyed, not stage-keyed: a registration action is planned in
+    VERIFYING SANDBOX and must run there, not be silently skipped because
+    that stage only used to execute AUTO actions.
+    """
+    if not _ask_approval(action, input_fn):
+        return False, "skipped: no approval"
+    if action.key == "register-local-image":
+        return _execute_registration(cfg, action, reporter)
+    if action.key == "pull-image":
+        return _stream_docker_pull(action.command, reporter)
+    return False, f"refused: no safe executor for approval action {action.key!r}"
+
+
 def _print_action(reporter: RepairReporter, action: RepairAction, *, dry_run: bool) -> None:
     label = {
         AUTO: "automatic",
@@ -449,24 +470,15 @@ def run_fix(
                 _print_action(reporter, action, dry_run=dry_run)
                 if action.kind != APPROVAL or dry_run:
                     continue
-                if not _ask_approval(action, input_fn):
+                ok, detail = _execute_approval(cfg, action, reporter, input_fn)
+                if ok:
+                    reporter.line(f"done: {detail}")
+                    executions.append(f"{action.key}: {detail}")
+                elif detail == "skipped: no approval":
                     reporter.line(
                         "skipped: no approval (the exact command is printed above "
                         "and in the READY summary)"
                     )
-                    continue
-                if action.key == "register-local-image":
-                    ok, detail = _execute_registration(cfg, action, reporter)
-                    if ok:
-                        reporter.line(f"done: {detail}")
-                        executions.append(f"{action.key}: {detail}")
-                    else:
-                        reporter.line(f"registration failed: {detail}", error=True)
-                    continue
-                ok, detail = _stream_docker_pull(action.command, reporter)
-                if ok:
-                    reporter.line(f"done: {detail}")
-                    executions.append(f"{action.key}: {detail}")
                 else:
                     reporter.line(f"pull failed: {detail}", error=True)
 
@@ -474,7 +486,27 @@ def run_fix(
         with reporter.stage("VERIFYING SANDBOX"):
             for action in plan.for_stage("VERIFYING SANDBOX"):
                 _print_action(reporter, action, dry_run=dry_run)
-                if action.kind != AUTO or dry_run:
+                if dry_run:
+                    continue
+                if action.kind == APPROVAL:
+                    # Registration is planned here, so it is approved and
+                    # executed here. The old stage-only dispatch silently
+                    # printed the proposal and never ran it.
+                    ok, detail = _execute_approval(
+                        cfg, action, reporter, input_fn
+                    )
+                    if ok:
+                        reporter.line(f"done: {detail}")
+                        executions.append(f"{action.key}: {detail}")
+                    elif detail == "skipped: no approval":
+                        reporter.line(
+                            "skipped: no approval (the exact command is printed "
+                            "above and in the READY summary)"
+                        )
+                    else:
+                        reporter.line(f"registration failed: {detail}", error=True)
+                    continue
+                if action.kind != AUTO:
                     continue
                 try:
                     note = _execute_auto(cfg, action)
