@@ -8,17 +8,19 @@ snapshot the workspace controller already reduced from real audit events.
 
 Two answer paths, both derived only from the snapshot:
 
-* the configured chat model, prompted with the snapshot and forbidden
-  from inventing results (plain ``chat`` — no tools are ever attached, so
-  an answer cannot trigger execution);
+* the local Ollama model, prompted with the snapshot and forbidden from
+  inventing results (plain completion — no tools are ever attached, so an
+  answer cannot trigger execution);
 * a deterministic summary built from the same snapshot, used whenever the
-  model is unavailable or refuses — the operator always gets a real,
+  local model is unavailable or refuses — the operator always gets a real,
   bounded answer, never a made-up one.
 
-Everything here is redaction-safe by construction: the snapshot's fields
-were reduced through ``ui.state.safe`` (redact + bound) by the state
-object, and the composed prompt goes through ``chat``'s secrets gate like
-every other LLM call in the product.
+Privacy: engagement data never leaves this machine. The snapshot contains
+the target, stages, findings and tool activity, so it is sent only to a
+local ``ollama/`` model at a loopback endpoint. There is no hosted fallback
+and no provider routing. If that path is unavailable or misconfigured, the
+deterministic summary is returned without any remote request. Redaction is
+defence in depth, never a licence to export engagement data.
 """
 
 from __future__ import annotations
@@ -227,18 +229,20 @@ def engagement_plain_summary(snapshot: dict[str, Any]) -> str:
 def answer_question(cfg: Any, snapshot: dict[str, Any], question: str) -> str:
     """Answer one operator question. Runs on a worker thread.
 
-    The model call is a plain chat completion with NO tools attached, so an
-    answer cannot execute anything. Any model failure — unavailable,
-    refused, timeout — falls back to the deterministic summary, and the
-    fallback is labelled honestly.
+    The model call is a plain completion with NO tools attached, so an
+    answer cannot execute anything. It goes only to the local Ollama model
+    at a loopback endpoint — never to a hosted provider. Any local failure
+    (unavailable, invalid model, non-loopback endpoint, refused, timeout)
+    falls back to the deterministic summary, and the fallback is labelled
+    honestly.
     """
-    from ..llm import LlmUnavailable, SecretsMustStayLocal, chat
+    from ..llm import LlmUnavailable, chat_local
 
     context = engagement_context_text(snapshot)
     question_text = redact(str(question or ""))[0][:2000]
     fallback_note = ""
     try:
-        reply = chat(
+        reply = chat_local(
             cfg,
             [
                 {"role": "system", "content": QUESTION_SYSTEM_PROMPT},
@@ -250,21 +254,18 @@ def answer_question(cfg: Any, snapshot: dict[str, Any], question: str) -> str:
                     ),
                 },
             ],
-            cfg.general_chat_model,
         )
         text = redact(str(reply or ""))[0].strip()
         if text:
             return text[:4000]
-        fallback_note = "The assistant returned an empty answer."
+        fallback_note = "The local assistant returned an empty answer."
     except LlmUnavailable as exc:
-        fallback_note = f"The assistant model is unavailable ({exc})."
-    except SecretsMustStayLocal as exc:
         fallback_note = (
-            "The question or the engagement record contains secret-shaped "
-            "text, so it was not sent to any hosted model."
+            "The local assistant is unavailable "
+            f"({redact(str(exc))[0]})."
         )
     except Exception as exc:  # presentation must never break the engagement
-        fallback_note = f"The assistant could not be reached ({type(exc).__name__})."
+        fallback_note = f"The local assistant could not be reached ({type(exc).__name__})."
     summary = engagement_plain_summary(snapshot)
     return f"(local summary — {fallback_note})\n{summary}"
 

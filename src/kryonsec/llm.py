@@ -7,11 +7,13 @@ local fallback when the preferred provider is unavailable.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
 import threading
 from typing import Any, NamedTuple
+from urllib.parse import urlsplit
 
 from .config import KryonsecConfig
 
@@ -67,6 +69,25 @@ def _normalize_host(host: str) -> str:
     if not host.startswith(("http://", "https://")):
         host = f"http://{host}"
     return host
+
+
+def is_loopback_endpoint(url: str) -> bool:
+    """True only when ``url`` points at this machine.
+
+    Accepts ``localhost`` and literal IPs in the loopback range. A DNS name
+    that merely resolves to loopback is rejected: resolution can change, and
+    this check is a privacy boundary, not a convenience.
+    """
+    parts = urlsplit(_normalize_host(str(url or "")))
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 # keep the old private name working (used across modules/tests)
@@ -883,6 +904,40 @@ def chat(
     raise LlmUnavailable(
         f"no {hosted.label} model answered — {provider_reason(last_error)}"
     )
+
+
+def chat_local(
+    cfg: KryonsecConfig,
+    messages: list[dict],
+    model: str | None = None,
+    **kwargs: Any,
+) -> str:
+    """Chat with the LOCAL Ollama model only. There is no hosted fallback.
+
+    This is the privacy boundary for engagement questions: the model must be
+    an ``ollama/`` id, the endpoint must be loopback, and the call goes
+    straight to the local model. Any misconfiguration raises
+    :class:`LlmUnavailable` instead of trying another provider, so a caller
+    can fall back to a deterministic answer without ever exporting data.
+    """
+    if llm_disabled():
+        raise LlmUnavailable("LLM disabled by KRYONSEC_DISABLE_LLM")
+    selected = model or cfg.local_model
+    if not isinstance(selected, str) or not selected.startswith("ollama/"):
+        raise LlmUnavailable(
+            f"local inference requires an ollama/ model, not {selected!r}"
+        )
+    if not is_loopback_endpoint(cfg.ollama_host):
+        raise LlmUnavailable(
+            f"Ollama endpoint {cfg.ollama_host!r} is not loopback; refusing "
+            "to send engagement data off this machine"
+        )
+    if not _ollama_model_ok(cfg, selected):
+        raise LlmUnavailable(
+            f"local model {selected} is unavailable — start `ollama serve` "
+            "and pull the model"
+        )
+    return _complete(cfg, selected, messages, **kwargs)
 
 
 def chat_with_usage(
