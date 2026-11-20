@@ -1,6 +1,8 @@
 """Tests for `kryonsec doctor` (M2): non-Linux machines must show deliberate
 skips as yellow SKIP, not red FAIL; exit code logic must stay intact."""
 
+import re
+
 from kryonsec.config import KryonsecConfig
 from kryonsec import doctor
 from kryonsec.purple.runtime_checks import DockerContextInfo
@@ -79,12 +81,30 @@ def test_context_inspection_error_fails(monkeypatch):
 # ---- provider key vs configuration state (Phase 4 regression) ---------------
 
 def _wide_console(monkeypatch) -> None:
-    """rich wraps narrow table cells mid-phrase, interleaving other
-    columns' text between the halves of a wrapped phrase; render on a
-    fixed wide console so row text stays on one line."""
+    """Render on a console wide enough that no table cell wraps.
+
+    The table's column widths depend on which rows exist, and those rows
+    differ by host (Docker/gVisor present or absent). A 240-column console
+    still wrapped the long provider diagnostic on CI even though it did not
+    wrap locally. 1000 columns is wider than the whole table, so the
+    diagnostic text is rendered as one string on every host.
+    """
     from rich.console import Console
 
-    monkeypatch.setattr(doctor, "console", Console(width=240))
+    monkeypatch.setattr(doctor, "console", Console(width=1000))
+
+
+# Rich draws a vertical border between wrapped cell lines. A phrase split
+# by a wrap therefore reads ``built-in │ default`` in captured output even
+# though the message is correct — and the exact wrap point depends on the
+# host's detected rows (Docker/gVisor present or absent). Strip the borders
+# before collapsing whitespace so the assertion tests the diagnostic text,
+# not the table's column geometry.
+_BOX_DRAWING = str.maketrans("", "", "│┃║┆┊╎╏")
+
+
+def _rendered_text(output: str) -> str:
+    return re.sub(r"\s+", " ", output.translate(_BOX_DRAWING))
 
 
 def test_missing_openai_key_fails_the_provider_row_not_configuration(
@@ -92,7 +112,6 @@ def test_missing_openai_key_fails_the_provider_row_not_configuration(
     """A valid config with provider=openai but no key anywhere: the
     OpenAI row must report the missing key honestly while the
     Configuration row still PASSes — the two states are distinct."""
-    import re
     from kryonsec.config import config_path, write_config
 
     write_config(config_path(tmp_path), {
@@ -101,7 +120,7 @@ def test_missing_openai_key_fails_the_provider_row_not_configuration(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     _wide_console(monkeypatch)
     rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
-    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    out = _rendered_text(capsys.readouterr().out)
     assert "valid TOML" in out
     assert "OPENAI_API_KEY not set" in out
 
@@ -113,7 +132,6 @@ def test_invalid_toml_names_the_config_fault_and_reports_the_key_state(
     'OPENAI_API_KEY not set'. The Configuration row must name the TOML
     fault as the cause; the provider row may only report the key state
     it can actually see (env), never claim readiness."""
-    import re
     from kryonsec.config import config_path
 
     config_path(tmp_path).write_text(
@@ -124,7 +142,7 @@ def test_invalid_toml_names_the_config_fault_and_reports_the_key_state(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     _wide_console(monkeypatch)
     rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
-    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    out = _rendered_text(capsys.readouterr().out)
     assert "invalid TOML" in out
     assert "OPENAI_API_KEY not set" in out
     assert "sk-file-only" not in out  # never echo a key value
@@ -215,13 +233,11 @@ def test_fresh_machine_names_the_builtin_default_it_checked(monkeypatch, tmp_pat
     configured anything must not read that FAIL as a mistake they made —
     the row has to say the checked provider is the built-in default and
     point at `kryonsec setup`."""
-    import re
-
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(doctor, "_check_storage", lambda c: (True, "OK (SQLite)"))
     _wide_console(monkeypatch)
     rc = doctor.run_doctor(KryonsecConfig(home=tmp_path))
-    out = re.sub(r"\s+", " ", capsys.readouterr().out)
+    out = _rendered_text(capsys.readouterr().out)
     assert rc == 1  # an unconfigured fresh machine is not yet usable — honest
     assert "OPENAI_API_KEY not set" in out
     assert "built-in default" in out
