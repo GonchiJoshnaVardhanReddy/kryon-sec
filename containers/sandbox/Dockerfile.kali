@@ -392,11 +392,12 @@ RUN chmod 0755 /entrypoint.sh
 # build FAILS — a release image that silently lost a required tool ships
 # a dead Mode B behind a digest that looks valid.
 #
-#   REQUIRED = the six vetted Mode B adapters (httpx-toolkit, whatweb,
-#   searchsploit, nuclei, /usr/bin/testssl, python3), the entrypoint's
-#   own helpers (jq/timeout/python3 — missing jq or timeout breaks EVERY
-#   tool run, not one capability), and the legacy EXPLOIT/verify lane's
-#   frozen-argv core tools + wordlists (all guaranteed by the core apt
+#   REQUIRED = the eleven vetted RECON_ACTIVE adapter executables
+#   (httpx-toolkit, whatweb, /usr/bin/testssl + tls_probe.py, api_probe.py,
+#   nuclei, dnsx, naabu, katana, nmap, feroxbuster, gowitness), the
+#   entrypoint's own helpers (jq/timeout/python3 — missing jq or timeout
+#   breaks EVERY tool run, not one capability), and the legacy EXPLOIT/verify
+#   lane's frozen-argv core tools + wordlists (all guaranteed by the core apt
 #   block above; asserted for free so the requirement stays true even if
 #   that block is ever loosened).
 #
@@ -411,9 +412,11 @@ RUN set -eu; \
     check_cmd() { command -v "$1" >/dev/null 2>&1 || missing="$missing $1"; }; \
     check_file() { test -e "$1" || missing="$missing $1"; }; \
     check_cmd httpx-toolkit; check_cmd whatweb; check_cmd searchsploit; \
-    check_cmd nuclei; check_cmd python3; check_file /usr/bin/testssl; \
+    check_cmd nuclei; check_cmd dnsx; check_cmd naabu; check_cmd katana; \
+    check_cmd nmap; check_cmd feroxbuster; check_cmd gowitness; \
+    check_cmd python3; check_file /usr/bin/testssl; \
     check_cmd jq; check_cmd timeout; \
-    check_cmd nmap; check_cmd sqlmap; check_cmd nikto; check_cmd gobuster; \
+    check_cmd sqlmap; check_cmd nikto; check_cmd gobuster; \
     check_cmd ffuf; check_cmd curl; check_cmd wget; check_cmd openssl; \
     check_cmd dig; check_cmd nc; \
     check_cmd wafw00f; check_cmd dirsearch; check_cmd dnsenum; \
@@ -429,7 +432,7 @@ RUN set -eu; \
     check_file /opt/kryonsec/nuclei_manifest.json; \
     check_file /opt/nuclei-templates/.kryonsec-commit; \
     [ -z "$missing" ] || { echo "FATAL: required tools/files missing:$missing"; exit 1; }; \
-    echo "required tools verified: 6 Mode B adapters + entrypoint helpers + EXPLOIT core + Phase 4 wired tools"
+    echo "required tools verified: 11 RECON_ACTIVE adapters + entrypoint helpers + EXPLOIT core + Phase 4 wired tools"
 
 ENTRYPOINT ["/entrypoint.sh"]
 USER kryonsec-runner

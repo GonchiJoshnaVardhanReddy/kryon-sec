@@ -106,3 +106,28 @@ def test_manifest_copy_runs_after_the_tool_install_layers():
         "every template review would re-download the whole toolset")
     assert manifest > code.rindex("pip install"), (
         "nuclei_manifest.json is COPYed before the pip tool layers")
+
+
+def test_every_registered_recon_adapter_executable_is_required_by_the_build():
+    """A registered adapter whose binary can vanish is a dead lane.
+
+    The REQUIRED-tool block is what makes a release image fail closed. Adding
+    an adapter without adding its executable here would let a digest look
+    valid while the lane cannot run at all.
+    """
+    from kryonsec.purple.adapter_whatweb import recon_active_registry
+
+    code = _code()
+    missing = []
+    for adapter in recon_active_registry().list_adapters():
+        executable = adapter.executable
+        needle = (
+            f"check_file {executable}"
+            if executable.startswith("/")
+            else f"check_cmd {executable}"
+        )
+        if needle not in code:
+            missing.append(needle)
+    assert not missing, (
+        "registered RECON_ACTIVE adapter executables are not checked by the "
+        f"image build guard: {missing}")
