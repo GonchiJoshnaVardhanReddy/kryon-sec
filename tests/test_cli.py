@@ -78,8 +78,13 @@ class _StubToolbox:
 
     def __init__(self):
         self.close_count = 0
+        self.allow_start = None
 
-    def connect_all(self):
+    def connect_all(self, allow_start=None):
+        # The real signature takes the registry's startup authorizer; the
+        # stub accepts it so a background connect thread cannot raise
+        # TypeError (which pytest reports as an unhandled thread warning).
+        self.allow_start = allow_start
         return {}
 
     def snapshot(self):
