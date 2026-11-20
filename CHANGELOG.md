@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — UI acceptance fixes: honest stop, honest failure, real replay clock
+
+Found while running the fullscreen UI against the real engine. Each fix has a
+regression test; no safety gate, allowlist, egress rule or sandbox boundary
+was relaxed.
+
+- **Ctrl+C in the Purple UI now really stops the run — at a state
+  boundary.** The UI already told the operator the current state would
+  finish first, but the loop had no stop input. The orchestrator now polls a
+  `should_stop` predicate between states (never mid-state), records
+  `operator_interrupt`, and keeps the finished state's evidence and
+  checkpoint. A predicate that raises is logged and treated as "no".
+- **A run with a failed stage is no longer recorded as completed.** A
+  subagent returning `failed` never halted the deterministic route, so the
+  terminal event used to say `completed` and `report.json` listed every
+  entered state as done. The orchestrator now tracks `failed_states`; one
+  helper (`engagement_outcome`) decides `completed` / `failed` / `halted` /
+  `interrupted` for the UI, the summary and the audit chain; the chain
+  records `failed_states` with reason `state_failed`; and the markdown report
+  and `report.json` name the stages that did not finish. `report.json` is
+  schema `1.1` (additive `failed_states`).
+- **INIT is a clean no-op.** The generic fallback stub made INIT return
+  `failed` on every run — noise before, and a false "failed engagement" once
+  failed stages started counting. It now returns `ok`; the real validation
+  still happens in `start_engagement`.
+- **A reopened engagement shows the duration it actually ran.** Replay used
+  the process's monotonic clock, so the elapsed field meant "time since the
+  tab opened" and every stage duration was zero. Replays now derive the
+  total and per-stage durations from the audit chain's ISO `ts` values, and
+  the engagement list reads the same `ts` field the chain writes (it had
+  been reading a non-existent `timestamp`).
+- **The model picker starts on the provider in use.** `/models` marked the
+  current provider but left the cursor on OpenAI, so a plain Enter
+  discovered the wrong provider.
+
 ## Unreleased — account/membership requirements removed (development build)
 
 The development branch no longer requires any Kryonsec account. `kryonsec

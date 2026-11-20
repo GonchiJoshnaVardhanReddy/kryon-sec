@@ -864,13 +864,20 @@ def _run_purple(
     output: bool = True,
     human_reviewer: "Callable[[list[dict]], set[str]] | None" = None,
     post_exploit_approver: "Callable[[str], bool] | None" = None,
+    stop_requested: "Callable[[], bool] | None" = None,
 ) -> int:
     """Run one Purple Team engagement on a target. Shared by the `purple`
     subcommand and the /mode toggle inside the chat loop.
 
     `memory_browser` is what those two callers pass: it prints the loopback
     URL of the read-only memory browser and leaves it serving. It is off by
-    default so a caller driving this function directly gets no socket."""
+    default so a caller driving this function directly gets no socket.
+
+    ``stop_requested`` is an optional predicate polled at each state
+    boundary by the orchestrator. It is the fullscreen UI's Ctrl+C: the
+    running state finishes, then the loop HALTs with ``operator_interrupt``.
+    The terminal (non-interactive) path has no such input and leaves it
+    None."""
     import uuid
     from pathlib import Path
 
@@ -879,6 +886,8 @@ def _run_purple(
     # longer printed anywhere. STATES is imported where it is used, below.
     from .engagement_id import is_valid_engagement_id
     from .purple.runner import (
+        STATE_FAILED_CODE,
+        engagement_outcome,
         persist_graph,
         persist_handoffs,
         record_engagement_ending,
@@ -1008,6 +1017,7 @@ def _run_purple(
     outcome: str | None = None
     reason: str | None = None
     exception_type: str | None = None
+    failed_states: list[str] = []
     try:
         try:
             orch, audit, graph = start_engagement(
@@ -1015,6 +1025,7 @@ def _run_purple(
                 code_folder=code_folder,
                 human_reviewer=human_reviewer,
                 post_exploit_approver=post_exploit_approver,
+                should_stop=stop_requested,
             )
             # Two existing hooks, no new plumbing: the orchestrator announces
             # state transitions (before the subagent is built, so HUMAN_REVIEW's
@@ -1053,10 +1064,12 @@ def _run_purple(
             ui.start()
             completed = orch.run()
             report_path = cfg.home / "engagements" / engagement_id / "report.md"
+            failed_states = list(getattr(orch, "failed_states", ()) or ())
             ui.finish(
-                "halted" if orch.halt_reason else "completed",
+                engagement_outcome(orch.halt_reason, failed_states),
                 halt_reason=orch.halt_reason,
                 report_path=str(report_path) if report_path.exists() else None,
+                failed_states=failed_states,
             )
         finally:
             ui.stop()
@@ -1094,8 +1107,13 @@ def _run_purple(
         # graph is a failure of the run, and reading the halt reason earlier
         # would have already labelled it a clean finish. Interruption and
         # failure are the exception handlers' to decide, not this line's.
-        outcome = "halted" if orch.halt_reason else "completed"
+        # A stage that returned ``failed`` did reach this line, so the
+        # outcome must say failed rather than completed.
+        failed_states = list(getattr(orch, "failed_states", ()) or ())
+        outcome = engagement_outcome(orch.halt_reason, failed_states)
         reason = safe_halt_code(orch.halt_reason)
+        if outcome == "failed" and reason is None:
+            reason = STATE_FAILED_CODE
     except KeyboardInterrupt:
         # Recorded, then re-raised. The operator asked for the run to stop,
         # and it still stops — same traceback, same exit status as before
@@ -1120,6 +1138,7 @@ def _run_purple(
             last_state=entered[-1] if entered else None,
             states_entered=len(entered),
             exception_type=exception_type,
+            failed_states=failed_states,
         )
 
     if output:
@@ -1167,6 +1186,11 @@ def _print_purple_summary(
 
     engaged = bool(attempts)
     halted = bool(orch.halt_reason)
+    failed_states = [
+        state for state in (getattr(orch, "failed_states", None) or ())
+        if isinstance(state, str)
+    ]
+    failed = bool(failed_states)
 
     evidence_dir = cfg.home / "engagements" / engagement_id / "evidence"
     evidence_count = 0
@@ -1181,6 +1205,8 @@ def _print_purple_summary(
     rows.add_row("", "")
     if halted:
         rows.add_row("Completed", f"{len(completed)} / {len(STATES)} stages")
+    elif failed:
+        rows.add_row("Entered", f"{len(completed)} / {len(STATES)} stages")
     rows.add_row("Verified findings", f"[red]{len(verified)}[/red]"
                  if verified else "0")
     rows.add_row("Possible findings", str(len(possible)))
@@ -1218,6 +1244,11 @@ def _print_purple_summary(
         detail = f"[red]{orch.halt_reason}[/red]"
         rows.add_row("", "")
         rows.add_row("Reason", detail)
+    elif failed:
+        title = "[bold red]ENGAGEMENT FAILED[/bold red]"
+        border = "red"
+        rows.add_row("", "")
+        rows.add_row("Failed stages", ", ".join(failed_states))
     else:
         title = "[bold green]ENGAGEMENT COMPLETE[/bold green]"
         border = "green"
@@ -1228,6 +1259,11 @@ def _print_purple_summary(
     # ---- the verdict, in one line ---------------------------------
     if halted:
         verdict = f"[red]HALTED[/red] — {orch.halt_reason}"
+    elif failed:
+        verdict = (
+            f"[red]FAILED[/red] — stage(s) did not complete: "
+            f"{', '.join(failed_states)}"
+        )
     elif verified:
         verdict = f"[red]{len(verified)} verified finding(s)[/red] on {target}"
     elif findings:
@@ -1248,6 +1284,8 @@ def _print_purple_summary(
     console.print(verdict)
     if halted:
         console.print("[dim]next safe action: resolve the gate above, run `kryonsec doctor`, then start a new engagement[/dim]")
+    elif failed:
+        console.print("[dim]next safe action: inspect the failed stage(s) and the default debug log, then start a new engagement[/dim]")
     else:
         console.print("[dim]next safe action: review the report and audit fingerprint before sharing results[/dim]")
     console.print(f"[dim]states: {f' {ARROW} '.join(completed) or '—'}[/dim]")

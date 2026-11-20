@@ -314,6 +314,27 @@ def test_local_summary_covers_tool_failure(workspace):
     assert "RECON_PASSIVE, RECON_ACTIVE, HYPOTHESIZE" in summary
 
 
+def test_local_summary_names_a_failed_stage(workspace):
+    """The fallback answer must not hide a stage that did not finish."""
+    snapshot = {
+        "target": "shop.example.com",
+        "current_state": "REPORT",
+        "outcome": "failed",
+        "completed_states": ["INIT", "RECON_PASSIVE", "RECON_ACTIVE", "REPORT"],
+        "failed_states": ["HYPOTHESIZE"],
+        "counts": {},
+        "findings": [],
+        "tools": [],
+        "notices": [],
+        "sandbox_status": "ready",
+        "sandbox_detail": "",
+        "engagement_id": "abcd1234",
+    }
+    summary = engagement_plain_summary(snapshot)
+    assert "has finished: failed" in summary
+    assert "did not finish: HYPOTHESIZE" in summary
+
+
 def test_secret_shaped_question_is_redacted_before_any_model_call(
     workspace, monkeypatch
 ):
@@ -412,6 +433,34 @@ def test_answer_matches_the_question_it_belongs_to(workspace, monkeypatch):
     assert [entry["q"] for entry in qa] == ["first question?", "second question?"]
 
 
+def test_engagement_receives_the_operator_stop_flag(workspace, monkeypatch):
+    """Ctrl+C in the UI must reach the loop as a boundary stop, not a promise."""
+    seen: dict[str, object] = {}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_run_purple(cfg, target, *, ui=None, stop_requested=None, **kwargs):
+        seen["stop"] = stop_requested
+        entered.set()
+        release.wait(timeout=10)
+        return 0
+
+    monkeypatch.setattr("kryonsec.cli._run_purple", fake_run_purple)
+
+    async def scenario():
+        task = asyncio.create_task(workspace.start_engagement("authorized.example"))
+        await asyncio.to_thread(entered.wait, 5)
+        stop = seen["stop"]
+        assert callable(stop)
+        assert stop() is False
+        workspace.stop_requested = True
+        assert stop() is True
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+
+
 # ---- reopened engagement views --------------------------------------------
 
 
@@ -446,6 +495,66 @@ def test_question_on_reopened_engagement(workspace, monkeypatch):
     qa = workspace.purple_view.snapshot()["qa"]
     assert len(qa) == 1
     assert qa[0]["a"] == "It was halted by the budget guard."
+
+
+def test_reopened_engagement_reports_its_real_duration(workspace):
+    """A replay must not report "time since the operator opened the tab"."""
+    engagement_dir = workspace.cfg.home / "engagements" / "cafe1234"
+    engagement_dir.mkdir(parents=True)
+    events = [
+        {"event": "engagement_created", "target": "recorded.example",
+         "ts": "2026-01-01T10:00:00+00:00"},
+        {"event": "state_enter", "state": "RECON_PASSIVE",
+         "ts": "2026-01-01T10:00:05+00:00"},
+        {"event": "state_enter", "state": "RECON_ACTIVE",
+         "ts": "2026-01-01T10:00:35+00:00"},
+        {"event": "engagement_finished", "outcome": "completed",
+         "ts": "2026-01-01T10:01:05+00:00"},
+    ]
+    (engagement_dir / "audit.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    tab = EngagementTab(
+        engagement_id="cafe1234", target="recorded.example", path=engagement_dir
+    )
+
+    workspace.load_engagement_view(tab)
+    snapshot = workspace.purple_view.snapshot()
+
+    assert snapshot["recorded_duration"] == 65.0
+    assert snapshot["state_duration"]["RECON_PASSIVE"] == 30.0
+    assert snapshot["state_duration"]["RECON_ACTIVE"] == 30.0
+    # The tab's sort key is the audit's real timestamp, not a field the
+    # chain never wrote (it writes ``ts``, not ``timestamp``).
+    tabs = workspace.engagement_store.list_tabs()
+    assert tabs[0].started_at == "2026-01-01T10:00:00+00:00"
+
+
+def test_reopened_failed_run_marks_the_recorded_stage(workspace):
+    engagement_dir = workspace.cfg.home / "engagements" / "cafe5678"
+    engagement_dir.mkdir(parents=True)
+    events = [
+        {"event": "engagement_created", "target": "recorded.example"},
+        {"event": "state_enter", "state": "RECON_ACTIVE"},
+        {"event": "engagement_finished", "outcome": "failed",
+         "reason": "state_failed", "failed_states": ["RECON_ACTIVE"]},
+    ]
+    (engagement_dir / "audit.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    tab = EngagementTab(
+        engagement_id="cafe5678", target="recorded.example", path=engagement_dir
+    )
+
+    workspace.load_engagement_view(tab)
+    snapshot = workspace.purple_view.snapshot()
+
+    assert snapshot["outcome"] == "failed"
+    assert snapshot["failed_states"] == ["RECON_ACTIVE"]
+    # A stage that failed is not also reported as completed.
+    assert "RECON_ACTIVE" not in snapshot["completed_states"]
 
 
 # ---- /report and report audit events (Phase 4) -----------------------------

@@ -173,6 +173,12 @@ def engagement_plain_summary(snapshot: dict[str, Any]) -> str:
     if completed:
         parts.append("Stages completed so far: " + ", ".join(completed) + ".")
 
+    failed = [str(s) for s in (snapshot.get("failed_states") or [])]
+    if failed:
+        parts.append(
+            "Stages that did not finish: " + ", ".join(failed) + "."
+        )
+
     counts = snapshot.get("counts") or {}
     findings = int(counts.get("findings", 0) or 0)
     verified = sum(

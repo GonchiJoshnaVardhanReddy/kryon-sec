@@ -1006,6 +1006,41 @@ def test_plain_models_opens_a_provider_picker_without_text_output(workspace):
     asyncio.run(scenario())
 
 
+def test_plain_models_starts_on_the_current_provider(workspace, monkeypatch):
+    """The row marked · current is the one Enter chooses.
+
+    Regression: the list was always highlighted at row 0 (OpenAI), so a
+    plain Enter on an Ollama/Bedrock/compatible config discovered the wrong
+    provider while the UI said which one was actually in use.
+    """
+    workspace.cfg.provider = "ollama"
+    discovered_for: list[str] = []
+
+    def fake_discover(cfg, provider):
+        discovered_for.append(provider)
+        return ["llama3.2:3b"], ""
+
+    monkeypatch.setattr("kryonsec.ui.app.discover_models", fake_discover)
+
+    async def scenario():
+        app = _app(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await _open_model_picker(pilot, app)
+            await pilot.pause()
+            screen = app.screen
+            listing = screen.query_one("#models-list")
+            assert listing.highlighted == 1  # Ollama is the second provider
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            assert screen._step == "models"
+            assert discovered_for == ["ollama"]
+
+    asyncio.run(scenario())
+
+
 def test_model_picker_filters_confirms_and_updates_the_sidebar(workspace, monkeypatch):
     discovered = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
     calls: list[tuple[str, str]] = []

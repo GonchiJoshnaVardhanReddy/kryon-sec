@@ -451,6 +451,11 @@ class ModelPickerScreen(ModalScreen[str | None]):
         self._subtitle("Select a provider")
         self._status("", error=False)
         self._footer("↑/↓ select · Enter continue · Esc close")
+        keys = list(PROVIDERS)
+        # Start on the provider that is actually in use. The list is ordered
+        # OpenAI-first, so leaving the cursor at row 0 would make a plain
+        # Enter discover OpenAI while the row above it is marked "current".
+        current = keys.index(self.cfg.provider) if self.cfg.provider in keys else 0
         self._fill(
             [
                 (
@@ -459,8 +464,9 @@ class ModelPickerScreen(ModalScreen[str | None]):
                     + ("  ·  current" if key == self.cfg.provider else ""),
                     f"provider:{key}",
                 )
-                for key in PROVIDERS
-            ]
+                for key in keys
+            ],
+            highlight=current,
         )
         self.query_one("#models-list", OptionList).focus()
 
@@ -744,7 +750,7 @@ class ModelPickerScreen(ModalScreen[str | None]):
 
     # ---- widgets ------------------------------------------------------
 
-    def _fill(self, rows: list[tuple]) -> None:
+    def _fill(self, rows: list[tuple], *, highlight: int = 0) -> None:
         listing = self.query_one("#models-list", OptionList)
         listing.clear_options()
         options: list[Option] = []
@@ -755,7 +761,9 @@ class ModelPickerScreen(ModalScreen[str | None]):
                 Option(_short(label, 72), id=option_id, disabled=disabled)
             )
         listing.add_options(options)
-        listing.highlighted = 0
+        listing.highlighted = (
+            max(0, min(highlight, len(options) - 1)) if options else 0
+        )
         listing.scroll_to_highlight()
 
     def _subtitle(self, value: str) -> None:
@@ -1401,7 +1409,7 @@ class KryonsecApp(App[None]):
             view = controller.purple_view
             if view is not None:
                 snapshot = view.snapshot()
-                stamp = elapsed(snapshot["started_at"], snapshot["finished_at"])
+                stamp = _engagement_clock(snapshot)
                 state = snapshot["current_state"].lower() or "waiting"
                 running_tool = next(
                     (row for row in reversed(snapshot["tools"]) if row["status"] == "running"),
@@ -1717,7 +1725,7 @@ class KryonsecApp(App[None]):
                 )
             else:
                 self.controller.notify(
-                    "Approval cancelled. Purple Team finishes the current state before it can stop."
+                    "Stop requested. Purple Team finishes the current state, then stops."
                 )
             return
         self.action_quit_app()
@@ -1810,7 +1818,7 @@ class KryonsecApp(App[None]):
         text.append("  agent       ", style="dim")
         text.append(f"{self._agent_of_state(current)}\n", style=self.tokens.text)
         text.append("  elapsed     ", style="dim")
-        text.append(f"{elapsed(snapshot['started_at'], snapshot['finished_at'])}\n\n")
+        text.append(f"{_engagement_clock(snapshot)}\n\n")
 
         text.append("  WORKFLOW · 10 STATES\n", style=f"bold {self.tokens.text}")
         completed = set(snapshot["completed_states"])
@@ -2078,7 +2086,7 @@ class KryonsecApp(App[None]):
             self._sidebar_row(text, "target", _short(snapshot["target"], 18), self.tokens.text)
             self._sidebar_row(text, "id", snapshot["engagement_id"], "dim")
             self._sidebar_row(text, "state", _short(current or "ready", 16), state_style)
-            self._sidebar_row(text, "elapsed", elapsed(snapshot["started_at"], snapshot["finished_at"]), self.tokens.text)
+            self._sidebar_row(text, "elapsed", _engagement_clock(snapshot), self.tokens.text)
             self._sidebar_row(text, "stage", _short(STATE_ACTION.get(current, "—"), 20), self.tokens.muted)
             self._sidebar_row(text, "agent", self._agent_of_state(current), state_style if not finished else self.tokens.muted)
             agents_snapshot = snapshot
@@ -2197,6 +2205,19 @@ class KryonsecApp(App[None]):
 
 
 # ---- helpers ------------------------------------------------------------
+
+
+def _engagement_clock(snapshot: dict[str, Any]) -> str:
+    """The live elapsed clock, or the recorded duration when replaying.
+
+    A reopened engagement has no process-relative start time, so it carries
+    the wall-clock duration read from its audit chain; using the monotonic
+    clock there would report how long the app had been open instead.
+    """
+    recorded = snapshot.get("recorded_duration")
+    if isinstance(recorded, (int, float)):
+        return elapsed(0.0, float(recorded))
+    return elapsed(snapshot.get("started_at"), snapshot.get("finished_at"))
 
 
 def _short(value: str, limit: int) -> str:

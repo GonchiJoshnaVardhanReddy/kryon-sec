@@ -22,6 +22,8 @@ from kryonsec.config import KryonsecConfig
 from kryonsec.purple.audit import AuditLog
 from kryonsec.purple.orchestrator import STATES
 from kryonsec.purple.runner import (
+    STATE_FAILED_CODE,
+    engagement_outcome,
     record_engagement_ending,
     safe_exception_type,
     safe_halt_code,
@@ -60,9 +62,11 @@ def _seed_chain(home, engagement_id, **fields):
 class _Orch:
     """A PurpleOrchestrator with only the attributes the CLI boundary reads."""
 
-    def __init__(self, *, completed=(), halt_reason=None, raises=None):
+    def __init__(self, *, completed=(), halt_reason=None, raises=None,
+                 failed_states=()):
         self.completed = list(completed)
         self.halt_reason = halt_reason
+        self.failed_states = list(failed_states)
         self.on_state = None
         self._raises = raises
 
@@ -114,6 +118,7 @@ def _stubbed_run(home, *, orch, persist=True):
     (None, None),
     ("", None),
     ("budget_exhausted", "budget_exhausted"),
+    ("operator_interrupt", "operator_interrupt"),
     ("purple_team_requires_profile2 (Linux + Docker + gVisor)",
      "profile2_required"),
     # A sandbox probe message quotes an image reference and names missing
@@ -125,6 +130,17 @@ def _stubbed_run(home, *, orch, persist=True):
 ])
 def test_halt_reasons_become_fixed_codes(reason, expected):
     assert safe_halt_code(reason) == expected
+
+
+@pytest.mark.parametrize("halt_reason,failed,expected", [
+    (None, [], "completed"),
+    (None, ["HYPOTHESIZE"], "failed"),
+    ("budget_exhausted", ["HYPOTHESIZE"], "halted"),
+    ("operator_interrupt", ["HYPOTHESIZE"], "interrupted"),
+])
+def test_the_terminal_outcome_has_one_definition(halt_reason, failed, expected):
+    """UI, summary and chain all call this, so they cannot disagree."""
+    assert engagement_outcome(halt_reason, failed) == expected
 
 
 def test_a_sandbox_message_never_reaches_the_chain(tmp_path):
@@ -269,6 +285,43 @@ def test_a_halted_run_is_recorded_with_its_code(tmp_path):
     assert ending["outcome"] == "halted"
     assert ending["reason"] == "budget_exhausted"
     assert ending["last_state"] == "RECON_ACTIVE"
+
+
+def test_a_run_with_a_failed_stage_is_not_recorded_as_completed(tmp_path):
+    """A route that reaches HALT is not the same as a run that worked.
+
+    HYPOTHESIZE/REPORT/... returning ``failed`` never stops the loop, so
+    the terminal event used to call the whole engagement "completed".
+    """
+    _seed_chain(tmp_path, "e-stage-fail")
+    orch = _Orch(
+        completed=["INIT", "RECON_PASSIVE", "RECON_ACTIVE"],
+        failed_states=["RECON_ACTIVE"],
+    )
+
+    with _stubbed_run(tmp_path, orch=orch) as cfg:
+        assert cli._run_purple(cfg, "acme.example", engagement_id="e-stage-fail") == 0
+
+    ending = _read_ending(tmp_path, "e-stage-fail")
+    assert ending["outcome"] == "failed"
+    assert ending["reason"] == STATE_FAILED_CODE
+    assert ending["last_state"] == "RECON_ACTIVE"
+    assert ending["failed_states"] == ["RECON_ACTIVE"]
+
+
+def test_an_operator_stop_is_interrupted_not_halted(tmp_path):
+    _seed_chain(tmp_path, "e-op")
+    orch = _Orch(
+        completed=["INIT", "RECON_PASSIVE"],
+        halt_reason="operator_interrupt",
+    )
+
+    with _stubbed_run(tmp_path, orch=orch) as cfg:
+        assert cli._run_purple(cfg, "acme.example", engagement_id="e-op") == 0
+
+    ending = _read_ending(tmp_path, "e-op")
+    assert ending["outcome"] == "interrupted"
+    assert ending["reason"] == "operator_interrupt"
 
 
 def test_an_interrupt_is_recorded_and_still_propagates(tmp_path):

@@ -113,7 +113,11 @@ def display_command(name: str, argv: list[str] | None) -> str:
 def elapsed(started_at: float | None, finished_at: float | None = None) -> str:
     if started_at is None:
         return "—"
-    seconds = max(0, int((finished_at or time.monotonic()) - started_at))
+    # ``finished_at`` is a monotonic timestamp, so 0.0 is a value, not
+    # "missing"; truthiness here made a zero-length recorded run render as
+    # the whole uptime of the process.
+    end = finished_at if finished_at is not None else time.monotonic()
+    seconds = max(0, int(end - started_at))
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
@@ -200,6 +204,11 @@ class PurpleWorkspaceState:
         self.qa: list[dict[str, str]] = []
         self.started_at = time.monotonic()
         self.finished_at: float | None = None
+        # Wall-clock duration read from a recorded audit chain when this view
+        # is a replay. ``started_at``/``finished_at`` are monotonic readings
+        # of the current process, so they cannot describe a run that ended
+        # before the app opened; this is the number the UI shows instead.
+        self.recorded_duration: float | None = None
         self._running: dict[str, PurpleToolRow] = {}
         self._lock = threading.RLock()
 
@@ -367,6 +376,7 @@ class PurpleWorkspaceState:
         *,
         halt_reason: str | None = None,
         report_path: str | None = None,
+        failed_states: "list[str] | tuple[str, ...] | None" = None,
     ) -> None:
         with self._lock:
             self.outcome = outcome
@@ -378,8 +388,17 @@ class PurpleWorkspaceState:
                 safe(report_path, 240) if report_path else self.report_path
             )
             self.finished_at = time.monotonic()
-            if outcome in {"failed", "halted"} and self.current_state:
-                self.failed_states.add(self.current_state)
+            if outcome in {"failed", "halted"}:
+                marked = False
+                for state in (failed_states or ()):
+                    value = safe(state, 40)
+                    if value:
+                        self.failed_states.add(value)
+                        marked = True
+                # A halt names no failed stage, but the state it stopped in
+                # is the one the operator must look at; keep that marker.
+                if not marked and outcome == "halted" and self.current_state:
+                    self.failed_states.add(self.current_state)
             self._snapshot_graph_locked()
         suffix = f" — {self.halt_reason}" if self.halt_reason else ""
         self._log_activity(f"engagement {outcome}{suffix}")
@@ -393,7 +412,15 @@ class PurpleWorkspaceState:
                 "sandbox_detail": self.sandbox_detail,
                 "current_state": self.current_state,
                 "completed_states": list(self.completed_states),
-                "failed_states": list(self.failed_states),
+                "failed_states": sorted(
+                    self.failed_states,
+                    key=lambda name: (
+                        PURPLE_STATES.index(name)
+                        if name in PURPLE_STATES
+                        else len(PURPLE_STATES),
+                        name,
+                    ),
+                ),
                 "state_started": dict(self.state_started),
                 "state_duration": dict(self.state_duration),
                 "tools": [
@@ -418,6 +445,7 @@ class PurpleWorkspaceState:
                 "report_path": self.report_path,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
+                "recorded_duration": self.recorded_duration,
                 "orchestrator": self.orchestrator,
             }
 

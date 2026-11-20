@@ -293,7 +293,7 @@ class EngagementStore:
             status=str(finished.get("outcome") or "running"),
             last_state=str(finished.get("last_state") or ""),
             path=path.parent,
-            started_at=str(created.get("timestamp") or ""),
+            started_at=str(created.get("ts") or ""),
             custom_title=self.read_display_title(path.parent),
         )
 

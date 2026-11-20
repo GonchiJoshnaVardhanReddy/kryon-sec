@@ -14,6 +14,7 @@ failure cannot alter a backend result.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import threading
 import time
@@ -98,6 +99,20 @@ class _LivePurpleState(PurpleWorkspaceState):
     def finish(self, outcome: str, **kw: Any) -> None:
         super().finish(outcome, **kw)
         self._notify("purple")
+
+
+def _audit_seconds(value: Any) -> float | None:
+    """Parse an audit ``ts`` (ISO-8601) into POSIX seconds.
+
+    Missing or malformed timestamps return None rather than raising: old
+    chains predate the field, and a replay must still render them.
+    """
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 class WorkspaceController:
@@ -1334,6 +1349,7 @@ class WorkspaceController:
                     output=False,
                     human_reviewer=self.request_human_review,
                     post_exploit_approver=self.request_post_exploit,
+                    stop_requested=lambda: self.stop_requested,
                 )
             except KeyboardInterrupt:
                 view.finish("interrupted", halt_reason="keyboard_interrupt")
@@ -1382,20 +1398,71 @@ class WorkspaceController:
             sandbox_status="recorded",
         )
         view.started_at = time.monotonic()
-        for event in self.engagement_store.read_events(tab):
+        events = self.engagement_store.read_events(tab)
+        for event in events:
             event_name = event.get("event")
             if event_name == "state_enter":
                 view.on_state(str(event.get("state") or ""))
             view.on_audit(event)
             if event_name == "engagement_finished":
+                recorded_failed = event.get("failed_states")
                 view.finish(
                     str(event.get("outcome") or "recorded"),
                     halt_reason=str(event.get("reason") or "") or None,
+                    failed_states=(
+                        recorded_failed if isinstance(recorded_failed, list) else None
+                    ),
                 )
-        if view.current_state and view.current_state not in view.completed_states and view.outcome:
+        if (
+            view.current_state
+            and view.current_state not in view.completed_states
+            and view.current_state not in view.failed_states
+            and view.outcome
+        ):
             view.on_state_complete(view.current_state)
+        self._apply_recorded_timing(view, events)
         with self._lock:
             self.purple_view = view
+
+    @staticmethod
+    def _apply_recorded_timing(
+        view: _LivePurpleState, events: list[dict[str, Any]]
+    ) -> None:
+        """Make a replay report the run's real clock, not the app's.
+
+        ``started_at``/``finished_at`` are monotonic readings of *this*
+        process, so a reopened engagement used to report how long it had
+        been open rather than how long it ran, and every state duration was
+        zero. The audit chain already carries a wall-clock ``ts`` on each
+        entry; derive the duration and the per-state spans from those. A
+        chain old enough to have no ``ts`` keeps the old fallback.
+        """
+        stamps: list[float] = []
+        state_starts: list[tuple[str, float]] = []
+        finished_at: float | None = None
+        for event in events:
+            at = _audit_seconds(event.get("ts"))
+            if at is None:
+                continue
+            stamps.append(at)
+            name = event.get("event")
+            if name == "state_enter":
+                state = str(event.get("state") or "")
+                if state:
+                    state_starts.append((state, at))
+            elif name == "engagement_finished":
+                finished_at = at
+        if not stamps:
+            return
+        end = finished_at if finished_at is not None else stamps[-1]
+        view.recorded_duration = max(0.0, end - stamps[0])
+        for index, (state, started) in enumerate(state_starts):
+            next_at = (
+                state_starts[index + 1][1]
+                if index + 1 < len(state_starts)
+                else end
+            )
+            view.state_duration[state] = max(0.0, next_at - started)
 
     # ---- approvals -----------------------------------------------------
 

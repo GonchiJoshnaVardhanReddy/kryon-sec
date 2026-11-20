@@ -56,6 +56,11 @@ engagement, so every issue below is an unconfirmed suggestion.
 {% if halt_reason %}
 The engagement stopped early. Reason: {{ halt_reason }}.
 {% endif %}
+{% if failed_states %}
+Some stages of the automated workflow did not finish: {{ failed_states | join(", ") }}.
+Results from these stages may be incomplete; the test history below records
+what each one reported.
+{% endif %}
 
 ## Timeline
 

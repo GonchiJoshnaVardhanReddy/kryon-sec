@@ -92,6 +92,24 @@ def test_report_renders_verified_disagreed_inconclusive_not_run(tmp_path):
         assert expected in report, props
 
 
+def test_report_names_a_failed_stage(tmp_path):
+    """A run with a failed stage must say so in the reader's report."""
+    report = render_report(
+        _report_graph(None), AuditLog(tmp_path / "a-stage.jsonl"), "e-rep",
+        failed_states=["HYPOTHESIZE"],
+    )
+    assert "HYPOTHESIZE" in report
+    assert "did not finish" in report
+
+
+def test_report_json_names_failed_stages(tmp_path):
+    doc = json.loads(build_report_json(
+        _report_graph(None), AuditLog(tmp_path / "a-stage-json.jsonl"),
+        "e-rep", failed_states=["HYPOTHESIZE"],
+    ))
+    assert doc["failed_states"] == ["HYPOTHESIZE"]
+
+
 def test_report_never_calls_unverified_findings_clean(tmp_path):
     """A finding with no verification at all is unverified — the report
     must not describe it as checked, safe or disproven."""
@@ -173,7 +191,7 @@ def test_report_json_is_deterministic_and_schema_versioned(tmp_path):
     two = build_report_json(graph, audit, "e-rep")
     assert one == two                       # same graph+chain -> same bytes
     doc = json.loads(one)
-    assert doc["schema_version"] == REPORT_JSON_SCHEMA_VERSION == "1.0"
+    assert doc["schema_version"] == REPORT_JSON_SCHEMA_VERSION == "1.1"
     assert doc["engagement_id"] == "e-rep"
     assert json.dumps(json.loads(one), sort_keys=True,
                       separators=(",", ":")) == one  # canonical already

@@ -86,13 +86,73 @@ def test_factory_crash_does_not_escape_run():
 
 
 def test_subagent_crash_does_not_escape_run():
-    """The callable path was already guarded — keep it that way."""
+    """A loader that raises is a failed state, not a broken loop."""
     def loader(state):
-        def boom():
-            raise RuntimeError("subagent blew up")
-        return boom
+        def run():
+            raise RuntimeError("boom")
+        return run
 
-    orch = PurpleOrchestrator(engagement_id="e-crash", subagent_loader=loader)
+    orch = PurpleOrchestrator(engagement_id="e", subagent_loader=loader)
     completed = orch.run()
+    assert completed[0] == "INIT"
+    assert "REPORT" in completed       # the deterministic route still ends
     assert orch.state == HALT
-    assert "REPORT" in completed
+    assert orch.halt_reason is None
+    assert orch.failed_states          # the crash is visible in the record
+
+
+def test_operator_stop_ends_at_the_next_state_boundary():
+    """The running state finishes; no later state starts."""
+    ran: list[str] = []
+    stop = {"value": False}
+
+    def loader(state):
+        def run():
+            ran.append(state)
+            stop["value"] = True
+            return SubagentResult(status="ok")
+        return run
+
+    orch = PurpleOrchestrator(
+        engagement_id="e",
+        subagent_loader=loader,
+        should_stop=lambda: stop["value"],
+    )
+    completed = orch.run()
+
+    assert completed == ["INIT"]        # the state that was running finished
+    assert ran == ["INIT"]              # and nothing else was started
+    assert orch.state == HALT
+    assert orch.halt_reason == "operator_interrupt"
+
+
+def test_a_failed_state_is_recorded_without_changing_the_route():
+    def loader(state):
+        if state == "RECON_PASSIVE":
+            return lambda: SubagentResult(status="failed")
+        return lambda: SubagentResult(status="ok")
+
+    orch = PurpleOrchestrator(engagement_id="e", subagent_loader=loader)
+    completed = orch.run()
+
+    assert orch.halt_reason is None
+    assert completed == [
+        "INIT", "RECON_PASSIVE", "RECON_ACTIVE", "HYPOTHESIZE",
+        "HUMAN_REVIEW", "BLUE_TEAM", "REPORT",
+    ]
+    assert orch.failed_states == ["RECON_PASSIVE"]
+
+
+def test_a_broken_stop_predicate_does_not_stop_the_run():
+    def boom() -> bool:
+        raise RuntimeError("stop flag unavailable")
+
+    orch = PurpleOrchestrator(
+        engagement_id="e",
+        subagent_loader=lambda state: (lambda: SubagentResult(status="ok")),
+        should_stop=boom,
+    )
+
+    assert orch.run()
+    assert orch.halt_reason is None
+    assert orch.state == HALT
