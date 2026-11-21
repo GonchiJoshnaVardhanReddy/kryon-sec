@@ -25,3 +25,10 @@ def test_tool_confirmation_without_verification_is_only_observed():
     audit.append({"event": "finding_verified", "finding_id": "H1"})
     verified = scorer.score(challenges, nodes, audit, "full", "lab", "non-human")
     assert verified["rows"][0]["verdict"] == "CONFIRMED"
+
+
+def test_lab_manifest_records_the_pinned_image_identity():
+    """Keep the lab manifest auditable without importing its live harness."""
+    path = Path(__file__).resolve().parents[1] / "research/lab/phase5_engagement_runs.py"
+    text = path.read_text(encoding="utf-8")
+    assert '"sandbox_image": cfg.sandbox_image,' in text
