@@ -44,6 +44,10 @@ engagement, so every issue below is an unconfirmed suggestion.
 {% elif a.properties.outcome == 'inconclusive' %}
 - **{{ a.label }}** ({{ a.properties.tool }}): ran and did **not** confirm
   the issue. A test that finds nothing is not proof that nothing is there.
+{% elif a.properties.outcome == 'tool-error' %}
+- **{{ a.label }}** ({{ a.properties.tool }}): **started but did not
+  finish** — the tool exited with an error, so there is no clean result.
+  Whatever it printed is partial evidence, not a finding{% if a.properties.exit_note | default('') %} ({{ a.properties.exit_note }}){% endif %}.
 {% elif a.properties.outcome == 'not-run' %}
 - **{{ a.label }}** ({{ a.properties.tool }}): **could not be run**, so
   nothing was checked{% if a.properties.not_run_reason %} ({{ a.properties.not_run_reason }}){% endif %}.
@@ -83,7 +87,14 @@ website only.
 {% for a in attempts %}
 ### Steps for {{ a.label }}
 
-{% if a.properties.outcome in ('confirmed', 'inconclusive') %}
+{% if a.properties.outcome == 'tool-error' %}
+1. The tool {{ a.properties.tool }} was started with these settings:
+   `{{ a.properties.argv | join(' ') }}`
+2. The tool exited with an error before the check completed{% if a.properties.exit_note | default('') %} — {{ a.properties.exit_note }}{% endif %}.
+   There is no clean result to compare against.
+3. Partial output (evidence, not a result):
+   {% if a.properties.output_excerpt %}`{{ a.properties.output_excerpt | trim | truncate(200) }}`{% else %}(nothing was recorded){% endif %}
+{% elif a.properties.outcome in ('confirmed', 'inconclusive') %}
 1. The tool {{ a.properties.tool }} was run with these settings:
    `{{ a.properties.argv | join(' ') }}`
 2. The tool sent test requests to the target website and watched how
@@ -104,7 +115,10 @@ test environment and compare what the tool answers. Only test websites
 you are allowed to test.
 {% endfor %}
 {% else %}
-No test steps to show — no tools were run in this engagement.
+No hypothesis-driven test steps to show — no exploit or verification
+tool ran in this engagement (no issue reached the testing phase).
+Reconnaissance tool runs, if any, are recorded in the engagement's audit
+chain; this section only ever describes tests of a proposed issue.
 {% endif %}
 
 ## What we found about the target
@@ -124,9 +138,14 @@ No test steps to show — no tools were run in this engagement.
 
 ## Possible security issues
 
-These are **suggestions only** — the assistant looked at public
-information and guessed what might be wrong. Nothing below is confirmed
-{% if not exploit_ran %}because no tests were run{% endif %}.
+These started as **suggestions**: the assistant looked at public
+information and guessed what might be wrong.
+{% if coverage.confirmed_findings %}The items marked **confirmed by the test tool** were
+really tested and the tool agreed; everything else below is still only
+a suggestion.
+{% elif not exploit_ran %}Nothing below is confirmed because no tests were run.
+{% else %}Nothing below is confirmed.
+{% endif %}
 
 {% for h in hypotheses %}
 ### {{ h.id }} — {{ h.title }}
@@ -140,7 +159,7 @@ information and guessed what might be wrong. Nothing below is confirmed
 {% endfor %}{% endif %}
 - How sure the assistant is: {{ "%.0f" | format((h.confidence or 0) * 100) }}%
 - Your decision: {{ "approved" if h.approved | default(false) else "not approved" }}
-{% if exploit_ran or h.exploit_status != 'none' %}- Tested: {{ "yes" if h.tested | default(false) else "no" }}{% if h.exploit_status in ('not-run', 'unrecorded') %} — {{ h.exploit_note }}{% endif %}{% endif %}
+{% if exploit_ran or h.exploit_status != 'none' %}- Tested: {% if h.exploit_status == 'tool-error' %}started, but the check did not finish{% else %}{{ "yes" if h.tested | default(false) else "no" }}{% endif %}{% if h.exploit_status in ('not-run', 'unrecorded') %} — {{ h.exploit_note }}{% endif %}{% endif %}
 {% if h.tested and h.confirmed | default(false) %}- Result: **confirmed by the test tool**{% endif %}
 {% if h.confirmed | default(false) %}{% if h.verification_status == 'verified' %}- Double-checked: **yes — a second tool re-tested it and agreed**{% elif h.verification_status == 'disagreed' %}- Double-checked: **a second tool re-tested it and did NOT agree** — treat this finding with care{% elif h.verification_status == 'inconclusive' %}- Double-checked: the second check ran but could not establish either conclusion — treat this finding with care{% else %}- Double-checked: the second check never ran — treat this finding with care (unverified, not disproven){% endif %}{% endif %}
 {% if h.cvss_vector %}- Severity guess (CVSS vector): {{ h.cvss_vector }}
@@ -219,10 +238,12 @@ from the assistant's statements. An item absent from a list here is
 {% else %}
 - Areas actually tested: **none** — no tool ran against this target.
 {% endif %}
-- Issue items the model proposed: {{ coverage.model_claims }} — tool runs really
-  started for {{ coverage.machine_observed_runs }} of them.
+- Issue items the model proposed: {{ coverage.model_claims }} — a tool run really
+  started for {{ coverage.items_with_run }} of them.
+- Tool runs that really started: {{ coverage.machine_observed_runs }}
 - Confirmed by a test tool: {{ coverage.confirmed_findings | length }}{% if coverage.confirmed_findings %} ({{ coverage.confirmed_findings | join(", ") }}){% endif %}
 - Tested but not confirmed: {{ coverage.tested_unconfirmed | length }}{% if coverage.tested_unconfirmed %} ({{ coverage.tested_unconfirmed | join(", ") }}){% endif %}
+- Started but did not finish (no clean result): {{ coverage.started_not_finished | length }}{% if coverage.started_not_finished %} ({{ coverage.started_not_finished | join(", ") }}){% endif %}
 - Unresolved results (ran with no conclusion either way): {{ coverage.unresolved | length }}{% if coverage.unresolved %} ({{ coverage.unresolved | join(", ") }}){% endif %}
 - Test steps that could not run: {{ coverage.skipped_or_blocked | length }}
 {% for b in coverage.skipped_or_blocked %}  - {{ b.item }} — could not start: {{ b.reason or "(no reason recorded)" }}

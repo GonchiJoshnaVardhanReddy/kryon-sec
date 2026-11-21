@@ -22,8 +22,8 @@ every run:
   injection was attempted.
 
 Verdicts (per challenge):
-  CONFIRMED     the run confirmed (finding_confirmed/finding_verified)
-                a finding whose evidence matches the challenge surface
+  CONFIRMED     an independent finding_verified event and a matching
+                finding; tool-only confirmation remains OBSERVED
   OBSERVED      an evidence node matches the surface (an observation
                 CONSISTENT with the challenge — NOT a claim of solving
                 it; observed != solved)
@@ -31,7 +31,7 @@ Verdicts (per challenge):
                 is noted but not scored
   MISSED        in scope, nothing matched
 
-  FALSE_POSITIVE  (per-finding, not per-challenge): a confirmed/verified
+  FALSE_POSITIVE  (per-finding, not per-challenge): an independently verified
   finding whose evidence matches NO challenge surface.
 
 Every verdict cites node ids from the persisted graph (read back from
@@ -63,7 +63,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/mnt/d/project/kryon-sec/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 LAB_DIR = Path(__file__).resolve().parent
 YAML_PATH = LAB_DIR / "ground-truth" / "juice-shop-v20.4.0-challenges.yml"
@@ -447,10 +447,8 @@ def score(challenges: list[dict], nodes: list[dict],
     evidence = [n for n in nodes if n.get("node_type") in EVIDENCE_TYPES]
     findings = {n["label"]: n for n in evidence
                 if n.get("node_type") == "finding"}
-    confirmed_events = [e for e in audit_events
-                        if e.get("event") == "finding_confirmed"]
     verified_events = [e for e in audit_events
-                       if e.get("event") == "finding_verified"]
+                        if e.get("event") == "finding_verified"]
 
     rows: list[dict] = []
     matched_findings: set[str] = set()
@@ -465,9 +463,8 @@ def score(challenges: list[dict], nodes: list[dict],
         hit_findings = sorted({n["label"] for n in hits
                                if n.get("node_type") == "finding"})
         confirmed = [f for f in hit_findings
-                     if any(e.get("hypothesis_id") == f
-                            or e.get("finding_id") == f
-                            for e in confirmed_events + verified_events)]
+                      if any(e.get("finding_id") == f
+                             for e in verified_events)]
         if key in _OOS:
             oos_class, reason = _OOS[key]
             verdict, why = "OUT_OF_SCOPE", f"{oos_class}: {reason}"
@@ -503,13 +500,12 @@ def score(challenges: list[dict], nodes: list[dict],
     for r in rows:
         verdicts[r["verdict"]] = verdicts.get(r["verdict"], 0) + 1
 
-    # FALSE_POSITIVE: confirmed/verified findings mapping to no challenge
+    # FALSE_POSITIVE: independently verified findings mapping to no challenge
     fps = []
     for f_id in sorted(findings):
         f_node = findings[f_id]
         was_confirmed = any(
-            e.get("hypothesis_id") == f_id or e.get("finding_id") == f_id
-            for e in confirmed_events + verified_events)
+            e.get("finding_id") == f_id for e in verified_events)
         if not was_confirmed:
             continue
         if f_id not in matched_findings:
@@ -537,7 +533,8 @@ def score(challenges: list[dict], nodes: list[dict],
             and r["reason"] in set(_NO_SURFACE.values())
             | {NO_SURFACE_NOTE}],
         "honest_notes": [
-            "observed != solved: only CONFIRMED is a solved-shaped claim; "
+            "observed != solved: only independently verified CONFIRMED is a "
+            "solved-shaped claim; "
             "OBSERVED means an evidence node matches the challenge's "
             "curated surface regex",
             "hypothesis/vuln_candidate/remediation nodes are excluded "

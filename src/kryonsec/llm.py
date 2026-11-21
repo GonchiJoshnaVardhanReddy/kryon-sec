@@ -903,7 +903,7 @@ def chat(
 
     raise LlmUnavailable(
         f"no {hosted.label} model answered — {provider_reason(last_error)}"
-    )
+    ) from last_error
 
 
 def chat_local(

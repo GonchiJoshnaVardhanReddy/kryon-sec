@@ -9,7 +9,9 @@ when available, JSON+validation fallback).
 from __future__ import annotations
 
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -54,13 +56,14 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     # vulnerability databases — same caveat as trivy (documented in the
     # tool-expansion record): they fail as audited skips offline.
     ("syft", ["syft", "scan", "/code", "-o", "json"]),
-    ("osv-scanner", ["osv-scanner", "-r", "/code", "--format", "json"]),
+    ("osv-scanner", ["osv-scanner", "scan", "source", "-r",
+                     "--format", "json", "/code"]),
     ("grype", ["grype", "dir:/code", "-o", "json"]),
     # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
     # the same read-only /code mount. checksec audits every ELF's
     # hardening; exiftool prints file metadata.
-    # File-granular binary tools (gdb/radare2/binwalk/…) stay dormant —
-    # see the Dockerfile Phase 4 note.
+    # File-granular binary tools (gdb/radare2/binwalk/…) run through the
+    # typed {file} plan below when the operator passed --code.
     # terrascan DEFERRED: no Kali package in the 2026-11 kali-rolling
     # snapshot (apt-cache Candidate: ABSENT — verified in-image), and a
     # plan entry naming an absent binary is a guaranteed tool-error row.
@@ -70,6 +73,102 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     ("exiftool", ["exiftool", "-r", "-q", "/code"]),
 ]
 HADOLINT_PLAN_ENTRY = ("hadolint", ["hadolint", "/code/Dockerfile"])
+
+# ---- Phase 3 (2026-11-19): typed {file} plan -------------------------------
+# File-granular binary tools, one spawn per selected file. The TEMPLATE here
+# is validated against the host allowlist at runtime like every other plan
+# entry; {file} is replaced with "/code/<relative path>" only after the path
+# passed the grammar's own rule. Flags verified live against the pinned
+# image (2026-11-19, /usr/bin/ls): all exit 0 with the shapes below.
+FILE_SCAN_PLAN: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+    # tool, template args, ELF-only?
+    ("strings", ("-n", "8", "{file}"), False),
+    ("xxd", ("-l", "4096", "{file}"), False),
+    ("binwalk", ("-B", "{file}"), False),
+    ("objdump", ("-d", "--no-show-raw-insn", "{file}"), True),
+    ("ROPgadget", ("--binary", "{file}", "--depth", "6",
+                   "--only", "pop|ret"), True),
+    ("r2", ("-N", "-q", "-c", "iI;q", "{file}"), True),
+    ("gdb", ("-nx", "-batch", "-ex", "info functions", "{file}"), True),
+)
+_FILE_GRANULAR_TOOLS = frozenset(tool for tool, _t, _e in FILE_SCAN_PLAN)
+# bounds: a code folder can be a whole repo; the plan is a bounded SAMPLE,
+# never an exhaustive walk. ELF caps are tighter — disassembly/ROP output
+# grows faster than the file.
+MAX_FILE_BYTES = 1_048_576
+MAX_ELF_BYTES = 524_288
+MAX_ANY_FILES = 4
+MAX_ELF_FILES = 2
+MAX_WALK_ENTRIES = 2000
+MAX_FILE_EXCERPT = 600
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".venv", "venv", ".mypy_cache", ".pytest_cache",
+})
+
+
+def _is_elf(path: Path) -> bool:
+    """ELF magic only — the host reads 4 bytes, never loads the file."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def build_file_scan_plan(code_folder: str | Path) -> list[tuple[str, list[str]]]:
+    """Deterministic, bounded plan for the file-granular tools.
+
+    The operator's folder is mounted read-only at the FIXED /code path; the
+    host path never appears in an argv. Only regular files are eligible:
+    symlinks are never followed, oversized files, unsafe names, and
+    VCS/dependency-cache directories are skipped. ELF files sort first so
+    the binary tools get a meaningful sample from a mixed tree. The same
+    tree always yields the same plan.
+    """
+    from .allowlist import is_safe_code_file
+
+    root = Path(code_folder)
+    if not root.is_dir():
+        return []
+    candidates: list[tuple[str, int, bool]] = []
+    examined = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIRS
+            and not (Path(dirpath) / d).is_symlink())
+        for name in sorted(filenames):
+            if examined >= MAX_WALK_ENTRIES:
+                break
+            examined += 1
+            p = Path(dirpath) / name
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size > MAX_FILE_BYTES:
+                continue
+            if not is_safe_code_file(f"/code/{rel}"):
+                continue
+            candidates.append(
+                (rel, size, size <= MAX_ELF_BYTES and _is_elf(p)))
+        if examined >= MAX_WALK_ENTRIES:
+            break
+
+    candidates.sort(key=lambda c: (not c[2], c[0]))  # ELF first, then path
+    any_files = candidates[:MAX_ANY_FILES]
+    elf_files = [c for c in candidates if c[2]][:MAX_ELF_FILES]
+    plan: list[tuple[str, list[str]]] = []
+    for tool, template, elf_only in FILE_SCAN_PLAN:
+        for rel, _size, _elf in (elf_files if elf_only else any_files):
+            path = f"/code/{rel}"
+            plan.append(
+                (tool, [tool, *(a.replace("{file}", path) for a in template)]))
+    return plan
 
 # bounded evidence: scanner output can be enormous
 MAX_SCANNER_EXCERPT = 2000
@@ -143,12 +242,37 @@ def _count_packages(stdout: str) -> int | None:
     return None
 
 
+def _scanner_failure_note(tool: str, result) -> str:
+    """Fixed operator guidance only; never copy scanner output into reports."""
+    output = result.stdout or ""
+    if not result.ok:
+        return "sandbox spawn failed; check doctor --deep --strict and the audit"
+    if tool in {"trivy", "grype", "osv-scanner"} and any(
+            marker in output.lower() for marker in (
+                "failed to download vulnerability db", "no vulnerability database",
+                "failed to fetch latest version",
+                "error when retrieving vulns",
+            )):
+        return "vulnerability database unavailable; provision an approved offline database before retrying"
+    if result.exit_code == 127:
+        if ("timeout: failed to run command" in output
+                and "No such file or directory" in output):
+            return "tool not installed in the selected sandbox image; check the image inventory"
+        if tool == "osv-scanner" and "Scanning dir --format" in output:
+            return "OSV-Scanner arguments are incompatible with this image; check the v2 scan source plan"
+        return "tool exited 127; check the selected image and scanner arguments"
+    if result.exit_code == 0 and tool in {"syft", "osv-scanner", "grype"}:
+        return "scanner returned no valid JSON results; check scanner output before claiming a clean scan"
+    return f"scanner exited {result.exit_code}; check the audit and scanner output"
+
+
 def run_code_scanners(
     graph: EngagementGraph,
     sandbox,
     audit: AuditLog,
     allowlist=None,
     has_dockerfile: bool = False,
+    code_folder: str | Path | None = None,
 ) -> int:
     """Pre-LLM tool phase: static analyzers over the /code mount.
 
@@ -156,13 +280,21 @@ def run_code_scanners(
     results become `scanner_result` graph nodes that the Jinja prompt
     renders as scanner evidence. A failing scanner is an audited skip —
     the LLM phase runs regardless. Returns the number of scanners that
-    actually ran."""
+    actually ran.
+
+    ``code_folder`` is the operator's HOST folder (already mounted at the
+    fixed read-only /code by the sandbox). When given, the file-granular
+    tools join the plan through the typed {file} contract; the host path
+    itself never reaches an argv.
+    """
     from .allowlist import AllowlistViolation, ToolAllowlist
 
     allow = allowlist or ToolAllowlist()
     plan = list(BLUE_TEAM_SCAN_PLAN)
     if has_dockerfile:
         plan.append(HADOLINT_PLAN_ENTRY)
+    if code_folder is not None:
+        plan.extend(build_file_scan_plan(code_folder))
 
     ran = 0
     for tool, argv in plan:
@@ -184,6 +316,19 @@ def run_code_scanners(
             "argv": argv,
         })
         result = sandbox.spawn(argv)
+        count = _count_findings(tool, result.stdout) if result.ok else None
+        json_valid = (
+            tool not in {"syft", "osv-scanner", "grype"}
+            or (count is not None if tool != "syft"
+                else _count_packages(result.stdout) is not None)
+        )
+        # A process that starts is not necessarily a completed scan. Exit 1
+        # is findings only when a supported scanner emitted recognizable
+        # findings; in particular Grype's database errors also exit 1.
+        completed = result.ok and json_valid and (
+            result.exit_code == 0
+            or (result.exit_code == 1 and count is not None and count > 0)
+        )
         audit.write({
             "event": "tool_result",
             "state": "BLUE_TEAM",
@@ -191,10 +336,25 @@ def run_code_scanners(
             "ok": result.ok,
             "exit_code": result.exit_code,
             "output_chars": len(result.stdout),
+            "scan_completed": completed,
         })
-        if not result.ok:
-            continue  # spawn failed — audited, next scanner
+        if not completed:
+            audit.write({
+                "event": "scanner_failed",
+                "state": "BLUE_TEAM",
+                "tool": tool,
+                "exit_code": result.exit_code,
+                "note": _scanner_failure_note(tool, result),
+            })
+            continue  # not evidence of a completed scan
         ran += 1
+        # file-granular entries carry their selected path; the label names
+        # BOTH the tool and the file (one node per check, never one merged
+        # node that hides which file produced what)
+        file_path = ""
+        if tool in _FILE_GRANULAR_TOOLS:
+            file_path = next(
+                (a for a in argv if a.startswith("/code/")), "")
         properties: dict = {
             "tool": tool,
             "exit_code": result.exit_code,
@@ -205,9 +365,11 @@ def run_code_scanners(
             # its own help in the Phase 4b run; --format=csv/json is
             # the FUTURE hook for honest counters, not adopted now —
             # a format switch would need its own real-path round)
-            "excerpt": clean_excerpt(result.stdout)[:MAX_SCANNER_EXCERPT],
+            "excerpt": clean_excerpt(result.stdout)[
+                :(MAX_FILE_EXCERPT if file_path else MAX_SCANNER_EXCERPT)],
         }
-        count = _count_findings(tool, result.stdout)
+        if file_path:
+            properties["path"] = file_path
         if count is not None:
             properties["findings_count"] = count
         if tool == "syft":
@@ -217,7 +379,9 @@ def run_code_scanners(
             if packages is not None:
                 properties["packages_count"] = packages
         graph.add_node(
-            node_type="scanner_result", label=tool, properties=properties,
+            node_type="scanner_result",
+            label=f"{tool}:{file_path}" if file_path else tool,
+            properties=properties,
         )
     audit.write({
         "event": "scanners_done",
@@ -549,6 +713,7 @@ class BlueTeamSubagent:
                 run_code_scanners(
                     self.graph, self.sandbox, self.audit,
                     has_dockerfile=has_dockerfile,
+                    code_folder=self.code_folder,
                 )
             except Exception as e:
                 self.audit.write({

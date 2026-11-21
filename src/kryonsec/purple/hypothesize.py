@@ -117,8 +117,38 @@ class AssetReference(BaseModel):
         return _claim_text(value, limit)
 
 
+#: Fields whose pydantic default is also the answer to an explicit ``null``.
+#: A default applies only when the key is ABSENT; a model that spells
+#: ``"cve": null`` means the same thing ("this hypothesis names no CVE"),
+#: and rejecting it fails the WHOLE set (pydantic validates the set
+#: atomically). Observed for real on 2026-11-19: four hypotheses, every
+#: one ``"cve": null``, four validation errors, zero hypotheses for the
+#: engagement. These are the optional fields whose default is meaningful
+#: as-is; the required evidence fields (id/title/target_asset/rationale)
+#: stay strict, because a hypothesis that names no asset cannot be tested
+#: and that failure must stay visible in the audit.
+_NULL_MEANS_DEFAULT: "dict[str, object]" = {
+    "cvss_vector": "",
+    "cve": "",
+    "tools": (),          # pydantic copies it into a fresh list
+    "confidence": 0.5,
+}
+
+
 class Hypothesis(BaseModel):
     """One vulnerability hypothesis proposed by the LLM."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explicit_null_uses_the_default(cls, value):
+        if not isinstance(value, dict):
+            return value
+        replaced = {
+            key: _NULL_MEANS_DEFAULT[key]
+            for key in _NULL_MEANS_DEFAULT
+            if key in value and value[key] is None
+        }
+        return {**value, **replaced} if replaced else value
 
     # id format is rigid where it MATTERS: ids join labels like
     # "H1:sqlmap", so a ':' in an id would silently corrupt the
@@ -274,6 +304,35 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
+_STRUCTURED_CALL_TIMEOUT_S = 90
+
+
+def _structured_chat(cfg: KryonsecConfig, messages: list[dict], model: str) -> str:
+    """Retry one timed-out JSON call; never retry a refusal or sensitive call."""
+    from ..llm import (
+        LlmUnavailable, _declared_redactions_in_messages,
+        _secrets_in_messages, chat,
+    )
+
+    sensitive = (_secrets_in_messages(messages)
+                 or _declared_redactions_in_messages(messages))
+    try:
+        return chat(cfg, messages, model=model, timeout=_STRUCTURED_CALL_TIMEOUT_S)
+    except LlmUnavailable as error:
+        cause = error.__cause__
+        if sensitive or cause is None:
+            raise
+        # LiteLLM maps provider timeouts to litellm.Timeout. A bare
+        # LlmUnavailable also covers disabled providers, missing keys and
+        # policy refusal; none of those may be replayed.
+        from litellm import Timeout
+
+        if not isinstance(cause, (TimeoutError, Timeout)):
+            raise
+        log.warning("hypothesis JSON call timed out; retrying once")
+        return chat(cfg, messages, model=model, timeout=_STRUCTURED_CALL_TIMEOUT_S)
+
+
 def propose_hypotheses_with_model(
     cfg: KryonsecConfig,
     prompt: str,
@@ -340,8 +399,6 @@ def propose_hypotheses_with_model(
     except Exception as e:  # provider error on the instructor path
         log.warning("instructor call failed (%s); trying JSON path", e)
 
-    from ..llm import chat
-
     json_prompt = (
         f"{prompt}\n\n"
         "Respond with ONLY a JSON object of this exact shape:\n"
@@ -358,7 +415,7 @@ def propose_hypotheses_with_model(
         {"role": "user", "content": json_prompt},
     ]
 
-    text = chat(cfg, messages, model=model)
+    text = _structured_chat(cfg, messages, model)
     try:
         return HypothesisSet.model_validate(_extract_json(text)), None
     except (ValueError, ValidationError):
@@ -371,7 +428,7 @@ def propose_hypotheses_with_model(
                 "Output ONLY the corrected JSON object now.",
             },
         ]
-        text = chat(cfg, retry, model=model)
+        text = _structured_chat(cfg, retry, model)
         return HypothesisSet.model_validate(_extract_json(text)), None
 
 

@@ -25,6 +25,80 @@ from kryonsec.purple.recon_passive import EngagementGraph
 from kryonsec.secrets import REDACTION_DECLARATION, detect_secrets
 
 
+def test_structured_chat_retries_only_a_timeout(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise llm.LlmUnavailable("provider timeout") from TimeoutError()
+        return "{}"
+
+    monkeypatch.setattr(llm, "chat", chat)
+    assert _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                            "model") == "{}"
+    assert [c["timeout"] for c in calls] == [90, 90]
+
+
+@pytest.mark.parametrize("error", [
+    "LLM disabled by KRYONSEC_DISABLE_LLM",
+    "no API key is set",
+])
+def test_structured_chat_does_not_retry_permanent_failure(monkeypatch, error):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable(error)
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable, match=error):
+        _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                         "model")
+    assert calls == [1]
+
+
+def test_structured_chat_never_retries_sensitive_prompt(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable("timeout") from TimeoutError()
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable):
+        _structured_chat(KryonsecConfig(),
+                         [{"role": "user", "content": f"{REDACTION_DECLARATION}: 1"}],
+                         "model")
+    assert calls == [1]
+
+
+def test_structured_chat_stops_after_second_timeout(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable("timeout") from TimeoutError()
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable):
+        _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                         "model")
+    assert len(calls) == 2
+
+
 def _graph_with_findings():
     graph = EngagementGraph(engagement_id="e-h")
     graph.add_node("target", "testcorp.example", {"source": "engagement_config"})
@@ -115,6 +189,40 @@ def test_hypothesis_id_rejects_colon():
     that must stay rigid."""
     with pytest.raises(ValidationError):
         Hypothesis(id="H1:sqlmap", title="t", target_asset="a", rationale="r")
+
+
+def test_explicit_null_in_an_optional_field_is_its_default():
+    """Real failure 2026-11-19T162715Z: the model answered ``"cve": null``
+    on every hypothesis; pydantic rejected the whole set (4 validation
+    errors -> hypothesize_failed -> zero hypotheses for an engagement
+    that paid for the call). A null on a field that HAS a default says
+    "none", exactly like omitting the key: sanitise, don't reject."""
+    hs = HypothesisSet.model_validate({"hypotheses": [{
+        "id": "H1", "title": "t", "target_asset": "/rest/products?id=1",
+        "rationale": "r",
+        "cve": None, "cvss_vector": None, "tools": None,
+        "confidence": None, "related_assets": None, "relationship": None,
+    }]})
+    h = hs.hypotheses[0]
+    assert h.cve == ""
+    assert h.cvss_vector == ""
+    assert h.tools == []
+    assert h.confidence == 0.5
+    assert h.related_assets == []
+    assert h.relationship == ""
+
+
+def test_null_in_a_required_evidence_field_still_fails():
+    """The tolerance above stops at the evidence fields: a hypothesis
+    that names no asset (or has no rationale) cannot be reviewed or
+    tested, and the audit must show the failure instead of silently
+    accepting an empty claim."""
+    for missing in ("target_asset", "rationale", "title", "id"):
+        payload = {"id": "H1", "title": "t", "target_asset": "/a",
+                   "rationale": "r"}
+        payload[missing] = None
+        with pytest.raises(ValidationError):
+            HypothesisSet.model_validate({"hypotheses": [payload]})
 
 
 # --- JSON extraction (the no-instructor fallback) ---

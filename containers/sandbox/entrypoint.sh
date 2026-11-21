@@ -60,10 +60,13 @@ ALLOWED_TOOLS=(
     # blue-team SBOM/dependency scanners (Phase 8)
     "syft" "osv-scanner" "grype"
     # blue-team binary/forensics dir-mode scanners (Phase 4): /code
-    # read-only mount only (dir-mode tools; file-granular binary tools
-    # stay UNALLOWLISTED until the {file} slot exists — Dockerfile note;
-    # terrascan deferred: no Kali package — Dockerfile note)
+    # read-only mount only (dir-mode tools; terrascan deferred: no Kali
+    # package — Dockerfile note)
     "checksec" "exiftool"
+    # blue-team file-granular binary tools (Phase 3, 2026-11-19): every
+    # argv carries a typed {file} value under /code (host Layer-2 rule);
+    # these are evidence readers only — never extraction or execution
+    "strings" "xxd" "binwalk" "objdump" "ROPgadget" "r2" "gdb"
     # image-side extras kept from the original image (not host-allowlisted
     # today, harmless here — the HOST allowlist is the authoritative gate)
     "python3" "kube-bench"

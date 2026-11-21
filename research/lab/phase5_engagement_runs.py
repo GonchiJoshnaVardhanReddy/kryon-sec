@@ -326,6 +326,8 @@ def summarize(mode: str, engagement_id: str, cfg, wall_s: float,
     manifest = {
         "mode": mode,
         "target": TARGET,
+        # Bind saved results to the configured, digest-pinned execution image.
+        "sandbox_image": cfg.sandbox_image,
         "engagement_id": engagement_id,
         "approval_provenance": (
             AUTO_APPROVAL_LABEL if mode == "full"

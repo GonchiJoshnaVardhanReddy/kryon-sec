@@ -138,6 +138,43 @@ class VerifySubagent:
                 return "https"
         return "http"
 
+    def _record_attempt(
+        self, finding_id: str, properties: dict,
+    ) -> dict:
+        """Add a ``verify_attempt`` node AND its lineage edge.
+
+        The edge records WHICH check examined the finding, not that the
+        check succeeded: a ``not_run`` attempt (unsupported category,
+        scope refusal, missing probe parameter, failed spawn) is linked
+        exactly like a ``disagreed`` one, so a report can always walk
+        finding -> attempt. A refused link is audited — the refusal
+        reason is the record, not a missing edge on the graph.
+        """
+        attempt_node = self.graph.add_node(
+            node_type="verify_attempt",
+            label=finding_id,
+            properties=properties,
+        )
+        finding_node = next(
+            (n for n in self.graph.by_type("finding")
+             if n["label"] == finding_id), None)
+        if finding_node is not None:
+            refused: list[str] = []
+            lineage.link(
+                self.graph, "verified_by", finding_node, attempt_node,
+                provenance={"agent": "VERIFY", "source_type": "tool"},
+                properties={"finding_id": finding_id},
+                on_refuse=refused.append,
+            )
+            if refused:
+                self.audit.write({
+                    "event": "lineage_refused",
+                    "relationship": "verified_by",
+                    "finding_id": finding_id,
+                    "reason": refused[0],
+                })
+        return attempt_node
+
     def _verify_one(self, finding: dict) -> int:
         """Independently check one finding. Returns 1 if verified.
 
@@ -169,14 +206,12 @@ class VerifySubagent:
                 "finding_id": finding_id,
                 "reason": "hypothesis asset outside engagement scope",
             })
-            self.graph.add_node(
-                node_type="verify_attempt",
-                label=finding_id,
-                properties={"status": VERIFICATION_NOT_RUN,
-                            "verified": False, "method": "n/a",
-                            "category": category,
-                            "reason": "asset outside engagement scope"},
-            )
+            self._record_attempt(finding_id, {
+                "status": VERIFICATION_NOT_RUN,
+                "verified": False, "method": "n/a",
+                "category": category,
+                "reason": "asset outside engagement scope",
+            })
             return 0
 
         if contract is None:
@@ -193,15 +228,13 @@ class VerifySubagent:
                 "category": category,
                 "reason": reason,
             })
-            self.graph.add_node(
-                node_type="verify_attempt",
-                label=finding_id,
-                properties={"status": VERIFICATION_NOT_RUN,
-                            "verified": False, "method": "n/a",
-                            "category": category,
-                            "reason": reason,
-                            "secondary_evidence": secondary},
-            )
+            self._record_attempt(finding_id, {
+                "status": VERIFICATION_NOT_RUN,
+                "verified": False, "method": "n/a",
+                "category": category,
+                "reason": reason,
+                "secondary_evidence": secondary,
+            })
             return 0
 
         # Independence: the verification tool must differ from the tool
@@ -217,14 +250,12 @@ class VerifySubagent:
                 "category": category,
                 "reason": reason,
             })
-            self.graph.add_node(
-                node_type="verify_attempt",
-                label=finding_id,
-                properties={"status": VERIFICATION_NOT_RUN,
-                            "verified": False, "method": "n/a",
-                            "category": category,
-                            "reason": reason},
-            )
+            self._record_attempt(finding_id, {
+                "status": VERIFICATION_NOT_RUN,
+                "verified": False, "method": "n/a",
+                "category": category,
+                "reason": reason,
+            })
             return 0
 
         probes = _boolean_probe_urls(url)
@@ -240,15 +271,13 @@ class VerifySubagent:
                 "category": category,
                 "reason": "no numeric query parameter to probe",
             })
-            self.graph.add_node(
-                node_type="verify_attempt",
-                label=finding_id,
-                properties={"status": VERIFICATION_NOT_RUN,
-                            "verified": False, "method": "n/a",
-                            "category": category,
-                            "reason": "no numeric query parameter",
-                            "secondary_evidence": secondary},
-            )
+            self._record_attempt(finding_id, {
+                "status": VERIFICATION_NOT_RUN,
+                "verified": False, "method": "n/a",
+                "category": category,
+                "reason": "no numeric query parameter",
+                "secondary_evidence": secondary,
+            })
             return 0
 
         true_url, false_url = probes
@@ -265,14 +294,12 @@ class VerifySubagent:
                 "category": category,
                 "reason": "curl probes failed to run",
             })
-            self.graph.add_node(
-                node_type="verify_attempt",
-                label=finding_id,
-                properties={"status": VERIFICATION_NOT_RUN,
-                            "verified": False, "method": "curl boolean",
-                            "category": category,
-                            "reason": "probe run failed"},
-            )
+            self._record_attempt(finding_id, {
+                "status": VERIFICATION_NOT_RUN,
+                "verified": False, "method": "curl boolean",
+                "category": category,
+                "reason": "probe run failed",
+            })
             return 0
 
         # boolean verdict with a BASELINE: pages with rotating content
@@ -340,61 +367,36 @@ class VerifySubagent:
                     "be ruled out, so a response difference alone is not "
                     "evidence the injected boolean executed")
 
-        attempt_node = self.graph.add_node(
-            node_type="verify_attempt",
-            label=finding_id,
-            properties={
-                "verified": responses_differ,
-                # producer convenience (read-time derivation is
-                # authoritative — views.verification_status re-derives
-                # from the execution fields below):
-                "status": status,
-                "method": "curl boolean probe",
-                "true_len": len(true_out),
-                "false_len": len(false_out),
-                "baseline_len": len(base_out) if baseline_used else None,
-                # the confirmation fetch (second baseline) — when it
-                # differed from the first, its length records the rotation
-                "baseline2_len": baseline2_len,
-                # Batch 5C: counterevidence the check itself observed —
-                # recorded, never discarded; non-empty means the verdict
-                # does NOT promote (the question stays open)
-                "counterevidence": counterevidence,
-                # Batch 5B: the registered contract this check ran under —
-                # its identity, its budget, and what the method cannot
-                # establish, recorded with the result it produced
-                "category": category,
-                "contract": {
-                    "category": contract.category,
-                    "method": contract.method,
-                    "tool": contract.tool,
-                    "stage": contract.stage,
-                    "max_probe_seconds": contract.max_probe_seconds,
-                },
-                "confidence_limit": contract.confidence_limit,
+        self._record_attempt(finding_id, {
+            "verified": responses_differ,
+            # producer convenience (read-time derivation is
+            # authoritative — views.verification_status re-derives
+            # from the execution fields below):
+            "status": status,
+            "method": "curl boolean probe",
+            "true_len": len(true_out),
+            "false_len": len(false_out),
+            "baseline_len": len(base_out) if baseline_used else None,
+            # the confirmation fetch (second baseline) — when it
+            # differed from the first, its length records the rotation
+            "baseline2_len": baseline2_len,
+            # Batch 5C: counterevidence the check itself observed —
+            # recorded, never discarded; non-empty means the verdict
+            # does NOT promote (the question stays open)
+            "counterevidence": counterevidence,
+            # Batch 5B: the registered contract this check ran under —
+            # its identity, its budget, and what the method cannot
+            # establish, recorded with the result it produced
+            "category": category,
+            "contract": {
+                "category": contract.category,
+                "method": contract.method,
+                "tool": contract.tool,
+                "stage": contract.stage,
+                "max_probe_seconds": contract.max_probe_seconds,
             },
-        )
-        # Phase 1C lineage: finding --verified_by--> its independent check,
-        # by node ids. A refused link is audited — the refusal reason is
-        # the record, not a missing edge on the graph.
-        finding_node = next(
-            (n for n in self.graph.by_type("finding")
-             if n["label"] == finding_id), None)
-        if finding_node is not None:
-            refused: list[str] = []
-            lineage.link(
-                self.graph, "verified_by", finding_node, attempt_node,
-                provenance={"agent": "VERIFY", "source_type": "tool"},
-                properties={"finding_id": finding_id},
-                on_refuse=refused.append,
-            )
-            if refused:
-                self.audit.write({
-                    "event": "lineage_refused",
-                    "relationship": "verified_by",
-                    "finding_id": finding_id,
-                    "reason": refused[0],
-                })
+            "confidence_limit": contract.confidence_limit,
+        })
         if responses_differ and not counterevidence:
             # the finding node gains independent confirmation — ONLY when
             # the check observed no counterevidence: a verdict with a

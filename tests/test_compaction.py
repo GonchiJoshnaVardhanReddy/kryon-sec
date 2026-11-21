@@ -72,3 +72,19 @@ def test_no_compaction_below_threshold(cfg):
     import asyncio
     asyncio.run(session.maybe_compact())
     assert len(session.messages) == 1
+
+
+def test_message_cap_recounts_the_estimate():
+    """The hard message cap drops messages; the token estimate must be
+    recomputed from what remains — a stale-high estimate (counted before
+    the drop) could trigger compaction on a session that no longer holds
+    that many tokens."""
+    from kryonsec.llm import count_tokens
+
+    cfg = KryonsecConfig(max_messages=3, max_session_tokens=10_000)
+    session = GeneralSession(cfg=cfg)
+    for i in range(6):
+        session.add("user", f"m{i} " + "x" * 400)
+    assert len(session.messages) == 3
+    expected = count_tokens("\n".join(m.content for m in session.messages))
+    assert session.token_estimate == expected

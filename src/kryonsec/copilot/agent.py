@@ -123,6 +123,33 @@ def build_toolbox(
             return out
         return wrapper
 
+    def _web_search(query: str) -> str:
+        # search_web returns None only when EVERY source failed
+        # (unreachable/offline) — the LLM must see that, not an empty
+        # result list it would read as "no such pages exist"
+        try:
+            results = search_web(cfg, query)
+        except Exception as e:
+            return f"error: web search failed ({type(e).__name__})"
+        if results is None:
+            return ("error: web search unavailable — no result source "
+                    "reachable (offline?)")
+        return results if results else "no results found"
+
+    def _cve_lookup(cve_id: str) -> str:
+        # None means "not in NVD or NVD unreachable" — say which word
+        # applies instead of handing the model a bare `None`
+        try:
+            record = lookup_cve(cfg, cve_id)
+        except ValueError as e:
+            return f"error: {e}"
+        except Exception as e:
+            return f"error: CVE lookup failed ({type(e).__name__})"
+        if record is None:
+            return (f"error: no data for {cve_id} — not found in NVD "
+                    "or NVD unreachable")
+        return record
+
     toolbox: Toolbox = {}
     if "file_read" in cfg.enabled_tools:
         toolbox["file_read"] = (
@@ -135,12 +162,10 @@ def build_toolbox(
             TOOL_SCHEMAS["list_dir"], bounded(file_tools.list_directory))
     if "web_search" in cfg.enabled_tools:
         toolbox["web_search"] = (
-            TOOL_SCHEMAS["web_search"],
-            bounded(lambda query: search_web(cfg, query) or []))
+            TOOL_SCHEMAS["web_search"], bounded(_web_search))
     if "cve_lookup" in cfg.enabled_tools:
         toolbox["cve_lookup"] = (
-            TOOL_SCHEMAS["cve_lookup"],
-            bounded(lambda cve_id: lookup_cve(cfg, cve_id)))
+            TOOL_SCHEMAS["cve_lookup"], bounded(_cve_lookup))
     if extra:
         toolbox.update(extra)
     return toolbox

@@ -73,8 +73,11 @@ class ToolAuditLog:
         return self.last_hash
 
     def verify(self) -> "tuple[bool, str | None]":
-        """Replay the chain; return (ok, failure reason)."""
+        """Replay the chain; return (ok, failure reason). Never raises:
+        a chain that was never written is simply not verified."""
         prev = _GENESIS_PREV
+        if not self.path.exists():
+            return (False, "no audit file — nothing written yet")
         with open(self.path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f, start=1):
                 line = line.strip()

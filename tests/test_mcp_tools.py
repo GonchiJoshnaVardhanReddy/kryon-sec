@@ -313,3 +313,93 @@ def test_dead_server_is_reported_with_its_stderr(tmp_path):
     assert not any(
         n.rstrip().endswith("unhandled errors in a TaskGroup (1 sub-exception)")
         for n in notices)
+
+
+# --- mid-session death: stale tools must leave, status must say so ---------
+
+def test_mid_session_death_unmerges_tools_and_reports(tmp_path):
+    notices: list[str] = []
+    tb = McpToolbox(KryonsecConfig(home=tmp_path), on_notice=notices.append)
+    conn = _ServerConnection("dead")
+    entry = ({"function": {"name": "mcp_x"}}, lambda **kw: "x")
+    conn.entry["mcp_x"] = entry
+    tb.connections.append(conn)   # registered live, as connect_all does
+    tb._merge(conn.entry)
+    assert "mcp_x" in tb.snapshot()
+
+    # now the death path: capture + clear on the connection, then report
+    conn.merged = dict(conn.entry)
+    conn.error = "server exited (EOF)"
+    conn.entry.clear()
+    tb._on_connection_death(conn)
+
+    assert "mcp_x" not in tb.snapshot(), "stale tool served from a dead server"
+    status = {s["name"]: s for s in tb.statuses()}["dead"]
+    assert status["status"] == "disconnected"
+    assert "server exited" in status["detail"]
+    assert any("no longer available" in n for n in notices)
+
+
+def test_death_never_unmerges_another_servers_tool(tmp_path):
+    """Same tool name on two servers: the collision rule keeps the FIRST;
+    the second server's death must not remove the first's entry."""
+    tb = McpToolbox(KryonsecConfig(home=tmp_path))
+    first = _ServerConnection("a")
+    first_entry = ({"function": {"name": "mcp_dup"}}, lambda **kw: "a")
+    first.entry["mcp_dup"] = first_entry
+    tb.connections.append(first)
+    tb._merge(first.entry)
+
+    second = _ServerConnection("b")
+    second.entry["mcp_dup"] = ({"function": {"name": "mcp_dup"}},
+                               lambda **kw: "b")
+    tb.connections.append(second)
+    # never merged (first wins), then it dies
+    second.merged = dict(second.entry)
+    second.error = "died"
+    second.entry.clear()
+    tb._on_connection_death(second)
+
+    assert tb.snapshot()["mcp_dup"] is first_entry
+
+
+def test_death_during_close_is_silent(tmp_path):
+    """close() unwinds sessions too — no 'server exited' noise on teardown."""
+    notices: list[str] = []
+    tb = McpToolbox(KryonsecConfig(home=tmp_path), on_notice=notices.append)
+    conn = _ServerConnection("dead")
+    conn.entry["mcp_x"] = ({"function": {"name": "mcp_x"}}, lambda **kw: "x")
+    tb.connections.append(conn)
+    tb._merge(conn.entry)
+    tb._closing = True
+    conn.merged = dict(conn.entry)
+    conn.entry.clear()
+    tb._on_connection_death(conn)
+
+    assert notices == []
+    assert "mcp_x" in tb.snapshot()  # closing: snapshot dies with the toolbox
+
+
+def test_connection_loss_detection():
+    """The transport-death signal is distinguished from a tool's own
+    error — only the former may mark a live server dead."""
+    from kryonsec.copilot.mcp_tools import _is_connection_loss
+
+    class FakeMcpError(Exception):
+        def __init__(self, code, message):
+            super().__init__(code, message)
+            self.code = code
+            self.message = message
+
+    assert _is_connection_loss(FakeMcpError(-32000, "Connection closed"))
+    assert _is_connection_loss(BrokenPipeError())
+    assert _is_connection_loss(ConnectionResetError())
+
+    class ClosedResourceError(Exception):
+        pass
+
+    assert _is_connection_loss(ClosedResourceError())
+
+    # a tool's OWN error must never be read as a dead server
+    assert not _is_connection_loss(FakeMcpError(-32000, "invalid input"))
+    assert not _is_connection_loss(ValueError("bad argument"))

@@ -117,6 +117,52 @@ def test_toolbox_extra_mcp_tools_win(cfg):
     assert tb["mcp_fetch"][0] is fake_mcp_tool[0]
 
 
+def test_web_search_unavailable_is_not_an_empty_result(cfg, monkeypatch):
+    """search_web returns None only when EVERY source failed (offline).
+    The model must see 'unavailable', not an empty list it would read as
+    'no such pages exist'."""
+    from kryonsec.copilot import websearch
+
+    monkeypatch.setattr(websearch, "search_web", lambda cfg, q: None)
+    cfg.enabled_tools = ["web_search"]
+    out = build_toolbox(cfg, FileTools(cfg))["web_search"][1]("anything")
+    assert "unavailable" in out and "offline" in out
+    assert out != "[]"
+
+
+def test_web_search_empty_result_is_no_results(cfg, monkeypatch):
+    from kryonsec.copilot import websearch
+
+    monkeypatch.setattr(websearch, "search_web", lambda cfg, q: [])
+    cfg.enabled_tools = ["web_search"]
+    out = build_toolbox(cfg, FileTools(cfg))["web_search"][1]("anything")
+    assert out == "no results found"
+
+
+def test_cve_lookup_missing_is_explained_not_none(cfg, monkeypatch):
+    """lookup_cve returns None for unknown/unreachable; the tool result
+    used to be the literal string 'None'."""
+    from kryonsec.copilot import cve
+
+    monkeypatch.setattr(cve, "lookup_cve", lambda cfg, cve_id: None)
+    cfg.enabled_tools = ["cve_lookup"]
+    out = build_toolbox(cfg, FileTools(cfg))["cve_lookup"][1]("CVE-2020-0001")
+    assert out != "None"
+    assert "CVE-2020-0001" in out and "NVD" in out
+
+
+def test_cve_lookup_invalid_id_is_an_error_string(cfg, monkeypatch):
+    from kryonsec.copilot import cve
+
+    def _raise(cfg, cve_id):
+        raise ValueError("invalid CVE id: not-a-cve")
+
+    monkeypatch.setattr(cve, "lookup_cve", _raise)
+    cfg.enabled_tools = ["cve_lookup"]
+    out = build_toolbox(cfg, FileTools(cfg))["cve_lookup"][1]("not-a-cve")
+    assert out.startswith("error:") and "invalid CVE id" in out
+
+
 # ---- run_agent loop --------------------------------------------------------
 
 def test_run_agent_tool_round_then_answer(cfg, monkeypatch):

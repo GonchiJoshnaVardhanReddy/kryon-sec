@@ -234,6 +234,36 @@ def test_count_packages_syft_sbom():
     assert _count_packages("not json") is None
 
 
+@pytest.mark.parametrize("tool,code,output", [
+    ("semgrep", 127, "command not found"),
+    ("checkov", 127, "command not found"),
+    ("hadolint", 127, "command not found"),
+    ("osv-scanner", 127, "cannot start scanner"),
+    ("trivy", 137, "killed"),
+    ("grype", 1, "database update failed"),
+])
+def test_failed_scanner_is_not_a_completed_scan(tmp_path, monkeypatch, tool, code, output):
+    from kryonsec.purple import blue_team
+
+    original = blue_team.BLUE_TEAM_SCAN_PLAN + [blue_team.HADOLINT_PLAN_ENTRY]
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN",
+                        [entry for entry in original if entry[0] == tool])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    ran = blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=code, stdout=output)}),
+        audit,
+    )
+    assert ran == 0
+    assert graph.by_type("scanner_result") == []
+    events = [json.loads(line) for line in audit.path.read_text().splitlines()]
+    assert any(e["event"] == "scanner_failed" and e["tool"] == tool
+               and e["exit_code"] == code for e in events)
+    from kryonsec.purple.report import report_limitations
+    assert any(tool in line and "did not complete" in line
+               for line in report_limitations(graph, audit))
+
+
 def test_scan_plan_argv_shapes_validate():
     """The fixed plan must validate against the SHIPPED allowlist — if the
     templates and the plan drift apart, every spawn is rejected at runtime."""
@@ -244,9 +274,73 @@ def test_scan_plan_argv_shapes_validate():
     )
 
     allow = ToolAllowlist()
+    # OSV-Scanner v2 requires `scan source`; flags precede the path.
+    assert next(argv for tool, argv in BLUE_TEAM_SCAN_PLAN
+                if tool == "osv-scanner") == [
+        "osv-scanner", "scan", "source", "-r", "--format", "json", "/code",
+    ]
     for tool, argv in BLUE_TEAM_SCAN_PLAN + [HADOLINT_PLAN_ENTRY]:
         allow.validate(argv[0], argv)
         allow.check_blocklist(argv)
+
+
+@pytest.mark.parametrize("tool", ["osv-scanner", "grype", "syft"])
+def test_json_scanner_empty_output_cannot_claim_clean_scan(
+        tmp_path, monkeypatch, tool):
+    from kryonsec.purple import blue_team
+    from kryonsec.purple.report import report_limitations
+
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN", [
+        entry for entry in blue_team.BLUE_TEAM_SCAN_PLAN if entry[0] == tool
+    ])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    assert blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=0, stdout="")}),
+        audit,
+    ) == 0
+    assert not graph.by_type("scanner_result")
+    assert any(e["event"] == "scanner_failed" and e["tool"] == tool
+               for e in audit.entries())
+    assert any(tool in note and "did not complete" in note
+               for note in report_limitations(graph, audit))
+
+
+@pytest.mark.parametrize("tool,code,output,expected", [
+    ("semgrep", 127, "timeout: failed to run command 'semgrep': "
+     "No such file or directory", "not installed"),
+    ("checkov", 127, "timeout: failed to run command 'checkov': "
+     "No such file or directory", "not installed"),
+    ("hadolint", 127, "timeout: failed to run command 'hadolint': "
+     "No such file or directory", "not installed"),
+    ("osv-scanner", 127, "Scanning dir --format\n"
+     "lstat --format: no such file or directory", "arguments"),
+    ("osv-scanner", 127, "Scanned /code/package-lock.json file and found 1 package\n"
+     "error when retrieving vulns: request failed: network is unreachable",
+     "database"),
+    ("trivy", 1, "failed to download vulnerability DB", "database"),
+    ("grype", 1, "no vulnerability database available", "database"),
+])
+def test_scanner_failure_reports_action_without_claiming_clean(
+        tmp_path, monkeypatch, tool, code, output, expected):
+    from kryonsec.purple import blue_team
+    from kryonsec.purple.report import report_limitations
+
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN", [
+        entry for entry in
+        blue_team.BLUE_TEAM_SCAN_PLAN + [blue_team.HADOLINT_PLAN_ENTRY]
+        if entry[0] == tool
+    ])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    assert blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=code, stdout=output)}),
+        audit,
+    ) == 0
+    assert not graph.by_type("scanner_result")
+    failure = next(e for e in audit.entries() if e["event"] == "scanner_failed")
+    assert expected in failure["note"]
+    assert any(expected in note for note in report_limitations(graph, audit))
 
 
 def test_run_code_scanners_full_run(tmp_path):
@@ -310,6 +404,101 @@ def test_run_code_scanners_full_run(tmp_path):
     assert events.count("tool_spawn") == 11
     assert events.count("tool_result") == 11
     assert "scanners_done" in events
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_file_scan_plan_is_typed_deterministic_and_symlink_safe(tmp_path):
+    """Phase 3: the file-granular plan carries ONLY /code paths the typed
+    {file} slot accepts. Symlinks are never followed, oversized files are
+    skipped, and the same tree builds the same plan twice."""
+    from kryonsec.purple.allowlist import ToolAllowlist
+    from kryonsec.purple.blue_team import (
+        MAX_FILE_BYTES, build_file_scan_plan,
+    )
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (code / ".env").write_text("TOKEN=x\n", encoding="utf-8")
+    spaced = code / "dir with space"
+    spaced.mkdir()
+    (spaced / "tool.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    elf = code / "elf-sample"
+    elf.write_bytes(b"\x7fELF" + b"\x00" * 128)
+    (code / "big.bin").write_bytes(b"\x00" * (MAX_FILE_BYTES + 1))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (code / "escape").symlink_to(outside)
+    (code / "escape-elf").symlink_to(elf)
+
+    plan = build_file_scan_plan(code)
+    assert plan, "a code folder with files must produce a file plan"
+    assert plan == build_file_scan_plan(code), "plan must be deterministic"
+
+    allow = ToolAllowlist()
+    paths = []
+    for tool, argv in plan:
+        allow.validate(tool, argv)  # every argv passes the REAL Layer 2
+        file_args = [a for a in argv if a.startswith("/code")]
+        assert len(file_args) == 1, argv
+        paths.append(file_args[0])
+    assert "/code/app.py" in paths
+    assert "/code/.env" in paths
+    assert "/code/dir with space/tool.sh" in paths
+    assert "/code/big.bin" not in paths, "oversized file must be skipped"
+    assert not any("escape" in p for p in paths), (
+        "a symlink must never be followed into the plan")
+    # objdump/ROPgadget/r2/gdb only see real ELF files
+    elf_tools = {"objdump", "ROPgadget", "r2", "gdb"}
+    for tool, argv in plan:
+        if tool in elf_tools:
+            assert any(a == "/code/elf-sample" for a in argv), argv
+
+
+def test_file_scanners_run_through_real_allowlist(tmp_path):
+    from kryonsec.purple.blue_team import run_code_scanners
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (code / "tool").write_bytes(b"\x7fELF" + b"\x00" * 64)
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    sandbox = _FakeSandbox({
+        # base dir-mode scanners still run (scripted so labels/counts are real)
+        "semgrep": _SpawnResult(stdout="0 findings in /code"),
+        "checksec": _SpawnResult(stdout="RELRO  STACK CANARY  NX  PIE"),
+        # file-granular tools (Phase 3)
+        "strings": _SpawnResult(stdout="GNU C Library"),
+        "xxd": _SpawnResult(stdout="00000000: 7f45 4c46"),
+        "binwalk": _SpawnResult(stdout="0  0x0  ELF, 64-bit"),
+        "objdump": _SpawnResult(stdout="file format elf64-x86-64"),
+        "ROPgadget": _SpawnResult(stdout="Gadgets information"),
+        "r2": _SpawnResult(stdout="arch x86"),
+        "gdb": _SpawnResult(stdout="All defined functions:"),
+    })
+
+    ran = run_code_scanners(graph, sandbox, audit,
+                            code_folder=str(code))
+    labels = {n["label"] for n in graph.by_type("scanner_result")}
+    # one node per (tool, file): the label names both, never just the tool
+    assert "strings:/code/app.py" in labels
+    assert "strings:/code/tool" in labels
+    assert "objdump:/code/tool" in labels
+    assert "gdb:/code/tool" in labels
+    # base scanners still ran with their plain labels
+    assert "semgrep" in labels and "checksec" in labels
+    assert ran > 7
+    # every file-granular spawn reads the fixed /code mount
+    file_tools = {"strings", "xxd", "binwalk", "objdump", "ROPgadget",
+                  "r2", "gdb"}
+    for argv in sandbox.argvs:
+        if argv[0] in file_tools:
+            assert any(a.startswith("/code/") for a in argv), argv
+            assert "\x1b" not in " ".join(argv)
+    audit_events = _events(audit)
+    assert audit_events.count("tool_spawn") == len(sandbox.argvs)
     ok, reason = audit.verify()
     assert ok, reason
 
@@ -524,6 +713,12 @@ def test_report_renders_everything(tmp_path):
     assert audit.head_hash() in report
     # no exploit_attempt nodes => the report must NOT claim testing happened
     assert "No testing was done against the website" in report
+    # ... and it must not deny the reconnaissance that DID happen either:
+    # lab run 20261119T162715Z had 14 real tool spawns (4 plan + 10
+    # adapters) yet the report said "no tools were run in this engagement".
+    assert "No test steps to show" not in report
+    assert "no tools were run in this engagement" not in report
+    assert "No hypothesis-driven test steps to show" in report
 
 
 def test_report_validation_clean(tmp_path):
@@ -628,6 +823,74 @@ def test_report_claims_testing_only_with_real_attempts(tmp_path):
     assert "### Steps for H1:sqlmap" in report
     # (the safety reminder wraps across lines — normalize whitespace)
     assert "you are allowed to test" in " ".join(report.split())
+
+
+def test_report_does_not_call_a_started_but_failed_tool_unrun(tmp_path):
+    """Real lab run 20261119T170135Z: H2:curl exited 18 after receiving
+    the /ftp page and H4:curl exited 7 on a refused connection. Both
+    attempts STARTED (ok, exit code and output are on the record), but
+    the report told the reader "this test did not run" and "did not
+    record whether the tool actually started" — the opposite of the same
+    document's coverage section, which counted them as runs."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:curl", {
+        "tool": "curl", "ok": True, "exit_code": 18, "confirmed": False,
+        "outcome": "tool-error",
+        "argv": ["curl", "-sS", "--max-time", "30",
+                 "http://target-corp.com/ftp"],
+        "output_excerpt": "<title>listing directory /ftp/</title>",
+        "exit_note": "partial response: server closed the transfer short "
+                     "of its Content-Length",
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    # the template wraps these lines; compare on collapsed whitespace
+    flat = " ".join(report.split())
+    # the record is a run with a partial result, not a missing run
+    assert "started but did not finish" in flat
+    assert "This test did not run" not in flat
+    assert "did not record whether the tool actually started" not in flat
+    # the partial output is shown as evidence, labelled as not a result
+    assert "Partial output (evidence, not a result)" in flat
+    assert "listing directory /ftp/" in flat
+    # and the hypothesis line does not read as a clean "Tested: yes"
+    assert "Tested: started, but the check did not finish" in flat
+    assert "Tested: yes" not in flat
+
+
+def test_coverage_counts_items_and_runs_separately(tmp_path):
+    """The old line said "tool runs really started for N of them" where
+    "them" was the hypothesis count — with several tools per hypothesis
+    N could exceed it (4 items, 7 runs on the 2026-11-19 lab run)."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _graph()
+    graph.add_node("exploit_attempt", "H1:sqlmap", {
+        "tool": "sqlmap", "ok": True, "exit_code": 0, "confirmed": True,
+        "outcome": "confirmed",
+        "argv": ["sqlmap"], "output_excerpt": "vulnerable",
+    })
+    graph.add_node("finding", "H1", {"tool": "sqlmap"})
+    graph.add_node("exploit_attempt", "H1:nikto", {
+        "tool": "nikto", "ok": True, "exit_code": 0, "confirmed": False,
+        "outcome": "inconclusive",
+        "argv": ["nikto"], "output_excerpt": "- Nikto v2.6.1",
+    })
+    graph.add_node("exploit_attempt", "H2:curl", {
+        "tool": "curl", "ok": True, "exit_code": 7, "confirmed": False,
+        "outcome": "tool-error",
+        "argv": ["curl", "-sS", "http://target-corp.com/x"],
+        "output_excerpt": "curl: (7) Failed to connect",
+    })
+
+    report = render_report(graph, audit, "e-bt")
+    flat = " ".join(report.split())
+    assert "a tool run really started for 2 of them" in flat
+    assert "Tool runs that really started: 3" in flat
+    assert "Started but did not finish (no clean result): 1 (H2)" in flat
+    # the confirmed item is not described as an unconfirmed suggestion
+    assert "These started as **suggestions**" in flat
+    assert "The items marked **confirmed by the test tool**" in flat
 
 
 def test_report_shows_verified_badge(tmp_path):

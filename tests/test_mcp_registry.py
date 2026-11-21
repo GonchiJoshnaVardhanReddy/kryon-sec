@@ -27,7 +27,6 @@ from kryonsec.copilot.mcp_registry import (
     terminal_mcp_approver,
     validate_arguments,
 )
-from kryonsec.copilot.tool_audit import ToolAuditLog
 
 FIXTURE = Path(__file__).parent / "mcp_fixture_server.py"
 # Locally generated placeholder credential (GitGuardian-safe: not real
@@ -973,3 +972,64 @@ def test_copilot_mcp_modules_import_nothing_from_purple():
         text = (copilot / name).read_text(encoding="utf-8")
         for needle in forbidden:
             assert needle not in text, f"{name} imports purple: {needle}"
+
+
+# --- Phase 1 (2026-11-18): honest failure surfaces -------------------------
+
+def test_non_object_arguments_refused_before_approval(tmp_path):
+    """A human is never shown an approval prompt for a call that is
+    refused anyway: the arguments shape is validated FIRST."""
+    seen = []
+    reg, cfg, box, audit = _ask_registry(
+        tmp_path, lambda req: seen.append(req) or True)
+    out = reg.call_mcp_tool("a", "echo", "not-an-object")
+    assert "arguments must be an object" in out
+    assert seen == [], "approval gate ran before the args-shape refusal"
+    assert "mcp_tool_refused" in _event_names(audit)
+    ok, reason = audit.verify()
+    assert ok, reason
+
+
+def test_real_fixture_mid_session_death_is_reported_honestly(
+        tmp_path, monkeypatch):
+    """A server that dies AFTER listing its tools must never be reported
+    as 'connected' with its tools still callable: the toolbox drops the
+    stale entries, the status says the process exited, and a call gets
+    'not running — server exited', never 'connected but has no tool'."""
+    import time
+
+    from kryonsec.copilot.mcp_tools import McpToolbox
+
+    # keep the worst case fast if the transport does not notice the EOF
+    monkeypatch.setattr(
+        "kryonsec.copilot.mcp_tools.TOOL_CALL_TIMEOUT_S", 5)
+    cfg = _cfg(tmp_path, [_fixture_row(
+        trust="allow", allow_tools=["pong", "die"], call_timeout_s=5)])
+    box = McpToolbox(cfg)
+    box.connect_all()
+    reg = McpRegistry(cfg, box, approver=None)
+    try:
+        assert any(k.endswith("_pong") for k in box.snapshot())
+        # kill the server through its own tool; the call itself may fail
+        # (the process is gone mid-call) — that failure is honest either way
+        out = reg.call_mcp_tool("fixture", "die", {})
+        assert out.startswith("error:") or "crashed" in out
+
+        deadline = time.time() + 10
+        while time.time() < deadline and "mcp_pong" in box.snapshot():
+            time.sleep(0.02)
+        assert "mcp_pong" not in box.snapshot(), \
+            "a dead server's tools are still being served"
+
+        entry, reason = reg._connection_entry("fixture", "pong")
+        assert entry is None
+        assert "not running" in reason and "server exited" in reason
+        assert "connected but has no tool" not in reason
+
+        status = {s["name"]: s for s in box.statuses()}["fixture"]
+        assert status["status"] == "disconnected"
+        assert "exited" in status["detail"]
+        ok, why = reg.audit.verify()
+        assert ok, why
+    finally:
+        box.close()

@@ -49,6 +49,10 @@ class GeneralSession:
         if len(self.messages) > self.cfg.max_messages:
             # hard cap on message count before token compaction kicks in
             self.messages = self.messages[-self.cfg.max_messages :]
+            # the cap dropped messages — the estimate counted them; a
+            # stale-high estimate could trigger compaction on a session
+            # that no longer holds that many tokens
+            self._recount()
 
     def as_llm_messages(self, system_prompt: str) -> list[dict]:
         out = [{"role": "system", "content": system_prompt}]
@@ -74,7 +78,10 @@ class GeneralSession:
         secrets_present = bool(secret_map)
         model = compaction_model_for(self.cfg, secrets_present)
 
-        summary = chat(
+        import asyncio
+
+        summary = await asyncio.to_thread(
+            chat,
             self.cfg,
             [{"role": "user", "content": COMPACTION_PROMPT + "\nMessages to summarize:\n" + redacted_text}],
             model=model,
@@ -82,6 +89,9 @@ class GeneralSession:
             # fallback, even when the local model is down (spec §6.4).
             local_only=secrets_present,
         )
+        # off the caller's event loop: the console path awaits this
+        # coroutine directly, and a synchronous LLM call here used to
+        # freeze the whole CLI for the length of a model timeout
         if secrets_present:
             summary = restore(summary, secret_map)
 

@@ -32,7 +32,7 @@ Two rules that explain most of the shape below:
   shaping. This is the allowlist-not-blocklist rule in action: the tool simply
   does not exist as far as the runner is concerned.
 
-Totals: **63 tools** on the host allowlist. The sandbox image additionally
+Totals: **80 tools** on the host allowlist. The sandbox image additionally
 carries `python3` and `kube-bench`, which are *not* host-allowlisted — the host
 allowlist is the authoritative gate, so they are unreachable.
 
@@ -103,6 +103,13 @@ the target's resolvers.
 | `rustscan` | `-a {target} -p {ports} --no-banner -t 2000` | **no** — allowlisted only |
 | `hakrawler` | `-url {url} -depth {depth}` | **no** — allowlisted only |
 | `massdns` | `-r <resolvers> -t A -o S -w /tmp/massdns.out <seclists DNS>` | **no** — allowlisted only |
+| `wafw00f` | `-a --no-color {url}` | yes — per web base (Phase 4) |
+| `dirsearch` | `-u {url} -w <seclists common.txt> -t 10 --timeout=30 --no-color` | yes — per web base (Phase 4) |
+| `dnsenum` | `--dnsserver {resolver} --enum {target}` | yes — only when a resolver is pinned (Phase 4) |
+| `fierce` | `--domain {term} --dns-servers {resolver}` | yes — only when a resolver is pinned (Phase 4) |
+| `nbtscan` | `-t 2000 {target}` | only when discovery observed 139/445 open (Phase 4) |
+| `smbmap` | `-H {target} --no-banner --no-color --no-update` | only when discovery observed 139/445 open (Phase 4) |
+| `enum4linux-ng` | `-A {target}` | only when discovery observed 139/445 open (Phase 4) |
 
 Why the three are parked: `nmap` + `naabu` already cover discovery and one
 failing is not worth a third scanner's runtime (`rustscan`); `hakrawler`
@@ -245,7 +252,7 @@ hypothesis review.
 
 | Tool | Template | In plan? |
 |---|---|---|
-| `linpeas.sh` | `-a` | yes (when reachable) |
+| `linpeas.sh` | `-s -N -q` | yes (when reachable) |
 | `pspy64` | *(no args)* | yes |
 | `linux-exploit-suggester.sh` | *(no args)* | yes |
 | `/opt/kryonsec/enum_processes.py` | `{target}` | yes |
@@ -289,12 +296,45 @@ path comes from the CLI, never from the LLM.
 | `osv-scanner` | `-r /code --format json` | yes |
 | `grype` | `dir:/code -o json` | yes |
 | `hadolint` | `/code/Dockerfile` | conditional — only when a Dockerfile exists |
+| `checksec` | `--dir=/code` | yes — dir mode, audits every ELF (Phase 4) |
+| `exiftool` | `-r -q /code` | yes — metadata for every file (Phase 4) |
+
+### File-granular binary tools (Phase 3)
+
+The typed `{file}` slot (see the appendix) lets the blue-team lane run one
+check per **selected regular file** under the fixed read-only `/code` mount.
+`build_file_scan_plan()` walks the operator's folder host-side, never follows a
+symlink, skips VCS/dependency-cache directories, caps file count (4 any-type,
+2 ELF) and size (1 MiB any, 512 KiB ELF), and maps each choice to a
+`/code/<relative>` path. The host path itself never appears in an argv. Flags
+were verified in the **original checkout's** pinned image on `/usr/bin/ls`
+(2026-11-19); this branch retains a different Dockerfile and has not yet
+rebuilt or re-pinned its image. This branch's runtime needs Linux/gVisor
+validation before file-tool availability can be claimed.
+
+| Tool | Template | Runs on |
+|---|---|---|
+| `strings` | `-n 8 {file}` | up to 4 selected files |
+| `xxd` | `-l 4096 {file}` | up to 4 selected files |
+| `binwalk` | `-B {file}` | up to 4 selected files — signature scan only, never `-e` (extraction) |
+| `objdump` | `-d --no-show-raw-insn {file}` | up to 2 ELF files |
+| `ROPgadget` | `--binary {file} --depth 6 --only pop\|ret` | up to 2 ELF files |
+| `r2` | `-N -q -c iI;q {file}` | up to 2 ELF files — `-N` skips the user rc file |
+| `gdb` | `-nx -batch -ex "info functions" {file}` | up to 2 ELF files — `-nx` skips init files |
+
+`r2 -N` and `gdb -nx` matter: without them a planted rc/init file in the code
+folder could execute. `binwalk` never extracts. `ropper` (output-heavy
+duplicate of ROPgadget), `steghide` (needs a carrier and passphrase), and
+`foremost` (carving writes an output tree) are **dormant** — not allowlisted,
+so both layers refuse them (audited, fail closed), regardless of whether
+their optional packages are present in the image.
 
 `kube-bench` is deliberately absent: it audits a live node's kubelet config, not
 a code folder — inside this sandbox it would test the sandbox itself.
 
 `trivy`, `osv-scanner`, and `grype` need egress to their vulnerability
-databases. Offline they fail as **audited skips**.
+databases. When they do not complete, they are audited as failures and
+reported as limitations, not as clean scans.
 
 ---
 
@@ -342,6 +382,7 @@ inside a larger literal (`--severity={low|medium}`).
 | `{hostport}` | `host:port` |
 | `{token}` | a JWT-shaped token (three base64url segments) |
 | `{term}` | search term, no shell metacharacters |
+| `{file}` | a file under the fixed read-only `/code` mount — no `.`/`..` segment, no shell metacharacter, always begins `/code/` (so it can never be read as an option) |
 
 Arguments are compiled to `^…\Z` regexes. `\Z` rather than `$` is deliberate:
 Python's `$` also matches just before a trailing newline, so `^…$` would have

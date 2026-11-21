@@ -195,6 +195,31 @@ def test_live_verification_writes_lineage_edge_by_ids(tmp_path):
     assert ok, reason
 
 
+def test_not_run_attempt_is_still_linked_to_its_finding(tmp_path):
+    """Lineage records WHICH check examined the finding, not that it
+    succeeded — a `disagreed` attempt is already linked the same way. An
+    unsupported category keeps its honest `not_run` AND the edge, so a
+    report can walk finding -> attempt. Found by the real Phase-2 lab
+    run (2026-11-19): a template_scan finding had its not_run attempt and
+    no edge at all."""
+    cfg = KryonsecConfig(home=tmp_path)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    graph = _finding_graph()
+    # nuclei maps to template_scan, which has no registered contract
+    graph.by_type("finding")[0]["properties"]["tool"] = "nuclei"
+    sandbox = _CannedSandbox("a", "b", "a")
+    VerifySubagent(cfg, graph, audit, "target-corp.com", sandbox).run()
+
+    attempts = graph.by_type("verify_attempt")
+    assert len(attempts) == 1
+    assert verification_status(attempts[0]) == VERIFICATION_NOT_RUN
+    edges = graph.find_edges("verified_by")
+    assert len(edges) == 1
+    assert edges[0]["source_node_id"] == graph.by_type("finding")[0]["id"]
+    assert edges[0]["target_node_id"] == attempts[0]["id"]
+    assert edges[0]["properties"]["finding_id"] == "H1"
+
+
 def test_contradictory_check_reads_disagreed(tmp_path):
     """Every response identical (including the baseline): the boolean
     method ran its full course and contradicts the original finding."""
