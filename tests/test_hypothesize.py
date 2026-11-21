@@ -25,6 +25,80 @@ from kryonsec.purple.recon_passive import EngagementGraph
 from kryonsec.secrets import REDACTION_DECLARATION, detect_secrets
 
 
+def test_structured_chat_retries_only_a_timeout(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise llm.LlmUnavailable("provider timeout") from TimeoutError()
+        return "{}"
+
+    monkeypatch.setattr(llm, "chat", chat)
+    assert _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                            "model") == "{}"
+    assert [c["timeout"] for c in calls] == [90, 90]
+
+
+@pytest.mark.parametrize("error", [
+    "LLM disabled by KRYONSEC_DISABLE_LLM",
+    "no API key is set",
+])
+def test_structured_chat_does_not_retry_permanent_failure(monkeypatch, error):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable(error)
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable, match=error):
+        _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                         "model")
+    assert calls == [1]
+
+
+def test_structured_chat_never_retries_sensitive_prompt(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable("timeout") from TimeoutError()
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable):
+        _structured_chat(KryonsecConfig(),
+                         [{"role": "user", "content": f"{REDACTION_DECLARATION}: 1"}],
+                         "model")
+    assert calls == [1]
+
+
+def test_structured_chat_stops_after_second_timeout(monkeypatch):
+    from kryonsec import llm
+    from kryonsec.purple.hypothesize import _structured_chat
+
+    calls = []
+
+    def chat(*args, **kwargs):
+        calls.append(1)
+        raise llm.LlmUnavailable("timeout") from TimeoutError()
+
+    monkeypatch.setattr(llm, "chat", chat)
+    with pytest.raises(llm.LlmUnavailable):
+        _structured_chat(KryonsecConfig(), [{"role": "user", "content": "safe"}],
+                         "model")
+    assert len(calls) == 2
+
+
 def _graph_with_findings():
     graph = EngagementGraph(engagement_id="e-h")
     graph.add_node("target", "testcorp.example", {"source": "engagement_config"})

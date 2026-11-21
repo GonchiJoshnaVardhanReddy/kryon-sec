@@ -304,6 +304,35 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
+_STRUCTURED_CALL_TIMEOUT_S = 90
+
+
+def _structured_chat(cfg: KryonsecConfig, messages: list[dict], model: str) -> str:
+    """Retry one timed-out JSON call; never retry a refusal or sensitive call."""
+    from ..llm import (
+        LlmUnavailable, _declared_redactions_in_messages,
+        _secrets_in_messages, chat,
+    )
+
+    sensitive = (_secrets_in_messages(messages)
+                 or _declared_redactions_in_messages(messages))
+    try:
+        return chat(cfg, messages, model=model, timeout=_STRUCTURED_CALL_TIMEOUT_S)
+    except LlmUnavailable as error:
+        cause = error.__cause__
+        if sensitive or cause is None:
+            raise
+        # LiteLLM maps provider timeouts to litellm.Timeout. A bare
+        # LlmUnavailable also covers disabled providers, missing keys and
+        # policy refusal; none of those may be replayed.
+        from litellm import Timeout
+
+        if not isinstance(cause, (TimeoutError, Timeout)):
+            raise
+        log.warning("hypothesis JSON call timed out; retrying once")
+        return chat(cfg, messages, model=model, timeout=_STRUCTURED_CALL_TIMEOUT_S)
+
+
 def propose_hypotheses_with_model(
     cfg: KryonsecConfig,
     prompt: str,
@@ -370,8 +399,6 @@ def propose_hypotheses_with_model(
     except Exception as e:  # provider error on the instructor path
         log.warning("instructor call failed (%s); trying JSON path", e)
 
-    from ..llm import chat
-
     json_prompt = (
         f"{prompt}\n\n"
         "Respond with ONLY a JSON object of this exact shape:\n"
@@ -388,7 +415,7 @@ def propose_hypotheses_with_model(
         {"role": "user", "content": json_prompt},
     ]
 
-    text = chat(cfg, messages, model=model)
+    text = _structured_chat(cfg, messages, model)
     try:
         return HypothesisSet.model_validate(_extract_json(text)), None
     except (ValueError, ValidationError):
@@ -401,7 +428,7 @@ def propose_hypotheses_with_model(
                 "Output ONLY the corrected JSON object now.",
             },
         ]
-        text = chat(cfg, retry, model=model)
+        text = _structured_chat(cfg, retry, model)
         return HypothesisSet.model_validate(_extract_json(text)), None
 
 
