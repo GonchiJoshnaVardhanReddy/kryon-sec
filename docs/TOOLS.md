@@ -307,7 +307,10 @@ check per **selected regular file** under the fixed read-only `/code` mount.
 symlink, skips VCS/dependency-cache directories, caps file count (4 any-type,
 2 ELF) and size (1 MiB any, 512 KiB ELF), and maps each choice to a
 `/code/<relative>` path. The host path itself never appears in an argv. Flags
-were verified live against the pinned image on `/usr/bin/ls` (2026-11-19).
+were verified in the **original checkout's** pinned image on `/usr/bin/ls`
+(2026-11-19); this branch retains a different Dockerfile and has not yet
+rebuilt or re-pinned its image. This branch's runtime needs Linux/gVisor
+validation before file-tool availability can be claimed.
 
 | Tool | Template | Runs on |
 |---|---|---|
@@ -322,14 +325,16 @@ were verified live against the pinned image on `/usr/bin/ls` (2026-11-19).
 `r2 -N` and `gdb -nx` matter: without them a planted rc/init file in the code
 folder could execute. `binwalk` never extracts. `ropper` (output-heavy
 duplicate of ROPgadget), `steghide` (needs a carrier and passphrase), and
-`foremost` (carving writes an output tree) are installed but **dormant** — not
-allowlisted, so both layers refuse them (audited, fail closed).
+`foremost` (carving writes an output tree) are **dormant** — not allowlisted,
+so both layers refuse them (audited, fail closed), regardless of whether
+their optional packages are present in the image.
 
 `kube-bench` is deliberately absent: it audits a live node's kubelet config, not
 a code folder — inside this sandbox it would test the sandbox itself.
 
 `trivy`, `osv-scanner`, and `grype` need egress to their vulnerability
-databases. Offline they fail as **audited skips**.
+databases. When they do not complete, they are audited as failures and
+reported as limitations, not as clean scans.
 
 ---
 
