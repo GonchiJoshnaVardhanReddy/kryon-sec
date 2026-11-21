@@ -131,3 +131,15 @@ def test_every_registered_recon_adapter_executable_is_required_by_the_build():
     assert not missing, (
         "registered RECON_ACTIVE adapter executables are not checked by the "
         f"image build guard: {missing}")
+
+
+def test_file_scan_plan_executables_are_required_by_the_build():
+    """The release image must not silently omit a wired file scanner."""
+    from kryonsec.purple.blue_team import FILE_SCAN_PLAN
+
+    required = _text().split("# REQUIRED-tool verification", 1)[1]
+    missing = [
+        tool for tool, _, _ in FILE_SCAN_PLAN
+        if f"check_cmd {tool};" not in required
+    ]
+    assert not missing, f"file scanners absent from image build guard: {missing}"
