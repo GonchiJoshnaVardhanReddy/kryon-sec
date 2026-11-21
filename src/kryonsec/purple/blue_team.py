@@ -56,7 +56,8 @@ BLUE_TEAM_SCAN_PLAN: list[tuple[str, list[str]]] = [
     # vulnerability databases — same caveat as trivy (documented in the
     # tool-expansion record): they fail as audited skips offline.
     ("syft", ["syft", "scan", "/code", "-o", "json"]),
-    ("osv-scanner", ["osv-scanner", "-r", "/code", "--format", "json"]),
+    ("osv-scanner", ["osv-scanner", "scan", "source", "-r",
+                     "--format", "json", "/code"]),
     ("grype", ["grype", "dir:/code", "-o", "json"]),
     # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
     # the same read-only /code mount. checksec audits every ELF's
@@ -241,6 +242,30 @@ def _count_packages(stdout: str) -> int | None:
     return None
 
 
+def _scanner_failure_note(tool: str, result) -> str:
+    """Fixed operator guidance only; never copy scanner output into reports."""
+    output = result.stdout or ""
+    if not result.ok:
+        return "sandbox spawn failed; check doctor --deep --strict and the audit"
+    if tool in {"trivy", "grype", "osv-scanner"} and any(
+            marker in output.lower() for marker in (
+                "failed to download vulnerability db", "no vulnerability database",
+                "failed to fetch latest version",
+                "error when retrieving vulns",
+            )):
+        return "vulnerability database unavailable; provision an approved offline database before retrying"
+    if result.exit_code == 127:
+        if ("timeout: failed to run command" in output
+                and "No such file or directory" in output):
+            return "tool not installed in the selected sandbox image; check the image inventory"
+        if tool == "osv-scanner" and "Scanning dir --format" in output:
+            return "OSV-Scanner arguments are incompatible with this image; check the v2 scan source plan"
+        return "tool exited 127; check the selected image and scanner arguments"
+    if result.exit_code == 0 and tool in {"syft", "osv-scanner", "grype"}:
+        return "scanner returned no valid JSON results; check scanner output before claiming a clean scan"
+    return f"scanner exited {result.exit_code}; check the audit and scanner output"
+
+
 def run_code_scanners(
     graph: EngagementGraph,
     sandbox,
@@ -292,10 +317,15 @@ def run_code_scanners(
         })
         result = sandbox.spawn(argv)
         count = _count_findings(tool, result.stdout) if result.ok else None
+        json_valid = (
+            tool not in {"syft", "osv-scanner", "grype"}
+            or (count is not None if tool != "syft"
+                else _count_packages(result.stdout) is not None)
+        )
         # A process that starts is not necessarily a completed scan. Exit 1
         # is findings only when a supported scanner emitted recognizable
         # findings; in particular Grype's database errors also exit 1.
-        completed = result.ok and (
+        completed = result.ok and json_valid and (
             result.exit_code == 0
             or (result.exit_code == 1 and count is not None and count > 0)
         )
@@ -314,6 +344,7 @@ def run_code_scanners(
                 "state": "BLUE_TEAM",
                 "tool": tool,
                 "exit_code": result.exit_code,
+                "note": _scanner_failure_note(tool, result),
             })
             continue  # not evidence of a completed scan
         ran += 1

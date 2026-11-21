@@ -481,7 +481,7 @@ BLUE_TEAM_TEMPLATES: dict[str, list[str]] = {
     "hadolint": ["/code/Dockerfile"],
     # Phase 8: SBOM + dependency-vulnerability scanners (JSON output)
     "syft": ["scan", "/code", "-o", "json"],
-    "osv-scanner": ["-r", "/code", "--format", "json"],
+    "osv-scanner": ["scan", "source", "-r", "--format", "json", "/code"],
     "grype": ["dir:/code", "-o", "json"],
     # Phase 4 (2026-11-17): dir-mode binary/forensics scanners over
     # the read-only /code mount.

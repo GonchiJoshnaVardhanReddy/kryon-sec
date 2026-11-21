@@ -779,6 +779,15 @@ def report_limitations(graph: EngagementGraph, audit: AuditLog) -> list[str]:
             "Code scanner(s) did not complete: "
             + ", ".join(failed_scanners[:20])
             + "; no finding or clean-scan claim can be made from those runs.")
+        for entry in events:
+            if (entry.get("event") == "scanner_failed"
+                    and entry.get("tool") in failed_scanners
+                    and isinstance(entry.get("note"), str)):
+                note = entry["note"]
+                if note and len(note) <= 200:
+                    detail = f"{entry['tool']}: {note}"
+                    if detail not in limitations:
+                        limitations.append(detail)
     return limitations[:10]
 
 

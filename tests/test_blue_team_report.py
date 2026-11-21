@@ -274,9 +274,73 @@ def test_scan_plan_argv_shapes_validate():
     )
 
     allow = ToolAllowlist()
+    # OSV-Scanner v2 requires `scan source`; flags precede the path.
+    assert next(argv for tool, argv in BLUE_TEAM_SCAN_PLAN
+                if tool == "osv-scanner") == [
+        "osv-scanner", "scan", "source", "-r", "--format", "json", "/code",
+    ]
     for tool, argv in BLUE_TEAM_SCAN_PLAN + [HADOLINT_PLAN_ENTRY]:
         allow.validate(argv[0], argv)
         allow.check_blocklist(argv)
+
+
+@pytest.mark.parametrize("tool", ["osv-scanner", "grype", "syft"])
+def test_json_scanner_empty_output_cannot_claim_clean_scan(
+        tmp_path, monkeypatch, tool):
+    from kryonsec.purple import blue_team
+    from kryonsec.purple.report import report_limitations
+
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN", [
+        entry for entry in blue_team.BLUE_TEAM_SCAN_PLAN if entry[0] == tool
+    ])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    assert blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=0, stdout="")}),
+        audit,
+    ) == 0
+    assert not graph.by_type("scanner_result")
+    assert any(e["event"] == "scanner_failed" and e["tool"] == tool
+               for e in audit.entries())
+    assert any(tool in note and "did not complete" in note
+               for note in report_limitations(graph, audit))
+
+
+@pytest.mark.parametrize("tool,code,output,expected", [
+    ("semgrep", 127, "timeout: failed to run command 'semgrep': "
+     "No such file or directory", "not installed"),
+    ("checkov", 127, "timeout: failed to run command 'checkov': "
+     "No such file or directory", "not installed"),
+    ("hadolint", 127, "timeout: failed to run command 'hadolint': "
+     "No such file or directory", "not installed"),
+    ("osv-scanner", 127, "Scanning dir --format\n"
+     "lstat --format: no such file or directory", "arguments"),
+    ("osv-scanner", 127, "Scanned /code/package-lock.json file and found 1 package\n"
+     "error when retrieving vulns: request failed: network is unreachable",
+     "database"),
+    ("trivy", 1, "failed to download vulnerability DB", "database"),
+    ("grype", 1, "no vulnerability database available", "database"),
+])
+def test_scanner_failure_reports_action_without_claiming_clean(
+        tmp_path, monkeypatch, tool, code, output, expected):
+    from kryonsec.purple import blue_team
+    from kryonsec.purple.report import report_limitations
+
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN", [
+        entry for entry in
+        blue_team.BLUE_TEAM_SCAN_PLAN + [blue_team.HADOLINT_PLAN_ENTRY]
+        if entry[0] == tool
+    ])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    assert blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=code, stdout=output)}),
+        audit,
+    ) == 0
+    assert not graph.by_type("scanner_result")
+    failure = next(e for e in audit.entries() if e["event"] == "scanner_failed")
+    assert expected in failure["note"]
+    assert any(expected in note for note in report_limitations(graph, audit))
 
 
 def test_run_code_scanners_full_run(tmp_path):
