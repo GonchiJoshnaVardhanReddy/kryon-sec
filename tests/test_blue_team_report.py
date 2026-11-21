@@ -234,6 +234,36 @@ def test_count_packages_syft_sbom():
     assert _count_packages("not json") is None
 
 
+@pytest.mark.parametrize("tool,code,output", [
+    ("semgrep", 127, "command not found"),
+    ("checkov", 127, "command not found"),
+    ("hadolint", 127, "command not found"),
+    ("osv-scanner", 127, "cannot start scanner"),
+    ("trivy", 137, "killed"),
+    ("grype", 1, "database update failed"),
+])
+def test_failed_scanner_is_not_a_completed_scan(tmp_path, monkeypatch, tool, code, output):
+    from kryonsec.purple import blue_team
+
+    original = blue_team.BLUE_TEAM_SCAN_PLAN + [blue_team.HADOLINT_PLAN_ENTRY]
+    monkeypatch.setattr(blue_team, "BLUE_TEAM_SCAN_PLAN",
+                        [entry for entry in original if entry[0] == tool])
+    graph = _graph()
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    ran = blue_team.run_code_scanners(
+        graph, _FakeSandbox({tool: _SpawnResult(exit_code=code, stdout=output)}),
+        audit,
+    )
+    assert ran == 0
+    assert graph.by_type("scanner_result") == []
+    events = [json.loads(line) for line in audit.path.read_text().splitlines()]
+    assert any(e["event"] == "scanner_failed" and e["tool"] == tool
+               and e["exit_code"] == code for e in events)
+    from kryonsec.purple.report import report_limitations
+    assert any(tool in line and "did not complete" in line
+               for line in report_limitations(graph, audit))
+
+
 def test_scan_plan_argv_shapes_validate():
     """The fixed plan must validate against the SHIPPED allowlist — if the
     templates and the plan drift apart, every spawn is rejected at runtime."""

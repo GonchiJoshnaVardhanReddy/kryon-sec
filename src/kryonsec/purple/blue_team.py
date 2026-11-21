@@ -291,6 +291,14 @@ def run_code_scanners(
             "argv": argv,
         })
         result = sandbox.spawn(argv)
+        count = _count_findings(tool, result.stdout) if result.ok else None
+        # A process that starts is not necessarily a completed scan. Exit 1
+        # is findings only when a supported scanner emitted recognizable
+        # findings; in particular Grype's database errors also exit 1.
+        completed = result.ok and (
+            result.exit_code == 0
+            or (result.exit_code == 1 and count is not None and count > 0)
+        )
         audit.write({
             "event": "tool_result",
             "state": "BLUE_TEAM",
@@ -298,9 +306,16 @@ def run_code_scanners(
             "ok": result.ok,
             "exit_code": result.exit_code,
             "output_chars": len(result.stdout),
+            "scan_completed": completed,
         })
-        if not result.ok:
-            continue  # spawn failed — audited, next scanner
+        if not completed:
+            audit.write({
+                "event": "scanner_failed",
+                "state": "BLUE_TEAM",
+                "tool": tool,
+                "exit_code": result.exit_code,
+            })
+            continue  # not evidence of a completed scan
         ran += 1
         # file-granular entries carry their selected path; the label names
         # BOTH the tool and the file (one node per check, never one merged
@@ -324,7 +339,6 @@ def run_code_scanners(
         }
         if file_path:
             properties["path"] = file_path
-        count = _count_findings(tool, result.stdout)
         if count is not None:
             properties["findings_count"] = count
         if tool == "syft":

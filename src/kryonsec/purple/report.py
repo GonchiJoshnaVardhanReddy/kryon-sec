@@ -734,9 +734,10 @@ def report_limitations(graph: EngagementGraph, audit: AuditLog) -> list[str]:
     # Phase 1E: the network-layer egress state is READ from the audit
     # chain, not asserted. Without `egress_policy_established` in this
     # engagement's chain the old default-bridge wording stays.
+    events = read_audit_events(audit)
     established = any(
         entry.get("event") == "egress_policy_established"
-        for entry in read_audit_events(audit))
+        for entry in events)
     if established:
         limitations = [
             "Network egress from the execution sandbox was restricted by a "
@@ -769,6 +770,15 @@ def report_limitations(graph: EngagementGraph, audit: AuditLog) -> list[str]:
         limitations.append(
             f"{blocked_checks} independent verification check(s) never ran; "
             "those findings are unverified, not disproven.")
+    failed_scanners = sorted({
+        str(entry.get("tool", "")) for entry in events
+        if entry.get("event") == "scanner_failed" and entry.get("tool")
+    })
+    if failed_scanners:
+        limitations.append(
+            "Code scanner(s) did not complete: "
+            + ", ".join(failed_scanners[:20])
+            + "; no finding or clean-scan claim can be made from those runs.")
     return limitations[:10]
 
 
